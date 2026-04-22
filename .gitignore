@@ -1,0 +1,27 @@
+# Build artifacts
+cpp/build/
+cpp/dist/
+typescript/dist/
+typescript/node_modules/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dependencies (optional - see below)
+# node_modules/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
