@@ -64,7 +64,7 @@ async function listSchemas() {
     LEFT JOIN LATERAL (SELECT JSONB_AGG(relname ORDER BY relname) AS relnames
                        FROM pg_class
                        WHERE relnamespace = pg_namespace.oid
-                         AND relkind IN ('r','m','f','p')
+                         AND relkind IN ('r','m','f','p','v')
                          AND relpersistence <> 't') ON true
     WHERE nspname NOT LIKE 'pg_%'
       AND nspname <> 'information_schema'
@@ -76,6 +76,8 @@ async function listTables(schema: string) {
   return await query(`
     SELECT JSONB_OBJECT_AGG(c.relname,
             JSONB_BUILD_OBJECT(
+             'kind', CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table'
+                                    WHEN 'm' THEN 'materialized view' WHEN 'v' THEN 'view' END,
              'description', COALESCE(obj_description(c.oid, 'pg_class'), ''),
              'rows', c.reltuples, 'size', c.relpages::bigint * 8192,
              'seq_scan', s.seq_scan, 'idx_scan', s.idx_scan,
@@ -84,7 +86,7 @@ async function listTables(schema: string) {
              'last_analyze', GREATEST(s.last_analyze, s.last_autoanalyze),
              'columns', columns, 'indexes', indexes, 'constraints', constraints))
     FROM pg_class AS c
-    JOIN pg_stat_user_tables AS s ON s.relid = c.oid
+    LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
     LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(attname, col_description(c.oid, attnum)) AS columns
                        FROM pg_attribute
                        WHERE attnum > 0
@@ -98,7 +100,7 @@ async function listTables(schema: string) {
                        FROM pg_constraint
                        WHERE conrelid = c.oid) ON true
     WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
-      AND c.relkind IN ('r', 'p', 'm')
+      AND c.relkind IN ('r', 'p', 'm', 'v')
   `, [schema]);
 }
 
@@ -107,6 +109,9 @@ async function tableDetails(schema: string, table: string) {
     SELECT JSONB_BUILD_OBJECT(
              'table', c.relname, 'rows', c.reltuples, 'size', c.relpages::bigint * 8192,
              'description', COALESCE(obj_description(c.oid, 'pg_class'), ''),
+             'kind', CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table'
+                                    WHEN 'm' THEN 'materialized view' WHEN 'v' THEN 'view' END,
+             'definition', CASE WHEN c.relkind IN ('v', 'm') THEN pg_get_viewdef(c.oid, true) END,
              'seq_scan', s.seq_scan, 'idx_scan', s.idx_scan,
              'n_live_tup', s.n_live_tup, 'n_dead_tup', s.n_dead_tup,
              'last_vacuum', GREATEST(s.last_vacuum, s.last_autovacuum),
@@ -117,7 +122,7 @@ async function tableDetails(schema: string, table: string) {
              'foreign_keys', COALESCE(foreign_keys, '{}'::jsonb),
              'triggers', COALESCE(triggers, '{}'::jsonb))
     FROM pg_class AS c
-    JOIN pg_stat_user_tables AS s ON s.relid = c.oid
+    LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
     LEFT JOIN LATERAL (SELECT JSONB_STRIP_NULLS(JSONB_OBJECT_AGG(a.attname,
                       JSONB_BUILD_OBJECT(
                        'description', col_description(c.oid, attnum),
@@ -192,6 +197,8 @@ async function searchTables(webSearch: string) {
   return await query(`
     SELECT JSONB_OBJECT_AGG(c.relnamespace::regnamespace::name || '.' || c.relname,
             JSONB_BUILD_OBJECT(
+             'kind', CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table'
+                                    WHEN 'm' THEN 'materialized view' WHEN 'v' THEN 'view' END,
              'description', COALESCE(obj_description(c.oid, 'pg_class'), ''),
              'rows', c.reltuples, 'size', c.relpages::bigint * 8192,
              'seq_scan', s.seq_scan, 'idx_scan', s.idx_scan,
@@ -200,7 +207,7 @@ async function searchTables(webSearch: string) {
              'last_analyze', GREATEST(s.last_analyze, s.last_autoanalyze),
              'columns', columns, 'indexes', indexes, 'constraints', constraints))
     FROM pg_class AS c
-    JOIN pg_stat_user_tables AS s ON s.relid = c.oid
+    LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
     LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(attname, col_description(c.oid, attnum)) AS columns
                        FROM pg_attribute
                        WHERE attnum > 0
@@ -213,16 +220,20 @@ async function searchTables(webSearch: string) {
     LEFT JOIN LATERAL (SELECT JSONB_AGG(pg_get_constraintdef(oid)) AS constraints
                        FROM pg_constraint
                        WHERE conrelid = c.oid) ON true
-    WHERE c.oid IN (SELECT DISTINCT objoid
-                    FROM pg_description
-                    WHERE to_tsvector('english', description) @@ websearch_to_tsquery('english', $1)
-                      AND classoid = 'pg_class'::regclass
-                      AND objsubid = 0)
-       OR TO_TSVECTOR('english',
-            REGEXP_REPLACE(
-              REGEXP_REPLACE(c.relname, '_', ' ', 'g'),
-              '([[:upper:]])', ' \\1', 'g'))
-            @@ websearch_to_tsquery('english', $1)
+    WHERE (c.oid IN (SELECT DISTINCT objoid
+                     FROM pg_description
+                     WHERE to_tsvector('english', description) @@ websearch_to_tsquery('english', $1)
+                       AND classoid = 'pg_class'::regclass
+                       AND objsubid = 0)
+        OR TO_TSVECTOR('english',
+             REGEXP_REPLACE(
+               REGEXP_REPLACE(c.relname, '_', ' ', 'g'),
+               '([[:upper:]])', ' \\1', 'g'))
+             @@ websearch_to_tsquery('english', $1))
+      AND c.relkind IN ('r', 'p', 'm', 'v')
+      AND c.relnamespace NOT IN (
+          SELECT oid FROM pg_namespace
+          WHERE nspname LIKE 'pg_%' OR nspname = 'information_schema')
   `, [webSearch]);
 }
 

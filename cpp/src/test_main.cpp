@@ -110,6 +110,20 @@ protected:
         " SELECT COUNT(*) FROM public.users; $$"
       );
 
+      txn.exec(
+        "CREATE VIEW public.active_users AS "
+        "  SELECT id, name FROM public.users WHERE name IS NOT NULL"
+      );
+
+      txn.exec(
+        "CREATE MATERIALIZED VIEW public.user_stats AS "
+        "  SELECT COUNT(*) AS user_count FROM public.users"
+      );
+
+      txn.exec("CREATE UNIQUE INDEX ON public.user_stats(user_count)");
+      txn.exec("REFRESH MATERIALIZED VIEW public.user_stats");
+      txn.exec("ANALYZE public.user_stats");
+
       txn.commit();
 
     } catch (const std::exception& e) {
@@ -431,6 +445,59 @@ TEST_F(PostgresMCPServerTest, TableDetailsIncludesTriggers) {
   EXPECT_TRUE(trig.contains("function"));
   EXPECT_EQ(trig["timing"].get<std::string>(), "AFTER");
   EXPECT_NE(trig["events"].get<std::string>().find("INSERT"), std::string::npos);
+}
+
+// --- view / materialized view tests ---
+
+TEST_F(PostgresMCPServerTest, SchemasContainsView) {
+  json result = srv->call_schemas();
+  auto tables = result["public"]["tables"];
+  std::vector<std::string> names(tables.begin(), tables.end());
+  EXPECT_NE(std::find(names.begin(), names.end(), "active_users"), names.end());
+}
+
+TEST_F(PostgresMCPServerTest, SchemasContainsMaterializedView) {
+  json result = srv->call_schemas();
+  auto tables = result["public"]["tables"];
+  std::vector<std::string> names(tables.begin(), tables.end());
+  EXPECT_NE(std::find(names.begin(), names.end(), "user_stats"), names.end());
+}
+
+TEST_F(PostgresMCPServerTest, TablesContainsViewAndMV) {
+  json result = srv->call_tables("public");
+  EXPECT_TRUE(result.contains("active_users"));
+  EXPECT_TRUE(result.contains("user_stats"));
+}
+
+TEST_F(PostgresMCPServerTest, TablesViewHasKindField) {
+  json result = srv->call_tables("public");
+  ASSERT_TRUE(result.contains("active_users"));
+  EXPECT_EQ(result["active_users"]["kind"].get<std::string>(), "view");
+}
+
+TEST_F(PostgresMCPServerTest, TablesMVHasKindField) {
+  json result = srv->call_tables("public");
+  ASSERT_TRUE(result.contains("user_stats"));
+  EXPECT_EQ(result["user_stats"]["kind"].get<std::string>(), "materialized view");
+}
+
+TEST_F(PostgresMCPServerTest, TableDetailsWorksForView) {
+  json result = srv->call_table("public", "active_users");
+  EXPECT_FALSE(result.empty());
+  EXPECT_TRUE(result.contains("columns"));
+  EXPECT_TRUE(result.contains("definition"));
+  EXPECT_FALSE(result["definition"].is_null());
+  EXPECT_FALSE(result["definition"].get<std::string>().empty());
+}
+
+TEST_F(PostgresMCPServerTest, TableDetailsWorksForMV) {
+  json result = srv->call_table("public", "user_stats");
+  EXPECT_FALSE(result.empty());
+  EXPECT_TRUE(result.contains("columns"));
+  EXPECT_TRUE(result.contains("definition"));
+  EXPECT_FALSE(result["definition"].is_null());
+  EXPECT_FALSE(result["definition"].get<std::string>().empty());
+  EXPECT_FALSE(result["indexes"].empty());
 }
 
 int main(int argc, char **argv) {
