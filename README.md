@@ -80,7 +80,35 @@ DATABASE_URL="port=5432 dbname=mydb" node dist/index.js
 
 ## MCP Configuration
 
-Add to your MCP client configuration (e.g. Claude Desktop `claude_desktop_config.json`):
+### Claude Code (`claude mcp add`)
+
+The `--scope` flag controls where the configuration is saved:
+
+| Scope | Flag | Config file | Use when |
+|-------|------|-------------|----------|
+| Project (default) | `--scope project` | `.claude.json` in project root | shared with the repo |
+| User | `--scope user` | `~/.claude.json` | available across all projects |
+| Local | `--scope local` | `.claude.json.local` (git-ignored) | personal overrides, not committed |
+
+**TypeScript:**
+```bash
+claude mcp add --scope project pg-licht \
+  -e DATABASE_URL="postgresql://user:pass@host/dbname" \
+  -- node /path/to/pg-licht/typescript/dist/index.js
+```
+
+**C++:**
+```bash
+claude mcp add --scope project pg-licht \
+  -e DATABASE_URL="postgresql://user:pass@host/dbname" \
+  -- /path/to/pg-licht/cpp/pg_licht_mcp
+```
+
+Replace `--scope project` with `--scope user` or `--scope local` as needed.
+
+### Manual — `.claude.json`
+
+You can also edit `.claude.json` (project root), `~/.claude.json` (user), or `.claude.json.local` (local) directly:
 
 **TypeScript:**
 ```json
@@ -110,6 +138,10 @@ Add to your MCP client configuration (e.g. Claude Desktop `claude_desktop_config
   }
 }
 ```
+
+### Claude Desktop
+
+Add the same JSON block above under `mcpServers` in `claude_desktop_config.json`.
 
 ## License
 
