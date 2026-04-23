@@ -64,8 +64,7 @@ async function listSchemas() {
     LEFT JOIN LATERAL (SELECT JSONB_AGG(relname ORDER BY relname) AS relnames
                        FROM pg_class
                        WHERE relnamespace = pg_namespace.oid
-                         AND relkind IN ('r','m','f','p','v')
-                         AND relpersistence <> 't') ON true
+                         AND relkind IN ('r','m','f','p','v')) ON true
     WHERE nspname NOT LIKE 'pg_%'
       AND nspname <> 'information_schema'
       AND relnames IS NOT NULL
