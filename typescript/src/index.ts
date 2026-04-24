@@ -228,7 +228,27 @@ async function searchTables(webSearch: string) {
              REGEXP_REPLACE(
                REGEXP_REPLACE(c.relname, '_', ' ', 'g'),
                '([[:upper:]])', ' \\1', 'g'))
-             @@ websearch_to_tsquery('english', $1))
+             @@ websearch_to_tsquery('english', $1)
+        OR c.oid IN (
+            SELECT DISTINCT a.attrelid
+            FROM pg_attribute AS a
+            JOIN pg_type AS et ON et.oid = a.atttypid AND et.typtype = 'e'
+            LEFT JOIN LATERAL (
+                SELECT STRING_AGG(ev.enumlabel, ' ') AS values_text
+                FROM pg_enum AS ev
+                WHERE ev.enumtypid = et.oid
+            ) ON true
+            WHERE a.attnum > 0 AND NOT a.attisdropped
+              AND (
+                  TO_TSVECTOR('english',
+                    REGEXP_REPLACE(REGEXP_REPLACE(et.typname, '_', ' ', 'g'), '([[:upper:]])', ' \\1', 'g'))
+                    @@ websearch_to_tsquery('english', $1)
+               OR TO_TSVECTOR('english', COALESCE(obj_description(et.oid, 'pg_type'), ''))
+                    @@ websearch_to_tsquery('english', $1)
+               OR TO_TSVECTOR('english', COALESCE(values_text, ''))
+                    @@ websearch_to_tsquery('english', $1)
+              )
+          ))
       AND c.relkind IN ('r', 'p', 'm', 'v')
       AND c.relnamespace NOT IN (
           SELECT oid FROM pg_namespace
@@ -336,6 +356,90 @@ async function searchFunctions(webSearch: string) {
   `, [webSearch]);
 }
 
+async function listEnums(schema: string) {
+  return await query(`
+    SELECT JSONB_OBJECT_AGG(
+             t.typname,
+             JSONB_BUILD_OBJECT(
+               'description', COALESCE(obj_description(t.oid, 'pg_type'), ''),
+               'values', values
+             )
+           )
+    FROM pg_type AS t
+    LEFT JOIN LATERAL (
+        SELECT JSONB_AGG(e.enumlabel ORDER BY e.enumsortorder) AS values
+        FROM pg_enum AS e
+        WHERE e.enumtypid = t.oid
+    ) ON true
+    WHERE t.typnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
+      AND t.typtype = 'e'
+  `, [schema]);
+}
+
+async function enumDetails(schema: string, enumName: string) {
+  return await query(`
+    SELECT JSONB_BUILD_OBJECT(
+             'description', COALESCE(obj_description(t.oid, 'pg_type'), ''),
+             'values', values,
+             'used_by_columns', COALESCE(used_by_columns, '[]'::jsonb)
+           )
+    FROM pg_type AS t
+    LEFT JOIN LATERAL (
+        SELECT JSONB_AGG(e.enumlabel ORDER BY e.enumsortorder) AS values
+        FROM pg_enum AS e
+        WHERE e.enumtypid = t.oid
+    ) ON true
+    LEFT JOIN LATERAL (
+        SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                 'table', c.relnamespace::regnamespace::text || '.' || c.relname,
+                 'column', a.attname
+               )) AS used_by_columns
+        FROM pg_attribute AS a
+        JOIN pg_class AS c ON c.oid = a.attrelid
+        WHERE a.atttypid = t.oid
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+          AND c.relkind IN ('r', 'p', 'm', 'v')
+    ) ON true
+    WHERE t.typnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
+      AND t.typname = $2
+      AND t.typtype = 'e'
+  `, [schema, enumName]);
+}
+
+async function searchEnums(webSearch: string) {
+  if (!webSearch.trim()) return null;
+  return await query(`
+    SELECT JSONB_OBJECT_AGG(
+             t.typnamespace::regnamespace::text || '.' || t.typname,
+             JSONB_BUILD_OBJECT(
+               'description', COALESCE(obj_description(t.oid, 'pg_type'), ''),
+               'values', values
+             )
+           )
+    FROM pg_type AS t
+    LEFT JOIN LATERAL (
+        SELECT JSONB_AGG(e.enumlabel ORDER BY e.enumsortorder) AS values,
+               STRING_AGG(e.enumlabel, ' ') AS values_text
+        FROM pg_enum AS e
+        WHERE e.enumtypid = t.oid
+    ) ON true
+    WHERE t.typtype = 'e'
+      AND t.typnamespace NOT IN (
+          SELECT oid FROM pg_namespace
+          WHERE nspname LIKE 'pg_%' OR nspname = 'information_schema')
+      AND (
+          TO_TSVECTOR('english',
+            REGEXP_REPLACE(REGEXP_REPLACE(t.typname, '_', ' ', 'g'), '([[:upper:]])', ' \\1', 'g'))
+            @@ websearch_to_tsquery('english', $1)
+       OR TO_TSVECTOR('english', COALESCE(obj_description(t.oid, 'pg_type'), ''))
+            @@ websearch_to_tsquery('english', $1)
+       OR TO_TSVECTOR('english', COALESCE(values_text, ''))
+            @@ websearch_to_tsquery('english', $1)
+      )
+  `, [webSearch]);
+}
+
 // ---------------------------------------------------------------------------
 // MCP server
 // ---------------------------------------------------------------------------
@@ -412,6 +516,36 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["web_search"],
       },
     },
+    {
+      name: "listEnums",
+      description: "return enum type list for a schema with their values and descriptions",
+      inputSchema: {
+        type: "object",
+        properties: { schema: { type: "string" } },
+        required: ["schema"],
+      },
+    },
+    {
+      name: "enumDetails",
+      description: "return enum type details including values and which columns use it",
+      inputSchema: {
+        type: "object",
+        properties: {
+          schema: { type: "string" },
+          enum: { type: "string" },
+        },
+        required: ["schema", "enum"],
+      },
+    },
+    {
+      name: "searchEnums",
+      description: "search enum types by name, values, or description",
+      inputSchema: {
+        type: "object",
+        properties: { web_search: { type: "string" } },
+        required: ["web_search"],
+      },
+    },
   ],
 }));
 
@@ -454,6 +588,21 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       case "searchFunctions":
         result = await searchFunctions((args.web_search as string) ?? "");
+        break;
+
+      case "listEnums":
+        result = await listEnums((args.schema as string) ?? "public");
+        break;
+
+      case "enumDetails":
+        result = await enumDetails(
+          (args.schema as string) ?? "public",
+          (args.enum as string) ?? ""
+        );
+        break;
+
+      case "searchEnums":
+        result = await searchEnums((args.web_search as string) ?? "");
         break;
 
       default:

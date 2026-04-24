@@ -36,6 +36,11 @@ public:
     return function_detail(schema, func_name);
   }
   const json call_search_functions(const std::string& web_search) { return search_functions(web_search); }
+  const json call_enums(const std::string& schema) { return enums(schema); }
+  const json call_enum_detail(const std::string& schema, const std::string& enum_name) {
+    return enum_detail(schema, enum_name);
+  }
+  const json call_search_enums(const std::string& web_search) { return search_enums(web_search); }
 
 private:
   pqxx::connection conn;
@@ -111,6 +116,40 @@ private:
 	  {
 	    {"name", "searchFunctions"},
 	    {"description", "search functions and procedures by name, source, language, trigger name, or description"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", {
+		    {"web_search", {{"type", "string"}}}
+		  }},
+		{"required", {"web_search"}}
+	      }}
+	  },
+	  {
+	    {"name", "listEnums"},
+	    {"description", "return enum type list for a schema with their values and descriptions"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", {
+		    {"schema", {{"type", "string"}}}
+		  }},
+		{"required", {"schema"}}
+	      }}
+	  },
+	  {
+	    {"name", "enumDetails"},
+	    {"description", "return enum type details including values and which columns use it"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", {
+		    {"schema", {{"type", "string"}}},
+		    {"enum", {{"type", "string"}}}
+		  }},
+		{"required", {"schema", "enum"}}
+	      }}
+	  },
+	  {
+	    {"name", "searchEnums"},
+	    {"description", "search enum types by name, values, or description"},
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", {
@@ -227,7 +266,27 @@ private:
                REGEXP_REPLACE(
                  REGEXP_REPLACE(c.relname, '_', ' ', 'g'),
                  '([[:upper:]])', ' \1', 'g'))
-               @@ websearch_to_tsquery('english', $1))
+               @@ websearch_to_tsquery('english', $1)
+          OR c.oid IN (
+              SELECT DISTINCT a.attrelid
+              FROM pg_attribute AS a
+              JOIN pg_type AS et ON et.oid = a.atttypid AND et.typtype = 'e'
+              LEFT JOIN LATERAL (
+                  SELECT STRING_AGG(ev.enumlabel, ' ') AS values_text
+                  FROM pg_enum AS ev
+                  WHERE ev.enumtypid = et.oid
+              ) ON true
+              WHERE a.attnum > 0 AND NOT a.attisdropped
+                AND (
+                    TO_TSVECTOR('english',
+                      REGEXP_REPLACE(REGEXP_REPLACE(et.typname, '_', ' ', 'g'), '([[:upper:]])', ' \1', 'g'))
+                      @@ websearch_to_tsquery('english', $1)
+                 OR TO_TSVECTOR('english', COALESCE(obj_description(et.oid, 'pg_type'), ''))
+                      @@ websearch_to_tsquery('english', $1)
+                 OR TO_TSVECTOR('english', COALESCE(values_text, ''))
+                      @@ websearch_to_tsquery('english', $1)
+                )
+          ))
         AND c.relkind IN ('r', 'p', 'm', 'v')
         AND c.relnamespace NOT IN (
             SELECT oid FROM pg_namespace
@@ -375,6 +434,123 @@ private:
     if (!res.empty() && !res[0][0].is_null()) {
       std::string pgsql_functions = res[0][0].as<std::string>();
       return json::parse(pgsql_functions);
+    } else {
+      return {};
+    }
+  }
+
+  const json enums(const std::string& schema) {
+    pqxx::work txn{conn};
+
+    std::string query = R"(
+      SELECT JSONB_OBJECT_AGG(
+               t.typname,
+               JSONB_BUILD_OBJECT(
+                 'description', COALESCE(obj_description(t.oid, 'pg_type'), ''),
+                 'values', values
+               )
+             )
+      FROM pg_type AS t
+      LEFT JOIN LATERAL (
+          SELECT JSONB_AGG(e.enumlabel ORDER BY e.enumsortorder) AS values
+          FROM pg_enum AS e
+          WHERE e.enumtypid = t.oid
+      ) ON true
+      WHERE t.typnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
+        AND t.typtype = 'e';
+    )";
+
+    pqxx::result res = txn.exec(query, pqxx::params{schema});
+
+    if (!res.empty() && !res[0][0].is_null()) {
+      return json::parse(res[0][0].as<std::string>());
+    } else {
+      return {};
+    }
+  }
+
+  const json enum_detail(const std::string& schema, const std::string& enum_name) {
+    pqxx::work txn{conn};
+
+    std::string query = R"(
+      SELECT JSONB_BUILD_OBJECT(
+               'description', COALESCE(obj_description(t.oid, 'pg_type'), ''),
+               'values', values,
+               'used_by_columns', COALESCE(used_by_columns, '[]'::jsonb)
+             )
+      FROM pg_type AS t
+      LEFT JOIN LATERAL (
+          SELECT JSONB_AGG(e.enumlabel ORDER BY e.enumsortorder) AS values
+          FROM pg_enum AS e
+          WHERE e.enumtypid = t.oid
+      ) ON true
+      LEFT JOIN LATERAL (
+          SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                   'table', c.relnamespace::regnamespace::text || '.' || c.relname,
+                   'column', a.attname
+                 )) AS used_by_columns
+          FROM pg_attribute AS a
+          JOIN pg_class AS c ON c.oid = a.attrelid
+          WHERE a.atttypid = t.oid
+            AND a.attnum > 0
+            AND NOT a.attisdropped
+            AND c.relkind IN ('r', 'p', 'm', 'v')
+      ) ON true
+      WHERE t.typnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
+        AND t.typname = $2
+        AND t.typtype = 'e';
+    )";
+
+    pqxx::result res = txn.exec(query, pqxx::params{schema, enum_name});
+
+    if (!res.empty() && !res[0][0].is_null()) {
+      return json::parse(res[0][0].as<std::string>());
+    } else {
+      return {};
+    }
+  }
+
+  const json search_enums(const std::string& web_search) {
+    if (web_search.empty()) {
+      return {};
+    }
+
+    pqxx::work txn{conn};
+
+    std::string query = R"(
+      SELECT JSONB_OBJECT_AGG(
+               t.typnamespace::regnamespace::text || '.' || t.typname,
+               JSONB_BUILD_OBJECT(
+                 'description', COALESCE(obj_description(t.oid, 'pg_type'), ''),
+                 'values', values
+               )
+             )
+      FROM pg_type AS t
+      LEFT JOIN LATERAL (
+          SELECT JSONB_AGG(e.enumlabel ORDER BY e.enumsortorder) AS values,
+                 STRING_AGG(e.enumlabel, ' ') AS values_text
+          FROM pg_enum AS e
+          WHERE e.enumtypid = t.oid
+      ) ON true
+      WHERE t.typtype = 'e'
+        AND t.typnamespace NOT IN (
+            SELECT oid FROM pg_namespace
+            WHERE nspname LIKE 'pg_%' OR nspname = 'information_schema')
+        AND (
+            TO_TSVECTOR('english',
+              REGEXP_REPLACE(REGEXP_REPLACE(t.typname, '_', ' ', 'g'), '([[:upper:]])', ' \1', 'g'))
+              @@ websearch_to_tsquery('english', $1)
+         OR TO_TSVECTOR('english', COALESCE(obj_description(t.oid, 'pg_type'), ''))
+              @@ websearch_to_tsquery('english', $1)
+         OR TO_TSVECTOR('english', COALESCE(values_text, ''))
+              @@ websearch_to_tsquery('english', $1)
+        );
+    )";
+
+    pqxx::result res = txn.exec(query, pqxx::params{web_search});
+
+    if (!res.empty() && !res[0][0].is_null()) {
+      return json::parse(res[0][0].as<std::string>());
     } else {
       return {};
     }
@@ -536,6 +712,19 @@ private:
 	else if (tool_name == "searchFunctions") {
 	  std::string web_search = arguments.contains("web_search") ? arguments["web_search"].get<std::string>() : "";
 	  result_content = search_functions(web_search);
+	}
+	else if (tool_name == "listEnums") {
+	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+	  result_content = enums(target_schema);
+	}
+	else if (tool_name == "enumDetails") {
+	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+	  std::string enum_name = arguments.contains("enum") ? arguments["enum"].get<std::string>() : "";
+	  result_content = enum_detail(target_schema, enum_name);
+	}
+	else if (tool_name == "searchEnums") {
+	  std::string web_search = arguments.contains("web_search") ? arguments["web_search"].get<std::string>() : "";
+	  result_content = search_enums(web_search);
 	}
 	else {
 	  send_error(req["id"], -32601, "Tool not found: " + tool_name);
