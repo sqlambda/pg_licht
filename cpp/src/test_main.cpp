@@ -124,6 +124,11 @@ protected:
       txn.exec("REFRESH MATERIALIZED VIEW public.user_stats");
       txn.exec("ANALYZE public.user_stats");
 
+      txn.exec("CREATE TYPE public.order_status AS ENUM ('pending', 'processing', 'shipped', 'delivered', 'cancelled')");
+      txn.exec("COMMENT ON TYPE public.order_status IS 'status of a customer order'");
+      txn.exec("ALTER TABLE public.orders ADD COLUMN status public.order_status DEFAULT 'pending'");
+      txn.exec("CREATE TYPE public.user_role AS ENUM ('admin', 'user', 'guest')");
+
       txn.commit();
 
     } catch (const std::exception& e) {
@@ -498,6 +503,143 @@ TEST_F(PostgresMCPServerTest, TableDetailsWorksForMV) {
   EXPECT_FALSE(result["definition"].is_null());
   EXPECT_FALSE(result["definition"].get<std::string>().empty());
   EXPECT_FALSE(result["indexes"].empty());
+}
+
+// --- listEnums tests ---
+
+TEST_F(PostgresMCPServerTest, EnumsReturnsKnownEnum) {
+  json result = srv->call_enums("public");
+  EXPECT_TRUE(result.is_object());
+  EXPECT_TRUE(result.contains("order_status"));
+  EXPECT_TRUE(result.contains("user_role"));
+}
+
+TEST_F(PostgresMCPServerTest, EnumsHasExpectedFields) {
+  json result = srv->call_enums("public");
+  ASSERT_TRUE(result.contains("order_status"));
+  EXPECT_TRUE(result["order_status"].contains("description"));
+  EXPECT_TRUE(result["order_status"].contains("values"));
+  EXPECT_TRUE(result["order_status"]["values"].is_array());
+  EXPECT_EQ(result["order_status"]["description"].get<std::string>(), "status of a customer order");
+}
+
+TEST_F(PostgresMCPServerTest, EnumsValuesAreOrdered) {
+  json result = srv->call_enums("public");
+  auto values = result["order_status"]["values"];
+  ASSERT_GE(values.size(), 5u);
+  EXPECT_EQ(values[0].get<std::string>(), "pending");
+  EXPECT_EQ(values[2].get<std::string>(), "shipped");
+  EXPECT_EQ(values[4].get<std::string>(), "cancelled");
+}
+
+TEST_F(PostgresMCPServerTest, EnumsUnknownSchemaReturnsEmpty) {
+  json result = srv->call_enums("does_not_exist_schema");
+  EXPECT_TRUE(result.empty() || result.is_null());
+}
+
+// --- enumDetails tests ---
+
+TEST_F(PostgresMCPServerTest, EnumDetailsHasValuesAndDescription) {
+  json result = srv->call_enum_detail("public", "order_status");
+  EXPECT_FALSE(result.empty());
+  EXPECT_TRUE(result.contains("description"));
+  EXPECT_TRUE(result.contains("values"));
+  EXPECT_TRUE(result["values"].is_array());
+  EXPECT_EQ(result["description"].get<std::string>(), "status of a customer order");
+}
+
+TEST_F(PostgresMCPServerTest, EnumDetailsHasUsedByColumns) {
+  json result = srv->call_enum_detail("public", "order_status");
+  EXPECT_TRUE(result.contains("used_by_columns"));
+  EXPECT_TRUE(result["used_by_columns"].is_array());
+  EXPECT_GE(result["used_by_columns"].size(), 1u);
+  bool found_orders = false;
+  for (auto& col : result["used_by_columns"]) {
+    if (col["table"].get<std::string>().find("orders") != std::string::npos) {
+      found_orders = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(found_orders);
+}
+
+TEST_F(PostgresMCPServerTest, EnumDetailsUnusedEnumHasEmptyUsedByColumns) {
+  json result = srv->call_enum_detail("public", "user_role");
+  EXPECT_TRUE(result.contains("used_by_columns"));
+  EXPECT_TRUE(result["used_by_columns"].is_array());
+  EXPECT_EQ(result["used_by_columns"].size(), 0u);
+}
+
+TEST_F(PostgresMCPServerTest, EnumDetailsNotFound) {
+  json result = srv->call_enum_detail("public", "nonexistent_enum");
+  EXPECT_TRUE(result.empty() || result.is_null());
+}
+
+// --- searchEnums tests ---
+
+TEST_F(PostgresMCPServerTest, SearchEnumsByName) {
+  json result = srv->call_search_enums("order status");
+  bool found = false;
+  for (auto& [key, value] : result.items()) {
+    if (key.find("order_status") != std::string::npos) { found = true; break; }
+  }
+  EXPECT_TRUE(found);
+}
+
+TEST_F(PostgresMCPServerTest, SearchEnumsByValue) {
+  json result = srv->call_search_enums("shipped");
+  bool found = false;
+  for (auto& [key, value] : result.items()) {
+    if (key.find("order_status") != std::string::npos) { found = true; break; }
+  }
+  EXPECT_TRUE(found);
+}
+
+TEST_F(PostgresMCPServerTest, SearchEnumsByDescription) {
+  json result = srv->call_search_enums("customer order");
+  bool found = false;
+  for (auto& [key, value] : result.items()) {
+    if (key.find("order_status") != std::string::npos) { found = true; break; }
+  }
+  EXPECT_TRUE(found);
+}
+
+TEST_F(PostgresMCPServerTest, SearchEnumsResultKeyIncludesSchema) {
+  json result = srv->call_search_enums("order status");
+  for (auto& [key, value] : result.items()) {
+    size_t dot_count = 0;
+    for (char c : key) { if (c == '.') dot_count++; }
+    EXPECT_EQ(dot_count, 1) << "Key should have exactly one dot: " << key;
+  }
+}
+
+// --- searchTables via enum types ---
+
+TEST_F(PostgresMCPServerTest, SearchTablesByEnumValue) {
+  json result = srv->call_search("shipped");
+  bool found = false;
+  for (auto& [key, value] : result.items()) {
+    if (key.find(".orders") != std::string::npos) { found = true; break; }
+  }
+  EXPECT_TRUE(found);
+}
+
+TEST_F(PostgresMCPServerTest, SearchTablesByEnumName) {
+  json result = srv->call_search("order status");
+  bool found = false;
+  for (auto& [key, value] : result.items()) {
+    if (key.find(".orders") != std::string::npos) { found = true; break; }
+  }
+  EXPECT_TRUE(found);
+}
+
+TEST_F(PostgresMCPServerTest, SearchTablesByEnumDescription) {
+  json result = srv->call_search("customer order");
+  bool found = false;
+  for (auto& [key, value] : result.items()) {
+    if (key.find(".orders") != std::string::npos) { found = true; break; }
+  }
+  EXPECT_TRUE(found);
 }
 
 int main(int argc, char **argv) {
