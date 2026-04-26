@@ -2,6 +2,12 @@
 
 A PostgreSQL MCP (Model Context Protocol) server that exposes schema exploration tools over JSON-RPC 2.0. Available in C++ and TypeScript.
 
+Motivation to create another PostgreSQL MCP:
+
+- Only queries the catalog to inspect the structure (lower risk to leak data)
+- Allow to describe database model and routines based on what is in the database
+- Fast inspection of available indexes and relationships when analyzing a query plan
+
 ## Tools
 
 | Tool | Description |
@@ -76,6 +82,24 @@ DATABASE_URL="postgresql://user:pass@host/dbname" node dist/index.js
 
 # libpq key-value format also works
 DATABASE_URL="port=5432 dbname=mydb" node dist/index.js
+```
+
+## Debugging with MCP Inspector
+
+The [MCP Inspector](https://github.com/modelcontextprotocol/inspector) lets you call tools interactively and inspect responses without an AI client.
+
+**C++:**
+```bash
+npx @modelcontextprotocol/inspector \
+  -e DATABASE_URL="postgresql://user:pass@host/dbname" \
+  ./cpp/pg_licht_mcp
+```
+
+**TypeScript:**
+```bash
+npx @modelcontextprotocol/inspector \
+  -e DATABASE_URL="postgresql://user:pass@host/dbname" \
+  node typescript/dist/index.js
 ```
 
 ## MCP Configuration
