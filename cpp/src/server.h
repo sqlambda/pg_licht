@@ -168,12 +168,19 @@ private:
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(nspname,
               JSONB_BUILD_OBJECT(
-               'tables', relnames))
+               'tables', relnames,
+               'roles', COALESCE(roles, '{}'::jsonb)))
       FROM pg_namespace
       LEFT JOIN LATERAL (SELECT JSONB_AGG(relname ORDER BY relname) AS relnames
                          FROM pg_class
                          WHERE relnamespace = pg_namespace.oid
                            AND relkind IN ('r','m','f','p','v')) ON true
+      LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(grantee, privs) AS roles
+                         FROM (SELECT COALESCE(r.rolname, 'PUBLIC') AS grantee,
+                                      JSONB_AGG(a.privilege_type ORDER BY a.privilege_type) AS privs
+                               FROM aclexplode(pg_namespace.nspacl) AS a
+                               LEFT JOIN pg_roles AS r ON r.oid = a.grantee
+                               GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) ON true
       WHERE nspname NOT LIKE 'pg_%'
         AND nspname <> 'information_schema'
         AND relnames IS NOT NULL;
@@ -242,7 +249,8 @@ private:
                'rows', c.reltuples, 'size', c.relpages::bigint * 8192,
                'seq_scan', s.seq_scan, 'idx_scan', s.idx_scan, 'n_live_tup', s.n_live_tup, 'n_dead_tup', s.n_dead_tup,
                'last_vacuum', GREATEST(s.last_vacuum, s.last_autovacuum), 'last_analyze', GREATEST(s.last_analyze, s.last_autoanalyze),
-               'columns', columns, 'indexes', indexes, 'constraints', constraints))
+               'columns', columns, 'indexes', indexes, 'constraints', constraints,
+               'roles', COALESCE(roles, '{}'::jsonb)))
       FROM pg_class AS c
       LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(attname, col_description(c.oid, attnum)) AS columns
@@ -257,36 +265,33 @@ private:
       LEFT JOIN LATERAL (SELECT JSONB_AGG(pg_get_constraintdef(oid)) AS constraints
                          FROM pg_constraint
                          WHERE conrelid = c.oid) ON true
-      WHERE (c.oid IN (SELECT DISTINCT objoid
-                       FROM pg_description
-                       WHERE to_tsvector('english', description) @@ websearch_to_tsquery('english', $1)
-                         AND classoid = 'pg_class'::regclass
-                         AND objsubid = 0)
-          OR TO_TSVECTOR('english',
-               REGEXP_REPLACE(
-                 REGEXP_REPLACE(c.relname, '_', ' ', 'g'),
-                 '([[:upper:]])', ' \1', 'g'))
-               @@ websearch_to_tsquery('english', $1)
-          OR c.oid IN (
-              SELECT DISTINCT a.attrelid
-              FROM pg_attribute AS a
-              JOIN pg_type AS et ON et.oid = a.atttypid AND et.typtype = 'e'
-              LEFT JOIN LATERAL (
-                  SELECT STRING_AGG(ev.enumlabel, ' ') AS values_text
-                  FROM pg_enum AS ev
-                  WHERE ev.enumtypid = et.oid
-              ) ON true
-              WHERE a.attnum > 0 AND NOT a.attisdropped
-                AND (
-                    TO_TSVECTOR('english',
-                      REGEXP_REPLACE(REGEXP_REPLACE(et.typname, '_', ' ', 'g'), '([[:upper:]])', ' \1', 'g'))
-                      @@ websearch_to_tsquery('english', $1)
-                 OR TO_TSVECTOR('english', COALESCE(obj_description(et.oid, 'pg_type'), ''))
-                      @@ websearch_to_tsquery('english', $1)
-                 OR TO_TSVECTOR('english', COALESCE(values_text, ''))
-                      @@ websearch_to_tsquery('english', $1)
-                )
-          ))
+      LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(grantee, privs) AS roles,
+                                STRING_AGG(grantee, ' ' ORDER BY grantee) AS role_names
+                         FROM (SELECT COALESCE(r.rolname, 'PUBLIC') AS grantee,
+                                      JSONB_AGG(a.privilege_type ORDER BY a.privilege_type) AS privs
+                               FROM aclexplode(c.relacl) AS a
+                               LEFT JOIN pg_roles AS r ON r.oid = a.grantee
+                               GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) ON true
+      LEFT JOIN LATERAL (
+          SELECT STRING_AGG(
+              REGEXP_REPLACE(REGEXP_REPLACE(et.typname, '_', ' ', 'g'), '([[:upper:]])', ' \1', 'g') || ' ' ||
+              COALESCE(obj_description(et.oid, 'pg_type'), '') || ' ' ||
+              COALESCE(values_text, ''), ' ') AS enum_text
+          FROM pg_attribute AS a
+          JOIN pg_type AS et ON et.oid = a.atttypid AND et.typtype = 'e'
+          LEFT JOIN LATERAL (
+              SELECT STRING_AGG(ev.enumlabel, ' ') AS values_text
+              FROM pg_enum AS ev WHERE ev.enumtypid = et.oid
+          ) ON true
+          WHERE a.attnum > 0 AND NOT a.attisdropped AND a.attrelid = c.oid
+      ) ON true
+      WHERE TO_TSVECTOR('english',
+              REGEXP_REPLACE(REGEXP_REPLACE(c.relname, '_', ' ', 'g'), '([[:upper:]])', ' \1', 'g') || ' ' ||
+              REGEXP_REPLACE(REGEXP_REPLACE(c.relnamespace::regnamespace::name, '_', ' ', 'g'), '([[:upper:]])', ' \1', 'g') || ' ' ||
+              COALESCE(obj_description(c.oid, 'pg_class'), '') || ' ' ||
+              COALESCE(enum_text, '') || ' ' ||
+              COALESCE(role_names, '')
+            ) @@ websearch_to_tsquery('english', $1)
         AND c.relkind IN ('r', 'p', 'm', 'v')
         AND c.relnamespace NOT IN (
             SELECT oid FROM pg_namespace
@@ -353,7 +358,8 @@ private:
                  'is_strict',        p.proisstrict,
                  'source',           p.prosrc,
                  'definition',       pg_get_functiondef(p.oid),
-                 'used_in_triggers', used_in_triggers
+                 'used_in_triggers', used_in_triggers,
+                 'roles',            COALESCE(roles, '{}'::jsonb)
                )
              )
       FROM   pg_proc AS p
@@ -366,6 +372,12 @@ private:
           FROM   pg_trigger AS t
           WHERE  t.tgfoid = p.oid AND NOT t.tgisinternal
       ) ON true
+      LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(grantee, privs) AS roles
+                         FROM (SELECT COALESCE(r.rolname, 'PUBLIC') AS grantee,
+                                      JSONB_AGG(a.privilege_type ORDER BY a.privilege_type) AS privs
+                               FROM aclexplode(p.proacl) AS a
+                               LEFT JOIN pg_roles AS r ON r.oid = a.grantee
+                               GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) ON true
       WHERE  p.pronamespace = $1::regnamespace
         AND  p.proname = $2
         AND  p.prokind IN ('f', 'p');
@@ -572,7 +584,8 @@ private:
                'indexes', COALESCE(indexes, '{}'::jsonb),
                'constraints', COALESCE(constraints, '{}'::jsonb),
                'foreign_keys', COALESCE(foreign_keys, '{}'::jsonb),
-               'triggers', COALESCE(triggers, '{}'::jsonb))
+               'triggers', COALESCE(triggers, '{}'::jsonb),
+               'roles', COALESCE(roles, '{}'::jsonb))
       FROM pg_class AS c
       LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
       LEFT JOIN LATERAL (SELECT JSONB_STRIP_NULLS(JSONB_OBJECT_AGG(a.attname,
@@ -640,6 +653,12 @@ private:
                          JOIN   pg_language AS l ON l.oid = p.prolang
                          WHERE  t.tgrelid = c.oid
                            AND  NOT t.tgisinternal) ON true
+      LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(grantee, privs) AS roles
+                         FROM (SELECT COALESCE(r.rolname, 'PUBLIC') AS grantee,
+                                      JSONB_AGG(a.privilege_type ORDER BY a.privilege_type) AS privs
+                               FROM aclexplode(c.relacl) AS a
+                               LEFT JOIN pg_roles AS r ON r.oid = a.grantee
+                               GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) ON true
       WHERE c.relnamespace = $1::regnamespace
         AND c.relname = $2;
     )";

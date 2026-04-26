@@ -4,14 +4,19 @@
   "description": "PostgreSQL MCP server — exposes schema, table, function, and search tools over JSON-RPC 2.0",
   "license": "Apache-2.0",
   "type": "module",
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts"
+  ],
   "main": "dist/index.js",
   "bin": {
     "pg-licht-mcp": "dist/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "rm -rf dist && tsc",
     "dev": "tsc --watch",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test": "node --import tsx/esm --test src/queries.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
@@ -19,6 +24,7 @@
   },
   "devDependencies": {
     "@types/pg": "^8.11.0",
+    "tsx": "^4.21.0",
     "typescript": "^5.7.0"
   }
 }

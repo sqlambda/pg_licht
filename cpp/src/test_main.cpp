@@ -14,11 +14,6 @@ protected:
 
   static void SetUpTestSuite() {
     const char* env_url = std::getenv("DATABASE_URL");
-    if (!env_url) {
-      GTEST_SKIP_("DATABASE_URL environment variable not set");
-      return;
-    }
-
     base_url = env_url;
 
     try {
@@ -57,77 +52,88 @@ protected:
       pqxx::connection test_conn(test_url);
       pqxx::work txn(test_conn);
 
+      txn.exec("CREATE SCHEMA grocery");
+
       txn.exec(
-        "CREATE TABLE public.users ("
+        "CREATE TABLE grocery.users ("
         "  id    SERIAL PRIMARY KEY,"
         "  name  VARCHAR(100) NOT NULL,"
         "  email VARCHAR(200) UNIQUE"
         ")"
       );
-      txn.exec("COMMENT ON TABLE public.users IS 'user account records'");
-      txn.exec("COMMENT ON COLUMN public.users.email IS 'unique email address'");
-      txn.exec("INSERT INTO public.users(name, email) VALUES ('Alice', 'alice@example.com')");
-      txn.exec("INSERT INTO public.users(name, email) VALUES ('Bob', 'bob@example.com')");
-      txn.exec("ANALYZE public.users");
+      txn.exec("COMMENT ON TABLE grocery.users IS 'user account records'");
+      txn.exec("COMMENT ON COLUMN grocery.users.email IS 'unique email address'");
+      txn.exec("INSERT INTO grocery.users(name, email) VALUES ('Alice', 'alice@example.com')");
+      txn.exec("INSERT INTO grocery.users(name, email) VALUES ('Bob', 'bob@example.com')");
+      txn.exec("ANALYZE grocery.users");
 
       txn.exec(
-        "CREATE TABLE public.orders ("
+        "CREATE TABLE grocery.orders ("
         "  id      SERIAL PRIMARY KEY,"
-        "  user_id INT NOT NULL REFERENCES public.users(id),"
+        "  user_id INT NOT NULL REFERENCES grocery.users(id),"
         "  amount  NUMERIC(10,2) CHECK (amount > 0)"
         ")"
       );
-      txn.exec("INSERT INTO public.orders(user_id, amount) VALUES (1, 99.99)");
-      txn.exec("ANALYZE public.orders");
+      txn.exec("INSERT INTO grocery.orders(user_id, amount) VALUES (1, 99.99)");
+      txn.exec("ANALYZE grocery.orders");
 
       txn.exec(
-        "CREATE TABLE public.user_account_log ("
+        "CREATE TABLE grocery.user_account_log ("
         "  id         SERIAL PRIMARY KEY,"
-        "  user_id    INT REFERENCES public.users(id),"
+        "  user_id    INT REFERENCES grocery.users(id),"
         "  action     TEXT,"
         "  logged_at  TIMESTAMPTZ DEFAULT now()"
         ")"
       );
 
-      txn.exec("CREATE TABLE public.bare_notes (note TEXT)");
+      txn.exec("CREATE TABLE grocery.bare_notes (note TEXT)");
 
       txn.exec(
-        "CREATE FUNCTION public.log_user_action() RETURNS trigger LANGUAGE plpgsql AS $$\n"
+        "CREATE FUNCTION grocery.log_user_action() RETURNS trigger LANGUAGE plpgsql AS $$\n"
         "BEGIN\n"
-        "  INSERT INTO public.user_account_log(user_id, action) VALUES (NEW.id, TG_OP);\n"
+        "  INSERT INTO grocery.user_account_log(user_id, action) VALUES (NEW.id, TG_OP);\n"
         "  RETURN NEW;\n"
         "END;\n"
         "$$"
       );
-      txn.exec("COMMENT ON FUNCTION public.log_user_action() IS 'audit trigger for user table'");
+      txn.exec("COMMENT ON FUNCTION grocery.log_user_action() IS 'audit trigger for user table'");
       txn.exec(
         "CREATE TRIGGER trg_user_audit"
-        " AFTER INSERT OR UPDATE ON public.users"
-        " FOR EACH ROW EXECUTE FUNCTION public.log_user_action()"
+        " AFTER INSERT OR UPDATE ON grocery.users"
+        " FOR EACH ROW EXECUTE FUNCTION grocery.log_user_action()"
       );
       txn.exec(
-        "CREATE FUNCTION public.get_user_count() RETURNS bigint LANGUAGE sql AS $$"
-        " SELECT COUNT(*) FROM public.users; $$"
-      );
-
-      txn.exec(
-        "CREATE VIEW public.active_users AS "
-        "  SELECT id, name FROM public.users WHERE name IS NOT NULL"
+        "CREATE FUNCTION grocery.get_user_count() RETURNS bigint LANGUAGE sql AS $$"
+        " SELECT COUNT(*) FROM grocery.users; $$"
       );
 
       txn.exec(
-        "CREATE MATERIALIZED VIEW public.user_stats AS "
-        "  SELECT COUNT(*) AS user_count FROM public.users"
+        "CREATE VIEW grocery.active_users AS "
+        "  SELECT id, name FROM grocery.users WHERE name IS NOT NULL"
       );
 
-      txn.exec("CREATE UNIQUE INDEX ON public.user_stats(user_count)");
-      txn.exec("REFRESH MATERIALIZED VIEW public.user_stats");
-      txn.exec("ANALYZE public.user_stats");
+      txn.exec(
+        "CREATE MATERIALIZED VIEW grocery.user_stats AS "
+        "  SELECT COUNT(*) AS user_count FROM grocery.users"
+      );
 
-      txn.exec("CREATE TYPE public.order_status AS ENUM ('pending', 'processing', 'shipped', 'delivered', 'cancelled')");
-      txn.exec("COMMENT ON TYPE public.order_status IS 'status of a customer order'");
-      txn.exec("ALTER TABLE public.orders ADD COLUMN status public.order_status DEFAULT 'pending'");
-      txn.exec("CREATE TYPE public.user_role AS ENUM ('admin', 'user', 'guest')");
+      txn.exec("CREATE UNIQUE INDEX ON grocery.user_stats(user_count)");
+      txn.exec("REFRESH MATERIALIZED VIEW grocery.user_stats");
+      txn.exec("ANALYZE grocery.user_stats");
+
+      txn.exec("CREATE TYPE grocery.order_status AS ENUM ('pending', 'processing', 'shipped', 'delivered', 'cancelled')");
+      txn.exec("COMMENT ON TYPE grocery.order_status IS 'status of a customer order'");
+      txn.exec("ALTER TABLE grocery.orders ADD COLUMN status grocery.order_status DEFAULT 'pending'");
+      txn.exec("CREATE TYPE grocery.user_role AS ENUM ('admin', 'user', 'guest')");
+
+      txn.exec("GRANT USAGE ON SCHEMA grocery TO PUBLIC");
+      txn.exec("GRANT SELECT ON grocery.users TO PUBLIC");
+      txn.exec("GRANT EXECUTE ON FUNCTION grocery.get_user_count() TO PUBLIC");
+      txn.exec("DROP ROLE IF EXISTS tomato");
+      txn.exec("DROP ROLE IF EXISTS carrot");
+      txn.exec("CREATE ROLE tomato");
+      txn.exec("CREATE ROLE carrot");
+      txn.exec("GRANT SELECT ON grocery.users TO tomato");
 
       txn.commit();
 
@@ -145,6 +151,8 @@ protected:
       if (admin_conn) {
         pqxx::nontransaction ntxn(*admin_conn);
         ntxn.exec("DROP DATABASE IF EXISTS \"" + test_dbname + "\"");
+        ntxn.exec("DROP ROLE IF EXISTS tomato");
+        ntxn.exec("DROP ROLE IF EXISTS carrot");
         ntxn.commit();
 
         delete admin_conn;
@@ -173,13 +181,13 @@ TEST_F(PostgresMCPServerTest, SchemasReturnsObject) {
   EXPECT_GT(result.size(), 0);
 }
 
-TEST_F(PostgresMCPServerTest, SchemasContainsPublic) {
+TEST_F(PostgresMCPServerTest, SchemasContainsGrocery) {
   json result = srv->call_schemas();
-  EXPECT_TRUE(result.contains("public"));
-  EXPECT_TRUE(result["public"].contains("tables"));
-  EXPECT_TRUE(result["public"]["tables"].is_array());
+  EXPECT_TRUE(result.contains("grocery"));
+  EXPECT_TRUE(result["grocery"].contains("tables"));
+  EXPECT_TRUE(result["grocery"]["tables"].is_array());
 
-  auto tables = result["public"]["tables"];
+  auto tables = result["grocery"]["tables"];
   std::vector<std::string> table_names(tables.begin(), tables.end());
   EXPECT_NE(std::find(table_names.begin(), table_names.end(), "users"), table_names.end());
   EXPECT_NE(std::find(table_names.begin(), table_names.end(), "orders"), table_names.end());
@@ -191,14 +199,30 @@ TEST_F(PostgresMCPServerTest, SchemasExcludesSystemSchemas) {
   EXPECT_FALSE(result.contains("information_schema"));
 }
 
+TEST_F(PostgresMCPServerTest, SchemasHasRolesField) {
+  json result = srv->call_schemas();
+  ASSERT_TRUE(result.contains("grocery"));
+  EXPECT_TRUE(result["grocery"].contains("roles"));
+  EXPECT_TRUE(result["grocery"]["roles"].is_object());
+}
+
+TEST_F(PostgresMCPServerTest, SchemasRolesShowsGrantedPrivilege) {
+  json result = srv->call_schemas();
+  ASSERT_TRUE(result.contains("grocery"));
+  ASSERT_TRUE(result["grocery"]["roles"].contains("PUBLIC"));
+  auto& privs = result["grocery"]["roles"]["PUBLIC"];
+  EXPECT_TRUE(std::any_of(privs.begin(), privs.end(),
+    [](const json& p) { return p.get<std::string>() == "USAGE"; }));
+}
+
 TEST_F(PostgresMCPServerTest, TablesReturnsKnownTables) {
-  json result = srv->call_tables("public");
+  json result = srv->call_tables("grocery");
   EXPECT_TRUE(result.contains("users"));
   EXPECT_TRUE(result.contains("orders"));
 }
 
 TEST_F(PostgresMCPServerTest, TablesHasExpectedFields) {
-  json result = srv->call_tables("public");
+  json result = srv->call_tables("grocery");
   EXPECT_TRUE(result["users"].contains("description"));
   EXPECT_TRUE(result["users"].contains("rows"));
   EXPECT_TRUE(result["users"].contains("size"));
@@ -214,7 +238,7 @@ TEST_F(PostgresMCPServerTest, TablesHasExpectedFields) {
 }
 
 TEST_F(PostgresMCPServerTest, TableWithNoIndexesIsIncluded) {
-  json result = srv->call_tables("public");
+  json result = srv->call_tables("grocery");
   EXPECT_TRUE(result.contains("bare_notes"));
 }
 
@@ -278,7 +302,7 @@ TEST_F(PostgresMCPServerTest, SearchSnakeCaseName) {
 }
 
 TEST_F(PostgresMCPServerTest, TableReturnsExpectedTopLevelKeys) {
-  json result = srv->call_table("public", "users");
+  json result = srv->call_table("grocery", "users");
   EXPECT_TRUE(result.contains("table"));
   EXPECT_TRUE(result.contains("rows"));
   EXPECT_TRUE(result.contains("size"));
@@ -292,7 +316,7 @@ TEST_F(PostgresMCPServerTest, TableReturnsExpectedTopLevelKeys) {
 }
 
 TEST_F(PostgresMCPServerTest, TableColumnsHaveTypeInfo) {
-  json result = srv->call_table("public", "users");
+  json result = srv->call_table("grocery", "users");
   EXPECT_TRUE(result["columns"].contains("name"));
   EXPECT_TRUE(result["columns"]["name"].contains("type"));
   EXPECT_TRUE(result["columns"]["name"].contains("format_type"));
@@ -300,21 +324,21 @@ TEST_F(PostgresMCPServerTest, TableColumnsHaveTypeInfo) {
 }
 
 TEST_F(PostgresMCPServerTest, TableColumnsIncludeStatsForAnalyzedTable) {
-  json result = srv->call_table("public", "users");
+  json result = srv->call_table("grocery", "users");
   EXPECT_TRUE(result["columns"]["name"].contains("null_frac"));
   EXPECT_TRUE(result["columns"]["name"].contains("avg_width"));
   EXPECT_TRUE(result["columns"]["name"].contains("n_distinct"));
 }
 
 TEST_F(PostgresMCPServerTest, TableWorksWhenUnanalyzed) {
-  json result = srv->call_table("public", "bare_notes");
+  json result = srv->call_table("grocery", "bare_notes");
   EXPECT_FALSE(result.empty());
   EXPECT_TRUE(result.contains("columns"));
   EXPECT_TRUE(result["columns"].contains("note"));
 }
 
 TEST_F(PostgresMCPServerTest, TableForeignKeyIsSeparateFromConstraints) {
-  json result = srv->call_table("public", "orders");
+  json result = srv->call_table("grocery", "orders");
   EXPECT_FALSE(result["foreign_keys"].empty());
 
   for (auto& [fk_name, fk_obj] : result["foreign_keys"].items()) {
@@ -332,10 +356,49 @@ TEST_F(PostgresMCPServerTest, TableForeignKeyIsSeparateFromConstraints) {
   EXPECT_FALSE(has_fk_in_constraints) << "Foreign keys should not appear in constraints";
 }
 
+TEST_F(PostgresMCPServerTest, SearchTablesByGranteeRoleName) {
+  json result = srv->call_search("tomato");
+  bool found = false;
+  for (auto& [key, value] : result.items()) {
+    if (key.find(".users") != std::string::npos) { found = true; break; }
+  }
+  EXPECT_TRUE(found);
+}
+
+TEST_F(PostgresMCPServerTest, SearchTablesNoResultForUnassignedRole) {
+  json result = srv->call_search("carrot");
+  EXPECT_TRUE(result.empty() || result.is_null());
+}
+
+TEST_F(PostgresMCPServerTest, SearchTablesBySchemaName) {
+  json result = srv->call_search("grocery");
+  bool found = false;
+  for (auto& [key, value] : result.items()) {
+    if (key.substr(0, 8) == "grocery.") { found = true; break; }
+  }
+  EXPECT_TRUE(found);
+}
+
+TEST_F(PostgresMCPServerTest, SearchTablesResultIncludesRoles) {
+  json result = srv->call_search("users");
+  for (auto& [key, value] : result.items()) {
+    if (key.find(".users") != std::string::npos) {
+      ASSERT_TRUE(value.contains("roles"));
+      EXPECT_TRUE(value["roles"].is_object());
+      ASSERT_TRUE(value["roles"].contains("PUBLIC"));
+      auto& privs = value["roles"]["PUBLIC"];
+      EXPECT_TRUE(std::any_of(privs.begin(), privs.end(),
+        [](const json& p) { return p.get<std::string>() == "SELECT"; }));
+      return;
+    }
+  }
+  FAIL() << "users table not found in search results";
+}
+
 // --- listFunctions tests ---
 
 TEST_F(PostgresMCPServerTest, FunctionsReturnsBothFunctions) {
-  json result = srv->call_functions("public");
+  json result = srv->call_functions("grocery");
   EXPECT_TRUE(result.is_object());
   bool has_log_user_action = false;
   bool has_get_user_count = false;
@@ -348,7 +411,7 @@ TEST_F(PostgresMCPServerTest, FunctionsReturnsBothFunctions) {
 }
 
 TEST_F(PostgresMCPServerTest, FunctionsExcludesAggregatesAndWindow) {
-  json result = srv->call_functions("public");
+  json result = srv->call_functions("grocery");
   for (auto& [key, value] : result.items()) {
     EXPECT_TRUE(value.contains("kind"));
     std::string kind = value["kind"].get<std::string>();
@@ -357,7 +420,7 @@ TEST_F(PostgresMCPServerTest, FunctionsExcludesAggregatesAndWindow) {
 }
 
 TEST_F(PostgresMCPServerTest, FunctionHasExpectedFields) {
-  json result = srv->call_functions("public");
+  json result = srv->call_functions("grocery");
   json func_entry;
   for (auto& [key, value] : result.items()) {
     if (key.find("get_user_count") != std::string::npos) {
@@ -377,7 +440,7 @@ TEST_F(PostgresMCPServerTest, FunctionHasExpectedFields) {
 // --- functionDetails tests ---
 
 TEST_F(PostgresMCPServerTest, FunctionDetailsIncludesSource) {
-  json result = srv->call_function_detail("public", "get_user_count");
+  json result = srv->call_function_detail("grocery", "get_user_count");
   EXPECT_TRUE(result.is_object());
   EXPECT_FALSE(result.empty());
   for (auto& [key, value] : result.items()) {
@@ -388,7 +451,7 @@ TEST_F(PostgresMCPServerTest, FunctionDetailsIncludesSource) {
 }
 
 TEST_F(PostgresMCPServerTest, FunctionDetailsShowsTriggerUsage) {
-  json result = srv->call_function_detail("public", "log_user_action");
+  json result = srv->call_function_detail("grocery", "log_user_action");
   EXPECT_TRUE(result.is_object());
   EXPECT_FALSE(result.empty());
   for (auto& [key, value] : result.items()) {
@@ -440,7 +503,7 @@ TEST_F(PostgresMCPServerTest, SearchFunctionsByTriggerName) {
 // --- tableDetails trigger enhancement test ---
 
 TEST_F(PostgresMCPServerTest, TableDetailsIncludesTriggers) {
-  json result = srv->call_table("public", "users");
+  json result = srv->call_table("grocery", "users");
   EXPECT_TRUE(result.contains("triggers"));
   EXPECT_TRUE(result["triggers"].is_object());
   EXPECT_TRUE(result["triggers"].contains("trg_user_audit"));
@@ -456,38 +519,38 @@ TEST_F(PostgresMCPServerTest, TableDetailsIncludesTriggers) {
 
 TEST_F(PostgresMCPServerTest, SchemasContainsView) {
   json result = srv->call_schemas();
-  auto tables = result["public"]["tables"];
+  auto tables = result["grocery"]["tables"];
   std::vector<std::string> names(tables.begin(), tables.end());
   EXPECT_NE(std::find(names.begin(), names.end(), "active_users"), names.end());
 }
 
 TEST_F(PostgresMCPServerTest, SchemasContainsMaterializedView) {
   json result = srv->call_schemas();
-  auto tables = result["public"]["tables"];
+  auto tables = result["grocery"]["tables"];
   std::vector<std::string> names(tables.begin(), tables.end());
   EXPECT_NE(std::find(names.begin(), names.end(), "user_stats"), names.end());
 }
 
 TEST_F(PostgresMCPServerTest, TablesContainsViewAndMV) {
-  json result = srv->call_tables("public");
+  json result = srv->call_tables("grocery");
   EXPECT_TRUE(result.contains("active_users"));
   EXPECT_TRUE(result.contains("user_stats"));
 }
 
 TEST_F(PostgresMCPServerTest, TablesViewHasKindField) {
-  json result = srv->call_tables("public");
+  json result = srv->call_tables("grocery");
   ASSERT_TRUE(result.contains("active_users"));
   EXPECT_EQ(result["active_users"]["kind"].get<std::string>(), "view");
 }
 
 TEST_F(PostgresMCPServerTest, TablesMVHasKindField) {
-  json result = srv->call_tables("public");
+  json result = srv->call_tables("grocery");
   ASSERT_TRUE(result.contains("user_stats"));
   EXPECT_EQ(result["user_stats"]["kind"].get<std::string>(), "materialized view");
 }
 
 TEST_F(PostgresMCPServerTest, TableDetailsWorksForView) {
-  json result = srv->call_table("public", "active_users");
+  json result = srv->call_table("grocery", "active_users");
   EXPECT_FALSE(result.empty());
   EXPECT_TRUE(result.contains("columns"));
   EXPECT_TRUE(result.contains("definition"));
@@ -496,7 +559,7 @@ TEST_F(PostgresMCPServerTest, TableDetailsWorksForView) {
 }
 
 TEST_F(PostgresMCPServerTest, TableDetailsWorksForMV) {
-  json result = srv->call_table("public", "user_stats");
+  json result = srv->call_table("grocery", "user_stats");
   EXPECT_FALSE(result.empty());
   EXPECT_TRUE(result.contains("columns"));
   EXPECT_TRUE(result.contains("definition"));
@@ -508,14 +571,14 @@ TEST_F(PostgresMCPServerTest, TableDetailsWorksForMV) {
 // --- listEnums tests ---
 
 TEST_F(PostgresMCPServerTest, EnumsReturnsKnownEnum) {
-  json result = srv->call_enums("public");
+  json result = srv->call_enums("grocery");
   EXPECT_TRUE(result.is_object());
   EXPECT_TRUE(result.contains("order_status"));
   EXPECT_TRUE(result.contains("user_role"));
 }
 
 TEST_F(PostgresMCPServerTest, EnumsHasExpectedFields) {
-  json result = srv->call_enums("public");
+  json result = srv->call_enums("grocery");
   ASSERT_TRUE(result.contains("order_status"));
   EXPECT_TRUE(result["order_status"].contains("description"));
   EXPECT_TRUE(result["order_status"].contains("values"));
@@ -524,7 +587,7 @@ TEST_F(PostgresMCPServerTest, EnumsHasExpectedFields) {
 }
 
 TEST_F(PostgresMCPServerTest, EnumsValuesAreOrdered) {
-  json result = srv->call_enums("public");
+  json result = srv->call_enums("grocery");
   auto values = result["order_status"]["values"];
   ASSERT_GE(values.size(), 5u);
   EXPECT_EQ(values[0].get<std::string>(), "pending");
@@ -540,7 +603,7 @@ TEST_F(PostgresMCPServerTest, EnumsUnknownSchemaReturnsEmpty) {
 // --- enumDetails tests ---
 
 TEST_F(PostgresMCPServerTest, EnumDetailsHasValuesAndDescription) {
-  json result = srv->call_enum_detail("public", "order_status");
+  json result = srv->call_enum_detail("grocery", "order_status");
   EXPECT_FALSE(result.empty());
   EXPECT_TRUE(result.contains("description"));
   EXPECT_TRUE(result.contains("values"));
@@ -549,7 +612,7 @@ TEST_F(PostgresMCPServerTest, EnumDetailsHasValuesAndDescription) {
 }
 
 TEST_F(PostgresMCPServerTest, EnumDetailsHasUsedByColumns) {
-  json result = srv->call_enum_detail("public", "order_status");
+  json result = srv->call_enum_detail("grocery", "order_status");
   EXPECT_TRUE(result.contains("used_by_columns"));
   EXPECT_TRUE(result["used_by_columns"].is_array());
   EXPECT_GE(result["used_by_columns"].size(), 1u);
@@ -564,14 +627,14 @@ TEST_F(PostgresMCPServerTest, EnumDetailsHasUsedByColumns) {
 }
 
 TEST_F(PostgresMCPServerTest, EnumDetailsUnusedEnumHasEmptyUsedByColumns) {
-  json result = srv->call_enum_detail("public", "user_role");
+  json result = srv->call_enum_detail("grocery", "user_role");
   EXPECT_TRUE(result.contains("used_by_columns"));
   EXPECT_TRUE(result["used_by_columns"].is_array());
   EXPECT_EQ(result["used_by_columns"].size(), 0u);
 }
 
 TEST_F(PostgresMCPServerTest, EnumDetailsNotFound) {
-  json result = srv->call_enum_detail("public", "nonexistent_enum");
+  json result = srv->call_enum_detail("grocery", "nonexistent_enum");
   EXPECT_TRUE(result.empty() || result.is_null());
 }
 
@@ -613,6 +676,60 @@ TEST_F(PostgresMCPServerTest, SearchEnumsResultKeyIncludesSchema) {
   }
 }
 
+// --- roles in tableDetails and functionDetails ---
+
+TEST_F(PostgresMCPServerTest, TableDetailsHasRolesField) {
+  json result = srv->call_table("grocery", "users");
+  EXPECT_TRUE(result.contains("roles"));
+  EXPECT_TRUE(result["roles"].is_object());
+}
+
+TEST_F(PostgresMCPServerTest, TableDetailsRolesShowsGrantedPrivilege) {
+  json result = srv->call_table("grocery", "users");
+  ASSERT_TRUE(result.contains("roles"));
+  ASSERT_TRUE(result["roles"].contains("PUBLIC"));
+  auto& privs = result["roles"]["PUBLIC"];
+  EXPECT_TRUE(std::any_of(privs.begin(), privs.end(),
+    [](const json& p) { return p.get<std::string>() == "SELECT"; }));
+}
+
+TEST_F(PostgresMCPServerTest, TableDetailsNoGrantsReturnsEmptyRoles) {
+  json result = srv->call_table("grocery", "bare_notes");
+  EXPECT_TRUE(result.contains("roles"));
+  EXPECT_TRUE(result["roles"].is_object());
+  EXPECT_TRUE(result["roles"].empty());
+}
+
+TEST_F(PostgresMCPServerTest, FunctionDetailsHasRolesField) {
+  json result = srv->call_function_detail("grocery", "get_user_count");
+  EXPECT_FALSE(result.empty());
+  for (auto& [key, value] : result.items()) {
+    EXPECT_TRUE(value.contains("roles"));
+    EXPECT_TRUE(value["roles"].is_object());
+  }
+}
+
+TEST_F(PostgresMCPServerTest, FunctionDetailsRolesShowsGrantedPrivilege) {
+  json result = srv->call_function_detail("grocery", "get_user_count");
+  EXPECT_FALSE(result.empty());
+  for (auto& [key, value] : result.items()) {
+    ASSERT_TRUE(value["roles"].contains("PUBLIC"));
+    auto& privs = value["roles"]["PUBLIC"];
+    EXPECT_TRUE(std::any_of(privs.begin(), privs.end(),
+      [](const json& p) { return p.get<std::string>() == "EXECUTE"; }));
+  }
+}
+
+TEST_F(PostgresMCPServerTest, FunctionDetailsNoGrantsReturnsEmptyRoles) {
+  json result = srv->call_function_detail("grocery", "log_user_action");
+  EXPECT_FALSE(result.empty());
+  for (auto& [key, value] : result.items()) {
+    EXPECT_TRUE(value.contains("roles"));
+    EXPECT_TRUE(value["roles"].is_object());
+    EXPECT_TRUE(value["roles"].empty());
+  }
+}
+
 // --- searchTables via enum types ---
 
 TEST_F(PostgresMCPServerTest, SearchTablesByEnumValue) {
@@ -643,6 +760,11 @@ TEST_F(PostgresMCPServerTest, SearchTablesByEnumDescription) {
 }
 
 int main(int argc, char **argv) {
+  if (!std::getenv("DATABASE_URL")) {
+    std::cerr << "ERROR: DATABASE_URL environment variable is required to run tests.\n"
+              << "  Example: DATABASE_URL=\"port=5555 dbname=pglitch\" " << argv[0] << "\n";
+    return 1;
+  }
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
