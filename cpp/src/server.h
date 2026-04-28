@@ -41,6 +41,7 @@ public:
     return enum_detail(schema, enum_name);
   }
   const json call_search_enums(const std::string& web_search) { return search_enums(web_search); }
+  const json call_database_size() { return database_size(); }
 
 private:
   pqxx::connection conn;
@@ -157,6 +158,14 @@ private:
 		  }},
 		{"required", {"web_search"}}
 	      }}
+	  },
+	  {
+	    {"name", "databaseSize"},
+	    {"description", "return the current database name and its total disk size"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", json::object()}
+	      }}
 	  }
 	}}
     };
@@ -253,7 +262,11 @@ private:
                'roles', COALESCE(roles, '{}'::jsonb)))
       FROM pg_class AS c
       LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
-      LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(attname, col_description(c.oid, attnum)) AS columns
+      LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(attname, col_description(c.oid, attnum)) AS columns,
+                                STRING_AGG(
+                                    REGEXP_REPLACE(REGEXP_REPLACE(attname, '_', ' ', 'g'), '([[:upper:]])', ' \1', 'g') || ' ' ||
+                                    COALESCE(col_description(c.oid, attnum), ''),
+                                    ' ') AS col_text
                          FROM pg_attribute
                          WHERE attnum > 0
                            AND attrelid = c.oid
@@ -290,7 +303,8 @@ private:
               REGEXP_REPLACE(REGEXP_REPLACE(c.relnamespace::regnamespace::name, '_', ' ', 'g'), '([[:upper:]])', ' \1', 'g') || ' ' ||
               COALESCE(obj_description(c.oid, 'pg_class'), '') || ' ' ||
               COALESCE(enum_text, '') || ' ' ||
-              COALESCE(role_names, '')
+              COALESCE(role_names, '') || ' ' ||
+              COALESCE(col_text, '')
             ) @@ websearch_to_tsquery('english', $1)
         AND c.relkind IN ('r', 'p', 'm', 'v')
         AND c.relnamespace NOT IN (
@@ -451,6 +465,25 @@ private:
     }
   }
 
+  const json database_size() {
+    pqxx::work txn{conn};
+
+    std::string query = R"(
+      SELECT JSONB_BUILD_OBJECT(
+               'database', current_database(),
+               'size',     pg_database_size(current_database())
+             );
+    )";
+
+    pqxx::result res = txn.exec(query);
+
+    if (!res.empty() && !res[0][0].is_null()) {
+      return json::parse(res[0][0].as<std::string>());
+    } else {
+      return {};
+    }
+  }
+
   const json enums(const std::string& schema) {
     pqxx::work txn{conn};
 
@@ -573,7 +606,7 @@ private:
 
     std::string query = R"(
       SELECT JSONB_BUILD_OBJECT(
-               'table', c.relname, 'rows', c.reltuples, 'size', c.relpages::bigint * 8192,
+               'table', c.relname, 'rows', c.reltuples, 'size', pg_table_size(c.oid), 'indexes_size', pg_indexes_size(c.oid),
                'description', COALESCE(obj_description(c.oid, 'pg_class'), ''),
                'kind', CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table'
                                       WHEN 'm' THEN 'materialized view' WHEN 'v' THEN 'view' END,
@@ -609,7 +642,7 @@ private:
                          AND NOT attisdropped) ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(indexname,
                           JSONB_BUILD_OBJECT(
-                           'definition', indexdef, 'index_uses', idx_scan, 'last_use', last_idx_scan)) AS indexes
+                           'definition', indexdef, 'size', pg_relation_size(si.indexrelid), 'index_uses', idx_scan, 'last_use', last_idx_scan)) AS indexes
                          FROM pg_indexes AS i
                          JOIN pg_stat_user_indexes si ON si.indexrelname = i.indexname
                                                       AND si.schemaname = i.schemaname
@@ -679,7 +712,7 @@ private:
         {"capabilities", {
             {"tools", json::object()}
 	  }},
-        {"serverInfo", {{"name", "pg-licht-cpp"}, {"version", "1.0.0"}}}
+        {"serverInfo", {{"name", "pg-licht-cpp"}, {"version", "1.1.0"}}}
       });
   }
 
@@ -744,6 +777,9 @@ private:
 	else if (tool_name == "searchEnums") {
 	  std::string web_search = arguments.contains("web_search") ? arguments["web_search"].get<std::string>() : "";
 	  result_content = search_enums(web_search);
+	}
+	else if (tool_name == "databaseSize") {
+	  result_content = database_size();
 	}
 	else {
 	  send_error(req["id"], -32601, "Tool not found: " + tool_name);

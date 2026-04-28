@@ -86,7 +86,7 @@ export async function listTables(client: pg.Client, schema: string) {
 export async function tableDetails(client: pg.Client, schema: string, table: string) {
   return await run(client, `
     SELECT JSONB_BUILD_OBJECT(
-             'table', c.relname, 'rows', c.reltuples, 'size', c.relpages::bigint * 8192,
+             'table', c.relname, 'rows', c.reltuples, 'size', pg_table_size(c.oid), 'indexes_size', pg_indexes_size(c.oid),
              'description', COALESCE(obj_description(c.oid, 'pg_class'), ''),
              'kind', CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table'
                                     WHEN 'm' THEN 'materialized view' WHEN 'v' THEN 'view' END,
@@ -124,7 +124,7 @@ export async function tableDetails(client: pg.Client, schema: string, table: str
                        AND NOT attisdropped) ON true
     LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(indexname,
                         JSONB_BUILD_OBJECT(
-                         'definition', indexdef, 'index_uses', idx_scan, 'last_use', last_idx_scan)) AS indexes
+                         'definition', indexdef, 'size', pg_relation_size(si.indexrelid), 'index_uses', idx_scan, 'last_use', last_idx_scan)) AS indexes
                        FROM pg_indexes AS i
                        JOIN pg_stat_user_indexes si ON si.indexrelname = i.indexname
                                                     AND si.schemaname = i.schemaname
@@ -195,7 +195,11 @@ export async function searchTables(client: pg.Client, webSearch: string) {
              'roles', COALESCE(roles, '{}'::jsonb)))
     FROM pg_class AS c
     LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
-    LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(attname, col_description(c.oid, attnum)) AS columns
+    LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(attname, col_description(c.oid, attnum)) AS columns,
+                              STRING_AGG(
+                                  REGEXP_REPLACE(REGEXP_REPLACE(attname, '_', ' ', 'g'), '([[:upper:]])', ' \\1', 'g') || ' ' ||
+                                  COALESCE(col_description(c.oid, attnum), ''),
+                                  ' ') AS col_text
                        FROM pg_attribute
                        WHERE attnum > 0
                          AND attrelid = c.oid
@@ -234,7 +238,8 @@ export async function searchTables(client: pg.Client, webSearch: string) {
             REGEXP_REPLACE(REGEXP_REPLACE(c.relnamespace::regnamespace::name, '_', ' ', 'g'), '([[:upper:]])', ' \\1', 'g') || ' ' ||
             COALESCE(obj_description(c.oid, 'pg_class'), '') || ' ' ||
             COALESCE(enum_text, '') || ' ' ||
-            COALESCE(role_names, '')
+            COALESCE(role_names, '') || ' ' ||
+            COALESCE(col_text, '')
           ) @@ websearch_to_tsquery('english', $1)
       AND c.relkind IN ('r', 'p', 'm', 'v')
       AND c.relnamespace NOT IN (
@@ -399,6 +404,15 @@ export async function enumDetails(client: pg.Client, schema: string, enumName: s
       AND t.typname = $2
       AND t.typtype = 'e'
   `, [schema, enumName]);
+}
+
+export async function databaseSize(client: pg.Client) {
+  return await run(client, `
+    SELECT JSONB_BUILD_OBJECT(
+             'database', current_database(),
+             'size',     pg_database_size(current_database())
+           )
+  `);
 }
 
 export async function searchEnums(client: pg.Client, webSearch: string) {
