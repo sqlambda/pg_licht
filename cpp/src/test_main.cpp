@@ -271,12 +271,6 @@ TEST_F(PostgresMCPServerTest, SearchByTableDescription) {
   EXPECT_TRUE(found);
 }
 
-TEST_F(PostgresMCPServerTest, SearchDoesNotMatchColumnComment) {
-  json result = srv->call_search("unique email");
-  for (auto& [key, value] : result.items()) {
-    EXPECT_NE(key.find(".users"), 0) << "Should not find users by column comment";
-  }
-}
 
 TEST_F(PostgresMCPServerTest, SearchResultKeyIncludesSchema) {
   json result = srv->call_search("users");
@@ -287,6 +281,24 @@ TEST_F(PostgresMCPServerTest, SearchResultKeyIncludesSchema) {
     }
     EXPECT_EQ(dot_count, 1) << "Key should have exactly one dot: " << key;
   }
+}
+
+TEST_F(PostgresMCPServerTest, SearchByColumnName) {
+  json result = srv->call_search("user_id");
+  bool found = false;
+  for (auto& [key, value] : result.items()) {
+    if (key.find(".orders") != std::string::npos) { found = true; break; }
+  }
+  EXPECT_TRUE(found);
+}
+
+TEST_F(PostgresMCPServerTest, SearchByColumnDescription) {
+  json result = srv->call_search("unique email address");
+  bool found = false;
+  for (auto& [key, value] : result.items()) {
+    if (key.find(".users") != std::string::npos) { found = true; break; }
+  }
+  EXPECT_TRUE(found);
 }
 
 TEST_F(PostgresMCPServerTest, SearchSnakeCaseName) {
@@ -306,6 +318,7 @@ TEST_F(PostgresMCPServerTest, TableReturnsExpectedTopLevelKeys) {
   EXPECT_TRUE(result.contains("table"));
   EXPECT_TRUE(result.contains("rows"));
   EXPECT_TRUE(result.contains("size"));
+  EXPECT_TRUE(result.contains("indexes_size"));
   EXPECT_TRUE(result.contains("description"));
   EXPECT_TRUE(result.contains("seq_scan"));
   EXPECT_TRUE(result.contains("idx_scan"));
@@ -313,6 +326,16 @@ TEST_F(PostgresMCPServerTest, TableReturnsExpectedTopLevelKeys) {
   EXPECT_TRUE(result.contains("indexes"));
   EXPECT_TRUE(result.contains("constraints"));
   EXPECT_TRUE(result.contains("foreign_keys"));
+}
+
+TEST_F(PostgresMCPServerTest, TableIndexesHaveSizeField) {
+  json result = srv->call_table("grocery", "users");
+  EXPECT_FALSE(result["indexes"].empty());
+  for (auto& [idx_name, idx_obj] : result["indexes"].items()) {
+    EXPECT_TRUE(idx_obj.contains("size")) << "Index " << idx_name << " missing size";
+    EXPECT_TRUE(idx_obj.contains("definition"));
+    EXPECT_TRUE(idx_obj.contains("index_uses"));
+  }
 }
 
 TEST_F(PostgresMCPServerTest, TableColumnsHaveTypeInfo) {
@@ -757,6 +780,17 @@ TEST_F(PostgresMCPServerTest, SearchTablesByEnumDescription) {
     if (key.find(".orders") != std::string::npos) { found = true; break; }
   }
   EXPECT_TRUE(found);
+}
+
+// --- databaseSize ---
+
+TEST_F(PostgresMCPServerTest, DatabaseSizeReturnsDatabaseNameAndSize) {
+  json result = srv->call_database_size();
+  EXPECT_TRUE(result.is_object());
+  EXPECT_TRUE(result.contains("database"));
+  EXPECT_TRUE(result.contains("size"));
+  EXPECT_FALSE(result["database"].get<std::string>().empty());
+  EXPECT_GT(result["size"].get<int64_t>(), 0);
 }
 
 int main(int argc, char **argv) {

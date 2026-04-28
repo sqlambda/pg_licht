@@ -1,6 +1,6 @@
 {
   "name": "pg-licht-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "PostgreSQL MCP server — exposes schema, table, function, and search tools over JSON-RPC 2.0",
   "license": "Apache-2.0",
   "type": "module",

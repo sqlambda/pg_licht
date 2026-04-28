@@ -13,6 +13,7 @@ import {
   listEnums,
   enumDetails,
   searchEnums,
+  databaseSize,
 } from "./queries.js";
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -207,12 +208,6 @@ test("searchTables by table description", async () => {
   assert.ok(Object.keys(result).some(k => k.endsWith(".users")));
 });
 
-test("searchTables does not match column comment", async () => {
-  const result = await searchTables(db, "unique email") as Record<string, unknown> | null;
-  if (result) {
-    assert.ok(!Object.keys(result).some(k => k.endsWith(".users")));
-  }
-});
 
 test("searchTables result key includes schema", async () => {
   const result = await searchTables(db, "users") as Record<string, unknown>;
@@ -227,12 +222,35 @@ test("searchTables finds snake_case name by words", async () => {
   assert.ok(Object.keys(result).some(k => k.endsWith(".user_account_log")));
 });
 
+test("searchTables finds table by column name", async () => {
+  const result = await searchTables(db, "user_id") as Record<string, unknown>;
+  assert.ok(result);
+  assert.ok(Object.keys(result).some(k => k.endsWith(".orders")));
+});
+
+test("searchTables finds table by column description", async () => {
+  const result = await searchTables(db, "unique email address") as Record<string, unknown>;
+  assert.ok(result);
+  assert.ok(Object.keys(result).some(k => k.endsWith(".users")));
+});
+
 // --- tableDetails ---
 
 test("tableDetails returns expected top-level keys", async () => {
   const result = await tableDetails(db, "grocery", "users") as Record<string, unknown>;
-  for (const field of ["table", "rows", "size", "description", "seq_scan", "idx_scan", "columns", "indexes", "constraints", "foreign_keys"]) {
+  for (const field of ["table", "rows", "size", "indexes_size", "description", "seq_scan", "idx_scan", "columns", "indexes", "constraints", "foreign_keys"]) {
     assert.ok(field in result, `missing field: ${field}`);
+  }
+});
+
+test("tableDetails indexes have size field", async () => {
+  const result = await tableDetails(db, "grocery", "users") as Record<string, Record<string, Record<string, unknown>>>;
+  const indexes = result["indexes"];
+  assert.ok(Object.keys(indexes).length > 0);
+  for (const [name, idx] of Object.entries(indexes)) {
+    assert.ok("size" in idx, `index ${name} missing size`);
+    assert.ok("definition" in idx, `index ${name} missing definition`);
+    assert.ok("index_uses" in idx, `index ${name} missing index_uses`);
   }
 });
 
@@ -580,4 +598,16 @@ test("functionDetails no grants returns empty roles", async () => {
     assert.ok(typeof roles === "object" && !Array.isArray(roles));
     assert.equal(Object.keys(roles).length, 0);
   }
+});
+
+// --- databaseSize ---
+
+test("databaseSize returns database name and size", async () => {
+  const result = await databaseSize(db) as Record<string, unknown>;
+  assert.ok(result);
+  assert.ok("database" in result);
+  assert.ok("size" in result);
+  assert.equal(typeof result["database"], "string");
+  assert.ok((result["database"] as string).length > 0);
+  assert.ok(typeof result["size"] === "number" && (result["size"] as number) > 0);
 });

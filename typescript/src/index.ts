@@ -19,6 +19,7 @@ import {
   listEnums,
   enumDetails,
   searchEnums,
+  databaseSize,
 } from "./queries.js";
 
 const connStr = process.env.DATABASE_URL ?? process.argv[2];
@@ -38,7 +39,7 @@ await client.connect();
 // ---------------------------------------------------------------------------
 
 const server = new Server(
-  { name: "pg-licht-mcp", version: "1.0.0" },
+  { name: "pg-licht-mcp", version: "1.1.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -139,6 +140,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["web_search"],
       },
     },
+    {
+      name: "databaseSize",
+      description: "return the current database name and its total disk size",
+      inputSchema: { type: "object", properties: {} },
+    },
   ],
 }));
 
@@ -199,6 +205,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       case "searchEnums":
         result = await searchEnums(client, (args.web_search as string) ?? "");
+        break;
+
+      case "databaseSize":
+        result = await databaseSize(client);
         break;
 
       default:
