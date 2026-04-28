@@ -12,13 +12,17 @@ Motivation to create another PostgreSQL MCP:
 
 | Tool | Description |
 |------|-------------|
-| `listSchemas` | All schemas with their table names |
-| `listTables` | Tables in a schema with row counts, sizes, and scan statistics |
-| `tableDetails` | Full table detail: columns (with pg_stats histograms), indexes (with usage counts), constraints, foreign keys, triggers |
-| `searchTables` | Full-text search across table names and descriptions |
-| `listFunctions` | Functions and procedures in a schema with metadata |
-| `functionDetails` | Full function detail: source code, definition, trigger usage |
+| `listSchemas` | All schemas with their table/view names and role grants |
+| `listTables` | Tables and views in a schema with kind, row counts, sizes, scan stats, columns (with descriptions), indexes, and constraints |
+| `tableDetails` | Full detail: columns (types, nullability, pg_stats histograms), indexes (size, usage counts), constraints, foreign keys, triggers (timing, events, language), view definition, scan stats, and role grants |
+| `searchTables` | Full-text search across table/schema names, descriptions, column names/descriptions, enum values used by columns, and role names; returns same fields as `listTables` |
+| `listFunctions` | Functions and procedures in a schema with kind, language, return type, arguments, volatility, security_definer, and is_strict |
+| `functionDetails` | Full function detail: source code, full definition, arguments, volatility, trigger usage, and role grants |
 | `searchFunctions` | Full-text search across function names, source code, language, trigger names, and descriptions |
+| `listEnums` | Enum types in a schema with their ordered values and descriptions |
+| `enumDetails` | Full enum detail: ordered values and all columns (across all tables) that reference it |
+| `searchEnums` | Full-text search across enum names, values, and descriptions |
+| `databaseSize` | Current database name and total disk size |
 
 ## C++
 
