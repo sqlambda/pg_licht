@@ -27,6 +27,13 @@ Motivation to create another PostgreSQL MCP:
 
 ## C++
 
+### Install via Homebrew (macOS and Linux)
+
+```bash
+brew tap sqlambda/pg-licht
+brew install pg-licht
+```
+
 ### Requirements
 
 - CMake 3.31+
