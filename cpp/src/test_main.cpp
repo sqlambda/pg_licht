@@ -89,6 +89,23 @@ protected:
       txn.exec("CREATE TABLE grocery.bare_notes (note TEXT)");
 
       txn.exec(
+        "CREATE TABLE grocery.order_tags ("
+        "  order_id INT  NOT NULL REFERENCES grocery.orders(id),"
+        "  tag      TEXT NOT NULL,"
+        "  PRIMARY KEY (order_id, tag)"
+        ")"
+      );
+      txn.exec("INSERT INTO grocery.order_tags(order_id, tag) VALUES (1, 'organic')");
+
+      txn.exec(
+        "CREATE TABLE grocery.product_refs ("
+        "  id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),"
+        "  name TEXT"
+        ")"
+      );
+      txn.exec("INSERT INTO grocery.product_refs(id, name) VALUES ('550e8400-e29b-41d4-a716-446655440000', 'Widget')");
+
+      txn.exec(
         "CREATE FUNCTION grocery.log_user_action() RETURNS trigger LANGUAGE plpgsql AS $$\n"
         "BEGIN\n"
         "  INSERT INTO grocery.user_account_log(user_id, action) VALUES (NEW.id, TG_OP);\n"
@@ -125,6 +142,15 @@ protected:
       txn.exec("COMMENT ON TYPE grocery.order_status IS 'status of a customer order'");
       txn.exec("ALTER TABLE grocery.orders ADD COLUMN status grocery.order_status DEFAULT 'pending'");
       txn.exec("CREATE TYPE grocery.user_role AS ENUM ('admin', 'user', 'guest')");
+      txn.exec("CREATE TYPE grocery.unused_enum AS ENUM ('x', 'y')");
+
+      txn.exec(
+        "CREATE TABLE grocery.role_settings ("
+        "  role         grocery.user_role PRIMARY KEY,"
+        "  max_sessions INT DEFAULT 5"
+        ")"
+      );
+      txn.exec("INSERT INTO grocery.role_settings(role) VALUES ('admin')");
 
       txn.exec("GRANT USAGE ON SCHEMA grocery TO PUBLIC");
       txn.exec("GRANT SELECT ON grocery.users TO PUBLIC");
@@ -327,6 +353,28 @@ TEST_F(PostgresMCPServerTest, TableReturnsExpectedTopLevelKeys) {
   EXPECT_TRUE(result.contains("constraints"));
   EXPECT_TRUE(result.contains("foreign_keys"));
   EXPECT_TRUE(result.contains("referenced_by"));
+  EXPECT_TRUE(result.contains("primary_key"));
+}
+
+TEST_F(PostgresMCPServerTest, TableDetailsSingleColumnPrimaryKey) {
+  json result = srv->call_table("grocery", "users");
+  ASSERT_TRUE(result["primary_key"].is_array());
+  ASSERT_EQ(result["primary_key"].size(), 1u);
+  EXPECT_EQ(result["primary_key"][0].get<std::string>(), "id");
+}
+
+TEST_F(PostgresMCPServerTest, TableDetailsMultiColumnPrimaryKey) {
+  json result = srv->call_table("grocery", "order_tags");
+  ASSERT_TRUE(result["primary_key"].is_array());
+  ASSERT_EQ(result["primary_key"].size(), 2u);
+  EXPECT_EQ(result["primary_key"][0].get<std::string>(), "order_id");
+  EXPECT_EQ(result["primary_key"][1].get<std::string>(), "tag");
+}
+
+TEST_F(PostgresMCPServerTest, TableDetailsNoPrimaryKeyReturnsEmptyArray) {
+  json result = srv->call_table("grocery", "bare_notes");
+  ASSERT_TRUE(result["primary_key"].is_array());
+  EXPECT_TRUE(result["primary_key"].empty());
 }
 
 TEST_F(PostgresMCPServerTest, TableDetailsUsersHasReferencedBy) {
@@ -352,6 +400,64 @@ TEST_F(PostgresMCPServerTest, TableDetailsBareNotesHasEmptyReferencedBy) {
   EXPECT_TRUE(result.contains("referenced_by"));
   EXPECT_TRUE(result["referenced_by"].is_object());
   EXPECT_TRUE(result["referenced_by"].empty());
+}
+
+TEST_F(PostgresMCPServerTest, CheckKeyTrueForExistingSingleKey) {
+  json result = srv->call_check_key("grocery", "users", json::array({1}));
+  EXPECT_EQ(result["exists"].get<bool>(), true);
+}
+
+TEST_F(PostgresMCPServerTest, CheckKeyFalseForMissingSingleKey) {
+  json result = srv->call_check_key("grocery", "users", json::array({999}));
+  EXPECT_EQ(result["exists"].get<bool>(), false);
+}
+
+TEST_F(PostgresMCPServerTest, CheckKeyTrueForExistingCompositeKey) {
+  json result = srv->call_check_key("grocery", "order_tags", json::array({1, "organic"}));
+  EXPECT_EQ(result["exists"].get<bool>(), true);
+}
+
+TEST_F(PostgresMCPServerTest, CheckKeyFalseForMissingCompositeKey) {
+  json result = srv->call_check_key("grocery", "order_tags", json::array({1, "missing"}));
+  EXPECT_EQ(result["exists"].get<bool>(), false);
+}
+
+TEST_F(PostgresMCPServerTest, CheckKeyThrowsForNoPrimaryKey) {
+  EXPECT_THROW(srv->call_check_key("grocery", "bare_notes", json::array({"x"})), std::exception);
+}
+
+TEST_F(PostgresMCPServerTest, CheckKeyThrowsForWrongValueCount) {
+  EXPECT_THROW(srv->call_check_key("grocery", "users", json::array({1, 2})), std::exception);
+}
+
+TEST_F(PostgresMCPServerTest, CheckKeyThrowsForTypeMismatch) {
+  EXPECT_THROW(srv->call_check_key("grocery", "users", json::array({"not-an-int"})), std::exception);
+}
+
+TEST_F(PostgresMCPServerTest, CheckKeyTrueForExistingUUIDKey) {
+  json result = srv->call_check_key("grocery", "product_refs",
+    json::array({"550e8400-e29b-41d4-a716-446655440000"}));
+  EXPECT_EQ(result["exists"].get<bool>(), true);
+}
+
+TEST_F(PostgresMCPServerTest, CheckKeyFalseForMissingUUIDKey) {
+  json result = srv->call_check_key("grocery", "product_refs",
+    json::array({"00000000-0000-0000-0000-000000000000"}));
+  EXPECT_EQ(result["exists"].get<bool>(), false);
+}
+
+TEST_F(PostgresMCPServerTest, CheckKeyThrowsForInvalidUUIDFormat) {
+  EXPECT_THROW(srv->call_check_key("grocery", "product_refs",
+    json::array({"not-a-uuid"})), std::exception);
+}
+
+TEST_F(PostgresMCPServerTest, CheckKeyAcceptsStringForCustomEnumKey) {
+  json result = srv->call_check_key("grocery", "role_settings", json::array({"admin"}));
+  EXPECT_EQ(result["exists"].get<bool>(), true);
+}
+
+TEST_F(PostgresMCPServerTest, CheckKeyThrowsNonStringForCustomEnumKey) {
+  EXPECT_THROW(srv->call_check_key("grocery", "role_settings", json::array({42})), std::exception);
 }
 
 TEST_F(PostgresMCPServerTest, TableColumnsIncludeDefaultWhenPresent) {
@@ -686,7 +792,7 @@ TEST_F(PostgresMCPServerTest, EnumDetailsHasUsedByColumns) {
 }
 
 TEST_F(PostgresMCPServerTest, EnumDetailsUnusedEnumHasEmptyUsedByColumns) {
-  json result = srv->call_enum_detail("grocery", "user_role");
+  json result = srv->call_enum_detail("grocery", "unused_enum");
   EXPECT_TRUE(result.contains("used_by_columns"));
   EXPECT_TRUE(result["used_by_columns"].is_array());
   EXPECT_EQ(result["used_by_columns"].size(), 0u);

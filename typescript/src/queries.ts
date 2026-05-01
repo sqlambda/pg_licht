@@ -96,6 +96,7 @@ export async function tableDetails(client: pg.Client, schema: string, table: str
              'last_vacuum', GREATEST(s.last_vacuum, s.last_autovacuum),
              'last_analyze', GREATEST(s.last_analyze, s.last_autoanalyze),
              'columns', columns,
+             'primary_key', COALESCE(primary_key, '[]'::jsonb),
              'indexes', COALESCE(indexes, '{}'::jsonb),
              'constraints', COALESCE(constraints, '{}'::jsonb),
              'foreign_keys', COALESCE(foreign_keys, '{}'::jsonb),
@@ -134,6 +135,10 @@ export async function tableDetails(client: pg.Client, schema: string, table: str
                                                     AND si.relname = i.tablename
                        WHERE i.schemaname = $1
                          AND i.tablename = c.relname) ON true
+    LEFT JOIN LATERAL (SELECT JSONB_AGG(a.attname ORDER BY array_position(pk.conkey, a.attnum)) AS primary_key
+                       FROM pg_constraint pk
+                       JOIN pg_attribute a ON a.attrelid = pk.conrelid AND a.attnum = ANY(pk.conkey)
+                       WHERE pk.conrelid = c.oid AND pk.contype = 'p') ON true
     LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(conname,
                         JSONB_BUILD_OBJECT(
                          'definition', pg_get_constraintdef(oid))) AS constraints
@@ -143,8 +148,8 @@ export async function tableDetails(client: pg.Client, schema: string, table: str
     LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(fk.conname,
                         JSONB_BUILD_OBJECT(
                          'target_table', fk.confrelid::regclass::text,
-                         'source_columns', (SELECT jsonb_agg(a.attname) FROM pg_attribute a WHERE a.attrelid = fk.conrelid AND a.attnum = ANY(fk.conkey)),
-                         'target_columns', (SELECT jsonb_agg(a.attname) FROM pg_attribute a WHERE a.attrelid = fk.confrelid AND a.attnum = ANY(fk.confkey)),
+                         'source_columns', (SELECT jsonb_agg(a.attname ORDER BY array_position(fk.conkey, a.attnum)) FROM pg_attribute a WHERE a.attrelid = fk.conrelid AND a.attnum = ANY(fk.conkey)),
+                         'target_columns', (SELECT jsonb_agg(a.attname ORDER BY array_position(fk.confkey, a.attnum)) FROM pg_attribute a WHERE a.attrelid = fk.confrelid AND a.attnum = ANY(fk.confkey)),
                          'definition', pg_get_constraintdef(fk.oid))) AS foreign_keys
                        FROM pg_constraint fk
                        WHERE fk.conrelid = c.oid
@@ -152,8 +157,8 @@ export async function tableDetails(client: pg.Client, schema: string, table: str
     LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(fk.conrelid::regclass::text || '.' || fk.conname,
                         JSONB_BUILD_OBJECT(
                          'source_table', fk.conrelid::regclass::text,
-                         'source_columns', (SELECT jsonb_agg(a.attname) FROM pg_attribute a WHERE a.attrelid = fk.conrelid AND a.attnum = ANY(fk.conkey)),
-                         'target_columns', (SELECT jsonb_agg(a.attname) FROM pg_attribute a WHERE a.attrelid = fk.confrelid AND a.attnum = ANY(fk.confkey)),
+                         'source_columns', (SELECT jsonb_agg(a.attname ORDER BY array_position(fk.conkey, a.attnum)) FROM pg_attribute a WHERE a.attrelid = fk.conrelid AND a.attnum = ANY(fk.conkey)),
+                         'target_columns', (SELECT jsonb_agg(a.attname ORDER BY array_position(fk.confkey, a.attnum)) FROM pg_attribute a WHERE a.attrelid = fk.confrelid AND a.attnum = ANY(fk.confkey)),
                          'definition', pg_get_constraintdef(fk.oid))) AS referenced_by
                        FROM pg_constraint fk
                        WHERE fk.confrelid = c.oid
@@ -458,4 +463,69 @@ export async function searchEnums(client: pg.Client, webSearch: string) {
             @@ websearch_to_tsquery('english', $1)
       )
   `, [webSearch]);
+}
+
+const INT_TYPES   = new Set(['int2', 'int4', 'int8', 'oid', 'xid', 'cid']);
+const FLOAT_TYPES = new Set(['float4', 'float8', 'numeric', 'money']);
+const STR_TYPES   = new Set(['text', 'varchar', 'bpchar', 'char', 'name', 'citext']);
+
+function quoteIdent(s: string): string {
+  return '"' + s.replace(/"/g, '""') + '"';
+}
+
+function validateKeyValue(value: unknown, pgType: string, col: string): void {
+  if (INT_TYPES.has(pgType)) {
+    if (typeof value !== 'number' || !Number.isInteger(value))
+      throw new Error(`column "${col}" (${pgType}) expects an integer`);
+  } else if (FLOAT_TYPES.has(pgType)) {
+    if (typeof value !== 'number')
+      throw new Error(`column "${col}" (${pgType}) expects a number`);
+  } else if (STR_TYPES.has(pgType)) {
+    if (typeof value !== 'string')
+      throw new Error(`column "${col}" (${pgType}) expects a string`);
+  } else if (pgType === 'uuid') {
+    if (typeof value !== 'string' ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value))
+      throw new Error(`column "${col}" (uuid) expects a UUID string`);
+  } else if (pgType === 'bool') {
+    if (typeof value !== 'boolean')
+      throw new Error(`column "${col}" (bool) expects a boolean`);
+  } else {
+    if (typeof value !== 'string')
+      throw new Error(`column "${col}" (${pgType}) expects a string`);
+  }
+}
+
+export async function checkKey(client: pg.Client, schema: string, table: string, values: unknown[]) {
+  const pkRes = await client.query<{ column: string; type: string; type_schema: string }>(`
+    SELECT a.attname AS column, t.typname AS type, n.nspname AS type_schema
+    FROM pg_constraint pk
+    JOIN pg_attribute a ON a.attrelid = pk.conrelid AND a.attnum = ANY(pk.conkey)
+    JOIN pg_type t ON t.oid = a.atttypid
+    JOIN pg_namespace n ON n.oid = t.typnamespace
+    WHERE pk.conrelid = ($1 || '.' || $2)::regclass AND pk.contype = 'p'
+    ORDER BY array_position(pk.conkey, a.attnum)
+  `, [schema, table]);
+
+  const cols = pkRes.rows;
+  if (cols.length === 0)
+    throw new Error(`table ${schema}.${table} has no primary key`);
+  if (values.length !== cols.length)
+    throw new Error(`primary key has ${cols.length} column(s), got ${values.length} value(s)`);
+
+  for (let i = 0; i < cols.length; i++)
+    validateKeyValue(values[i], cols[i].type, cols[i].column);
+
+  const tableRef = `${quoteIdent(schema)}.${quoteIdent(table)}`;
+  const where = cols.map((c, i) => {
+    const cast = c.type_schema !== 'pg_catalog'
+      ? `::${quoteIdent(c.type_schema)}.${quoteIdent(c.type)}`
+      : '';
+    return `${quoteIdent(c.column)} = $${i + 1}${cast}`;
+  }).join(' AND ');
+  const res = await client.query<{ exists: boolean }>(
+    `SELECT EXISTS(SELECT 1 FROM ${tableRef} WHERE ${where})`,
+    values as unknown[]
+  );
+  return { exists: res.rows[0].exists };
 }
