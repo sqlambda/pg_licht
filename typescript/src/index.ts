@@ -61,7 +61,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "tableDetails",
-      description: "return table details like columns, foreign keys, indexes, triggers, data histograms",
+      description: "return table details like columns, foreign keys, inbound foreign keys (referenced_by), indexes, triggers, data histograms",
       inputSchema: {
         type: "object",
         properties: {

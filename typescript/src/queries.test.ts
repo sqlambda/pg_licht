@@ -238,9 +238,19 @@ test("searchTables finds table by column description", async () => {
 
 test("tableDetails returns expected top-level keys", async () => {
   const result = await tableDetails(db, "grocery", "users") as Record<string, unknown>;
-  for (const field of ["table", "rows", "size", "indexes_size", "description", "seq_scan", "idx_scan", "columns", "indexes", "constraints", "foreign_keys"]) {
+  for (const field of ["table", "rows", "size", "indexes_size", "description", "seq_scan", "idx_scan", "columns", "indexes", "constraints", "foreign_keys", "referenced_by"]) {
     assert.ok(field in result, `missing field: ${field}`);
   }
+});
+
+test("tableDetails columns include default value when present", async () => {
+  const result = await tableDetails(db, "grocery", "user_account_log") as Record<string, Record<string, Record<string, unknown>>>;
+  assert.equal(result["columns"]["logged_at"]["default"], "now()");
+});
+
+test("tableDetails columns have no default when absent", async () => {
+  const result = await tableDetails(db, "grocery", "users") as Record<string, Record<string, Record<string, unknown>>>;
+  assert.ok(!("default" in result["columns"]["name"]), "column without default should not have default key");
 });
 
 test("tableDetails indexes have size field", async () => {
@@ -298,6 +308,24 @@ test("tableDetails includes triggers", async () => {
   assert.ok("function" in trig);
   assert.equal(trig["timing"], "AFTER");
   assert.ok((trig["events"] as string).includes("INSERT"));
+});
+
+test("tableDetails users has referenced_by with inbound FKs", async () => {
+  const result = await tableDetails(db, "grocery", "users") as Record<string, Record<string, Record<string, unknown>>>;
+  const ref = result["referenced_by"];
+  assert.ok(ref && typeof ref === "object" && !Array.isArray(ref));
+  assert.ok(Object.keys(ref).length >= 1);
+  const ordersKey = Object.keys(ref).find(k => k.startsWith("grocery.orders."));
+  assert.ok(ordersKey, "expected inbound FK from grocery.orders");
+  const fk = ref[ordersKey!];
+  assert.equal(fk["source_table"], "grocery.orders");
+  assert.ok("source_columns" in fk && "target_columns" in fk && "definition" in fk);
+});
+
+test("tableDetails bare_notes has empty referenced_by", async () => {
+  const result = await tableDetails(db, "grocery", "bare_notes") as Record<string, unknown>;
+  assert.ok("referenced_by" in result);
+  assert.equal(Object.keys(result["referenced_by"] as object).length, 0);
 });
 
 test("searchTables finds table by grantee role name", async () => {

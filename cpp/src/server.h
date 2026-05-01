@@ -70,7 +70,7 @@ private:
 	  },
 	  {
 	    {"name", "tableDetails"},
-	    {"description", "return table details like columns, foreign keys, indexes, data histograms"},
+	    {"description", "return table details like columns, foreign keys, inbound foreign keys (referenced_by), indexes, data histograms"},
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", {
@@ -617,6 +617,7 @@ private:
                'indexes', COALESCE(indexes, '{}'::jsonb),
                'constraints', COALESCE(constraints, '{}'::jsonb),
                'foreign_keys', COALESCE(foreign_keys, '{}'::jsonb),
+               'referenced_by', COALESCE(referenced_by, '{}'::jsonb),
                'triggers', COALESCE(triggers, '{}'::jsonb),
                'roles', COALESCE(roles, '{}'::jsonb))
       FROM pg_class AS c
@@ -628,6 +629,7 @@ private:
                          'format_type', format_type(a.atttypid, a.atttypmod),
                          'size', NULLIF(a.attlen, -1),
                          'not_null', a.attnotnull,
+                         'default', pg_get_expr(ad.adbin, ad.adrelid),
                          'null_frac', ps.null_frac,
                          'avg_width', ps.avg_width,
                          'n_distinct', ps.n_distinct,
@@ -636,6 +638,7 @@ private:
                          'most_common_freqs', ps.most_common_freqs))) AS columns
                        FROM pg_attribute AS a
                        JOIN pg_type AS t ON t.oid = a.atttypid
+                       LEFT JOIN pg_attrdef AS ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
                        LEFT JOIN pg_stats AS ps ON ps.schemaname = $1 AND ps.tablename = $2 AND ps.attname = a.attname
                        WHERE attnum > 0
                          AND attrelid = c.oid
@@ -663,6 +666,15 @@ private:
                            'definition', pg_get_constraintdef(fk.oid))) AS foreign_keys
                          FROM pg_constraint fk
                          WHERE fk.conrelid = c.oid
+                           AND fk.contype = 'f') ON true
+      LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(fk.conrelid::regclass::text || '.' || fk.conname,
+                          JSONB_BUILD_OBJECT(
+                           'source_table', fk.conrelid::regclass::text,
+                           'source_columns', (SELECT jsonb_agg(a.attname) FROM pg_attribute a WHERE a.attrelid = fk.conrelid AND a.attnum = ANY(fk.conkey)),
+                           'target_columns', (SELECT jsonb_agg(a.attname) FROM pg_attribute a WHERE a.attrelid = fk.confrelid AND a.attnum = ANY(fk.confkey)),
+                           'definition', pg_get_constraintdef(fk.oid))) AS referenced_by
+                         FROM pg_constraint fk
+                         WHERE fk.confrelid = c.oid
                            AND fk.contype = 'f') ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(t.tgname,
                           JSONB_BUILD_OBJECT(
