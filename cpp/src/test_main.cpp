@@ -326,6 +326,42 @@ TEST_F(PostgresMCPServerTest, TableReturnsExpectedTopLevelKeys) {
   EXPECT_TRUE(result.contains("indexes"));
   EXPECT_TRUE(result.contains("constraints"));
   EXPECT_TRUE(result.contains("foreign_keys"));
+  EXPECT_TRUE(result.contains("referenced_by"));
+}
+
+TEST_F(PostgresMCPServerTest, TableDetailsUsersHasReferencedBy) {
+  json result = srv->call_table("grocery", "users");
+  EXPECT_TRUE(result.contains("referenced_by"));
+  EXPECT_TRUE(result["referenced_by"].is_object());
+  EXPECT_GE(result["referenced_by"].size(), 1u);
+  bool found = false;
+  for (auto& [key, val] : result["referenced_by"].items()) {
+    if (key.rfind("grocery.orders.", 0) == 0) {
+      found = true;
+      EXPECT_EQ(val["source_table"].get<std::string>(), "grocery.orders");
+      EXPECT_TRUE(val.contains("source_columns"));
+      EXPECT_TRUE(val.contains("target_columns"));
+      EXPECT_TRUE(val.contains("definition"));
+    }
+  }
+  EXPECT_TRUE(found) << "Expected inbound FK from grocery.orders";
+}
+
+TEST_F(PostgresMCPServerTest, TableDetailsBareNotesHasEmptyReferencedBy) {
+  json result = srv->call_table("grocery", "bare_notes");
+  EXPECT_TRUE(result.contains("referenced_by"));
+  EXPECT_TRUE(result["referenced_by"].is_object());
+  EXPECT_TRUE(result["referenced_by"].empty());
+}
+
+TEST_F(PostgresMCPServerTest, TableColumnsIncludeDefaultWhenPresent) {
+  json result = srv->call_table("grocery", "user_account_log");
+  EXPECT_EQ(result["columns"]["logged_at"]["default"].get<std::string>(), "now()");
+}
+
+TEST_F(PostgresMCPServerTest, TableColumnsHaveNoDefaultWhenAbsent) {
+  json result = srv->call_table("grocery", "users");
+  EXPECT_FALSE(result["columns"]["name"].contains("default"));
 }
 
 TEST_F(PostgresMCPServerTest, TableIndexesHaveSizeField) {
