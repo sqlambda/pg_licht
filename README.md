@@ -14,7 +14,7 @@ Motivation to create another PostgreSQL MCP:
 |------|-------------|
 | `listSchemas` | All schemas with their table/view names and role grants |
 | `listTables` | Tables and views in a schema with kind, row counts, sizes, scan stats, columns (with descriptions), indexes, and constraints |
-| `tableDetails` | Full detail: columns (types, nullability, defaults, pg_stats histograms), indexes (size, usage counts), constraints, foreign keys, inbound foreign keys (`referenced_by`), triggers (timing, events, language), view definition, scan stats, and role grants |
+| `tableDetails` | Full detail: columns (types, nullability, defaults, pg_stats histograms), primary key (single or composite, as ordered column list), indexes (size, usage counts), constraints, foreign keys, inbound foreign keys (`referenced_by`), triggers (timing, events, language), view definition, scan stats, and role grants |
 | `searchTables` | Full-text search across table/schema names, descriptions, column names/descriptions, enum values used by columns, and role names; returns same fields as `listTables` |
 | `listFunctions` | Functions and procedures in a schema with kind, language, return type, arguments, volatility, security_definer, and is_strict |
 | `functionDetails` | Full function detail: source code, full definition, arguments, volatility, trigger usage, and role grants |
@@ -23,6 +23,7 @@ Motivation to create another PostgreSQL MCP:
 | `enumDetails` | Full enum detail: ordered values and all columns (across all tables) that reference it |
 | `searchEnums` | Full-text search across enum names, values, and descriptions |
 | `databaseSize` | Current database name and total disk size |
+| `checkKey` | Check if a row exists by primary key (single or composite); validates value types against PK column types before querying |
 
 ## C++
 

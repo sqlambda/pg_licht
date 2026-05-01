@@ -20,6 +20,7 @@ import {
   enumDetails,
   searchEnums,
   databaseSize,
+  checkKey,
 } from "./queries.js";
 
 const connStr = process.env.DATABASE_URL ?? process.argv[2];
@@ -39,7 +40,7 @@ await client.connect();
 // ---------------------------------------------------------------------------
 
 const server = new Server(
-  { name: "pg-licht-mcp", version: "1.1.0" },
+  { name: "pg-licht-mcp", version: "1.3.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -145,6 +146,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description: "return the current database name and its total disk size",
       inputSchema: { type: "object", properties: {} },
     },
+    {
+      name: "checkKey",
+      description: "check if a row exists by primary key; validates value types against the PK column types before querying",
+      inputSchema: {
+        type: "object",
+        properties: {
+          schema: { type: "string" },
+          table:  { type: "string" },
+          values: { type: "array" },
+        },
+        required: ["schema", "table", "values"],
+      },
+    },
   ],
 }));
 
@@ -209,6 +223,15 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       case "databaseSize":
         result = await databaseSize(client);
+        break;
+
+      case "checkKey":
+        result = await checkKey(
+          client,
+          (args.schema as string) ?? "public",
+          (args.table  as string) ?? "",
+          (args.values as unknown[]) ?? []
+        );
         break;
 
       default:

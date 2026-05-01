@@ -14,6 +14,7 @@ import {
   enumDetails,
   searchEnums,
   databaseSize,
+  checkKey,
 } from "./queries.js";
 
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -76,6 +77,23 @@ before(async () => {
   await db.query("CREATE TABLE grocery.bare_notes (note TEXT)");
 
   await db.query(`
+    CREATE TABLE grocery.order_tags (
+      order_id INT  NOT NULL REFERENCES grocery.orders(id),
+      tag      TEXT NOT NULL,
+      PRIMARY KEY (order_id, tag)
+    )
+  `);
+  await db.query("INSERT INTO grocery.order_tags(order_id, tag) VALUES (1, 'organic')");
+
+  await db.query(`
+    CREATE TABLE grocery.product_refs (
+      id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name TEXT
+    )
+  `);
+  await db.query("INSERT INTO grocery.product_refs(id, name) VALUES ('550e8400-e29b-41d4-a716-446655440000', 'Widget')");
+
+  await db.query(`
     CREATE FUNCTION grocery.log_user_action() RETURNS trigger LANGUAGE plpgsql AS $$
     BEGIN
       INSERT INTO grocery.user_account_log(user_id, action) VALUES (NEW.id, TG_OP);
@@ -111,6 +129,15 @@ before(async () => {
   await db.query("COMMENT ON TYPE grocery.order_status IS 'status of a customer order'");
   await db.query("ALTER TABLE grocery.orders ADD COLUMN status grocery.order_status DEFAULT 'pending'");
   await db.query("CREATE TYPE grocery.user_role AS ENUM ('admin', 'user', 'guest')");
+  await db.query("CREATE TYPE grocery.unused_enum AS ENUM ('x', 'y')");
+
+  await db.query(`
+    CREATE TABLE grocery.role_settings (
+      role         grocery.user_role PRIMARY KEY,
+      max_sessions INT DEFAULT 5
+    )
+  `);
+  await db.query("INSERT INTO grocery.role_settings(role) VALUES ('admin')");
 
   await db.query("GRANT USAGE ON SCHEMA grocery TO PUBLIC");
   await db.query("GRANT SELECT ON grocery.users TO PUBLIC");
@@ -238,9 +265,24 @@ test("searchTables finds table by column description", async () => {
 
 test("tableDetails returns expected top-level keys", async () => {
   const result = await tableDetails(db, "grocery", "users") as Record<string, unknown>;
-  for (const field of ["table", "rows", "size", "indexes_size", "description", "seq_scan", "idx_scan", "columns", "indexes", "constraints", "foreign_keys", "referenced_by"]) {
+  for (const field of ["table", "rows", "size", "indexes_size", "description", "seq_scan", "idx_scan", "columns", "indexes", "constraints", "foreign_keys", "referenced_by", "primary_key"]) {
     assert.ok(field in result, `missing field: ${field}`);
   }
+});
+
+test("tableDetails single-column primary key", async () => {
+  const result = await tableDetails(db, "grocery", "users") as Record<string, unknown>;
+  assert.deepEqual(result["primary_key"], ["id"]);
+});
+
+test("tableDetails multi-column primary key", async () => {
+  const result = await tableDetails(db, "grocery", "order_tags") as Record<string, unknown>;
+  assert.deepEqual(result["primary_key"], ["order_id", "tag"]);
+});
+
+test("tableDetails no primary key returns empty array", async () => {
+  const result = await tableDetails(db, "grocery", "bare_notes") as Record<string, unknown>;
+  assert.deepEqual(result["primary_key"], []);
 });
 
 test("tableDetails columns include default value when present", async () => {
@@ -326,6 +368,76 @@ test("tableDetails bare_notes has empty referenced_by", async () => {
   const result = await tableDetails(db, "grocery", "bare_notes") as Record<string, unknown>;
   assert.ok("referenced_by" in result);
   assert.equal(Object.keys(result["referenced_by"] as object).length, 0);
+});
+
+test("checkKey returns true for existing single-column key", async () => {
+  const result = await checkKey(db, "grocery", "users", [1]);
+  assert.deepEqual(result, { exists: true });
+});
+
+test("checkKey returns false for missing single-column key", async () => {
+  const result = await checkKey(db, "grocery", "users", [999]);
+  assert.deepEqual(result, { exists: false });
+});
+
+test("checkKey returns true for existing composite key", async () => {
+  const result = await checkKey(db, "grocery", "order_tags", [1, "organic"]);
+  assert.deepEqual(result, { exists: true });
+});
+
+test("checkKey returns false for missing composite key", async () => {
+  const result = await checkKey(db, "grocery", "order_tags", [1, "missing"]);
+  assert.deepEqual(result, { exists: false });
+});
+
+test("checkKey throws for table with no primary key", async () => {
+  await assert.rejects(
+    () => checkKey(db, "grocery", "bare_notes", ["x"]),
+    /no primary key/
+  );
+});
+
+test("checkKey throws for wrong value count", async () => {
+  await assert.rejects(
+    () => checkKey(db, "grocery", "users", [1, 2]),
+    /1 column\(s\), got 2/
+  );
+});
+
+test("checkKey throws for type mismatch", async () => {
+  await assert.rejects(
+    () => checkKey(db, "grocery", "users", ["not-an-int"]),
+    /expects an integer/
+  );
+});
+
+test("checkKey returns true for existing UUID key", async () => {
+  const result = await checkKey(db, "grocery", "product_refs", ["550e8400-e29b-41d4-a716-446655440000"]);
+  assert.deepEqual(result, { exists: true });
+});
+
+test("checkKey returns false for missing UUID key", async () => {
+  const result = await checkKey(db, "grocery", "product_refs", ["00000000-0000-0000-0000-000000000000"]);
+  assert.deepEqual(result, { exists: false });
+});
+
+test("checkKey throws for invalid UUID format", async () => {
+  await assert.rejects(
+    () => checkKey(db, "grocery", "product_refs", ["not-a-uuid"]),
+    /UUID/
+  );
+});
+
+test("checkKey accepts string for custom enum key", async () => {
+  const result = await checkKey(db, "grocery", "role_settings", ["admin"]);
+  assert.deepEqual(result, { exists: true });
+});
+
+test("checkKey throws non-string for custom enum key", async () => {
+  await assert.rejects(
+    () => checkKey(db, "grocery", "role_settings", [42]),
+    /expects a string/
+  );
 });
 
 test("searchTables finds table by grantee role name", async () => {
@@ -521,7 +633,7 @@ test("enumDetails has used_by_columns referencing orders", async () => {
 });
 
 test("enumDetails unused enum has empty used_by_columns", async () => {
-  const result = await enumDetails(db, "grocery", "user_role") as Record<string, unknown>;
+  const result = await enumDetails(db, "grocery", "unused_enum") as Record<string, unknown>;
   const cols = result["used_by_columns"] as unknown[];
   assert.ok(Array.isArray(cols));
   assert.equal(cols.length, 0);

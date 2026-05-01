@@ -1,9 +1,13 @@
 #pragma once
 
 #include <iostream>
+#include <set>
 #include <string>
 #include <nlohmann/json.hpp>
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #include <pqxx/pqxx>
+#pragma GCC diagnostic pop
 
 using json = nlohmann::json;
 
@@ -42,6 +46,9 @@ public:
   }
   const json call_search_enums(const std::string& web_search) { return search_enums(web_search); }
   const json call_database_size() { return database_size(); }
+  const json call_check_key(const std::string& schema, const std::string& table_name, const json& values) {
+    return check_key(schema, table_name, values);
+  }
 
 private:
   pqxx::connection conn;
@@ -165,6 +172,19 @@ private:
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", json::object()}
+	      }}
+	  },
+	  {
+	    {"name", "checkKey"},
+	    {"description", "check if a row exists by primary key; validates value types against the PK column types before querying"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", {
+		    {"schema", {{"type", "string"}}},
+		    {"table",  {{"type", "string"}}},
+		    {"values", {{"type", "array"}}}
+		  }},
+		{"required", {"schema", "table", "values"}}
 	      }}
 	  }
 	}}
@@ -484,6 +504,98 @@ private:
     }
   }
 
+  const json check_key(const std::string& schema, const std::string& table_name, const json& values) {
+    if (!values.is_array())
+      throw std::runtime_error("values must be an array");
+
+    pqxx::work txn{conn};
+
+    // Step 1: fetch PK column names, types, and type schemas
+    pqxx::result pk_res = txn.exec(
+      "SELECT a.attname, t.typname, n.nspname "
+      "FROM pg_constraint pk "
+      "JOIN pg_attribute a ON a.attrelid = pk.conrelid AND a.attnum = ANY(pk.conkey) "
+      "JOIN pg_type t ON t.oid = a.atttypid "
+      "JOIN pg_namespace n ON n.oid = t.typnamespace "
+      "WHERE pk.conrelid = (" +
+        txn.quote(schema) + " || '.' || " + txn.quote(table_name) +
+      ")::regclass AND pk.contype = 'p' "
+      "ORDER BY array_position(pk.conkey, a.attnum)"
+    );
+
+    if (pk_res.empty())
+      throw std::runtime_error("table " + schema + "." + table_name + " has no primary key");
+    if (values.size() != static_cast<size_t>(pk_res.size()))
+      throw std::runtime_error("primary key has " + std::to_string(pk_res.size()) +
+                               " column(s), got " + std::to_string(values.size()) + " value(s)");
+
+    // Step 2: validate value types
+    static const std::set<std::string> INT_TYPES   = {"int2","int4","int8","oid","xid","cid"};
+    static const std::set<std::string> FLOAT_TYPES = {"float4","float8","numeric","money"};
+    static const std::set<std::string> STR_TYPES   = {"text","varchar","bpchar","char","name","citext"};
+
+    for (pqxx::result::size_type i = 0; i < pk_res.size(); i++) {
+      std::string col  = pk_res[i][0].as<std::string>();
+      std::string type = pk_res[i][1].as<std::string>();
+      const json& v    = values[static_cast<size_t>(i)];
+
+      if (INT_TYPES.count(type)) {
+        if (!v.is_number_integer())
+          throw std::runtime_error("column \"" + col + "\" (" + type + ") expects an integer");
+      } else if (FLOAT_TYPES.count(type)) {
+        if (!v.is_number())
+          throw std::runtime_error("column \"" + col + "\" (" + type + ") expects a number");
+      } else if (STR_TYPES.count(type)) {
+        if (!v.is_string())
+          throw std::runtime_error("column \"" + col + "\" (" + type + ") expects a string");
+      } else if (type == "uuid") {
+        if (!v.is_string())
+          throw std::runtime_error("column \"" + col + "\" (uuid) expects a string");
+        std::string s = v.get<std::string>();
+        if (s.size() != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-')
+          throw std::runtime_error("column \"" + col + "\" (uuid) expects a UUID string");
+      } else if (type == "bool") {
+        if (!v.is_boolean())
+          throw std::runtime_error("column \"" + col + "\" (bool) expects a boolean");
+      } else {
+        if (!v.is_string())
+          throw std::runtime_error("column \"" + col + "\" (" + type + ") expects a string");
+      }
+    }
+
+    // Step 3: build quoted identifier helper, WHERE clause, and params
+    auto qi = [](const std::string& s) {
+      std::string r = "\"";
+      for (char c : s) { if (c == '"') r += "\"\""; else r += c; }
+      return r + "\"";
+    };
+
+    std::string where;
+    pqxx::params params;
+    for (pqxx::result::size_type i = 0; i < pk_res.size(); i++) {
+      if (i > 0) where += " AND ";
+      std::string type_schema = pk_res[i][2].as<std::string>();
+      std::string cast = type_schema != "pg_catalog"
+        ? "::" + qi(type_schema) + "." + qi(pk_res[i][1].as<std::string>())
+        : "";
+      where += qi(pk_res[i][0].as<std::string>()) + " = $" + std::to_string(i + 1) + cast;
+      const json& v = values[static_cast<size_t>(i)];
+      if (v.is_number_integer())     params.append(v.get<int64_t>());
+      else if (v.is_number_float())  params.append(v.get<double>());
+      else if (v.is_string())        params.append(v.get<std::string>());
+      else if (v.is_boolean())       params.append(v.get<bool>());
+      else                           params.append(v.dump());
+    }
+
+    std::string sql = "SELECT EXISTS(SELECT 1 FROM " +
+                      qi(schema) + "." + qi(table_name) +
+                      " WHERE " + where + ")";
+
+    pqxx::result res = txn.exec(sql, params);
+    bool exists = res[0][0].as<bool>();
+    return {{"exists", exists}};
+  }
+
   const json enums(const std::string& schema) {
     pqxx::work txn{conn};
 
@@ -614,6 +726,7 @@ private:
                'seq_scan', s.seq_scan, 'idx_scan', s.idx_scan, 'n_live_tup', s.n_live_tup, 'n_dead_tup', s.n_dead_tup,
                'last_vacuum', GREATEST(s.last_vacuum, s.last_autovacuum), 'last_analyze', GREATEST(s.last_analyze, s.last_autoanalyze),
                'columns', columns,
+               'primary_key', COALESCE(primary_key, '[]'::jsonb),
                'indexes', COALESCE(indexes, '{}'::jsonb),
                'constraints', COALESCE(constraints, '{}'::jsonb),
                'foreign_keys', COALESCE(foreign_keys, '{}'::jsonb),
@@ -652,6 +765,10 @@ private:
                                                       AND si.relname = i.tablename
                          WHERE i.schemaname = $1
                            AND i.tablename = c.relname) ON true
+      LEFT JOIN LATERAL (SELECT JSONB_AGG(a.attname ORDER BY array_position(pk.conkey, a.attnum)) AS primary_key
+                         FROM pg_constraint pk
+                         JOIN pg_attribute a ON a.attrelid = pk.conrelid AND a.attnum = ANY(pk.conkey)
+                         WHERE pk.conrelid = c.oid AND pk.contype = 'p') ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(conname,
                           JSONB_BUILD_OBJECT(
                            'definition', pg_get_constraintdef(oid))) AS constraints
@@ -661,8 +778,8 @@ private:
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(fk.conname,
                           JSONB_BUILD_OBJECT(
                            'target_table', fk.confrelid::regclass::text,
-                           'source_columns', (SELECT jsonb_agg(a.attname) FROM pg_attribute a WHERE a.attrelid = fk.conrelid AND a.attnum = ANY(fk.conkey)),
-                           'target_columns', (SELECT jsonb_agg(a.attname) FROM pg_attribute a WHERE a.attrelid = fk.confrelid AND a.attnum = ANY(fk.confkey)),
+                           'source_columns', (SELECT jsonb_agg(a.attname ORDER BY array_position(fk.conkey, a.attnum)) FROM pg_attribute a WHERE a.attrelid = fk.conrelid AND a.attnum = ANY(fk.conkey)),
+                           'target_columns', (SELECT jsonb_agg(a.attname ORDER BY array_position(fk.confkey, a.attnum)) FROM pg_attribute a WHERE a.attrelid = fk.confrelid AND a.attnum = ANY(fk.confkey)),
                            'definition', pg_get_constraintdef(fk.oid))) AS foreign_keys
                          FROM pg_constraint fk
                          WHERE fk.conrelid = c.oid
@@ -670,8 +787,8 @@ private:
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(fk.conrelid::regclass::text || '.' || fk.conname,
                           JSONB_BUILD_OBJECT(
                            'source_table', fk.conrelid::regclass::text,
-                           'source_columns', (SELECT jsonb_agg(a.attname) FROM pg_attribute a WHERE a.attrelid = fk.conrelid AND a.attnum = ANY(fk.conkey)),
-                           'target_columns', (SELECT jsonb_agg(a.attname) FROM pg_attribute a WHERE a.attrelid = fk.confrelid AND a.attnum = ANY(fk.confkey)),
+                           'source_columns', (SELECT jsonb_agg(a.attname ORDER BY array_position(fk.conkey, a.attnum)) FROM pg_attribute a WHERE a.attrelid = fk.conrelid AND a.attnum = ANY(fk.conkey)),
+                           'target_columns', (SELECT jsonb_agg(a.attname ORDER BY array_position(fk.confkey, a.attnum)) FROM pg_attribute a WHERE a.attrelid = fk.confrelid AND a.attnum = ANY(fk.confkey)),
                            'definition', pg_get_constraintdef(fk.oid))) AS referenced_by
                          FROM pg_constraint fk
                          WHERE fk.confrelid = c.oid
@@ -724,7 +841,7 @@ private:
         {"capabilities", {
             {"tools", json::object()}
 	  }},
-        {"serverInfo", {{"name", "pg-licht-cpp"}, {"version", "1.1.0"}}}
+        {"serverInfo", {{"name", "pg-licht-cpp"}, {"version", "1.3.0"}}}
       });
   }
 
@@ -792,6 +909,12 @@ private:
 	}
 	else if (tool_name == "databaseSize") {
 	  result_content = database_size();
+	}
+	else if (tool_name == "checkKey") {
+	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+	  std::string target_table  = arguments.contains("table")  ? arguments["table"].get<std::string>()  : "";
+	  json vals = arguments.contains("values") ? arguments["values"] : json::array();
+	  result_content = check_key(target_schema, target_table, vals);
 	}
 	else {
 	  send_error(req["id"], -32601, "Tool not found: " + tool_name);
