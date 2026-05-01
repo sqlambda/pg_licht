@@ -18,6 +18,7 @@ target_link_libraries(pg_licht_mcp
         PkgConfig::PQXX
 )
 target_compile_options(pg_licht_mcp PRIVATE -Wall -Wextra -Wpedantic)
+install(TARGETS pg_licht_mcp DESTINATION bin)
 
 option(BUILD_TESTING "Build the test suite" ON)
 if(BUILD_TESTING)
