@@ -23,6 +23,7 @@ Motivation to create another PostgreSQL MCP:
 | `enumDetails` | Full enum detail: ordered values and all columns (across all tables) that reference it |
 | `searchEnums` | Full-text search across enum names, values, and descriptions |
 | `databaseSize` | Current database name and total disk size |
+| `serverSettings` | All PostgreSQL server settings (`pg_settings`) grouped by category; each setting includes current value, unit, description, context, type, source, and `pending_restart` flag |
 | `checkKey` | Check if a row exists by primary key (single or composite); validates value types against PK column types before querying |
 
 ## C++
@@ -46,28 +47,28 @@ brew install pg-licht
 
 ```bash
 cd cpp
-cmake .
-make
+cmake -B build
+cmake --build build
 ```
 
 ### Run
 
 ```bash
-DATABASE_URL="postgresql://user:pass@host/dbname" ./pg_licht_mcp
+DATABASE_URL="postgresql://user:pass@host/dbname" ./build/pg_licht_mcp
 
 # libpq key-value format also works
-DATABASE_URL="host=localhost port=5432 dbname=mydb" ./pg_licht_mcp
+DATABASE_URL="host=localhost port=5432 dbname=mydb" ./build/pg_licht_mcp
 
 # or as an argument
-./pg_licht_mcp "postgresql://user:pass@host/dbname"
+./build/pg_licht_mcp "postgresql://user:pass@host/dbname"
 ```
 
 ### Test
 
 ```bash
-DATABASE_URL="port=5432 dbname=mydb" ./pg_licht_mcp_test
+DATABASE_URL="port=5432 dbname=mydb" ./build/pg_licht_mcp_test
 # or
-DATABASE_URL="port=5432 dbname=mydb" ctest --output-on-failure
+DATABASE_URL="port=5432 dbname=mydb" ctest --test-dir build --output-on-failure
 ```
 
 Tests create and destroy a temporary database named `pg_licht_test_<PID>` automatically.
@@ -104,7 +105,7 @@ The [MCP Inspector](https://github.com/modelcontextprotocol/inspector) lets you 
 ```bash
 npx @modelcontextprotocol/inspector \
   -e DATABASE_URL="postgresql://user:pass@host/dbname" \
-  ./cpp/pg_licht_mcp
+  ./cpp/build/pg_licht_mcp
 ```
 
 **TypeScript:**
@@ -137,7 +138,7 @@ claude mcp add --scope project pg-licht \
 ```bash
 claude mcp add --scope project pg-licht \
   -e DATABASE_URL="postgresql://user:pass@host/dbname" \
-  -- /path/to/pg-licht/cpp/pg_licht_mcp
+  -- /path/to/pg-licht/cpp/build/pg_licht_mcp
 ```
 
 Replace `--scope project` with `--scope user` or `--scope local` as needed.
@@ -166,7 +167,7 @@ You can also edit `.claude.json` (project root), `~/.claude.json` (user), or `.c
 {
   "mcpServers": {
     "pg-licht": {
-      "command": "/path/to/pg-licht/cpp/pg_licht_mcp",
+      "command": "/path/to/pg-licht/cpp/build/pg_licht_mcp",
       "env": {
         "DATABASE_URL": "postgresql://user:pass@host/dbname"
       }

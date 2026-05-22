@@ -14,6 +14,7 @@ import {
   enumDetails,
   searchEnums,
   databaseSize,
+  serverSettings,
   checkKey,
 } from "./queries.js";
 
@@ -106,6 +107,12 @@ before(async () => {
     CREATE TRIGGER trg_user_audit
     AFTER INSERT OR UPDATE ON grocery.users
     FOR EACH ROW EXECUTE FUNCTION grocery.log_user_action()
+  `);
+  await db.query(`
+    CREATE TRIGGER trg_user_audit_conditional
+    AFTER UPDATE ON grocery.users
+    FOR EACH ROW WHEN (OLD.name IS DISTINCT FROM NEW.name)
+    EXECUTE FUNCTION grocery.log_user_action()
   `);
   await db.query(`
     CREATE FUNCTION grocery.get_user_count() RETURNS bigint LANGUAGE sql AS $$
@@ -348,8 +355,13 @@ test("tableDetails includes triggers", async () => {
   assert.ok("timing" in trig);
   assert.ok("events" in trig);
   assert.ok("function" in trig);
+  assert.ok("when" in trig);
   assert.equal(trig["timing"], "AFTER");
   assert.ok((trig["events"] as string).includes("INSERT"));
+  assert.equal(trig["when"], null);
+  const condTrig = result["triggers"]["trg_user_audit_conditional"];
+  assert.ok(condTrig);
+  assert.ok(typeof condTrig["when"] === "string" && condTrig["when"].length > 0);
 });
 
 test("tableDetails users has referenced_by with inbound FKs", async () => {
@@ -738,6 +750,22 @@ test("functionDetails no grants returns empty roles", async () => {
     assert.ok(typeof roles === "object" && !Array.isArray(roles));
     assert.equal(Object.keys(roles).length, 0);
   }
+});
+
+// --- serverSettings ---
+
+test("serverSettings returns categories with settings", async () => {
+  const result = await serverSettings(db) as Record<string, Record<string, Record<string, unknown>>>;
+  assert.ok(result && typeof result === "object");
+  assert.ok(Object.keys(result).length > 0);
+  const allSettings = Object.values(result).flatMap(cat => Object.values(cat));
+  const first = allSettings[0];
+  assert.ok("setting" in first);
+  assert.ok("short_desc" in first);
+  assert.ok("context" in first);
+  assert.ok("vartype" in first);
+  assert.ok("source" in first);
+  assert.ok("pending_restart" in first);
 });
 
 // --- databaseSize ---

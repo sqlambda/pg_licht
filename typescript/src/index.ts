@@ -20,6 +20,7 @@ import {
   enumDetails,
   searchEnums,
   databaseSize,
+  serverSettings,
   checkKey,
 } from "./queries.js";
 
@@ -40,7 +41,7 @@ await client.connect();
 // ---------------------------------------------------------------------------
 
 const server = new Server(
-  { name: "pg-licht-mcp", version: "1.3.0" },
+  { name: "pg-licht-mcp", version: "1.4.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -147,6 +148,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: { type: "object", properties: {} },
     },
     {
+      name: "serverSettings",
+      description: "return all PostgreSQL server settings (pg_settings) grouped by category, each with current value, unit, description, context, type, source, and pending_restart flag",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
       name: "checkKey",
       description: "check if a row exists by primary key; validates value types against the PK column types before querying",
       inputSchema: {
@@ -223,6 +229,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       case "databaseSize":
         result = await databaseSize(client);
+        break;
+
+      case "serverSettings":
+        result = await serverSettings(client);
         break;
 
       case "checkKey":

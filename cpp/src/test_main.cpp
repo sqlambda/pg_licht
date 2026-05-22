@@ -120,6 +120,12 @@ protected:
         " FOR EACH ROW EXECUTE FUNCTION grocery.log_user_action()"
       );
       txn.exec(
+        "CREATE TRIGGER trg_user_audit_conditional"
+        " AFTER UPDATE ON grocery.users"
+        " FOR EACH ROW WHEN (OLD.name IS DISTINCT FROM NEW.name)"
+        " EXECUTE FUNCTION grocery.log_user_action()"
+      );
+      txn.exec(
         "CREATE FUNCTION grocery.get_user_count() RETURNS bigint LANGUAGE sql AS $$"
         " SELECT COUNT(*) FROM grocery.users; $$"
       );
@@ -676,8 +682,14 @@ TEST_F(PostgresMCPServerTest, TableDetailsIncludesTriggers) {
   EXPECT_TRUE(trig.contains("timing"));
   EXPECT_TRUE(trig.contains("events"));
   EXPECT_TRUE(trig.contains("function"));
+  EXPECT_TRUE(trig.contains("when"));
   EXPECT_EQ(trig["timing"].get<std::string>(), "AFTER");
   EXPECT_NE(trig["events"].get<std::string>().find("INSERT"), std::string::npos);
+  EXPECT_TRUE(trig["when"].is_null());
+  EXPECT_TRUE(result["triggers"].contains("trg_user_audit_conditional"));
+  auto& cond = result["triggers"]["trg_user_audit_conditional"];
+  EXPECT_TRUE(cond["when"].is_string());
+  EXPECT_FALSE(cond["when"].get<std::string>().empty());
 }
 
 // --- view / materialized view tests ---
@@ -922,6 +934,26 @@ TEST_F(PostgresMCPServerTest, SearchTablesByEnumDescription) {
     if (key.find(".orders") != std::string::npos) { found = true; break; }
   }
   EXPECT_TRUE(found);
+}
+
+// --- serverSettings ---
+
+TEST_F(PostgresMCPServerTest, ServerSettingsReturnsCategoriesWithSettings) {
+  json result = srv->call_server_settings();
+  EXPECT_TRUE(result.is_object());
+  EXPECT_GT(result.size(), 0u);
+  for (auto& [cat, settings] : result.items()) {
+    EXPECT_TRUE(settings.is_object());
+    for (auto& [name, s] : settings.items()) {
+      EXPECT_TRUE(s.contains("setting"));
+      EXPECT_TRUE(s.contains("short_desc"));
+      EXPECT_TRUE(s.contains("context"));
+      EXPECT_TRUE(s.contains("vartype"));
+      EXPECT_TRUE(s.contains("source"));
+      EXPECT_TRUE(s.contains("pending_restart"));
+    }
+    break; // checking one category is enough
+  }
 }
 
 // --- databaseSize ---

@@ -179,7 +179,10 @@ export async function tableDetails(client: pg.Client, schema: string, table: str
                                           CASE WHEN (t.tgtype & 8)  <> 0 THEN 'DELETE'   END,
                                           CASE WHEN (t.tgtype & 16) <> 0 THEN 'UPDATE'   END,
                                           CASE WHEN (t.tgtype & 32) <> 0 THEN 'TRUNCATE' END
-                                        ]::text[], ' OR '))) AS triggers
+                                        ]::text[], ' OR '),
+                         'when',        CASE WHEN t.tgqual IS NOT NULL
+                                          THEN (regexp_match(pg_get_triggerdef(t.oid), 'WHEN [(](.+)[)] EXECUTE'))[1]
+                                          ELSE NULL END)) AS triggers
                        FROM   pg_trigger AS t
                        JOIN   pg_proc AS p ON p.oid = t.tgfoid
                        JOIN   pg_language AS l ON l.oid = p.prolang
@@ -421,6 +424,28 @@ export async function enumDetails(client: pg.Client, schema: string, enumName: s
       AND t.typname = $2
       AND t.typtype = 'e'
   `, [schema, enumName]);
+}
+
+export async function serverSettings(client: pg.Client) {
+  return await run(client, `
+    SELECT JSONB_OBJECT_AGG(category, settings ORDER BY category)
+    FROM (
+      SELECT category,
+             JSONB_OBJECT_AGG(name,
+               JSONB_BUILD_OBJECT(
+                 'setting',         setting,
+                 'unit',            unit,
+                 'short_desc',      short_desc,
+                 'context',         context,
+                 'vartype',         vartype,
+                 'source',          source,
+                 'pending_restart', pending_restart
+               ) ORDER BY name
+             ) AS settings
+      FROM pg_settings
+      GROUP BY category
+    ) s
+  `);
 }
 
 export async function databaseSize(client: pg.Client) {
