@@ -46,6 +46,7 @@ public:
   }
   const json call_search_enums(const std::string& web_search) { return search_enums(web_search); }
   const json call_database_size() { return database_size(); }
+  const json call_server_settings() { return server_settings(); }
   const json call_check_key(const std::string& schema, const std::string& table_name, const json& values) {
     return check_key(schema, table_name, values);
   }
@@ -169,6 +170,14 @@ private:
 	  {
 	    {"name", "databaseSize"},
 	    {"description", "return the current database name and its total disk size"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", json::object()}
+	      }}
+	  },
+	  {
+	    {"name", "serverSettings"},
+	    {"description", "return all PostgreSQL server settings (pg_settings) grouped by category, each with current value, unit, description, context, type, source, and pending_restart flag"},
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", json::object()}
@@ -480,6 +489,38 @@ private:
     if (!res.empty() && !res[0][0].is_null()) {
       std::string pgsql_functions = res[0][0].as<std::string>();
       return json::parse(pgsql_functions);
+    } else {
+      return {};
+    }
+  }
+
+  const json server_settings() {
+    pqxx::work txn{conn};
+
+    std::string query = R"(
+      SELECT JSONB_OBJECT_AGG(category, settings ORDER BY category)
+      FROM (
+        SELECT category,
+               JSONB_OBJECT_AGG(name,
+                 JSONB_BUILD_OBJECT(
+                   'setting',         setting,
+                   'unit',            unit,
+                   'short_desc',      short_desc,
+                   'context',         context,
+                   'vartype',         vartype,
+                   'source',          source,
+                   'pending_restart', pending_restart
+                 ) ORDER BY name
+               ) AS settings
+        FROM pg_settings
+        GROUP BY category
+      ) s;
+    )";
+
+    pqxx::result res = txn.exec(query);
+
+    if (!res.empty() && !res[0][0].is_null()) {
+      return json::parse(res[0][0].as<std::string>());
     } else {
       return {};
     }
@@ -809,7 +850,10 @@ private:
                                             CASE WHEN (t.tgtype & 8)  <> 0 THEN 'DELETE'   END,
                                             CASE WHEN (t.tgtype & 16) <> 0 THEN 'UPDATE'   END,
                                             CASE WHEN (t.tgtype & 32) <> 0 THEN 'TRUNCATE' END
-                                          ]::text[], ' OR '))) AS triggers
+                                          ]::text[], ' OR '),
+                           'when',        CASE WHEN t.tgqual IS NOT NULL
+                                            THEN (regexp_match(pg_get_triggerdef(t.oid), 'WHEN [(](.+)[)] EXECUTE'))[1]
+                                            ELSE NULL END)) AS triggers
                          FROM   pg_trigger AS t
                          JOIN   pg_proc AS p ON p.oid = t.tgfoid
                          JOIN   pg_language AS l ON l.oid = p.prolang
@@ -841,7 +885,7 @@ private:
         {"capabilities", {
             {"tools", json::object()}
 	  }},
-        {"serverInfo", {{"name", "pg-licht-cpp"}, {"version", "1.3.0"}}}
+        {"serverInfo", {{"name", "pg-licht-cpp"}, {"version", "1.4.0"}}}
       });
   }
 
@@ -909,6 +953,9 @@ private:
 	}
 	else if (tool_name == "databaseSize") {
 	  result_content = database_size();
+	}
+	else if (tool_name == "serverSettings") {
+	  result_content = server_settings();
 	}
 	else if (tool_name == "checkKey") {
 	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
