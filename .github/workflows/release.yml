@@ -105,7 +105,14 @@ jobs:
           # support (needed by libpqxx 8.x's C++20 requirement; complete only
           # since GCC 13). gcc-toolset-13 is Rocky's own AppStream package
           # for a newer GCC without replacing the system compiler.
-          dnf install -y cmake gcc-toolset-13-gcc-c++ binutils libpq-devel nlohmann-json-devel pkg-config rpm-build
+          #
+          # PGDG's "libpq-devel" virtual package on RHEL/Rocky resolves to
+          # the *versioned* postgresql18-devel, which installs libpq.pc to
+          # /usr/pgsql-18/lib/pkgconfig -- never on pkg-config's default
+          # search path. libpq5-devel is PGDG's separate, unversioned
+          # package (same naming as its Debian/Ubuntu counterpart) that
+          # installs to the standard FHS pkgconfig location instead.
+          dnf install -y cmake gcc-toolset-13-gcc-c++ binutils libpq5-devel nlohmann-json-devel pkg-config rpm-build
           echo "CC=/opt/rh/gcc-toolset-13/root/usr/bin/gcc" >> $GITHUB_ENV
           echo "CXX=/opt/rh/gcc-toolset-13/root/usr/bin/g++" >> $GITHUB_ENV
           export CC=/opt/rh/gcc-toolset-13/root/usr/bin/gcc

@@ -64,7 +64,7 @@ set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/sqlambda/pg_licht")
 set(CPACK_DEBIAN_PACKAGE_DEPENDS "libpq5")
 set(CPACK_DEBIAN_PACKAGE_SECTION "database")
 
-set(CPACK_RPM_PACKAGE_REQUIRES "libpq")
+set(CPACK_RPM_PACKAGE_REQUIRES "libpq5")
 set(CPACK_RPM_PACKAGE_LICENSE "Apache-2.0")
 set(CPACK_RPM_PACKAGE_GROUP "Applications/Databases")
 
