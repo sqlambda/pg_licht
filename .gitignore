@@ -1,5 +1,7 @@
 # Build artifacts
 cpp/build/
+cpp/build_*/
+cpp/Testing/
 cpp/dist/
 typescript/dist/
 typescript/node_modules/

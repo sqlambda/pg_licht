@@ -24,6 +24,11 @@ import {
   checkKey,
 } from "./queries.js";
 
+process.stderr.write(
+  "DEPRECATED: The TypeScript version of pg-licht is deprecated and will be removed in a future release.\n" +
+  "Please use the C++ version instead: https://github.com/sqlambda/pg_licht\n"
+);
+
 const connStr = process.env.DATABASE_URL ?? process.argv[2];
 if (!connStr) {
   process.stderr.write(
@@ -41,7 +46,7 @@ await client.connect();
 // ---------------------------------------------------------------------------
 
 const server = new Server(
-  { name: "pg-licht-mcp", version: "1.4.0" },
+  { name: "pg-licht-mcp", version: "1.5.0" },
   { capabilities: { tools: {} } }
 );
 

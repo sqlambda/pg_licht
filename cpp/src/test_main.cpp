@@ -2,7 +2,17 @@
 #include <cstdlib>
 #include <unistd.h>
 #include <sstream>
+#if defined(__GNUC__) && !defined(__clang__)
+// GCC-only false positive inside <regex> internals at -O1+; Clang doesn't
+// have this warning group at all, and with -Werror active it would hard-fail
+// on "unknown warning group" if this pragma weren't guarded.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
 #include <regex>
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 #include "server.h"
 
 class PostgresMCPServerTest : public ::testing::Test {
@@ -11,6 +21,7 @@ protected:
   static PostgresMCPServer* srv;
   static std::string test_dbname;
   static std::string base_url;
+  static std::string test_url;
 
   static void SetUpTestSuite() {
     const char* env_url = std::getenv("DATABASE_URL");
@@ -34,7 +45,6 @@ protected:
       ntxn.exec("CREATE DATABASE \"" + test_dbname + "\"");
       ntxn.commit();
 
-      std::string test_url;
       std::regex dbname_re(R"(\bdbname\s*=\s*\S+)");
       if (std::regex_search(base_url, dbname_re)) {
         test_url = std::regex_replace(base_url, dbname_re, "dbname=" + test_dbname);
@@ -76,6 +86,15 @@ protected:
       );
       txn.exec("INSERT INTO grocery.orders(user_id, amount) VALUES (1, 99.99)");
       txn.exec("ANALYZE grocery.orders");
+
+      txn.exec("ALTER TABLE grocery.orders ENABLE ROW LEVEL SECURITY");
+      txn.exec(
+        "CREATE POLICY orders_owner_only ON grocery.orders"
+        " FOR SELECT USING (user_id = current_setting('app.user_id', true)::int)"
+      );
+
+      txn.exec("CREATE SEQUENCE grocery.order_number_seq START 100 INCREMENT 1");
+      txn.exec("COMMENT ON SEQUENCE grocery.order_number_seq IS 'external order numbering'");
 
       txn.exec(
         "CREATE TABLE grocery.user_account_log ("
@@ -158,14 +177,73 @@ protected:
       );
       txn.exec("INSERT INTO grocery.role_settings(role) VALUES ('admin')");
 
+      txn.exec("CREATE TYPE grocery.address AS (street TEXT, city TEXT, zip_code TEXT)");
+      txn.exec("COMMENT ON TYPE grocery.address IS 'postal address components'");
+      txn.exec("ALTER TABLE grocery.users ADD COLUMN home_address grocery.address");
+
+      txn.exec("CREATE DOMAIN grocery.positive_amount AS NUMERIC(10,2) NOT NULL DEFAULT 0 CHECK (VALUE >= 0)");
+      txn.exec("COMMENT ON DOMAIN grocery.positive_amount IS 'a non-negative monetary amount'");
+      txn.exec("ALTER TABLE grocery.bare_notes ADD COLUMN price grocery.positive_amount");
+
+      txn.exec("CREATE EXTENSION IF NOT EXISTS postgres_fdw");
+      txn.exec("CREATE EXTENSION IF NOT EXISTS pgstattuple");
+      txn.exec(
+        "CREATE SERVER grocery_remote FOREIGN DATA WRAPPER postgres_fdw"
+        " OPTIONS (host 'localhost', dbname 'probe', port '5432')"
+      );
+      txn.exec(
+        "CREATE FOREIGN TABLE grocery.remote_orders (id INT, amount NUMERIC)"
+        " SERVER grocery_remote OPTIONS (schema_name 'public', table_name 'orders')"
+      );
+      txn.exec("COMMENT ON FOREIGN TABLE grocery.remote_orders IS 'orders mirrored from a remote system'");
+
+      txn.exec("CREATE COLLATION grocery.case_sensitive_c FROM \"C\"");
+      txn.exec("COMMENT ON COLLATION grocery.case_sensitive_c IS 'byte-order comparison, copied from C'");
+
+      txn.exec(
+        "CREATE FUNCTION grocery.probe_event_trigger_fn() RETURNS event_trigger"
+        " LANGUAGE plpgsql AS $$ BEGIN END; $$"
+      );
+      txn.exec(
+        "CREATE EVENT TRIGGER grocery_ddl_audit ON ddl_command_end"
+        " EXECUTE FUNCTION grocery.probe_event_trigger_fn()"
+      );
+      txn.exec("COMMENT ON EVENT TRIGGER grocery_ddl_audit IS 'audits DDL changes'");
+
+      txn.exec("CREATE PUBLICATION grocery_users_pub FOR TABLE grocery.users");
+
+      txn.exec("CREATE TYPE grocery.price_range AS RANGE (subtype = numeric)");
+
+      txn.exec("CREATE STATISTICS grocery.orders_stats (dependencies) ON user_id, amount FROM grocery.orders");
+      txn.exec("COMMENT ON STATISTICS grocery.orders_stats IS 'user_id/amount correlation'");
+
+      txn.exec("CREATE RULE protect_bare_notes AS ON DELETE TO grocery.bare_notes DO INSTEAD NOTHING");
+
+      txn.exec("CREATE FUNCTION grocery.add_ints(int, int) RETURNS int LANGUAGE sql AS 'SELECT $1 + $2'");
+      txn.exec(
+        "CREATE OPERATOR grocery.#+# (FUNCTION = grocery.add_ints, LEFTARG = int, RIGHTARG = int)"
+      );
+
+      txn.exec(
+        "CREATE FUNCTION grocery.address_to_text(grocery.address) RETURNS text"
+        " LANGUAGE sql AS 'SELECT ($1).street'"
+      );
+      txn.exec(
+        "CREATE CAST (grocery.address AS text)"
+        " WITH FUNCTION grocery.address_to_text(grocery.address) AS ASSIGNMENT"
+      );
+
+      txn.exec("CREATE TEXT SEARCH CONFIGURATION grocery.simple_english (COPY = pg_catalog.english)");
+
       txn.exec("GRANT USAGE ON SCHEMA grocery TO PUBLIC");
       txn.exec("GRANT SELECT ON grocery.users TO PUBLIC");
       txn.exec("GRANT EXECUTE ON FUNCTION grocery.get_user_count() TO PUBLIC");
       txn.exec("DROP ROLE IF EXISTS tomato");
       txn.exec("DROP ROLE IF EXISTS carrot");
       txn.exec("CREATE ROLE tomato");
-      txn.exec("CREATE ROLE carrot");
+      txn.exec("CREATE ROLE carrot LOGIN");
       txn.exec("GRANT SELECT ON grocery.users TO tomato");
+      txn.exec("GRANT tomato TO carrot");
 
       txn.commit();
 
@@ -206,6 +284,7 @@ pqxx::connection* PostgresMCPServerTest::admin_conn = nullptr;
 PostgresMCPServer* PostgresMCPServerTest::srv = nullptr;
 std::string PostgresMCPServerTest::test_dbname;
 std::string PostgresMCPServerTest::base_url;
+std::string PostgresMCPServerTest::test_url;
 
 TEST_F(PostgresMCPServerTest, SchemasReturnsObject) {
   json result = srv->call_schemas();
@@ -265,13 +344,28 @@ TEST_F(PostgresMCPServerTest, TablesHasExpectedFields) {
   EXPECT_TRUE(result["users"].contains("last_vacuum"));
   EXPECT_TRUE(result["users"].contains("last_analyze"));
   EXPECT_TRUE(result["users"].contains("columns"));
-  EXPECT_TRUE(result["users"].contains("indexes"));
-  EXPECT_TRUE(result["users"].contains("constraints"));
+  EXPECT_TRUE(result["users"].contains("index_count"));
+  EXPECT_TRUE(result["users"].contains("constraint_count"));
+  EXPECT_GT(result["users"]["index_count"].get<int>(), 0);
+  EXPECT_GT(result["users"]["constraint_count"].get<int>(), 0);
+}
+
+TEST_F(PostgresMCPServerTest, TablesColumnsIncludePerColumnIndexCount) {
+  json result = srv->call_tables("grocery");
+  ASSERT_TRUE(result["users"]["columns"].contains("id"));
+  auto& id_col = result["users"]["columns"]["id"];
+  EXPECT_TRUE(id_col.contains("description"));
+  EXPECT_TRUE(id_col.contains("index_count"));
+  EXPECT_GT(id_col["index_count"].get<int>(), 0); // primary key is indexed
+
+  ASSERT_TRUE(result["orders"]["columns"].contains("amount"));
+  EXPECT_EQ(result["orders"]["columns"]["amount"]["index_count"].get<int>(), 0); // not indexed
 }
 
 TEST_F(PostgresMCPServerTest, TableWithNoIndexesIsIncluded) {
   json result = srv->call_tables("grocery");
-  EXPECT_TRUE(result.contains("bare_notes"));
+  ASSERT_TRUE(result.contains("bare_notes"));
+  EXPECT_EQ(result["bare_notes"]["index_count"].get<int>(), 0);
 }
 
 TEST_F(PostgresMCPServerTest, TablesUnknownSchemaReturnsEmpty) {
@@ -692,6 +786,31 @@ TEST_F(PostgresMCPServerTest, TableDetailsIncludesTriggers) {
   EXPECT_FALSE(cond["when"].get<std::string>().empty());
 }
 
+TEST_F(PostgresMCPServerTest, TableDetailsIncludesRowLevelSecurityAndPolicies) {
+  json result = srv->call_table("grocery", "orders");
+  ASSERT_TRUE(result.contains("row_level_security"));
+  EXPECT_TRUE(result["row_level_security"]["enabled"].get<bool>());
+  EXPECT_FALSE(result["row_level_security"]["forced"].get<bool>());
+
+  ASSERT_TRUE(result.contains("policies"));
+  ASSERT_TRUE(result["policies"].contains("orders_owner_only"));
+  auto& pol = result["policies"]["orders_owner_only"];
+  EXPECT_EQ(pol["command"].get<std::string>(), "SELECT");
+  EXPECT_TRUE(pol["permissive"].get<bool>());
+  ASSERT_TRUE(pol["roles"].is_array());
+  EXPECT_EQ(pol["roles"][0].get<std::string>(), "PUBLIC");
+  EXPECT_NE(pol["using"].get<std::string>().find("user_id"), std::string::npos);
+  EXPECT_TRUE(pol["with_check"].is_null());
+}
+
+TEST_F(PostgresMCPServerTest, TableDetailsNoRLSReturnsDisabledAndEmptyPolicies) {
+  json result = srv->call_table("grocery", "users");
+  ASSERT_TRUE(result.contains("row_level_security"));
+  EXPECT_FALSE(result["row_level_security"]["enabled"].get<bool>());
+  EXPECT_FALSE(result["row_level_security"]["forced"].get<bool>());
+  EXPECT_TRUE(result["policies"].empty());
+}
+
 // --- view / materialized view tests ---
 
 TEST_F(PostgresMCPServerTest, SchemasContainsView) {
@@ -956,6 +1075,401 @@ TEST_F(PostgresMCPServerTest, ServerSettingsReturnsCategoriesWithSettings) {
   }
 }
 
+// --- connection setup (application_name, read-only session) ---
+
+TEST_F(PostgresMCPServerTest, ConnectionDefaultsToReadOnlySession) {
+  json result = srv->call_server_settings();
+  bool found = false;
+  for (auto& [category, settings] : result.items()) {
+    if (settings.contains("default_transaction_read_only")) {
+      EXPECT_EQ(settings["default_transaction_read_only"]["setting"].get<std::string>(), "on");
+      found = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(found);
+}
+
+TEST_F(PostgresMCPServerTest, ConnectionSetsApplicationNameWithVersion) {
+  pqxx::nontransaction ntxn(*admin_conn);
+  pqxx::result res = ntxn.exec(
+    "SELECT application_name FROM pg_stat_activity "
+    "WHERE datname = " + ntxn.quote(test_dbname) +
+    " AND application_name LIKE 'pg-licht-cpp/%'"
+  );
+  ASSERT_FALSE(res.empty());
+  std::string app_name = res[0][0].as<std::string>();
+  EXPECT_EQ(app_name.rfind("pg-licht-cpp/", 0), 0u);
+  EXPECT_GT(app_name.size(), std::string("pg-licht-cpp/").size());
+}
+
+// --- listTypes / typeDetails ---
+
+TEST_F(PostgresMCPServerTest, ListTypesReturnsCompositeType) {
+  json result = srv->call_types("grocery");
+  ASSERT_TRUE(result.contains("address"));
+  auto& addr = result["address"];
+  EXPECT_EQ(addr["kind"].get<std::string>(), "composite");
+  EXPECT_EQ(addr["description"].get<std::string>(), "postal address components");
+  ASSERT_TRUE(addr["attributes"].is_array());
+  EXPECT_EQ(addr["attributes"].size(), 3u);
+  EXPECT_EQ(addr["attributes"][0]["name"].get<std::string>(), "street");
+}
+
+TEST_F(PostgresMCPServerTest, ListTypesReturnsDomain) {
+  json result = srv->call_types("grocery");
+  ASSERT_TRUE(result.contains("positive_amount"));
+  auto& amt = result["positive_amount"];
+  EXPECT_EQ(amt["kind"].get<std::string>(), "domain");
+  EXPECT_TRUE(amt["not_null"].get<bool>());
+  EXPECT_NE(amt["base_type"].get<std::string>().find("numeric"), std::string::npos);
+  ASSERT_TRUE(amt["constraints"].is_array());
+  EXPECT_GT(amt["constraints"].size(), 0u);
+}
+
+TEST_F(PostgresMCPServerTest, ListTypesExcludesTableRowTypesAndEnums) {
+  json result = srv->call_types("grocery");
+  EXPECT_FALSE(result.contains("users"));
+  EXPECT_FALSE(result.contains("order_status"));
+}
+
+TEST_F(PostgresMCPServerTest, TypeDetailsCompositeIncludesUsedByColumns) {
+  json result = srv->call_type_detail("grocery", "address");
+  ASSERT_TRUE(result.contains("used_by_columns"));
+  bool found = false;
+  for (auto& col : result["used_by_columns"]) {
+    if (col["column"].get<std::string>() == "home_address") { found = true; break; }
+  }
+  EXPECT_TRUE(found);
+}
+
+TEST_F(PostgresMCPServerTest, TypeDetailsDomainIncludesUsedByColumns) {
+  json result = srv->call_type_detail("grocery", "positive_amount");
+  ASSERT_TRUE(result.contains("used_by_columns"));
+  bool found = false;
+  for (auto& col : result["used_by_columns"]) {
+    if (col["column"].get<std::string>() == "price") { found = true; break; }
+  }
+  EXPECT_TRUE(found);
+}
+
+TEST_F(PostgresMCPServerTest, TypeDetailsNotFoundReturnsEmpty) {
+  json result = srv->call_type_detail("grocery", "does_not_exist");
+  EXPECT_TRUE(result.empty());
+}
+
+// --- listRoles ---
+
+TEST_F(PostgresMCPServerTest, ListRolesReturnsGroupAndLoginRoles) {
+  json result = srv->call_roles();
+  ASSERT_TRUE(result.contains("tomato"));
+  EXPECT_EQ(result["tomato"]["kind"].get<std::string>(), "group");
+  ASSERT_TRUE(result.contains("carrot"));
+  EXPECT_EQ(result["carrot"]["kind"].get<std::string>(), "login");
+}
+
+TEST_F(PostgresMCPServerTest, ListRolesReturnsMembership) {
+  json result = srv->call_roles();
+  ASSERT_TRUE(result.contains("carrot"));
+  auto& member_of = result["carrot"]["member_of"];
+  ASSERT_TRUE(member_of.is_array());
+  std::vector<std::string> groups(member_of.begin(), member_of.end());
+  EXPECT_NE(std::find(groups.begin(), groups.end(), "tomato"), groups.end());
+}
+
+TEST_F(PostgresMCPServerTest, ListRolesHasAttributeFields) {
+  json result = srv->call_roles();
+  ASSERT_TRUE(result.contains("tomato"));
+  auto& r = result["tomato"];
+  EXPECT_TRUE(r.contains("superuser"));
+  EXPECT_TRUE(r.contains("create_role"));
+  EXPECT_TRUE(r.contains("create_db"));
+  EXPECT_TRUE(r.contains("replication"));
+  EXPECT_TRUE(r.contains("bypass_rls"));
+  EXPECT_TRUE(r.contains("connection_limit"));
+}
+
+// --- listForeignTables / listForeignServers ---
+
+TEST_F(PostgresMCPServerTest, ListForeignServersReturnsServerWithOptions) {
+  json result = srv->call_foreign_servers();
+  ASSERT_TRUE(result.contains("grocery_remote"));
+  auto& srv_entry = result["grocery_remote"];
+  EXPECT_EQ(srv_entry["fdw"].get<std::string>(), "postgres_fdw");
+  ASSERT_TRUE(srv_entry["options"].is_array());
+  std::vector<std::string> opts(srv_entry["options"].begin(), srv_entry["options"].end());
+  EXPECT_NE(std::find(opts.begin(), opts.end(), "host=localhost"), opts.end());
+}
+
+TEST_F(PostgresMCPServerTest, ListForeignServersNeverExposesCredentials) {
+  json result = srv->call_foreign_servers();
+  std::string dumped = result.dump();
+  EXPECT_EQ(dumped.find("password"), std::string::npos);
+}
+
+TEST_F(PostgresMCPServerTest, ListForeignTablesReturnsTableWithServerAndColumns) {
+  json result = srv->call_foreign_tables("grocery");
+  ASSERT_TRUE(result.contains("remote_orders"));
+  auto& ft = result["remote_orders"];
+  EXPECT_EQ(ft["server"].get<std::string>(), "grocery_remote");
+  EXPECT_EQ(ft["fdw"].get<std::string>(), "postgres_fdw");
+  EXPECT_EQ(ft["description"].get<std::string>(), "orders mirrored from a remote system");
+  ASSERT_TRUE(ft["columns"].contains("id"));
+  ASSERT_TRUE(ft["columns"].contains("amount"));
+}
+
+TEST_F(PostgresMCPServerTest, ListForeignTablesUnknownSchemaReturnsEmpty) {
+  json result = srv->call_foreign_tables("does_not_exist");
+  EXPECT_TRUE(result.empty());
+}
+
+// --- listTablespaces ---
+
+TEST_F(PostgresMCPServerTest, ListTablespacesReturnsDefaultTablespace) {
+  json result = srv->call_tablespaces();
+  ASSERT_TRUE(result.contains("pg_default"));
+  EXPECT_TRUE(result["pg_default"].contains("owner"));
+  EXPECT_TRUE(result["pg_default"].contains("location"));
+}
+
+// --- listCollations ---
+
+TEST_F(PostgresMCPServerTest, ListCollationsReturnsCustomCollation) {
+  json result = srv->call_collations("grocery");
+  ASSERT_TRUE(result.contains("case_sensitive_c"));
+  auto& coll = result["case_sensitive_c"];
+  EXPECT_EQ(coll["provider"].get<std::string>(), "libc");
+  EXPECT_EQ(coll["description"].get<std::string>(), "byte-order comparison, copied from C");
+}
+
+// --- listEventTriggers ---
+
+TEST_F(PostgresMCPServerTest, ListEventTriggersReturnsEnabledTrigger) {
+  json result = srv->call_event_triggers();
+  ASSERT_TRUE(result.contains("grocery_ddl_audit"));
+  auto& evt = result["grocery_ddl_audit"];
+  EXPECT_EQ(evt["event"].get<std::string>(), "ddl_command_end");
+  EXPECT_TRUE(evt["enabled"].get<bool>());
+  EXPECT_EQ(evt["description"].get<std::string>(), "audits DDL changes");
+  EXPECT_NE(evt["function"].get<std::string>().find("probe_event_trigger_fn"), std::string::npos);
+}
+
+// --- listPublications ---
+
+TEST_F(PostgresMCPServerTest, ListPublicationsReturnsPublicationWithTable) {
+  json result = srv->call_publications();
+  ASSERT_TRUE(result.contains("grocery_users_pub"));
+  auto& pub = result["grocery_users_pub"];
+  EXPECT_FALSE(pub["all_tables"].get<bool>());
+  ASSERT_TRUE(pub["tables"].is_array());
+  std::vector<std::string> tables(pub["tables"].begin(), pub["tables"].end());
+  EXPECT_NE(std::find(tables.begin(), tables.end(), "grocery.users"), tables.end());
+}
+
+// --- listSubscriptions ---
+
+TEST_F(PostgresMCPServerTest, ListSubscriptionsReturnsEmptyWhenNoneExist) {
+  json result = srv->call_subscriptions();
+  EXPECT_TRUE(result.empty());
+}
+
+// --- listTypes range support ---
+
+TEST_F(PostgresMCPServerTest, ListTypesReturnsRangeType) {
+  json result = srv->call_types("grocery");
+  ASSERT_TRUE(result.contains("price_range"));
+  auto& pr = result["price_range"];
+  EXPECT_EQ(pr["kind"].get<std::string>(), "range");
+  EXPECT_EQ(pr["subtype"].get<std::string>(), "numeric");
+  ASSERT_TRUE(pr["multirange_type"].is_string());
+  EXPECT_FALSE(pr["multirange_type"].get<std::string>().empty());
+}
+
+TEST_F(PostgresMCPServerTest, ListTypesExcludesMultirangeCompanion) {
+  json result = srv->call_types("grocery");
+  json price_range = result["price_range"];
+  std::string multirange_name = price_range["multirange_type"].get<std::string>();
+  // strip schema qualification if present
+  auto dot = multirange_name.find('.');
+  if (dot != std::string::npos) multirange_name = multirange_name.substr(dot + 1);
+  EXPECT_FALSE(result.contains(multirange_name));
+}
+
+// --- tableDetails rules ---
+
+TEST_F(PostgresMCPServerTest, TableDetailsIncludesRules) {
+  json result = srv->call_table("grocery", "bare_notes");
+  ASSERT_TRUE(result.contains("rules"));
+  ASSERT_TRUE(result["rules"].contains("protect_bare_notes"));
+  auto& rule = result["rules"]["protect_bare_notes"];
+  EXPECT_EQ(rule["event"].get<std::string>(), "DELETE");
+  EXPECT_TRUE(rule["instead"].get<bool>());
+  EXPECT_NE(rule["definition"].get<std::string>().find("INSTEAD"), std::string::npos);
+}
+
+TEST_F(PostgresMCPServerTest, TableDetailsNoRulesReturnsEmpty) {
+  json result = srv->call_table("grocery", "users");
+  EXPECT_TRUE(result["rules"].empty());
+}
+
+// --- tableDetails TOAST info ---
+
+TEST_F(PostgresMCPServerTest, TableDetailsIncludesToastInfoWhenPresent) {
+  json result = srv->call_table("grocery", "users"); // has VARCHAR columns
+  ASSERT_TRUE(result.contains("toast"));
+  ASSERT_FALSE(result["toast"].is_null());
+  EXPECT_TRUE(result["toast"]["name"].get<std::string>().rfind("pg_toast", 0) == 0);
+  EXPECT_TRUE(result["toast"].contains("size"));
+  EXPECT_TRUE(result["toast"].contains("index_size"));
+}
+
+TEST_F(PostgresMCPServerTest, TableDetailsToastIsNullWhenNoToastableColumns) {
+  json result = srv->call_table("grocery", "role_settings"); // enum PK + int, no toastable column
+  ASSERT_TRUE(result.contains("toast"));
+  EXPECT_TRUE(result["toast"].is_null());
+}
+
+TEST_F(PostgresMCPServerTest, TableDetailsColumnsIncludeStorageAndCompression) {
+  json result = srv->call_table("grocery", "users");
+  ASSERT_TRUE(result["columns"].contains("email"));
+  auto& email_col = result["columns"]["email"];
+  EXPECT_EQ(email_col["storage"].get<std::string>(), "extended");
+  EXPECT_EQ(email_col["compression"].get<std::string>(), "default");
+
+  json fixed = srv->call_table("grocery", "role_settings");
+  ASSERT_TRUE(fixed["columns"].contains("max_sessions"));
+  EXPECT_EQ(fixed["columns"]["max_sessions"]["storage"].get<std::string>(), "plain");
+}
+
+// --- listLanguages ---
+
+TEST_F(PostgresMCPServerTest, ListLanguagesReturnsPlpgsql) {
+  json result = srv->call_languages();
+  ASSERT_TRUE(result.contains("plpgsql"));
+  auto& lang = result["plpgsql"];
+  EXPECT_TRUE(lang["trusted"].get<bool>());
+  EXPECT_TRUE(lang["procedural"].get<bool>());
+}
+
+// --- listExtendedStatistics ---
+
+TEST_F(PostgresMCPServerTest, ListExtendedStatisticsReturnsStatsObject) {
+  json result = srv->call_extended_statistics("grocery");
+  ASSERT_TRUE(result.contains("orders_stats"));
+  auto& stats = result["orders_stats"];
+  EXPECT_EQ(stats["table"].get<std::string>(), "grocery.orders");
+  EXPECT_EQ(stats["description"].get<std::string>(), "user_id/amount correlation");
+  ASSERT_TRUE(stats["columns"].is_array());
+  std::vector<std::string> cols(stats["columns"].begin(), stats["columns"].end());
+  EXPECT_NE(std::find(cols.begin(), cols.end(), "user_id"), cols.end());
+  EXPECT_NE(std::find(cols.begin(), cols.end(), "amount"), cols.end());
+  ASSERT_TRUE(stats["kinds"].is_array());
+  std::vector<std::string> kinds(stats["kinds"].begin(), stats["kinds"].end());
+  EXPECT_NE(std::find(kinds.begin(), kinds.end(), "dependencies"), kinds.end());
+}
+
+// --- listOperators ---
+
+TEST_F(PostgresMCPServerTest, ListOperatorsReturnsCustomOperator) {
+  json result = srv->call_operators("grocery");
+  ASSERT_TRUE(result.contains("#+#(integer,integer)"));
+  auto& op = result["#+#(integer,integer)"];
+  EXPECT_EQ(op["left_type"].get<std::string>(), "integer");
+  EXPECT_EQ(op["right_type"].get<std::string>(), "integer");
+  EXPECT_EQ(op["result_type"].get<std::string>(), "integer");
+  EXPECT_NE(op["function"].get<std::string>().find("add_ints"), std::string::npos);
+}
+
+// --- listOperatorClasses ---
+
+TEST_F(PostgresMCPServerTest, ListOperatorClassesReturnsBtreeInt4Ops) {
+  json result = srv->call_operator_classes("pg_catalog");
+  ASSERT_TRUE(result.contains("int4_ops (btree)"));
+  auto& opc = result["int4_ops (btree)"];
+  EXPECT_EQ(opc["access_method"].get<std::string>(), "btree");
+  EXPECT_EQ(opc["input_type"].get<std::string>(), "integer");
+  EXPECT_TRUE(opc["default"].get<bool>());
+}
+
+// --- listAccessMethods ---
+
+TEST_F(PostgresMCPServerTest, ListAccessMethodsReturnsBtreeAndHeap) {
+  json result = srv->call_access_methods();
+  ASSERT_TRUE(result.contains("btree"));
+  EXPECT_EQ(result["btree"]["type"].get<std::string>(), "index");
+  ASSERT_TRUE(result.contains("heap"));
+  EXPECT_EQ(result["heap"]["type"].get<std::string>(), "table");
+}
+
+// --- listCasts ---
+
+TEST_F(PostgresMCPServerTest, ListCastsReturnsCustomCast) {
+  json result = srv->call_casts();
+  ASSERT_TRUE(result.contains("grocery.address->text"));
+  auto& cast = result["grocery.address->text"];
+  EXPECT_EQ(cast["context"].get<std::string>(), "assignment");
+  EXPECT_EQ(cast["method"].get<std::string>(), "function");
+  EXPECT_NE(cast["function"].get<std::string>().find("address_to_text"), std::string::npos);
+}
+
+TEST_F(PostgresMCPServerTest, ListCastsExcludesBuiltinToBuiltinNoise) {
+  json result = srv->call_casts();
+  // bigint->smallint is a built-in-to-built-in cast; neither side is user-defined
+  EXPECT_FALSE(result.contains("bigint->smallint"));
+}
+
+// --- listTextSearchConfigs ---
+
+TEST_F(PostgresMCPServerTest, ListTextSearchConfigsReturnsCopiedConfig) {
+  json result = srv->call_text_search_configs("grocery");
+  ASSERT_TRUE(result.contains("simple_english"));
+  auto& cfg = result["simple_english"];
+  EXPECT_EQ(cfg["parser"].get<std::string>(), "default");
+  ASSERT_TRUE(cfg["mappings"].is_object());
+  EXPECT_TRUE(cfg["mappings"].contains("asciiword"));
+}
+
+// --- listSequences ---
+
+TEST_F(PostgresMCPServerTest, ListSequencesReturnsSerialOwnedSequence) {
+  json result = srv->call_sequences("grocery");
+  ASSERT_TRUE(result.contains("users_id_seq"));
+  auto& seq = result["users_id_seq"];
+  EXPECT_TRUE(seq.contains("data_type"));
+  EXPECT_TRUE(seq.contains("increment_by"));
+  EXPECT_TRUE(seq.contains("cycle"));
+  EXPECT_FALSE(seq["cycle"].get<bool>());
+  ASSERT_TRUE(seq["owned_by"].is_string());
+  EXPECT_EQ(seq["owned_by"].get<std::string>(), "users.id");
+}
+
+TEST_F(PostgresMCPServerTest, ListSequencesStandaloneSequenceHasNullOwnedBy) {
+  json result = srv->call_sequences("grocery");
+  ASSERT_TRUE(result.contains("order_number_seq"));
+  auto& seq = result["order_number_seq"];
+  EXPECT_EQ(seq["start_value"].get<int64_t>(), 100);
+  EXPECT_EQ(seq["description"].get<std::string>(), "external order numbering");
+  EXPECT_TRUE(seq["owned_by"].is_null());
+}
+
+TEST_F(PostgresMCPServerTest, ListSequencesUnknownSchemaReturnsEmpty) {
+  json result = srv->call_sequences("does_not_exist");
+  EXPECT_TRUE(result.empty());
+}
+
+// --- listExtensions ---
+
+TEST_F(PostgresMCPServerTest, ListExtensionsReturnsKnownExtension) {
+  json result = srv->call_extensions();
+  EXPECT_TRUE(result.is_object());
+  ASSERT_TRUE(result.contains("plpgsql"));
+  auto& ext = result["plpgsql"];
+  EXPECT_TRUE(ext.contains("version"));
+  EXPECT_TRUE(ext.contains("schema"));
+  EXPECT_TRUE(ext.contains("relocatable"));
+  EXPECT_TRUE(ext.contains("description"));
+}
+
 // --- databaseSize ---
 
 TEST_F(PostgresMCPServerTest, DatabaseSizeReturnsDatabaseNameAndSize) {
@@ -965,6 +1479,101 @@ TEST_F(PostgresMCPServerTest, DatabaseSizeReturnsDatabaseNameAndSize) {
   EXPECT_TRUE(result.contains("size"));
   EXPECT_FALSE(result["database"].get<std::string>().empty());
   EXPECT_GT(result["size"].get<int64_t>(), 0);
+}
+
+// --- currentActivity ---
+
+TEST_F(PostgresMCPServerTest, ActivityReturnsOtherBackends) {
+  json result = srv->call_activity();
+  EXPECT_TRUE(result.is_object());
+  EXPECT_GT(result.size(), 0u); // admin_conn's backend is visible even if idle
+  for (auto& [pid, entry] : result.items()) {
+    EXPECT_TRUE(entry.contains("backend_type"));
+    EXPECT_TRUE(entry.contains("state"));
+    EXPECT_TRUE(entry.contains("query"));
+    break;
+  }
+}
+
+// --- currentLocks ---
+
+TEST_F(PostgresMCPServerTest, LocksShowsHeldLockFromAnotherConnection) {
+  pqxx::connection lock_conn(test_url);
+  pqxx::work lock_txn(lock_conn);
+  lock_txn.exec("LOCK TABLE grocery.users IN ACCESS EXCLUSIVE MODE");
+
+  json result = srv->call_locks();
+  ASSERT_TRUE(result.is_array());
+
+  bool found = false;
+  for (auto& lock : result) {
+    if (lock.contains("relation") && !lock["relation"].is_null() &&
+        lock["relation"].get<std::string>() == "grocery.users" &&
+        lock["granted"].get<bool>()) {
+      found = true;
+      EXPECT_EQ(lock["mode"].get<std::string>(), "AccessExclusiveLock");
+      break;
+    }
+  }
+  EXPECT_TRUE(found);
+
+  lock_txn.abort();
+}
+
+// --- replicationSlots ---
+
+TEST_F(PostgresMCPServerTest, ReplicationSlotsReturnsEmptyWhenNoneConfigured) {
+  json result = srv->call_replication_slots();
+  EXPECT_TRUE(result.empty());
+}
+
+// --- databaseStats ---
+
+TEST_F(PostgresMCPServerTest, DatabaseStatsIncludesCurrentDatabase) {
+  json result = srv->call_database_stats();
+  ASSERT_TRUE(result.contains(test_dbname));
+  auto& stats = result[test_dbname];
+  EXPECT_TRUE(stats.contains("numbackends"));
+  EXPECT_TRUE(stats.contains("xact_commit"));
+  EXPECT_TRUE(stats.contains("deadlocks"));
+  EXPECT_GE(stats["numbackends"].get<int>(), 1); // srv's own connection
+}
+
+// --- statementStats ---
+
+TEST_F(PostgresMCPServerTest, StatementStatsReturnsHintWhenNotInstalled) {
+  json result = srv->call_statement_stats(20);
+  // pg_stat_statements is not in shared_preload_libraries in the test environment.
+  ASSERT_TRUE(result.contains("error"));
+  EXPECT_EQ(result["error"].get<std::string>(), "pg_stat_statements is not installed");
+  EXPECT_TRUE(result.contains("hint"));
+}
+
+// --- tableBloat ---
+
+TEST_F(PostgresMCPServerTest, TableBloatApproxReturnsExpectedFields) {
+  json result = srv->call_table_bloat("grocery", "users", false);
+  EXPECT_EQ(result["method"].get<std::string>(), "approx");
+  EXPECT_TRUE(result.contains("table_len"));
+  EXPECT_TRUE(result.contains("scanned_percent"));
+  EXPECT_TRUE(result.contains("tuple_count"));
+  EXPECT_TRUE(result.contains("dead_tuple_percent"));
+  EXPECT_TRUE(result.contains("free_percent"));
+}
+
+TEST_F(PostgresMCPServerTest, TableBloatExactReturnsExpectedFields) {
+  json result = srv->call_table_bloat("grocery", "users", true);
+  EXPECT_EQ(result["method"].get<std::string>(), "exact");
+  EXPECT_FALSE(result.contains("scanned_percent")); // exact scans the whole table
+  EXPECT_TRUE(result.contains("table_len"));
+  EXPECT_TRUE(result.contains("tuple_count"));
+  EXPECT_TRUE(result.contains("dead_tuple_percent"));
+  EXPECT_TRUE(result.contains("free_percent"));
+}
+
+TEST_F(PostgresMCPServerTest, TableBloatUnknownTableReturnsEmpty) {
+  json result = srv->call_table_bloat("grocery", "does_not_exist", false);
+  EXPECT_TRUE(result.empty());
 }
 
 int main(int argc, char **argv) {
