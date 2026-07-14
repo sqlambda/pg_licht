@@ -4,88 +4,151 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+
+env:
+  # Pinned so every Linux target links the same libpqxx, built statically from
+  # source, instead of whatever version each distro happens to package.
+  # libpq stays dynamic (its C ABI is stable across versions; distros patch
+  # it independently), so it's still installed from each distro's own repo.
+  PQXX_VERSION: 8.0.1
 
 jobs:
-  build-linux:
-    runs-on: ubuntu-latest
-    container:
-      image: ubuntu:resolute
+  build:
+    name: Build (${{ matrix.artifact }})
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container || '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: pg_licht_mcp-linux-x86_64
+            distro: ubuntu
+            extension: tar.gz
+          - os: ubuntu-24.04-arm
+            artifact: pg_licht_mcp-linux-arm64
+            distro: ubuntu
+            extension: tar.gz
+          - os: ubuntu-latest
+            container: debian:trixie
+            artifact: pg_licht_mcp-linux-x86_64-debian13
+            distro: debian
+            extension: deb
+          - os: ubuntu-24.04-arm
+            container: debian:trixie
+            artifact: pg_licht_mcp-linux-arm64-debian13
+            distro: debian
+            extension: deb
+          - os: ubuntu-latest
+            container: rockylinux:9
+            artifact: pg_licht_mcp-linux-x86_64-rocky9
+            distro: rocky
+            extension: rpm
+          - os: ubuntu-24.04-arm
+            container: rockylinux:9
+            artifact: pg_licht_mcp-linux-arm64-rocky9
+            distro: rocky
+            extension: rpm
+          - os: macos-latest
+            artifact: pg_licht_mcp-macos-arm64
+            distro: macos
+            extension: tar.gz
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install dependencies (Ubuntu)
+        if: matrix.distro == 'ubuntu'
+        run: |
+          sudo apt-get install -y curl ca-certificates lsb-release
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -q
+          sudo apt-get install -y cmake libpq-dev nlohmann-json3-dev pkg-config
+          curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
+          cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
+          cmake --build /tmp/libpqxx-build -j"$(nproc)"
+          sudo cmake --install /tmp/libpqxx-build
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
+
+      - name: Install dependencies (Debian)
+        if: matrix.distro == 'debian'
         run: |
           apt-get update -q
-          apt-get install -y build-essential cmake libpqxx-dev nlohmann-json3-dev pkg-config
+          apt-get install -y curl ca-certificates gnupg lsb-release cmake build-essential pkg-config dpkg-dev
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            > /etc/apt/sources.list.d/pgdg.list
+          apt-get update -q
+          apt-get install -y libpq-dev nlohmann-json3-dev
+          curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
+          cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
+          cmake --build /tmp/libpqxx-build -j"$(nproc)"
+          cmake --install /tmp/libpqxx-build
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
 
-      - name: Build
-        working-directory: cpp
+      - name: Install dependencies (Rocky Linux)
+        if: matrix.distro == 'rocky'
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
-          cmake --build build --target pg_licht_mcp
-          strip build/pg_licht_mcp
+          dnf install -y epel-release dnf-plugins-core
+          dnf config-manager --set-enabled crb
+          dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-$(uname -m)/pgdg-redhat-repo-latest.noarch.rpm
+          dnf module disable -y postgresql
+          dnf install -y cmake gcc-c++ binutils libpq-devel nlohmann-json-devel pkg-config rpm-build curl
+          curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
+          cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
+          cmake --build /tmp/libpqxx-build -j"$(nproc)"
+          cmake --install /tmp/libpqxx-build
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
 
-      - name: Package
-        run: tar -czf pg_licht_mcp-linux-x86_64.tar.gz -C cpp/build pg_licht_mcp
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: linux
-          path: pg_licht_mcp-linux-x86_64.tar.gz
-
-  build-macos:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies
+      - name: Install dependencies (macOS)
+        if: matrix.distro == 'macos'
         run: |
-          brew install libpq libpqxx nlohmann-json pkg-config
+          brew install cmake libpq libpqxx nlohmann-json pkg-config
           echo "PKG_CONFIG_PATH=$(brew --prefix libpq)/lib/pkgconfig" >> $GITHUB_ENV
 
       - name: Build
-        working-directory: cpp
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
-            -DCMAKE_PREFIX_PATH="$(brew --prefix)"
-          cmake --build build --target pg_licht_mcp
-          strip build/pg_licht_mcp
+          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake --build cpp/build --target pg_licht_mcp
+          strip cpp/build/pg_licht_mcp
 
-      - name: Package
-        run: tar -czf pg_licht_mcp-macos-arm64.tar.gz -C cpp/build pg_licht_mcp
+      - name: Package (tar.gz)
+        if: matrix.extension == 'tar.gz'
+        run: tar -czf ${{ matrix.artifact }}.tar.gz -C cpp/build pg_licht_mcp
+
+      - name: Package (deb)
+        if: matrix.extension == 'deb'
+        run: |
+          cd cpp/build && cpack -G DEB
+          mv pg-licht-*.deb ${{ github.workspace }}/${{ matrix.artifact }}.deb
+
+      - name: Package (rpm)
+        if: matrix.extension == 'rpm'
+        run: |
+          cd cpp/build && cpack -G RPM
+          mv pg-licht-*.rpm ${{ github.workspace }}/${{ matrix.artifact }}.rpm
 
       - uses: actions/upload-artifact@v4
         with:
-          name: macos
-          path: pg_licht_mcp-macos-arm64.tar.gz
-
-  build-typescript:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: Build and pack
-        working-directory: typescript
-        run: |
-          npm ci
-          npm version ${GITHUB_REF_NAME#v} --no-git-tag-version --allow-same-version
-          npm run build
-          npm pack
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: typescript
-          path: typescript/pg-licht-mcp-*.tgz
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.${{ matrix.extension }}
 
   release:
-    needs: [build-linux, build-macos, build-typescript]
+    name: Create release and update Homebrew formula
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -98,7 +161,31 @@ jobs:
             --title "pg_licht_mcp ${{ github.ref_name }}" \
             --generate-notes \
             pg_licht_mcp-linux-x86_64.tar.gz \
-            pg_licht_mcp-macos-arm64.tar.gz \
-            pg-licht-mcp-*.tgz
+            pg_licht_mcp-linux-arm64.tar.gz \
+            pg_licht_mcp-linux-x86_64-debian13.deb \
+            pg_licht_mcp-linux-arm64-debian13.deb \
+            pg_licht_mcp-linux-x86_64-rocky9.rpm \
+            pg_licht_mcp-linux-arm64-rocky9.rpm \
+            pg_licht_mcp-macos-arm64.tar.gz
         env:
           GH_TOKEN: ${{ github.token }}
+
+      - name: Compute source tarball SHA256
+        id: sha
+        run: |
+          SHA=$(curl -sL "https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.ref_name }}.tar.gz" | sha256sum | cut -d' ' -f1)
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Update Homebrew formula
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/sqlambda/homebrew-pg-licht.git" tap
+          cd tap
+          sed -i "s|refs/tags/v[^/]*.tar.gz|refs/tags/${{ github.ref_name }}.tar.gz|" Formula/pg-licht.rb
+          sed -i "s/sha256 \"[a-f0-9]\{64\}\"/sha256 \"${{ steps.sha.outputs.sha256 }}\"/" Formula/pg-licht.rb
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add Formula/pg-licht.rb
+          git diff --cached --quiet || git commit -m "Update pg-licht to ${{ github.ref_name }}"
+          git push

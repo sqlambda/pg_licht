@@ -1,0 +1,111 @@
+name: Sanitizers
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  sanitize:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: address-undefined
+            sanitizer: ADDRESS_UNDEFINED
+          - name: thread
+            sanitizer: THREAD
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get install -y curl ca-certificates lsb-release
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -q
+          sudo apt-get install -y cmake libpq-dev nlohmann-json3-dev libgtest-dev pkg-config
+          curl -fsSL https://github.com/jtv/libpqxx/archive/refs/tags/7.10.0.tar.gz | tar -xz -C /tmp
+          cmake -S /tmp/libpqxx-7.10.0 -B /tmp/libpqxx-build \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DBUILD_SHARED_LIBS=ON
+          cmake --build /tmp/libpqxx-build
+          sudo cmake --install /tmp/libpqxx-build
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
+
+      - name: Configure and build
+        run: |
+          cmake -S cpp -B cpp/build \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DPGLICHT_SANITIZER=${{ matrix.sanitizer }}
+          cmake --build cpp/build --target pg_licht_mcp_test
+
+      - name: Run tests
+        working-directory: cpp/build
+        env:
+          DATABASE_URL: "host=localhost port=5432 user=postgres password=postgres dbname=postgres"
+          ASAN_OPTIONS: detect_leaks=1
+        run: ctest --output-on-failure
+
+  valgrind:
+    name: valgrind
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get install -y curl ca-certificates lsb-release
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -q
+          sudo apt-get install -y cmake libpq-dev nlohmann-json3-dev libgtest-dev pkg-config valgrind
+          curl -fsSL https://github.com/jtv/libpqxx/archive/refs/tags/7.10.0.tar.gz | tar -xz -C /tmp
+          cmake -S /tmp/libpqxx-7.10.0 -B /tmp/libpqxx-build \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DBUILD_SHARED_LIBS=ON
+          cmake --build /tmp/libpqxx-build
+          sudo cmake --install /tmp/libpqxx-build
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
+
+      - name: Configure and build
+        run: |
+          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build cpp/build --target pg_licht_mcp_test
+
+      - name: Run tests under Valgrind
+        working-directory: cpp/build
+        env:
+          DATABASE_URL: "host=localhost port=5432 user=postgres password=postgres dbname=postgres"
+        run: ctest -R valgrind --output-on-failure
