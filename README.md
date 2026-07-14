@@ -62,15 +62,39 @@ brew tap sqlambda/pg-licht
 brew install pg-licht
 ```
 
-### Pre-built binaries
+### Pre-built packages and binaries
 
-Download the latest binary for your platform from the [releases page](https://github.com/sqlambda/pg_licht/releases):
+Download the latest release for your platform from the [releases page](https://github.com/sqlambda/pg_licht/releases):
 
-| Platform | File |
-|----------|------|
-| Linux x86_64 | `pg_licht_mcp-linux-x86_64.tar.gz` |
-| Linux arm64 | `pg_licht_mcp-linux-arm64.tar.gz` |
-| macOS Apple Silicon | `pg_licht_mcp-macos-arm64.tar.gz` |
+| Platform | File | Format |
+|----------|------|--------|
+| Debian 13 (Trixie) x86_64 | `pg_licht_mcp-linux-x86_64-debian13.deb` | `.deb` |
+| Debian 13 (Trixie) arm64 | `pg_licht_mcp-linux-arm64-debian13.deb` | `.deb` |
+| Rocky Linux 9 x86_64 | `pg_licht_mcp-linux-x86_64-rocky9.rpm` | `.rpm` |
+| Rocky Linux 9 arm64 | `pg_licht_mcp-linux-arm64-rocky9.rpm` | `.rpm` |
+| Linux x86_64 (generic) | `pg_licht_mcp-linux-x86_64.tar.gz` | tarball |
+| Linux arm64 (generic) | `pg_licht_mcp-linux-arm64.tar.gz` | tarball |
+| macOS Apple Silicon | `pg_licht_mcp-macos-arm64.tar.gz` | tarball |
+
+**Debian / Ubuntu / other apt-based distros (`.deb`):**
+
+```bash
+sudo apt install ./pg_licht_mcp-linux-x86_64-debian13.deb
+pg_licht_mcp "postgresql://user:pass@host/dbname"
+```
+
+`apt install ./file.deb` (not `dpkg -i`) so apt resolves the declared `libpq5` dependency automatically. Installs to `/usr/bin/pg_licht_mcp`, already on `PATH`.
+
+**Rocky Linux / RHEL / Fedora / other dnf-based distros (`.rpm`):**
+
+```bash
+sudo dnf install ./pg_licht_mcp-linux-x86_64-rocky9.rpm
+pg_licht_mcp "postgresql://user:pass@host/dbname"
+```
+
+Same reasoning: `dnf install ./file.rpm` resolves the declared `libpq5` dependency; `rpm -i` won't. Installs to `/usr/bin/pg_licht_mcp`.
+
+**Generic tarball (any glibc-based Linux, or macOS):**
 
 ```bash
 tar -xzf pg_licht_mcp-<platform>.tar.gz
@@ -124,31 +148,32 @@ npx @modelcontextprotocol/inspector \
 
 ### Claude Code (`claude mcp add`)
 
-The `--scope` flag controls where the configuration is saved:
+The `--scope`/`-s` flag controls where the configuration is saved:
 
-| Scope | Flag | Config file | Use when |
-|-------|------|-------------|----------|
-| Project (default) | `--scope project` | `.claude.json` in project root | shared with the repo |
-| User | `--scope user` | `~/.claude.json` | available across all projects |
-| Local | `--scope local` | `.claude.json.local` (git-ignored) | personal overrides, not committed |
+| Scope | Flag | Stored in | Use when |
+|-------|------|-----------|----------|
+| Local (default) | `--scope local` | `~/.claude.json`, under this project's entry | personal, current project only, not shared |
+| Project | `--scope project` | `.mcp.json` in project root | shared with the team via version control (each teammate approves it once) |
+| User | `--scope user` | `~/.claude.json` | available across all your projects |
 
 ```bash
-claude mcp add --scope project pg-licht \
+claude mcp add --transport stdio pg-licht \
   -e DATABASE_URL="postgresql://user:pass@host/dbname" \
   -- /path/to/pg-licht/cpp/build/pg_licht_mcp
 ```
 
-Replace `--scope project` with `--scope user` or `--scope local` as needed.
+Add `--scope project` or `--scope user` to change where it's saved; omit for the local-only default.
 
-### Manual — `.claude.json`
+### Manual — `.mcp.json` / `~/.claude.json`
 
-You can also edit `.claude.json` (project root), `~/.claude.json` (user), or `.claude.json.local` (local) directly:
+Project-scoped servers live in `.mcp.json` at the project root (commit this to share with your team):
 
 ```json
 {
   "mcpServers": {
     "pg-licht": {
       "command": "/path/to/pg-licht/cpp/build/pg_licht_mcp",
+      "args": [],
       "env": {
         "DATABASE_URL": "postgresql://user:pass@host/dbname"
       }
@@ -157,9 +182,31 @@ You can also edit `.claude.json` (project root), `~/.claude.json` (user), or `.c
 }
 ```
 
+Local- and user-scoped servers live in `~/.claude.json` instead (edit via `claude mcp add`/`claude mcp add-json` rather than by hand, since that file also holds per-project state).
+
 ### Claude Desktop
 
 Add the same JSON block above under `mcpServers` in `claude_desktop_config.json`.
+
+### Grok Build (`grok mcp add`)
+
+Grok Build reads `.mcp.json` and `~/.claude.json` for compatibility, so an MCP server already configured for Claude Code (above) is picked up automatically — no extra steps needed.
+
+To configure it directly instead:
+
+```bash
+grok mcp add pg-licht -- /path/to/pg-licht/cpp/build/pg_licht_mcp
+```
+
+Environment variables for stdio servers are set in the config file rather than on the command line. `--scope project` writes to `.grok/config.toml` in the project (add it to your repo to share); omit it for the user-level `~/.grok/config.toml`:
+
+```toml
+[mcp_servers.pg-licht]
+command = "/path/to/pg-licht/cpp/build/pg_licht_mcp"
+env = { DATABASE_URL = "postgresql://user:pass@host/dbname" }
+```
+
+Verify with `grok mcp list` or `grok mcp doctor pg-licht`.
 
 ## License
 
