@@ -1997,6 +1997,12 @@ private:
                'last_vacuum', GREATEST(s.last_vacuum, s.last_autovacuum), 'last_analyze', GREATEST(s.last_analyze, s.last_autoanalyze),
                'reloptions', c.reloptions,
                'columns', columns,
+               'toast', CASE WHEN c.reltoastrelid != 0 THEN
+                          JSONB_BUILD_OBJECT(
+                            'name',       tc.relname,
+                            'size',       pg_relation_size(c.reltoastrelid),
+                            'index_size', pg_indexes_size(c.reltoastrelid))
+                        END,
                'primary_key', COALESCE(primary_key, '[]'::jsonb),
                'indexes', COALESCE(indexes, '{}'::jsonb),
                'constraints', COALESCE(constraints, '{}'::jsonb),
@@ -2010,6 +2016,7 @@ private:
                'roles', COALESCE(roles, '{}'::jsonb))
       FROM pg_class AS c
       LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
+      LEFT JOIN pg_class AS tc ON tc.oid = c.reltoastrelid
       LEFT JOIN LATERAL (SELECT JSONB_STRIP_NULLS(JSONB_OBJECT_AGG(a.attname,
                         JSONB_BUILD_OBJECT(
                          'description', col_description(c.oid, attnum),
@@ -2018,6 +2025,9 @@ private:
                          'size', NULLIF(a.attlen, -1),
                          'not_null', a.attnotnull,
                          'default', pg_get_expr(ad.adbin, ad.adrelid),
+                         'storage', CASE a.attstorage WHEN 'p' THEN 'plain' WHEN 'e' THEN 'external'
+                                                       WHEN 'm' THEN 'main' WHEN 'x' THEN 'extended' END,
+                         'compression', CASE a.attcompression WHEN 'p' THEN 'pglz' WHEN 'l' THEN 'lz4' ELSE 'default' END,
                          'null_frac', ps.null_frac,
                          'avg_width', ps.avg_width,
                          'n_distinct', ps.n_distinct,

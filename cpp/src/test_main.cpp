@@ -1305,6 +1305,35 @@ TEST_F(PostgresMCPServerTest, TableDetailsNoRulesReturnsEmpty) {
   EXPECT_TRUE(result["rules"].empty());
 }
 
+// --- tableDetails TOAST info ---
+
+TEST_F(PostgresMCPServerTest, TableDetailsIncludesToastInfoWhenPresent) {
+  json result = srv->call_table("grocery", "users"); // has VARCHAR columns
+  ASSERT_TRUE(result.contains("toast"));
+  ASSERT_FALSE(result["toast"].is_null());
+  EXPECT_TRUE(result["toast"]["name"].get<std::string>().rfind("pg_toast", 0) == 0);
+  EXPECT_TRUE(result["toast"].contains("size"));
+  EXPECT_TRUE(result["toast"].contains("index_size"));
+}
+
+TEST_F(PostgresMCPServerTest, TableDetailsToastIsNullWhenNoToastableColumns) {
+  json result = srv->call_table("grocery", "role_settings"); // enum PK + int, no toastable column
+  ASSERT_TRUE(result.contains("toast"));
+  EXPECT_TRUE(result["toast"].is_null());
+}
+
+TEST_F(PostgresMCPServerTest, TableDetailsColumnsIncludeStorageAndCompression) {
+  json result = srv->call_table("grocery", "users");
+  ASSERT_TRUE(result["columns"].contains("email"));
+  auto& email_col = result["columns"]["email"];
+  EXPECT_EQ(email_col["storage"].get<std::string>(), "extended");
+  EXPECT_EQ(email_col["compression"].get<std::string>(), "default");
+
+  json fixed = srv->call_table("grocery", "role_settings");
+  ASSERT_TRUE(fixed["columns"].contains("max_sessions"));
+  EXPECT_EQ(fixed["columns"]["max_sessions"]["storage"].get<std::string>(), "plain");
+}
+
 // --- listLanguages ---
 
 TEST_F(PostgresMCPServerTest, ListLanguagesReturnsPlpgsql) {
