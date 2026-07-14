@@ -2,10 +2,17 @@
 #include <cstdlib>
 #include <unistd.h>
 #include <sstream>
+#if defined(__GNUC__) && !defined(__clang__)
+// GCC-only false positive inside <regex> internals at -O1+; Clang doesn't
+// have this warning group at all, and with -Werror active it would hard-fail
+// on "unknown warning group" if this pragma weren't guarded.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
 #include <regex>
+#if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
+#endif
 #include "server.h"
 
 class PostgresMCPServerTest : public ::testing::Test {

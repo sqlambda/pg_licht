@@ -4,10 +4,17 @@
 #include <set>
 #include <string>
 #include <nlohmann/json.hpp>
+#if defined(__GNUC__) && !defined(__clang__)
+// GCC-only false positive from std::variant inside pqxx headers; Clang
+// doesn't have this warning group at all, and with -Werror active it would
+// hard-fail on "unknown warning group" if this pragma weren't guarded.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
 #include <pqxx/pqxx>
+#if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
+#endif
 
 using json = nlohmann::json;
 
