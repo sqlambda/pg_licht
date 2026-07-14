@@ -101,7 +101,15 @@ jobs:
           dnf config-manager --set-enabled crb
           dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-$(uname -m)/pgdg-redhat-repo-latest.noarch.rpm
           dnf module disable -y postgresql
-          dnf install -y cmake gcc-c++ binutils libpq-devel nlohmann-json-devel pkg-config rpm-build
+          # Rocky 9's default gcc-c++ is GCC 11, which lacks full <format>
+          # support (needed by libpqxx 8.x's C++20 requirement; complete only
+          # since GCC 13). gcc-toolset-13 is Rocky's own AppStream package
+          # for a newer GCC without replacing the system compiler.
+          dnf install -y cmake gcc-toolset-13-gcc-c++ binutils libpq-devel nlohmann-json-devel pkg-config rpm-build
+          echo "CC=/opt/rh/gcc-toolset-13/root/usr/bin/gcc" >> $GITHUB_ENV
+          echo "CXX=/opt/rh/gcc-toolset-13/root/usr/bin/g++" >> $GITHUB_ENV
+          export CC=/opt/rh/gcc-toolset-13/root/usr/bin/gcc
+          export CXX=/opt/rh/gcc-toolset-13/root/usr/bin/g++
           curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
           cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
@@ -129,13 +137,16 @@ jobs:
         if: matrix.extension == 'deb'
         run: |
           cd cpp/build && cpack -G DEB
-          mv pg-licht-*.deb ${{ github.workspace }}/${{ matrix.artifact }}.deb
+          # github.workspace is the host runner's path; this step runs inside
+          # a container where the workspace is mounted elsewhere (/__w/...),
+          # so a relative path is used instead of the host path.
+          mv pg-licht-*.deb ../../${{ matrix.artifact }}.deb
 
       - name: Package (rpm)
         if: matrix.extension == 'rpm'
         run: |
           cd cpp/build && cpack -G RPM
-          mv pg-licht-*.rpm ${{ github.workspace }}/${{ matrix.artifact }}.rpm
+          mv pg-licht-*.rpm ../../${{ matrix.artifact }}.rpm
 
       - uses: actions/upload-artifact@v4
         with:
