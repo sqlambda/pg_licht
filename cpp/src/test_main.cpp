@@ -262,7 +262,12 @@ protected:
       }
       if (admin_conn) {
         pqxx::nontransaction ntxn(*admin_conn);
-        ntxn.exec("DROP DATABASE IF EXISTS \"" + test_dbname + "\"");
+        // WITH (FORCE) terminates any remaining backends on the database. That
+        // matters when the server under test is reached through a
+        // transaction-mode pooler: the pooler keeps idle server connections
+        // open to this database, and a plain DROP would fail with "database is
+        // being accessed by other users". Matches the pgss fixture below.
+        ntxn.exec("DROP DATABASE IF EXISTS \"" + test_dbname + "\" WITH (FORCE)");
         ntxn.exec("DROP ROLE IF EXISTS tomato");
         ntxn.exec("DROP ROLE IF EXISTS carrot");
         ntxn.commit();

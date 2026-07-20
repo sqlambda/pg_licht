@@ -189,6 +189,23 @@ DATABASE_URL="port=5432 dbname=mydb" ctest --test-dir cpp/build --output-on-fail
 
 Tests create and destroy a temporary database named `pg_licht_test_<PID>` automatically.
 
+### Through a connection pooler
+
+Because the read-only guard is transaction-scoped specifically so it survives a
+transaction-mode pooler, there is a script that verifies exactly that. It stands up a
+throwaway PostgreSQL cluster and a companion PgBouncer (`pool_mode=transaction`,
+`server_reset_query=DISCARD ALL`) in a temp directory, runs the full suite both directly
+and through the pooler, and tears everything down — touching nothing else on the machine:
+
+```bash
+cmake --build cpp/build          # the script needs the test binary built
+cpp/test/run-pooled-tests.sh
+```
+
+Requires `initdb`/`pg_ctl` (PostgreSQL 16+) and `pgbouncer` on the machine; it picks the
+newest installed PostgreSQL and free defaults, all overridable via environment
+(`PG_BINDIR`, `PGBOUNCER`, `PG_PORT`, `BOUNCER_PORT`).
+
 ## Debugging with MCP Inspector
 
 The [MCP Inspector](https://github.com/modelcontextprotocol/inspector) lets you call tools interactively and inspect responses without an AI client.
