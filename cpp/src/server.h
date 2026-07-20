@@ -1,9 +1,11 @@
 #pragma once
 
+#include <cctype>
 #include <iostream>
 #include <set>
 #include <string>
 #include <nlohmann/json.hpp>
+#include "config.h"
 #if defined(__GNUC__) && !defined(__clang__)
 // GCC-only false positive from std::variant inside pqxx headers; Clang
 // doesn't have this warning group at all, and with -Werror active it would
@@ -29,19 +31,63 @@ inline pqxx::result pqxx_exec(pqxx::work& txn, const std::string& sql, P&& param
 #endif
 }
 
+// One unit of work: connect, open a READ ONLY transaction, roll back and
+// disconnect on scope exit.
+//
+// Why connect per call rather than hold one connection: the target deployment
+// is PgBouncer in transaction mode (pool_mode=transaction,
+// server_reset_query=DISCARD ALL). There the server connection is handed back
+// to the pool at COMMIT and wiped, so *session* state does not survive between
+// transactions. An earlier version set `default_transaction_read_only` once at
+// startup and committed; behind such a pooler that setting was silently
+// discarded and every later call ran without the read-only guard.
+//
+// So nothing here relies on session state. The read-only guarantee and the
+// statement timeout are both transaction-scoped, which is exactly the scope a
+// transaction pooler preserves. The GUC cannot be pushed into the connection
+// string either -- PgBouncer rejects it outright:
+//   FATAL: unsupported startup parameter in options: default_transaction_read_only
+class Session {
+public:
+  explicit Session(const pglicht::ConnConfig& cfg, int timeout_ms = 0)
+    : conn_(cfg.conninfo), txn_(conn_) {
+    // Must be the first statement in the transaction. This is the real write
+    // backstop: it catches writes a query plan cannot reveal, such as a
+    // VOLATILE function that modifies data, aborting with SQLSTATE 25006.
+    txn_.exec("SET TRANSACTION READ ONLY");
+    if (timeout_ms > 0) {
+      // set_config(..., is_local => true) is SET LOCAL: transaction-scoped,
+      // and binds the value as a parameter instead of concatenating it.
+      pqxx_exec(txn_, "SELECT set_config('statement_timeout', $1, true)",
+                pqxx::params{std::to_string(timeout_ms)});
+    }
+  }
+
+  pqxx::work& txn() { return txn_; }
+
+  // txn_ is destroyed before conn_, rolling back; conn_ then disconnects.
+  ~Session() = default;
+
+  Session(const Session&) = delete;
+  Session& operator=(const Session&) = delete;
+
+private:
+  pqxx::connection conn_;
+  pqxx::work txn_;
+};
+
 class PostgresMCPServer {
 public:
-  PostgresMCPServer(const std::string& conn_str) : conn(conn_str) {
-    pqxx::work txn{conn};
-    // set_config() (not plain SET) so application_name is bound as a real
-    // parameter rather than concatenated into SQL text.
-    pqxx_exec(txn, "SELECT set_config('application_name', $1, false)",
-              pqxx::params{std::string("pg-licht-cpp/") + PGLICHT_VERSION});
-    // Defense in depth: this server only ever reads. Rejecting writes at the
-    // session level means even a bug that let a query mutate data would still
-    // fail, rather than succeed silently.
-    txn.exec("SET default_transaction_read_only = on");
-    txn.commit();
+  // Single-connection form: DATABASE_URL, an explicit conninfo, or argv[1].
+  explicit PostgresMCPServer(const std::string& conn_str)
+    : registry_(pglicht::ConnectionRegistry::from_url(conn_str, app_name())) {
+    probe();
+  }
+
+  // Multi-connection form, from an INI file of named sections.
+  explicit PostgresMCPServer(pglicht::ConnectionRegistry registry)
+    : registry_(std::move(registry)) {
+    probe();
   }
 
   void run() {
@@ -109,11 +155,50 @@ public:
     return check_key(schema, table_name, values);
   }
 
+  const json call_connections() { return connections(); }
+
 private:
-  pqxx::connection conn;
+  pglicht::ConnectionRegistry registry_;
+  // Which configured connection the in-flight tool call targets. Resolved once
+  // per request by handle_request so the ~40 query methods keep their existing
+  // signatures. The server reads stdin line by line, so only one call is ever
+  // in flight and a member is safe.
+  std::string active_;
+  unsigned long long explain_seq_ = 0;
+
+  static std::string app_name() {
+    return std::string("pg-licht-cpp/") + PGLICHT_VERSION;
+  }
+
+  const pglicht::ConnConfig& active_cfg() const { return registry_.get(active_); }
+
+  // Fail fast on an unusable default connection, matching the previous
+  // behaviour where the constructor connected eagerly.
+  void probe() {
+    Session s{registry_.get(registry_.default_name())};
+    s.txn().exec("SELECT 1");
+  }
+
+  const json connections() {
+    json out = json::array();
+    for (const auto& name : registry_.names()) {
+      const auto& c = registry_.get(name);
+      json entry = {{"name", name}, {"default", name == registry_.default_name()}};
+      // Only non-secret fields. A service name is reported as-is and never
+      // expanded: the service file may hold a password, and resolving it here
+      // would leak it into tool output.
+      if (!c.service.empty()) entry["service"] = c.service;
+      if (!c.host.empty())    entry["host"]    = c.host;
+      if (!c.port.empty())    entry["port"]    = c.port;
+      if (!c.dbname.empty())  entry["dbname"]  = c.dbname;
+      if (!c.user.empty())    entry["user"]    = c.user;
+      out.push_back(entry);
+    }
+    return out;
+  }
 
   const json get_tools_list() {
-    return {
+    json list = {
       {"tools", {
 	  {
 	    {"name", "listSchemas"},
@@ -488,13 +573,36 @@ private:
 		  }},
 		{"required", {"schema", "table", "values"}}
 	      }}
+	  },
+	  {
+	    {"name", "listConnections"},
+	    {"description", "return the configured database connections by name, with the libpq service name or host/port/dbname/user for each, and which is the default; passwords are never returned and a service file is never expanded. Pass a name as the 'connection' argument of any other tool to run that tool against that database"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", json::object()}
+	      }}
 	  }
 	}}
     };
+
+    // Every tool accepts an optional `connection`. Injecting it here keeps the
+    // ~40 tool definitions and their method signatures untouched; the name is
+    // resolved once per request in handle_request.
+    json conn_prop = {
+      {"type", "string"},
+      {"description", "name of a configured connection (see listConnections); "
+                      "defaults to \"" + registry_.default_name() + "\""}
+    };
+    for (auto& tool : list["tools"]) {
+      if (tool["name"] == "listConnections") continue;
+      tool["inputSchema"]["properties"]["connection"] = conn_prop;
+    }
+    return list;
   }
 
   const json schemas() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(nspname,
@@ -528,7 +636,8 @@ private:
   }
 
   const json tables(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(c.relname,
@@ -576,7 +685,8 @@ private:
   }
 
   const json search(const std::string& web_search) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(c.relnamespace::regnamespace::name || '.' || c.relname,
@@ -659,7 +769,8 @@ private:
   }
 
   const json functions(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -692,7 +803,8 @@ private:
   }
 
   const json function_detail(const std::string& schema, const std::string& func_name) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -748,7 +860,8 @@ private:
       return {};
     }
 
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -802,7 +915,8 @@ private:
   }
 
   const json server_settings() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(category, settings ORDER BY category)
@@ -834,7 +948,8 @@ private:
   }
 
   const json extensions() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -860,7 +975,8 @@ private:
   }
 
   const json activity() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(pid::text,
@@ -893,7 +1009,8 @@ private:
   }
 
   const json locks() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_AGG(
@@ -933,7 +1050,8 @@ private:
   }
 
   const json replication_slots() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     // retained_wal_bytes is the key diagnostic: a lagging or unused slot holds
     // back WAL cleanup indefinitely, a common cause of disk bloat incidents.
@@ -964,7 +1082,8 @@ private:
   }
 
   const json database_stats() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(datname,
@@ -1002,7 +1121,8 @@ private:
   }
 
   const json statement_stats(int limit) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_AGG(row_json)
@@ -1051,7 +1171,8 @@ private:
   }
 
   const json table_bloat(const std::string& schema, const std::string& table_name, bool exact) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     // pgstattuple() does a full sequential scan (real I/O on large tables);
     // pgstattuple_approx() uses the visibility map for a cheap estimate.
@@ -1117,7 +1238,8 @@ private:
   }
 
   const json database_size() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_BUILD_OBJECT(
@@ -1139,7 +1261,8 @@ private:
     if (!values.is_array())
       throw std::runtime_error("values must be an array");
 
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     // Step 1: fetch PK column names, types, and type schemas
     pqxx::result pk_res = txn.exec(
@@ -1228,7 +1351,8 @@ private:
   }
 
   const json enums(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1258,7 +1382,8 @@ private:
   }
 
   const json enum_detail(const std::string& schema, const std::string& enum_name) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_BUILD_OBJECT(
@@ -1303,7 +1428,8 @@ private:
       return {};
     }
 
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1345,7 +1471,8 @@ private:
   }
 
   const json types(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1406,7 +1533,8 @@ private:
   }
 
   const json type_detail(const std::string& schema, const std::string& type_name) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_BUILD_OBJECT(
@@ -1478,7 +1606,8 @@ private:
   }
 
   const json roles() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1516,7 +1645,8 @@ private:
   }
 
   const json foreign_tables(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     // Deliberately excludes user mapping options: pg_user_mapping/pg_user_mappings
     // expose credentials (e.g. password) in cleartext to superusers, which would
@@ -1556,7 +1686,8 @@ private:
   }
 
   const json foreign_servers() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     // Server options only (host/port/dbname-style); never user mapping credentials.
     std::string query = R"(
@@ -1584,7 +1715,8 @@ private:
   }
 
   const json tablespaces() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1609,7 +1741,8 @@ private:
   }
 
   const json collations(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     // Restrict to collations usable in this database's encoding (collencoding = -1
     // means "any encoding"); otherwise libc ships many same-named rows per locale,
@@ -1641,7 +1774,8 @@ private:
   }
 
   const json event_triggers() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1668,7 +1802,8 @@ private:
   }
 
   const json publications() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1701,7 +1836,8 @@ private:
   }
 
   const json subscriptions() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     // Deliberately excludes subconninfo: pg_subscription is a shared (cluster-wide)
     // catalog and that column holds the full connection string, which may embed a
@@ -1734,7 +1870,8 @@ private:
   }
 
   const json languages() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1760,7 +1897,8 @@ private:
   }
 
   const json extended_statistics(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1797,7 +1935,8 @@ private:
   }
 
   const json operators(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1825,7 +1964,8 @@ private:
   }
 
   const json operator_classes(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1852,7 +1992,8 @@ private:
   }
 
   const json access_methods() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1876,7 +2017,8 @@ private:
   }
 
   const json casts() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     // Filtered to casts involving at least one user-defined type; unfiltered this
     // returns hundreds of built-in numeric/string coercions that are pure noise
@@ -1909,7 +2051,8 @@ private:
   }
 
   const json text_search_configs(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1947,7 +2090,8 @@ private:
   }
 
   const json sequences(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1990,7 +2134,8 @@ private:
   }
 
   const json table(const std::string& schema, const std::string& table) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_BUILD_OBJECT(
@@ -2180,7 +2325,17 @@ private:
       try {
 	json result_content;
 
-	if (tool_name == "listSchemas") {
+	// Resolve the target connection once, before dispatch. get() throws a
+	// message listing the configured names if this one is unknown, so a
+	// typo fails here rather than as a confusing connect error later.
+	active_ = arguments.contains("connection") && arguments["connection"].is_string()
+	  ? arguments["connection"].get<std::string>() : std::string{};
+	(void)registry_.get(active_);
+
+	if (tool_name == "listConnections") {
+	  result_content = connections();
+	}
+	else if (tool_name == "listSchemas") {
 	  result_content = schemas();
 	}
 	else if (tool_name == "listTables") {

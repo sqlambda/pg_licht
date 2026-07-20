@@ -2,6 +2,8 @@
 #include <cstdlib>
 #include <unistd.h>
 #include <sstream>
+#include <fstream>
+#include <sys/stat.h>
 #if defined(__GNUC__) && !defined(__clang__)
 // GCC-only false positive inside <regex> internals at -O1+; Clang doesn't
 // have this warning group at all, and with -Werror active it would hard-fail
@@ -1077,12 +1079,17 @@ TEST_F(PostgresMCPServerTest, ServerSettingsReturnsCategoriesWithSettings) {
 
 // --- connection setup (application_name, read-only session) ---
 
-TEST_F(PostgresMCPServerTest, ConnectionDefaultsToReadOnlySession) {
+// The read-only guarantee is per transaction, not per session. It used to be a
+// session GUC set once at startup, which a transaction-pooling PgBouncer
+// silently discarded (server_reset_query=DISCARD ALL) -- leaving every call
+// after the first running unguarded. These tests assert the transaction-scoped
+// mechanism that replaced it.
+TEST_F(PostgresMCPServerTest, QueriesRunInAReadOnlyTransaction) {
   json result = srv->call_server_settings();
   bool found = false;
   for (auto& [category, settings] : result.items()) {
-    if (settings.contains("default_transaction_read_only")) {
-      EXPECT_EQ(settings["default_transaction_read_only"]["setting"].get<std::string>(), "on");
+    if (settings.contains("transaction_read_only")) {
+      EXPECT_EQ(settings["transaction_read_only"]["setting"].get<std::string>(), "on");
       found = true;
       break;
     }
@@ -1090,17 +1097,70 @@ TEST_F(PostgresMCPServerTest, ConnectionDefaultsToReadOnlySession) {
   EXPECT_TRUE(found);
 }
 
+// The regression test for the pooler defect: a write must actually fail, not
+// merely be discouraged by a setting we hope survived.
+TEST_F(PostgresMCPServerTest, ReadOnlyTransactionRejectsWrites) {
+  pglicht::ConnConfig cfg;
+  cfg.name = "test";
+  cfg.conninfo = test_url;
+  Session sess{cfg};
+  try {
+    sess.txn().exec("CREATE TABLE grocery.should_not_exist(i int)");
+    FAIL() << "a write succeeded inside a read-only transaction";
+  } catch (const pqxx::sql_error& e) {
+    EXPECT_EQ(e.sqlstate(), "25006");   // read_only_sql_transaction
+  }
+}
+
+// Reproduces the pooler defect directly. A transaction-mode PgBouncer runs
+// server_reset_query = DISCARD ALL when it returns a server connection to the
+// pool, which wipes session state. The old design set
+// default_transaction_read_only once at startup and committed, so behind such a
+// pooler it was discarded and every subsequent call ran unguarded. The
+// transaction-scoped replacement is immune because it re-establishes the
+// guarantee inside each transaction.
+TEST_F(PostgresMCPServerTest, ReadOnlyGuaranteeSurvivesPoolerSessionReset) {
+  pqxx::connection c(test_url);
+  {
+    pqxx::nontransaction n(c);
+    n.exec("SET default_transaction_read_only = on");   // what the old code did
+  }
+  {
+    pqxx::nontransaction n(c);
+    n.exec("DISCARD ALL");                              // what the pooler does
+  }
+  {
+    pqxx::nontransaction n(c);
+    pqxx::result r = n.exec("SHOW default_transaction_read_only");
+    // The old guard is gone -- this is the bug, reproduced.
+    EXPECT_EQ(r[0][0].as<std::string>(), "off");
+  }
+
+  // A Session is read-only regardless of any prior session state.
+  pglicht::ConnConfig cfg;
+  cfg.name = "test";
+  cfg.conninfo = test_url;
+  Session sess{cfg};
+  pqxx::result r = sess.txn().exec("SHOW transaction_read_only");
+  EXPECT_EQ(r[0][0].as<std::string>(), "on");
+}
+
 TEST_F(PostgresMCPServerTest, ConnectionSetsApplicationNameWithVersion) {
-  pqxx::nontransaction ntxn(*admin_conn);
-  pqxx::result res = ntxn.exec(
-    "SELECT application_name FROM pg_stat_activity "
-    "WHERE datname = " + ntxn.quote(test_dbname) +
-    " AND application_name LIKE 'pg-licht-cpp/%'"
-  );
-  ASSERT_FALSE(res.empty());
-  std::string app_name = res[0][0].as<std::string>();
-  EXPECT_EQ(app_name.rfind("pg-licht-cpp/", 0), 0u);
-  EXPECT_GT(app_name.size(), std::string("pg-licht-cpp/").size());
+  // Connections are opened per call and closed after, so the server's backend
+  // cannot be observed from another session. Read the GUC from inside the
+  // server's own transaction instead.
+  json result = srv->call_server_settings();
+  bool found = false;
+  for (auto& [category, settings] : result.items()) {
+    if (settings.contains("application_name")) {
+      std::string app_name = settings["application_name"]["setting"].get<std::string>();
+      EXPECT_EQ(app_name.rfind("pg-licht-cpp/", 0), 0u);
+      EXPECT_GT(app_name.size(), std::string("pg-licht-cpp/").size());
+      found = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(found);
 }
 
 // --- listTypes / typeDetails ---
@@ -1574,6 +1634,171 @@ TEST_F(PostgresMCPServerTest, TableBloatExactReturnsExpectedFields) {
 TEST_F(PostgresMCPServerTest, TableBloatUnknownTableReturnsEmpty) {
   json result = srv->call_table_bloat("grocery", "does_not_exist", false);
   EXPECT_TRUE(result.empty());
+}
+
+// --- connection config ---
+
+namespace {
+
+// Writes an INI to a unique temp path with the given mode and removes it on
+// destruction, so permission-sensitive tests cannot leak state between runs.
+class TempIni {
+public:
+  TempIni(const std::string& body, mode_t mode = 0600) {
+    std::ostringstream p;
+    p << "/tmp/pg_licht_test_" << ::getpid() << "_" << (counter_++) << ".ini";
+    path_ = p.str();
+    std::ofstream out(path_);
+    out << body;
+    out.close();
+    ::chmod(path_.c_str(), mode);
+  }
+  ~TempIni() { ::unlink(path_.c_str()); }
+  const std::string& path() const { return path_; }
+private:
+  std::string path_;
+  static int counter_;
+};
+int TempIni::counter_ = 0;
+
+pglicht::ConnectionRegistry load(const std::string& body, mode_t mode = 0600) {
+  TempIni ini(body, mode);
+  return pglicht::ConnectionRegistry::from_ini(ini.path(), "pg-licht-test");
+}
+
+}  // namespace
+
+TEST(ConnectionConfigTest, ParsesNamedSections) {
+  auto reg = load("[default]\nhost = localhost\nport = 5432\ndbname = one\n"
+                  "\n[other]\ndbname = two\nuser = bob\n");
+  EXPECT_EQ(reg.default_name(), "default");
+  ASSERT_EQ(reg.names().size(), 2u);
+  EXPECT_EQ(reg.get("other").dbname, "two");
+  EXPECT_EQ(reg.get("other").user, "bob");
+  EXPECT_NE(reg.get("default").conninfo.find("dbname=one"), std::string::npos);
+}
+
+TEST(ConnectionConfigTest, AppendsApplicationName) {
+  auto reg = load("[default]\ndbname = one\n");
+  EXPECT_NE(reg.get("default").conninfo.find("application_name=pg-licht-test"),
+            std::string::npos);
+}
+
+TEST(ConnectionConfigTest, RespectsExplicitApplicationName) {
+  auto reg = load("[default]\ndbname = one\napplication_name = custom\n");
+  const std::string& ci = reg.get("default").conninfo;
+  EXPECT_NE(ci.find("application_name=custom"), std::string::npos);
+  EXPECT_EQ(ci.find("pg-licht-test"), std::string::npos);
+}
+
+TEST(ConnectionConfigTest, ServiceAloneIsValid) {
+  auto reg = load("[prod]\nservice = mysvc\n");
+  EXPECT_EQ(reg.get("prod").service, "mysvc");
+  EXPECT_NE(reg.get("prod").conninfo.find("service=mysvc"), std::string::npos);
+}
+
+TEST(ConnectionConfigTest, ServiceCombinesWithExplicitKeys) {
+  auto reg = load("[staging]\nservice = mysvc\ndbname = override\n");
+  EXPECT_EQ(reg.get("staging").service, "mysvc");
+  EXPECT_EQ(reg.get("staging").dbname, "override");
+}
+
+TEST(ConnectionConfigTest, SectionWithNeitherServiceNorDbnameIsRejected) {
+  // The section name must appear in the message, so the operator knows which
+  // one to fix rather than getting a bare libpq failure at connect time.
+  try {
+    load("[broken]\nhost = localhost\n");
+    FAIL() << "expected a rejection";
+  } catch (const std::exception& e) {
+    EXPECT_NE(std::string(e.what()).find("broken"), std::string::npos);
+  }
+}
+
+TEST(ConnectionConfigTest, GroupReadableFileIsRejected) {
+  try {
+    load("[default]\ndbname = one\npassword = hunter2\n", 0644);
+    FAIL() << "expected a permission rejection";
+  } catch (const std::exception& e) {
+    EXPECT_NE(std::string(e.what()).find("chmod 600"), std::string::npos);
+  }
+}
+
+TEST(ConnectionConfigTest, OptionsKeyIsRejectedWithPgBouncerExplanation) {
+  // PgBouncer refuses GUCs in the startup packet, so this would fail only at
+  // connect time against the pooler this server targets.
+  try {
+    load("[default]\ndbname = one\noptions = -c statement_timeout=1000\n");
+    FAIL() << "expected 'options' to be rejected";
+  } catch (const std::exception& e) {
+    EXPECT_NE(std::string(e.what()).find("PgBouncer"), std::string::npos);
+  }
+}
+
+TEST(ConnectionConfigTest, UnknownConnectionNameListsConfiguredOnes) {
+  auto reg = load("[default]\ndbname = one\n\n[other]\ndbname = two\n");
+  try {
+    reg.get("nope");
+    FAIL() << "expected unknown connection to throw";
+  } catch (const std::exception& e) {
+    std::string msg = e.what();
+    EXPECT_NE(msg.find("nope"), std::string::npos);
+    EXPECT_NE(msg.find("other"), std::string::npos);
+  }
+}
+
+TEST(ConnectionConfigTest, EmptyNameResolvesToDefault) {
+  auto reg = load("[first]\ndbname = one\n\n[second]\ndbname = two\n");
+  // No [default] section, so the first in file order becomes the default.
+  EXPECT_EQ(reg.default_name(), "first");
+  EXPECT_EQ(reg.get("").dbname, "one");
+}
+
+TEST(ConnectionConfigTest, CommentsAndQuotedValuesAreHandled) {
+  auto reg = load("; leading comment\n[default]\n# another\n"
+                  "dbname = one   ; trailing comment\n"
+                  "password = 'has spaces; and #hash'\n");
+  EXPECT_EQ(reg.get("default").dbname, "one");
+  // A quoted value keeps characters that would otherwise start a comment, and
+  // is re-quoted for libpq because it contains whitespace.
+  EXPECT_NE(reg.get("default").conninfo.find("'has spaces; and #hash'"),
+            std::string::npos);
+}
+
+TEST(ConnectionConfigTest, DuplicateSectionIsRejected) {
+  EXPECT_THROW(load("[a]\ndbname = one\n[a]\ndbname = two\n"), std::exception);
+}
+
+TEST(ConnectionConfigTest, PasswordIsNotRetainedForDisplay) {
+  auto reg = load("[default]\ndbname = one\npassword = hunter2\n");
+  const auto& c = reg.get("default");
+  // It must reach libpq via the conninfo, but never be echoed back.
+  EXPECT_NE(c.conninfo.find("password=hunter2"), std::string::npos);
+  EXPECT_EQ(c.host, "");
+  EXPECT_EQ(c.service, "");
+  EXPECT_EQ(c.dbname, "one");
+}
+
+TEST(ConnectionConfigTest, FromUrlBuildsASingleDefault) {
+  auto reg = pglicht::ConnectionRegistry::from_url("port=5555 dbname=x", "app/1");
+  EXPECT_EQ(reg.default_name(), "default");
+  EXPECT_EQ(reg.names().size(), 1u);
+  EXPECT_NE(reg.get("default").conninfo.find("application_name=app/1"),
+            std::string::npos);
+}
+
+TEST(ConnectionConfigTest, FromUrlLeavesUriFormUntouched) {
+  // libpq parses URI forms itself; appending keywords would corrupt them.
+  auto reg = pglicht::ConnectionRegistry::from_url("postgresql://h/db", "app/1");
+  EXPECT_EQ(reg.get("default").conninfo, "postgresql://h/db");
+}
+
+TEST_F(PostgresMCPServerTest, ListConnectionsReportsDefaultWithoutSecrets) {
+  json result = srv->call_connections();
+  ASSERT_TRUE(result.is_array());
+  ASSERT_EQ(result.size(), 1u);
+  EXPECT_EQ(result[0]["name"].get<std::string>(), "default");
+  EXPECT_TRUE(result[0]["default"].get<bool>());
+  EXPECT_FALSE(result[0].contains("password"));
 }
 
 int main(int argc, char **argv) {

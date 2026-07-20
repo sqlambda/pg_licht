@@ -8,7 +8,9 @@ Motivation to create another PostgreSQL MCP:
 - Allow to describe database model and routines based on what is in the database
 - Fast inspection of available indexes and relationships when analyzing a query plan
 
-Every query is parameterized (`$1`/`$2` bindings or `::regnamespace`/`::regclass` casts) — no schema, table, or search-term argument is ever concatenated into SQL text. On connect, the session sets `default_transaction_read_only = on`, so even a bug that let a query attempt a write would still fail rather than succeed silently.
+Every query is parameterized (`$1`/`$2` bindings or `::regnamespace`/`::regclass` casts) — no schema, table, or search-term argument is ever concatenated into SQL text. Every tool call runs inside its own `READ ONLY` transaction, so even a bug that let a query attempt a write would still fail (SQLSTATE `25006`) rather than succeed silently.
+
+The read-only guard is deliberately *transaction*-scoped rather than session-scoped. Under a connection pooler in transaction mode (PgBouncer's `pool_mode = transaction` with `server_reset_query = DISCARD ALL`), the server connection is returned to the pool at commit and its session state is wiped — so a `SET` issued once at startup silently stops applying to later calls. Transaction scope is the scope a pooler preserves. The setting cannot be pushed into the connection string either: PgBouncer rejects GUCs in the startup packet outright (`unsupported startup parameter in options: ...`).
 
 ## Tools
 
@@ -52,6 +54,9 @@ Every query is parameterized (`$1`/`$2` bindings or `::regnamespace`/`::regclass
 | `statementStats` | The slowest tracked queries by total execution time (`pg_stat_statements`), with calls, timing, row counts, and buffer usage; returns a clear error with setup instructions if the extension is not installed |
 | `tableBloat` | Physical storage bloat for a table (`pgstattuple`/`pgstattuple_approx`): live/dead tuple counts and percentages, free space and percentage. Defaults to the cheap visibility-map-based approximation; `exact: true` runs a precise but I/O-heavy full table scan. More accurate than the ANALYZE-time estimates in `listTables`/`tableDetails`. Returns a clear error with setup instructions if the extension is not installed |
 | `checkKey` | Check if a row exists by primary key (single or composite); validates value types against PK column types before querying |
+| `listConnections` | The configured database connections by name, with the libpq `service` name or host/port/dbname/user for each, and which is the default. Passwords are never returned and a service file is never expanded |
+
+Every tool also accepts an optional `connection` argument naming one of the configured connections (see [Configuration](#configuration)); omit it to use the default.
 
 ## Install
 
@@ -122,7 +127,56 @@ DATABASE_URL="host=localhost port=5432 dbname=mydb" ./pg_licht_mcp
 
 # or as an argument
 ./pg_licht_mcp "postgresql://user:pass@host/dbname"
+
+# or several named databases from a config file
+./pg_licht_mcp --config ~/.config/pg_licht/connections.ini
 ```
+
+## Configuration
+
+A single database needs nothing beyond `DATABASE_URL`. To reach several databases from one
+server, list them in an INI file:
+
+```ini
+[default]
+port    = 6432
+dbname  = pglicht
+user    = daniel
+sslmode = prefer
+; no password here — use ~/.pgpass or a service file
+
+[prod]
+; a libpq service name, resolved from ~/.pg_service.conf,
+; $PGSERVICEFILE, or $PGSYSCONFDIR/pg_service.conf
+service = podb01_ro
+
+[staging]
+service = podb01_ro        ; the service supplies the defaults…
+dbname  = podb01_staging   ; …and explicit keys override them
+```
+
+Pass a section name as the `connection` argument of any tool to run it against that
+database; omit it to use `[default]` (or, if there is no `[default]`, the first section).
+`listConnections` reports what is configured.
+
+Keys are passed through to libpq, so anything libpq accepts works — including `service`,
+which may be used on its own in place of `host`/`port`/`dbname`/`user`. Each section must
+set either `service` or at least `dbname`. `options` is rejected, because PgBouncer refuses
+GUCs in the startup packet; pg-licht sets what it needs per transaction instead.
+
+The file is resolved in this order: `--config <path>`, `$PG_LICHT_CONFIG`,
+`~/.config/pg_licht/connections.ini` (only if it exists), then `DATABASE_URL`, then
+`argv[1]`.
+
+Because sections may carry passwords, the file must not be group- or world-accessible —
+pg-licht refuses to load it otherwise, the same rule libpq applies to `~/.pgpass`:
+
+```bash
+chmod 600 ~/.config/pg_licht/connections.ini
+```
+
+Note that libpq enforces that rule on `~/.pgpass` but *not* on `pg_service.conf`, so if a
+service file holds a password, its permissions are yours to manage.
 
 ## Test
 
