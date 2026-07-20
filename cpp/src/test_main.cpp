@@ -1636,6 +1636,343 @@ TEST_F(PostgresMCPServerTest, TableBloatUnknownTableReturnsEmpty) {
   EXPECT_TRUE(result.empty());
 }
 
+// --- explainQuery ---
+
+TEST_F(PostgresMCPServerTest, ExplainQueryReturnsAPlan) {
+  json r = srv->call_explain_query("", "SELECT * FROM grocery.users", json::array(), false, 0);
+  ASSERT_TRUE(r.contains("plan")) << r.dump(2);
+  EXPECT_FALSE(r["generic"].get<bool>());
+  EXPECT_FALSE(r["analyzed"].get<bool>());
+  EXPECT_TRUE(r["read_only"].get<bool>());
+  EXPECT_EQ(r["source"].get<std::string>(), "sql");
+  ASSERT_TRUE(r["plan"].is_array());
+  EXPECT_TRUE(r["plan"][0].contains("Plan"));
+}
+
+TEST_F(PostgresMCPServerTest, ExplainQueryAnalyzeAddsActualTimings) {
+  json r = srv->call_explain_query("", "SELECT * FROM grocery.users", json::array(), true, 5000);
+  ASSERT_TRUE(r.contains("plan")) << r.dump(2);
+  EXPECT_TRUE(r["analyzed"].get<bool>());
+  EXPECT_TRUE(r["plan"][0].contains("Execution Time"));
+  EXPECT_TRUE(r["plan"][0]["Plan"].contains("Actual Total Time"));
+}
+
+TEST_F(PostgresMCPServerTest, ExplainQueryAnalyzeRequiresExplicitTimeout) {
+  EXPECT_THROW(srv->call_explain_query("", "SELECT 1", json::array(), true, 0),
+               std::exception);
+}
+
+TEST_F(PostgresMCPServerTest, ExplainQueryPlaceholdersFallBackToGenericPlan) {
+  json r = srv->call_explain_query("", "SELECT * FROM grocery.users WHERE id = $1",
+                                   json::array(), false, 0);
+  ASSERT_TRUE(r.contains("plan")) << r.dump(2);
+  EXPECT_TRUE(r["generic"].get<bool>());
+  EXPECT_FALSE(r["analyzed"].get<bool>());
+}
+
+TEST_F(PostgresMCPServerTest, ExplainQueryGenericPlanIsNeverAnalyzed) {
+  json r = srv->call_explain_query("", "SELECT * FROM grocery.users WHERE id = $1",
+                                   json::array(), true, 5000);
+  EXPECT_TRUE(r["generic"].get<bool>());
+  EXPECT_FALSE(r["analyzed"].get<bool>());
+  ASSERT_TRUE(r.contains("note"));
+}
+
+TEST_F(PostgresMCPServerTest, ExplainQueryWithParamsGivesRealPlanAndAnalyzes) {
+  json r = srv->call_explain_query("", "SELECT * FROM grocery.users WHERE id = $1",
+                                   json::array({1}), true, 5000);
+  ASSERT_TRUE(r.contains("plan")) << r.dump(2);
+  EXPECT_FALSE(r["generic"].get<bool>());
+  EXPECT_TRUE(r["analyzed"].get<bool>());
+  EXPECT_TRUE(r["plan"][0].contains("Execution Time"));
+}
+
+// The write gate: a plan is inspected for ModifyTable before anything runs.
+TEST_F(PostgresMCPServerTest, ExplainQueryRefusesToAnalyzeUpdate) {
+  json r = srv->call_explain_query(
+    "", "UPDATE grocery.users SET name = 'zzz' WHERE id = 1", json::array(), true, 5000);
+  ASSERT_TRUE(r.contains("plan")) << r.dump(2);
+  EXPECT_FALSE(r["read_only"].get<bool>());
+  EXPECT_FALSE(r["analyzed"].get<bool>());
+  ASSERT_TRUE(r.contains("note"));
+  json chk = srv->call_check_key("grocery", "users", json::array({1}));
+  EXPECT_TRUE(chk["exists"].get<bool>());
+}
+
+// The case a root-node-only check would miss: the ModifyTable is nested under
+// a CTE subplan.
+TEST_F(PostgresMCPServerTest, ExplainQueryRefusesToAnalyzeDataModifyingCTE) {
+  json r = srv->call_explain_query(
+    "", "WITH d AS (DELETE FROM grocery.users WHERE id = 2 RETURNING *) SELECT * FROM d",
+    json::array(), true, 5000);
+  ASSERT_TRUE(r.contains("plan")) << r.dump(2);
+  EXPECT_FALSE(r["read_only"].get<bool>());
+  EXPECT_FALSE(r["analyzed"].get<bool>());
+  json chk = srv->call_check_key("grocery", "users", json::array({2}));
+  EXPECT_TRUE(chk["exists"].get<bool>());
+}
+
+TEST_F(PostgresMCPServerTest, ExplainQueryRejectsUtilityStatements) {
+  EXPECT_THROW(srv->call_explain_query("", "SET work_mem = '4MB'", json::array(), false, 0),
+               std::exception);
+  EXPECT_THROW(srv->call_explain_query("", "VACUUM grocery.users", json::array(), false, 0),
+               std::exception);
+  EXPECT_THROW(srv->call_explain_query("", "CREATE TABLE t(i int)", json::array(), false, 0),
+               std::exception);
+}
+
+TEST_F(PostgresMCPServerTest, ExplainQueryRejectsMultipleStatements) {
+  EXPECT_THROW(srv->call_explain_query("", "SELECT 1; SELECT 2", json::array(), false, 0),
+               std::exception);
+}
+
+TEST_F(PostgresMCPServerTest, ExplainQueryAcceptsATrailingSemicolon) {
+  json r = srv->call_explain_query("", "SELECT * FROM grocery.users;", json::array(), false, 0);
+  EXPECT_TRUE(r.contains("plan")) << r.dump(2);
+}
+
+TEST_F(PostgresMCPServerTest, ExplainQueryRejectsBothOrNeitherSource) {
+  EXPECT_THROW(srv->call_explain_query("", "", json::array(), false, 0), std::exception);
+  EXPECT_THROW(srv->call_explain_query("123", "SELECT 1", json::array(), false, 0),
+               std::exception);
+}
+
+TEST_F(PostgresMCPServerTest, ExplainQuerySyntaxErrorReturnsHint) {
+  json r = srv->call_explain_query("", "SELECT FROM WHERE", json::array(), false, 0);
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  EXPECT_TRUE(r.contains("hint"));
+}
+
+// Values reach EXECUTE as SQL text, so escaping is the only thing standing
+// between a parameter and statement injection.
+TEST_F(PostgresMCPServerTest, ExplainQueryParamsAreNotInjectable) {
+  json r = srv->call_explain_query(
+    "", "SELECT * FROM grocery.users WHERE name = $1",
+    json::array({"x'); DROP TABLE grocery.users; --"}), true, 5000);
+  ASSERT_TRUE(r.contains("plan")) << r.dump(2);
+  EXPECT_TRUE(r["analyzed"].get<bool>());
+  json chk = srv->call_check_key("grocery", "users", json::array({1}));
+  EXPECT_TRUE(chk["exists"].get<bool>());
+}
+
+TEST_F(PostgresMCPServerTest, ExplainQueryNullParamBindsAsSqlNull) {
+  json r = srv->call_explain_query("", "SELECT * FROM grocery.users WHERE name = $1",
+                                   json::array({nullptr}), true, 5000);
+  ASSERT_TRUE(r.contains("plan")) << r.dump(2);
+  EXPECT_TRUE(r["analyzed"].get<bool>());
+}
+
+TEST_F(PostgresMCPServerTest, ExplainQueryWrongParamCountThrows) {
+  EXPECT_THROW(srv->call_explain_query("", "SELECT * FROM grocery.users WHERE id = $1",
+                                       json::array({1, 2}), false, 0), std::exception);
+}
+
+TEST_F(PostgresMCPServerTest, ExplainQueryTimeoutIsClamped) {
+  json r = srv->call_explain_query("", "SELECT 1", json::array(), true, 999999);
+  EXPECT_EQ(r["timeout_ms"].get<int>(), 30000);
+  json r2 = srv->call_explain_query("", "SELECT 1", json::array(), false, 0);
+  EXPECT_EQ(r2["timeout_ms"].get<int>(), 5000);
+}
+
+TEST_F(PostgresMCPServerTest, ExplainQueryTimeoutFiresOnSlowAnalyze) {
+  json r = srv->call_explain_query("", "SELECT pg_sleep(5)", json::array(), true, 200);
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  EXPECT_NE(r["error"].get<std::string>().find("timeout"), std::string::npos);
+  EXPECT_TRUE(r.contains("hint"));
+}
+
+// Prepared statements are session state and survive ROLLBACK, so a leak would
+// accumulate on a reused connection. Two identical calls must both succeed.
+TEST_F(PostgresMCPServerTest, ExplainQueryLeavesNoPreparedStatementBehind) {
+  for (int i = 0; i < 3; i++) {
+    json r = srv->call_explain_query("", "SELECT * FROM grocery.users WHERE id = $1",
+                                     json::array({1}), true, 5000);
+    ASSERT_TRUE(r["analyzed"].get<bool>()) << r.dump(2);
+  }
+}
+
+TEST_F(PostgresMCPServerTest, ExplainQueryRejectsNonNumericQueryId) {
+  EXPECT_THROW(srv->call_explain_query("abc", "", json::array(), false, 0), std::exception);
+  EXPECT_THROW(srv->call_explain_query("1; DROP TABLE x", "", json::array(), false, 0),
+               std::exception);
+}
+
+TEST_F(PostgresMCPServerTest, ExplainQueryByQueryIdReportsMissingExtension) {
+  // pg_stat_statements is per-database and the test database is created fresh,
+  // so the extension is absent here -- the same reason
+  // StatementStatsReturnsHintWhenNotInstalled passes.
+  json r = srv->call_explain_query("123456789", "", json::array(), false, 0);
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  EXPECT_EQ(r["error"].get<std::string>(), "pg_stat_statements is not installed");
+  EXPECT_TRUE(r.contains("hint"));
+}
+
+// --- explainQuery against a real pg_stat_statements ---
+//
+// The main fixture's database deliberately has no pg_stat_statements (which is
+// what StatementStatsReturnsHintWhenNotInstalled asserts), so the queryid path
+// gets its own database and creates the extension there. It skips when the
+// library is not preloaded, so this still passes on a server without it.
+//
+// This exists because both bugs found in the queryid path were null fields
+// coming back from pg_stat_statements, which no amount of sql-argument testing
+// would have caught.
+class PgssMCPServerTest : public ::testing::Test {
+protected:
+  static pqxx::connection* admin;
+  static PostgresMCPServer* srv;
+  static std::string dbname;
+  static std::string url;
+  static bool available;
+
+  static void SetUpTestSuite() {
+    const char* env_url = std::getenv("DATABASE_URL");
+    std::string base = env_url;
+    dbname = "pg_licht_pgss_" + std::to_string(getpid());
+
+    try {
+      admin = new pqxx::connection(base);
+      {
+        pqxx::nontransaction n(*admin);
+        n.exec("CREATE DATABASE \"" + dbname + "\"");
+      }
+
+      std::regex dbname_re(R"(\bdbname\s*=\s*\S+)");
+      if (std::regex_search(base, dbname_re))
+        url = std::regex_replace(base, dbname_re, "dbname=" + dbname);
+      else
+        url = base + " dbname=" + dbname;
+
+      pqxx::connection c(url);
+      {
+        pqxx::work t(c);
+        t.exec("CREATE EXTENSION pg_stat_statements");
+        t.commit();
+      }
+      {
+        // Generate a statement with a placeholder so the recovered text is
+        // normalised, which is the case the tool has to cope with.
+        pqxx::work t(c);
+        t.exec("SELECT count(*) FROM pg_class WHERE relname LIKE 'pg_%'");
+        t.commit();
+      }
+      srv = new PostgresMCPServer(url);
+      available = true;
+    } catch (const std::exception&) {
+      // Most likely pg_stat_statements is not in shared_preload_libraries.
+      available = false;
+    }
+  }
+
+  static void TearDownTestSuite() {
+    delete srv; srv = nullptr;
+    if (admin) {
+      try {
+        pqxx::nontransaction n(*admin);
+        n.exec("DROP DATABASE IF EXISTS \"" + dbname + "\" WITH (FORCE)");
+      } catch (const std::exception&) {}
+      delete admin; admin = nullptr;
+    }
+  }
+
+  void SetUp() override {
+    if (!available)
+      GTEST_SKIP() << "pg_stat_statements unavailable (not in shared_preload_libraries)";
+  }
+
+  // The queryid of the seeded statement, as a decimal string.
+  static std::string seeded_queryid() {
+    pqxx::connection c(url);
+    pqxx::work t(c);
+    pqxx::result r = t.exec(
+      "SELECT queryid::text FROM pg_stat_statements "
+      "WHERE query ILIKE 'SELECT count(*) FROM pg_class%' "
+      "AND dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) "
+      "ORDER BY total_exec_time DESC LIMIT 1");
+    return r.empty() ? std::string{} : r[0][0].as<std::string>();
+  }
+};
+
+pqxx::connection* PgssMCPServerTest::admin = nullptr;
+PostgresMCPServer* PgssMCPServerTest::srv = nullptr;
+std::string PgssMCPServerTest::dbname;
+std::string PgssMCPServerTest::url;
+bool PgssMCPServerTest::available = false;
+
+TEST_F(PgssMCPServerTest, RecoversStatementByQueryIdAndPlansItGenerically) {
+  std::string qid = seeded_queryid();
+  ASSERT_FALSE(qid.empty());
+
+  json r = srv->call_explain_query(qid, "", json::array(), false, 0);
+  ASSERT_TRUE(r.contains("plan")) << r.dump(2);
+  EXPECT_EQ(r["source"].get<std::string>(), "pg_stat_statements");
+  // The recovered text is normalised, so it can only be planned generically.
+  EXPECT_TRUE(r["generic"].get<bool>());
+  EXPECT_NE(r["sql"].get<std::string>().find("$1"), std::string::npos);
+  ASSERT_TRUE(r.contains("statement"));
+  EXPECT_GT(r["statement"]["calls"].get<long long>(), 0);
+}
+
+TEST_F(PgssMCPServerTest, ParamsTurnARecoveredStatementIntoARealAnalyzedPlan) {
+  std::string qid = seeded_queryid();
+  ASSERT_FALSE(qid.empty());
+
+  json r = srv->call_explain_query(qid, "", json::array({"pg_%"}), true, 5000);
+  ASSERT_TRUE(r.contains("plan")) << r.dump(2);
+  EXPECT_FALSE(r["generic"].get<bool>());
+  EXPECT_TRUE(r["analyzed"].get<bool>());
+  EXPECT_TRUE(r["plan"][0].contains("Execution Time"));
+}
+
+TEST_F(PgssMCPServerTest, UnknownQueryIdReturnsHint) {
+  json r = srv->call_explain_query("987654321987654321", "", json::array(), false, 0);
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  EXPECT_NE(r["error"].get<std::string>().find("no pg_stat_statements entry"),
+            std::string::npos);
+  EXPECT_TRUE(r.contains("hint"));
+}
+
+// pg_stat_statements keeps entries for databases that have since been dropped,
+// so the LEFT JOIN to pg_database yields a null name. Reading that with
+// json::value() throws; this is the regression test for that.
+TEST_F(PgssMCPServerTest, QueryIdFromADroppedDatabaseIsReportedNotCrashed) {
+  std::string victim = dbname + "_victim";
+  {
+    pqxx::nontransaction n(*admin);
+    n.exec("CREATE DATABASE \"" + victim + "\"");
+  }
+  std::string victim_url = std::regex_replace(
+    url, std::regex(R"(\bdbname\s*=\s*\S+)"), "dbname=" + victim);
+  {
+    pqxx::connection c(victim_url);
+    pqxx::work t(c);
+    // The marker must be an identifier, not a literal: pg_stat_statements
+    // normalises literals away, so a distinctive string constant would not
+    // survive to be searched for.
+    t.exec("SELECT count(*) AS zzz_victim_marker FROM pg_class");
+    t.commit();
+  }
+  std::string qid;
+  {
+    pqxx::connection c(url);
+    pqxx::work t(c);
+    pqxx::result r = t.exec(
+      "SELECT queryid::text FROM pg_stat_statements "
+      "WHERE query ILIKE '%zzz_victim_marker%' ORDER BY total_exec_time DESC LIMIT 1");
+    if (!r.empty()) qid = r[0][0].as<std::string>();
+  }
+  {
+    pqxx::nontransaction n(*admin);
+    n.exec("DROP DATABASE \"" + victim + "\" WITH (FORCE)");
+  }
+  if (qid.empty()) GTEST_SKIP() << "could not seed a foreign-database statement";
+
+  json r = srv->call_explain_query(qid, "", json::array(), false, 0);
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  EXPECT_NE(r["error"].get<std::string>().find("no longer exists"), std::string::npos);
+  EXPECT_TRUE(r.contains("hint"));
+}
+
 // --- connection config ---
 
 namespace {

@@ -8,6 +8,16 @@
 
 ### New tools
 
+- **`explainQuery`** — returns the raw `EXPLAIN (FORMAT JSON)` plan for a statement, closing the loop left open by `statementStats`: you could see *that* a query was slow but never *why*. Takes either a `queryid` (the full untruncated text is re-fetched from `pg_stat_statements` server-side) or `sql` directly, so a proposed rewrite can be explained and compared against the original.
+
+  Statements recovered from `pg_stat_statements` are normalized, with literals replaced by `$1`/`$2`. Plain `EXPLAIN` rejects that text outright, so they are planned with `EXPLAIN (GENERIC_PLAN)` (PostgreSQL 16+). Supplying `params` instead has the statement `PREPARE`d and planned with real values, which also enables `ANALYZE`.
+
+  Nothing that modifies data is ever executed. Four layers, in order: utility statements are rejected before any SQL is sent (`pg_stat_statements` tracks `CREATE DATABASE`, `SET`, `VACUUM`, … which have no plan at all); multi-statement text is rejected; the plan is inspected for a `ModifyTable` node anywhere in the tree, which catches data-modifying CTEs such as `WITH d AS (DELETE … RETURNING *) SELECT * FROM d` where the node is nested under a CTE subplan; and the enclosing `READ ONLY` transaction aborts anything a plan cannot reveal, such as a `VOLATILE` function that writes at runtime. `analyze: true` additionally requires an explicit `timeout_ms` (clamped to 100–30000) — these are by construction the slowest statements in the cluster, so the caller has to state a bound rather than inherit one.
+
+  Parameter values reach `EXECUTE` as SQL text, since `EXECUTE` arguments cannot be bind parameters. Every non-null value is emitted as a quoted literal of unknown type through a single escaping path and coerced by PostgreSQL to the inferred parameter type, so there is one place to get escaping right rather than one per JSON type.
+
+  The output is the plan verbatim plus `generic`/`analyzed`/`read_only` flags, the timeout used, the statement text actually explained, and the `pg_stat_statements` row. No heuristics and no generated DDL — interpretation is left to the caller.
+
 - **`listConnections`** — returns the configured connections by name, with the libpq `service` name or host/port/dbname/user for each, and which is the default. Passwords are never returned and a service file is never expanded.
 
 ### Enhancements

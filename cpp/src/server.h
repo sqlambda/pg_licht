@@ -4,6 +4,7 @@
 #include <iostream>
 #include <set>
 #include <string>
+#include <unistd.h>
 #include <nlohmann/json.hpp>
 #include "config.h"
 #if defined(__GNUC__) && !defined(__clang__)
@@ -156,6 +157,10 @@ public:
   }
 
   const json call_connections() { return connections(); }
+  const json call_explain_query(const std::string& queryid, const std::string& sql,
+                                const json& params, bool analyze, int timeout_ms) {
+    return explain_query(queryid, sql, params, analyze, timeout_ms);
+  }
 
 private:
   pglicht::ConnectionRegistry registry_;
@@ -572,6 +577,35 @@ private:
 		    {"values", {{"type", "array"}}}
 		  }},
 		{"required", {"schema", "table", "values"}}
+	      }}
+	  },
+	  {
+	    {"name", "explainQuery"},
+	    {"description", "return the raw EXPLAIN (FORMAT JSON) plan for a statement, either recovered from pg_stat_statements by queryid (full untruncated text) or supplied directly as sql. Runs in a read-only transaction bounded by statement_timeout. Statements with $n placeholders are planned with GENERIC_PLAN unless concrete params are supplied, in which case the statement is PREPAREd and planned with real values. analyze:true runs EXPLAIN (ANALYZE, BUFFERS), which really executes the statement, and is honoured only after the plan is proven free of any ModifyTable node -- so data-modifying statements, including data-modifying CTEs, are never executed; it also requires an explicit timeout_ms. Returns the plan verbatim plus generic/analyzed/read_only flags and the pg_stat_statements row; no heuristics and no generated DDL, the plan is yours to interpret"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", {
+		    {"queryid", {
+			{"type", "string"},
+			{"description", "pg_stat_statements queryid as a decimal string (it is a 64-bit value and does not survive JSON number precision). Mutually exclusive with 'sql'"}
+		      }},
+		    {"sql", {
+			{"type", "string"},
+			{"description", "a single SELECT/INSERT/UPDATE/DELETE/MERGE/WITH/TABLE/VALUES statement to explain. Utility statements (SET, CREATE, VACUUM, ...) are rejected. Mutually exclusive with 'queryid'"}
+		      }},
+		    {"params", {
+			{"type", "array"},
+			{"description", "concrete values for the statement's $1..$n placeholders, in order. Supply these for a real (non-generic) plan; required to use analyze. Values are bound as literals of unknown type and coerced by PostgreSQL to the inferred parameter types; use null for SQL NULL"}
+		      }},
+		    {"analyze", {
+			{"type", "boolean"},
+			{"description", "run EXPLAIN (ANALYZE, BUFFERS), which really executes the statement. Requires timeout_ms. Ignored with an explanatory 'note' if the statement modifies data or could only be planned generically. Default false"}
+		      }},
+		    {"timeout_ms", {
+			{"type", "integer"},
+			{"description", "statement_timeout for the explain, in milliseconds, clamped to [100, 30000]. Required when analyze is true; defaults to 5000 for plan-only calls"}
+		      }}
+		  }}
 	      }}
 	  },
 	  {
@@ -1167,6 +1201,377 @@ private:
         };
       }
       throw;
+    }
+  }
+
+  // A plan is read-only iff no ModifyTable node appears anywhere in the tree.
+  // Checking the whole tree rather than just the root is what catches a
+  // data-modifying CTE -- WITH d AS (DELETE ... RETURNING *) SELECT * FROM d --
+  // where the ModifyTable is nested under a CTE subplan.
+  static bool plan_has_modify(const json& node) {
+    if (node.is_array()) {
+      for (const auto& e : node) if (plan_has_modify(e)) return true;
+      return false;
+    }
+    if (!node.is_object()) return false;
+    auto it = node.find("Node Type");
+    if (it != node.end() && it->is_string() && it->get<std::string>() == "ModifyTable")
+      return true;
+    for (const auto& e : node.items()) if (plan_has_modify(e.value())) return true;
+    return false;
+  }
+
+  // First keyword of a statement, uppercased, skipping leading whitespace and
+  // comments. pg_stat_statements also tracks utility statements (CREATE
+  // DATABASE, SET, VACUUM, ...), and EXPLAIN cannot take those at all --
+  // "EXPLAIN SET work_mem='4MB'" is a syntax error, not a graceful failure.
+  static std::string leading_keyword(const std::string& sql) {
+    size_t i = 0;
+    for (;;) {
+      while (i < sql.size() && std::isspace(static_cast<unsigned char>(sql[i]))) i++;
+      if (i + 1 < sql.size() && sql[i] == '-' && sql[i + 1] == '-') {
+        while (i < sql.size() && sql[i] != '\n') i++;
+      } else if (i + 1 < sql.size() && sql[i] == '/' && sql[i + 1] == '*') {
+        size_t e = sql.find("*/", i + 2);
+        if (e == std::string::npos) return "";
+        i = e + 2;
+      } else {
+        break;
+      }
+    }
+    // A leading "(" means a parenthesised SELECT, e.g. (SELECT ...) UNION ...
+    if (i < sql.size() && sql[i] == '(') return "SELECT";
+    size_t s = i;
+    while (i < sql.size() && std::isalpha(static_cast<unsigned char>(sql[i]))) i++;
+    std::string kw = sql.substr(s, i - s);
+    for (char& c : kw) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return kw;
+  }
+
+  // Strip one trailing semicolon; reject anything that looks like a second
+  // statement. pqxx uses the simple protocol for exec(), which would happily
+  // run "SELECT 1; DROP TABLE t" as two statements once concatenated after
+  // EXPLAIN, so caller-supplied text must be proven to be a single statement.
+  static std::string require_single_statement(const std::string& sql) {
+    std::string t = sql;
+    size_t end = t.find_last_not_of(" \t\r\n");
+    if (end != std::string::npos) t = t.substr(0, end + 1);
+    if (!t.empty() && t.back() == ';') {
+      t.pop_back();
+      size_t e2 = t.find_last_not_of(" \t\r\n");
+      t = (e2 == std::string::npos) ? "" : t.substr(0, e2 + 1);
+    }
+    if (t.find(';') != std::string::npos)
+      throw std::runtime_error(
+        "sql must be a single statement; found an embedded ';'");
+    return t;
+  }
+
+  // Build the literal list for EXECUTE. EXECUTE arguments are parsed as
+  // expressions and cannot be bind parameters, so the values have to appear in
+  // the SQL text. Every non-null value is emitted as a quoted string literal of
+  // unknown type and left for PostgreSQL to coerce into the prepared
+  // statement's inferred parameter type. That is deliberate: it means there is
+  // exactly one escaping path (txn.quote, i.e. libpq's escaping) rather than
+  // one per JSON type, and no numeric or boolean value is ever spliced in raw.
+  static std::string build_execute_literals(pqxx::work& txn, const json& params) {
+    std::string lits;
+    for (size_t i = 0; i < params.size(); i++) {
+      if (i > 0) lits += ", ";
+      const json& v = params[i];
+      if (v.is_null())          lits += "NULL";
+      else if (v.is_string())   lits += txn.quote(v.get<std::string>());
+      else if (v.is_boolean())  lits += txn.quote(std::string(v.get<bool>() ? "true" : "false"));
+      else                      lits += txn.quote(v.dump());
+    }
+    return lits;
+  }
+
+  // json::value() throws if a key exists but holds null, which happens
+  // routinely here: pg_stat_statements keeps entries for dropped databases, so
+  // the LEFT JOIN to pg_database yields a null name, and query text can be null
+  // when the caller lacks permission to read it.
+  static std::string json_str(const json& j, const char* key,
+                              const std::string& fallback = "") {
+    auto it = j.find(key);
+    if (it == j.end() || !it->is_string()) return fallback;
+    return it->get<std::string>();
+  }
+
+  const json explain_query(const std::string& queryid, const std::string& sql_in,
+                           const json& params, bool analyze, int timeout_ms) {
+    // --- argument validation (caller errors -> isError:true via dispatch) ---
+    if (queryid.empty() && sql_in.empty())
+      throw std::runtime_error("one of queryid or sql is required");
+    if (!queryid.empty() && !sql_in.empty())
+      throw std::runtime_error("queryid and sql are mutually exclusive");
+    if (!params.is_array())
+      throw std::runtime_error("params must be an array");
+    if (params.size() > 64)
+      throw std::runtime_error("params has " + std::to_string(params.size()) +
+                               " entries; at most 64 are supported");
+    if (!queryid.empty()) {
+      bool ok = !queryid.empty() && queryid.size() <= 20;
+      for (size_t i = 0; ok && i < queryid.size(); i++) {
+        if (i == 0 && queryid[i] == '-') { ok = queryid.size() > 1; continue; }
+        if (!std::isdigit(static_cast<unsigned char>(queryid[i]))) ok = false;
+      }
+      if (!ok)
+        throw std::runtime_error("queryid must be a decimal integer string");
+    }
+    // EXPLAIN ANALYZE really executes the statement, and these are by
+    // construction the slowest queries in the cluster. The caller must state a
+    // bound consciously rather than inherit a default.
+    if (analyze && timeout_ms <= 0)
+      throw std::runtime_error(
+        "analyze requires an explicit timeout_ms (100-30000): EXPLAIN ANALYZE "
+        "executes the statement, and statements recovered from "
+        "pg_stat_statements are the slowest ones in the cluster");
+
+    int tmo = timeout_ms > 0 ? timeout_ms : 5000;
+    if (tmo < 100)   tmo = 100;
+    if (tmo > 30000) tmo = 30000;
+
+    Session sess{active_cfg(), tmo};
+    pqxx::work& txn = sess.txn();
+
+    // --- resolve the statement text ---
+    std::string sql = sql_in;
+    json stats = nullptr;
+
+    if (!queryid.empty()) {
+      // Full, untruncated text: recovering it is the whole point of the
+      // queryid path, so this deliberately omits statementStats' LEFT(query,500).
+      std::string q = R"(
+        SELECT JSONB_BUILD_OBJECT(
+                 'query',            pss.query,
+                 'query_id',         pss.queryid,
+                 'calls',            pss.calls,
+                 'total_exec_ms',    pss.total_exec_time,
+                 'mean_exec_ms',     pss.mean_exec_time,
+                 'min_exec_ms',      pss.min_exec_time,
+                 'max_exec_ms',      pss.max_exec_time,
+                 'rows',             pss.rows,
+                 'shared_blks_hit',  pss.shared_blks_hit,
+                 'shared_blks_read', pss.shared_blks_read,
+                 'user',             r.rolname,
+                 'database',         d.datname,
+                 -- oid serialises to JSON as a string, so make it text
+                 -- explicitly rather than leave the type to chance.
+                 'database_oid',     pss.dbid::text,
+                 'is_current_db',    COALESCE(d.datname = current_database(), false)
+               )
+        FROM pg_stat_statements AS pss
+        LEFT JOIN pg_roles AS r ON r.oid = pss.userid
+        LEFT JOIN pg_database AS d ON d.oid = pss.dbid
+        WHERE pss.queryid = $1::bigint
+        ORDER BY (d.datname = current_database()) DESC NULLS LAST,
+                 pss.total_exec_time DESC
+        LIMIT 1;
+      )";
+
+      try {
+        pqxx::result res = pqxx_exec(txn, q, pqxx::params{queryid});
+        if (res.empty() || res[0][0].is_null()) {
+          return {
+            {"error", "no pg_stat_statements entry for queryid " + queryid},
+            {"hint", "queryids are reset by pg_stat_statements_reset() and evicted "
+                     "once pg_stat_statements.max is exceeded; re-run statementStats "
+                     "for a current queryid"}
+          };
+        }
+        stats = json::parse(res[0][0].as<std::string>());
+      } catch (const pqxx::sql_error& e) {
+        if (e.sqlstate() == "42P01") { // undefined_table
+          return {
+            {"error", "pg_stat_statements is not installed"},
+            {"hint", "Add 'pg_stat_statements' to shared_preload_libraries in "
+                     "postgresql.conf, restart PostgreSQL, then run: "
+                     "CREATE EXTENSION pg_stat_statements;"}
+          };
+        }
+        throw;
+      }
+
+      // Planning a statement from another database against this one's catalogs
+      // gives a plan that is either an error or, worse, silently wrong.
+      if (!stats.value("is_current_db", false)) {
+        // A null name means the database has since been dropped;
+        // pg_stat_statements keeps the entry regardless.
+        std::string db = json_str(stats, "database");
+        bool dropped = db.empty();
+        return {
+          {"error", "queryid " + queryid + " belongs to " +
+                    (dropped ? "a database that no longer exists (oid " +
+                               json_str(stats, "database_oid", "?") + ")"
+                             : "database \"" + db + "\"") +
+                    ", not the connected database"},
+          {"hint", dropped
+             ? "pg_stat_statements retains entries for dropped databases; there is "
+               "nothing to explain. Re-run statementStats for a current queryid"
+             : "point pg-licht at that database with the 'connection' argument "
+               "(see listConnections), or pass the statement text via 'sql'"},
+          {"statement", stats}
+        };
+      }
+
+      sql = json_str(stats, "query");
+      if (sql.empty()) {
+        return {
+          {"error", "pg_stat_statements has no query text for queryid " + queryid},
+          {"hint", "the text is hidden unless you are a superuser or a member of "
+                   "pg_read_all_stats, and it can be evicted under memory pressure; "
+                   "pass the statement via the 'sql' argument instead"},
+          {"statement", stats}
+        };
+      }
+    }
+
+    sql = require_single_statement(sql);
+    if (sql.empty())
+      throw std::runtime_error("the statement is empty");
+
+    static const std::set<std::string> EXPLAINABLE = {
+      "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "WITH", "TABLE", "VALUES"
+    };
+    std::string kw = leading_keyword(sql);
+    if (!EXPLAINABLE.count(kw))
+      throw std::runtime_error(
+        "statement cannot be EXPLAINed: it starts with \"" +
+        (kw.empty() ? std::string("(nothing)") : kw) +
+        "\". EXPLAIN accepts only SELECT/INSERT/UPDATE/DELETE/MERGE/WITH/TABLE/"
+        "VALUES; pg_stat_statements also tracks utility statements (SET, CREATE, "
+        "VACUUM, ...), which have no plan");
+
+    std::string prepared;
+    std::string lits;
+    json plan;
+    bool generic = false;
+
+    try {
+      // --- Phase A: produce a plan without executing anything ---
+      if (params.empty()) {
+        try {
+          // A savepoint, so that the expected failure below leaves the
+          // transaction usable rather than aborted.
+          pqxx::subtransaction sub{txn};
+          pqxx::result r = sub.exec("EXPLAIN (FORMAT JSON) " + sql);
+          plan = json::parse(r[0][0].as<std::string>());
+          sub.commit();
+        } catch (const pqxx::sql_error& e) {
+          // 42P02 undefined_parameter: the statement has $n placeholders and no
+          // values were supplied. Whether that is the case is decided by
+          // PostgreSQL rather than by scanning for "$n" ourselves, which would
+          // false-positive inside string literals and dollar-quoted bodies.
+          if (e.sqlstate() != "42P02") throw;
+          pqxx::result r = txn.exec("EXPLAIN (GENERIC_PLAN, FORMAT JSON) " + sql);
+          plan = json::parse(r[0][0].as<std::string>());
+          generic = true;
+        }
+      } else {
+        prepared = "pg_licht_explain_" + std::to_string(static_cast<long long>(::getpid())) +
+                   "_" + std::to_string(++explain_seq_);
+        txn.exec("PREPARE " + prepared + " AS " + sql);
+
+        pqxx::result pr = pqxx_exec(
+          txn,
+          "SELECT COALESCE(array_length(parameter_types, 1), 0) "
+          "FROM pg_prepared_statements WHERE name = $1",
+          pqxx::params{prepared});
+        size_t want = (pr.empty() || pr[0][0].is_null())
+                        ? 0u : static_cast<size_t>(pr[0][0].as<long long>());
+        if (want != params.size())
+          throw std::runtime_error("statement takes " + std::to_string(want) +
+                                   " parameter(s), got " + std::to_string(params.size()));
+
+        lits = build_execute_literals(txn, params);
+        pqxx::result r = txn.exec(
+          "EXPLAIN (FORMAT JSON) EXECUTE " + prepared + "(" + lits + ")");
+        plan = json::parse(r[0][0].as<std::string>());
+      }
+
+      // --- the write gate ---
+      bool read_only = !plan_has_modify(plan);
+      bool analyzed = false;
+      std::string note;
+
+      // --- Phase B: optionally execute, only once proven safe ---
+      if (analyze) {
+        if (!read_only) {
+          note = "not analyzed: the plan contains a ModifyTable node, so the "
+                 "statement modifies data; only the plan is returned";
+        } else if (generic) {
+          note = "not analyzed: the statement has $n placeholders and no params "
+                 "were supplied, so only a generic plan could be produced; supply "
+                 "params to get a real plan and enable ANALYZE";
+        } else {
+          std::string target = prepared.empty()
+            ? sql : ("EXECUTE " + prepared + "(" + lits + ")");
+          pqxx::result r = txn.exec(
+            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + target);
+          plan = json::parse(r[0][0].as<std::string>());
+          analyzed = true;
+        }
+      }
+
+      if (!prepared.empty()) txn.exec("DEALLOCATE " + prepared);
+
+      json out = {
+        {"plan",       plan},
+        {"generic",    generic},
+        {"analyzed",   analyzed},
+        {"read_only",  read_only},
+        {"timeout_ms", tmo},
+        {"source",     queryid.empty() ? "sql" : "pg_stat_statements"},
+        {"sql",        sql}
+      };
+      if (!note.empty())    out["note"] = note;
+      if (!stats.is_null()) out["statement"] = stats;
+      return out;
+
+    } catch (const pqxx::sql_error& e) {
+      // Returned as successful results with error/hint, matching the pattern
+      // used for missing extensions: the caller needs to read the reason and
+      // retry differently, not just be told something failed.
+      std::string ss = e.sqlstate();
+      if (ss == "42601")
+        return {{"error", "the statement could not be parsed"},
+                {"hint", "pg_stat_statements truncates query text at "
+                         "track_activity_query_size; raise that setting, or pass "
+                         "the full statement via the 'sql' argument"},
+                {"detail", e.what()}};
+      if (ss == "42P18")
+        return {{"error", "PostgreSQL could not infer the type of one or more parameters"},
+                {"hint", "add an explicit cast in the statement, e.g. "
+                         "WHERE col = $1::uuid, and retry"},
+                {"detail", e.what()}};
+      if (ss == "57014")
+        return {{"error", "the explain exceeded the statement timeout of " +
+                          std::to_string(tmo) + " ms"},
+                {"hint", "this is expected for a genuinely slow statement; raise "
+                         "timeout_ms (max 30000), or omit analyze to plan without "
+                         "executing"}};
+      if (ss == "25006")
+        return {{"error", "the statement attempted to write in a read-only transaction"},
+                {"hint", "pg-licht never executes data-modifying statements; only "
+                         "the plan can be returned"},
+                {"detail", e.what()}};
+      if (ss == "0A000")
+        return {{"error", "this statement cannot be explained on this server"},
+                {"hint", "EXPLAIN (GENERIC_PLAN) requires PostgreSQL 16 or newer; "
+                         "supply concrete values via params instead"},
+                {"detail", e.what()}};
+      if (ss == "42P02")
+        return {{"error", "the statement has parameters that could not be planned generically"},
+                {"hint", "supply values via the params argument"},
+                {"detail", e.what()}};
+      if (ss == "42P01")
+        return {{"error", "a relation referenced by the statement does not exist"},
+                {"hint", "the statement may target a different database; check "
+                         "listTables, or select another database with the "
+                         "'connection' argument"},
+                {"detail", e.what()}};
+      return {{"error", "explain failed"}, {"sqlstate", ss}, {"detail", e.what()}};
     }
   }
 
@@ -2477,6 +2882,23 @@ private:
 	  std::string target_table  = arguments.contains("table")  ? arguments["table"].get<std::string>()  : "";
 	  json vals = arguments.contains("values") ? arguments["values"] : json::array();
 	  result_content = check_key(target_schema, target_table, vals);
+	}
+	else if (tool_name == "explainQuery") {
+	  // queryid is documented as a string because a 64-bit value does not
+	  // survive JSON number precision, but accept a number too rather than
+	  // fail with a raw nlohmann type error.
+	  std::string qid;
+	  if (arguments.contains("queryid")) {
+	    if (arguments["queryid"].is_string())
+	      qid = arguments["queryid"].get<std::string>();
+	    else if (arguments["queryid"].is_number_integer())
+	      qid = std::to_string(arguments["queryid"].get<long long>());
+	  }
+	  std::string sql = arguments.contains("sql") ? arguments["sql"].get<std::string>() : "";
+	  json prms = arguments.contains("params") ? arguments["params"] : json::array();
+	  bool do_analyze = arguments.contains("analyze") ? arguments["analyze"].get<bool>() : false;
+	  int tmo = arguments.contains("timeout_ms") ? arguments["timeout_ms"].get<int>() : 0;
+	  result_content = explain_query(qid, sql, prms, do_analyze, tmo);
 	}
 	else {
 	  send_error(req["id"], -32601, "Tool not found: " + tool_name);
