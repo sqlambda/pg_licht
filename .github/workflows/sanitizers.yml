@@ -8,11 +8,11 @@ on:
 
 jobs:
   sanitize:
-    name: ${{ matrix.name }}
+    name: ${{ matrix.sanitizer.name }}-pg${{ matrix.pg }}
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:18
+        image: postgres:${{ matrix.pg }}
         env:
           POSTGRES_PASSWORD: postgres
         ports:
@@ -25,11 +25,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
+        pg: [16, 17, 18]
+        sanitizer:
           - name: address-undefined
-            sanitizer: ADDRESS_UNDEFINED
+            flag: ADDRESS_UNDEFINED
           - name: thread
-            sanitizer: THREAD
+            flag: THREAD
 
     steps:
       - uses: actions/checkout@v4
@@ -54,7 +55,7 @@ jobs:
         run: |
           cmake -S cpp -B cpp/build \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DPGLICHT_SANITIZER=${{ matrix.sanitizer }}
+            -DPGLICHT_SANITIZER=${{ matrix.sanitizer.flag }}
           cmake --build cpp/build --target pg_licht_mcp_test
 
       - name: Run tests
@@ -65,11 +66,15 @@ jobs:
         run: ctest --output-on-failure
 
   valgrind:
-    name: valgrind
+    name: valgrind-pg${{ matrix.pg }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [16, 17, 18]
     services:
       postgres:
-        image: postgres:18
+        image: postgres:${{ matrix.pg }}
         env:
           POSTGRES_PASSWORD: postgres
         ports:
@@ -109,3 +114,52 @@ jobs:
         env:
           DATABASE_URL: "host=localhost port=5432 user=postgres password=postgres dbname=postgres"
         run: ctest -R valgrind --output-on-failure
+
+  # Runs the full suite directly and then through a companion PgBouncer in
+  # transaction mode (server_reset_query=DISCARD ALL) -- the deployment a
+  # session-scoped read-only guard silently fails on. The script provisions its
+  # own throwaway cluster + pooler, so no service container is used here; it
+  # also preloads pg_stat_statements, exercising the queryid path that the
+  # service-container jobs above skip.
+  pooled:
+    name: pooled-pg${{ matrix.pg }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [16, 17, 18]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get install -y curl ca-certificates lsb-release
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -q
+          # postgresql-${{ matrix.pg }} brings initdb/pg_ctl and the bundled
+          # contrib extensions (pg_stat_statements, postgres_fdw, pgstattuple)
+          # the fixtures install; pgbouncer is the companion pooler.
+          sudo apt-get install -y cmake libpq-dev nlohmann-json3-dev libgtest-dev pkg-config \
+            postgresql-${{ matrix.pg }} pgbouncer
+          curl -fsSL https://github.com/jtv/libpqxx/archive/refs/tags/7.10.0.tar.gz | tar -xz -C /tmp
+          cmake -S /tmp/libpqxx-7.10.0 -B /tmp/libpqxx-build \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DBUILD_SHARED_LIBS=ON
+          cmake --build /tmp/libpqxx-build
+          sudo cmake --install /tmp/libpqxx-build
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
+
+      - name: Build test binary
+        run: |
+          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build cpp/build --target pg_licht_mcp_test
+
+      - name: Run suite directly and through the pooler
+        env:
+          # Pin the cluster to the matrix version rather than letting the script
+          # autodetect the newest one the runner happens to have installed.
+          PG_BINDIR: /usr/lib/postgresql/${{ matrix.pg }}/bin
+        run: cpp/test/run-pooled-tests.sh

@@ -114,15 +114,6 @@ for _ in $(seq 1 20); do
 done
 
 # --- run the suite both ways -----------------------------------------------
-run() {
-  local label="$1" url="$2"
-  echo
-  echo "================ $label ================"
-  if DATABASE_URL="$url" "$TEST_BIN" 2>&1 | tail -4; then :; fi
-  # tail hides the exit status; recover it from PIPESTATUS
-  return "${PIPESTATUS[0]}"
-}
-
 rc=0
 DATABASE_URL="host=127.0.0.1 port=$PG_PORT dbname=pglicht user=pglicht" "$TEST_BIN" >/tmp/pgl.direct.$$ 2>&1 || rc=$?
 echo "================ DIRECT (port $PG_PORT) ================"; tail -4 /tmp/pgl.direct.$$; rm -f /tmp/pgl.direct.$$
