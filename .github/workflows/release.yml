@@ -12,7 +12,7 @@ env:
   # source, instead of whatever version each distro happens to package.
   # libpq stays dynamic (its C ABI is stable across versions; distros patch
   # it independently), so it's still installed from each distro's own repo.
-  PQXX_VERSION: 8.0.1
+  PQXX_VERSION: 8.0.2
 
 jobs:
   build:

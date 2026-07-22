@@ -44,8 +44,8 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update -q
           sudo apt-get install -y cmake libpq-dev nlohmann-json3-dev libgtest-dev pkg-config
-          curl -fsSL https://github.com/jtv/libpqxx/archive/refs/tags/8.0.1.tar.gz | tar -xz -C /tmp
-          cmake -S /tmp/libpqxx-8.0.1 -B /tmp/libpqxx-build \
+          curl -fsSL https://github.com/jtv/libpqxx/archive/refs/tags/8.0.2.tar.gz | tar -xz -C /tmp
+          cmake -S /tmp/libpqxx-8.0.2 -B /tmp/libpqxx-build \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
           cmake --build /tmp/libpqxx-build
           sudo cmake --install /tmp/libpqxx-build
@@ -97,8 +97,8 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update -q
           sudo apt-get install -y cmake libpq-dev nlohmann-json3-dev libgtest-dev pkg-config valgrind
-          curl -fsSL https://github.com/jtv/libpqxx/archive/refs/tags/8.0.1.tar.gz | tar -xz -C /tmp
-          cmake -S /tmp/libpqxx-8.0.1 -B /tmp/libpqxx-build \
+          curl -fsSL https://github.com/jtv/libpqxx/archive/refs/tags/8.0.2.tar.gz | tar -xz -C /tmp
+          cmake -S /tmp/libpqxx-8.0.2 -B /tmp/libpqxx-build \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
           cmake --build /tmp/libpqxx-build
           sudo cmake --install /tmp/libpqxx-build
@@ -145,8 +145,8 @@ jobs:
           # the fixtures install; pgbouncer is the companion pooler.
           sudo apt-get install -y cmake libpq-dev nlohmann-json3-dev libgtest-dev pkg-config \
             postgresql-${{ matrix.pg }} pgbouncer
-          curl -fsSL https://github.com/jtv/libpqxx/archive/refs/tags/8.0.1.tar.gz | tar -xz -C /tmp
-          cmake -S /tmp/libpqxx-8.0.1 -B /tmp/libpqxx-build \
+          curl -fsSL https://github.com/jtv/libpqxx/archive/refs/tags/8.0.2.tar.gz | tar -xz -C /tmp
+          cmake -S /tmp/libpqxx-8.0.2 -B /tmp/libpqxx-build \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
           cmake --build /tmp/libpqxx-build
           sudo cmake --install /tmp/libpqxx-build
