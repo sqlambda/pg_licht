@@ -1,9 +1,12 @@
 #pragma once
 
+#include <cctype>
 #include <iostream>
 #include <set>
 #include <string>
+#include <unistd.h>
 #include <nlohmann/json.hpp>
+#include "config.h"
 #if defined(__GNUC__) && !defined(__clang__)
 // GCC-only false positive from std::variant inside pqxx headers; Clang
 // doesn't have this warning group at all, and with -Werror active it would
@@ -29,19 +32,69 @@ inline pqxx::result pqxx_exec(pqxx::work& txn, const std::string& sql, P&& param
 #endif
 }
 
+// One unit of work: connect, open a READ ONLY transaction, roll back and
+// disconnect on scope exit.
+//
+// Why connect per call rather than hold one connection: the target deployment
+// is PgBouncer in transaction mode (pool_mode=transaction,
+// server_reset_query=DISCARD ALL). There the server connection is handed back
+// to the pool at COMMIT and wiped, so *session* state does not survive between
+// transactions. An earlier version set `default_transaction_read_only` once at
+// startup and committed; behind such a pooler that setting was silently
+// discarded and every later call ran without the read-only guard.
+//
+// So nothing here relies on session state. The read-only guarantee and the
+// statement timeout are both transaction-scoped, which is exactly the scope a
+// transaction pooler preserves. The GUC cannot be pushed into the connection
+// string either -- PgBouncer rejects it outright:
+//   FATAL: unsupported startup parameter in options: default_transaction_read_only
+class Session {
+public:
+  explicit Session(const pglicht::ConnConfig& cfg, int timeout_ms = 0)
+    : conn_(cfg.conninfo), txn_(conn_) {
+    // Must be the first statement in the transaction. This is the real write
+    // backstop: it catches writes a query plan cannot reveal, such as a
+    // VOLATILE function that modifies data, aborting with SQLSTATE 25006.
+    txn_.exec("SET TRANSACTION READ ONLY");
+    if (timeout_ms > 0) {
+      // set_config(..., is_local => true) is SET LOCAL: transaction-scoped,
+      // and binds the value as a parameter instead of concatenating it.
+      pqxx_exec(txn_, "SELECT set_config('statement_timeout', $1, true)",
+                pqxx::params{std::to_string(timeout_ms)});
+    }
+  }
+
+  pqxx::work& txn() { return txn_; }
+
+  // Server version as an integer (e.g. 160004 for 16.4), from the startup
+  // handshake -- no round trip. Used to gate catalog columns and SQL features
+  // that don't exist on older majors; correct per connection, which matters
+  // when different configured connections point at different-version servers.
+  int server_version() const { return conn_.server_version(); }
+
+  // txn_ is destroyed before conn_, rolling back; conn_ then disconnects.
+  ~Session() = default;
+
+  Session(const Session&) = delete;
+  Session& operator=(const Session&) = delete;
+
+private:
+  pqxx::connection conn_;
+  pqxx::work txn_;
+};
+
 class PostgresMCPServer {
 public:
-  PostgresMCPServer(const std::string& conn_str) : conn(conn_str) {
-    pqxx::work txn{conn};
-    // set_config() (not plain SET) so application_name is bound as a real
-    // parameter rather than concatenated into SQL text.
-    pqxx_exec(txn, "SELECT set_config('application_name', $1, false)",
-              pqxx::params{std::string("pg-licht-cpp/") + PGLICHT_VERSION});
-    // Defense in depth: this server only ever reads. Rejecting writes at the
-    // session level means even a bug that let a query mutate data would still
-    // fail, rather than succeed silently.
-    txn.exec("SET default_transaction_read_only = on");
-    txn.commit();
+  // Single-connection form: DATABASE_URL, an explicit conninfo, or argv[1].
+  explicit PostgresMCPServer(const std::string& conn_str)
+    : registry_(pglicht::ConnectionRegistry::from_url(conn_str, app_name())) {
+    probe();
+  }
+
+  // Multi-connection form, from an INI file of named sections.
+  explicit PostgresMCPServer(pglicht::ConnectionRegistry registry)
+    : registry_(std::move(registry)) {
+    probe();
   }
 
   void run() {
@@ -109,11 +162,54 @@ public:
     return check_key(schema, table_name, values);
   }
 
+  const json call_connections() { return connections(); }
+  const json call_explain_query(const std::string& queryid, const std::string& sql,
+                                const json& params, bool analyze, int timeout_ms) {
+    return explain_query(queryid, sql, params, analyze, timeout_ms);
+  }
+
 private:
-  pqxx::connection conn;
+  pglicht::ConnectionRegistry registry_;
+  // Which configured connection the in-flight tool call targets. Resolved once
+  // per request by handle_request so the ~40 query methods keep their existing
+  // signatures. The server reads stdin line by line, so only one call is ever
+  // in flight and a member is safe.
+  std::string active_;
+  unsigned long long explain_seq_ = 0;
+
+  static std::string app_name() {
+    return std::string("pg-licht-cpp/") + PGLICHT_VERSION;
+  }
+
+  const pglicht::ConnConfig& active_cfg() const { return registry_.get(active_); }
+
+  // Fail fast on an unusable default connection, matching the previous
+  // behaviour where the constructor connected eagerly.
+  void probe() {
+    Session s{registry_.get(registry_.default_name())};
+    s.txn().exec("SELECT 1");
+  }
+
+  const json connections() {
+    json out = json::array();
+    for (const auto& name : registry_.names()) {
+      const auto& c = registry_.get(name);
+      json entry = {{"name", name}, {"default", name == registry_.default_name()}};
+      // Only non-secret fields. A service name is reported as-is and never
+      // expanded: the service file may hold a password, and resolving it here
+      // would leak it into tool output.
+      if (!c.service.empty()) entry["service"] = c.service;
+      if (!c.host.empty())    entry["host"]    = c.host;
+      if (!c.port.empty())    entry["port"]    = c.port;
+      if (!c.dbname.empty())  entry["dbname"]  = c.dbname;
+      if (!c.user.empty())    entry["user"]    = c.user;
+      out.push_back(entry);
+    }
+    return out;
+  }
 
   const json get_tools_list() {
-    return {
+    json list = {
       {"tools", {
 	  {
 	    {"name", "listSchemas"},
@@ -488,13 +584,65 @@ private:
 		  }},
 		{"required", {"schema", "table", "values"}}
 	      }}
+	  },
+	  {
+	    {"name", "explainQuery"},
+	    {"description", "return the raw EXPLAIN (FORMAT JSON) plan for a statement, either recovered from pg_stat_statements by queryid (full untruncated text) or supplied directly as sql. Runs in a read-only transaction bounded by statement_timeout. Statements with $n placeholders are planned with GENERIC_PLAN unless concrete params are supplied, in which case the statement is PREPAREd and planned with real values. analyze:true runs EXPLAIN (ANALYZE, BUFFERS), which really executes the statement, and is honoured only after the plan is proven free of any ModifyTable node -- so data-modifying statements, including data-modifying CTEs, are never executed; it also requires an explicit timeout_ms. Returns the plan verbatim plus generic/analyzed/read_only flags and the pg_stat_statements row; no heuristics and no generated DDL, the plan is yours to interpret"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", {
+		    {"queryid", {
+			{"type", "string"},
+			{"description", "pg_stat_statements queryid as a decimal string (it is a 64-bit value and does not survive JSON number precision). Mutually exclusive with 'sql'"}
+		      }},
+		    {"sql", {
+			{"type", "string"},
+			{"description", "a single SELECT/INSERT/UPDATE/DELETE/MERGE/WITH/TABLE/VALUES statement to explain. Utility statements (SET, CREATE, VACUUM, ...) are rejected. Mutually exclusive with 'queryid'"}
+		      }},
+		    {"params", {
+			{"type", "array"},
+			{"description", "concrete values for the statement's $1..$n placeholders, in order. Supply these for a real (non-generic) plan; required to use analyze. Values are bound as literals of unknown type and coerced by PostgreSQL to the inferred parameter types; use null for SQL NULL"}
+		      }},
+		    {"analyze", {
+			{"type", "boolean"},
+			{"description", "run EXPLAIN (ANALYZE, BUFFERS), which really executes the statement. Requires timeout_ms. Ignored with an explanatory 'note' if the statement modifies data or could only be planned generically. Default false"}
+		      }},
+		    {"timeout_ms", {
+			{"type", "integer"},
+			{"description", "statement_timeout for the explain, in milliseconds, clamped to [100, 30000]. Required when analyze is true; defaults to 5000 for plan-only calls"}
+		      }}
+		  }}
+	      }}
+	  },
+	  {
+	    {"name", "listConnections"},
+	    {"description", "return the configured database connections by name, with the libpq service name or host/port/dbname/user for each, and which is the default; passwords are never returned and a service file is never expanded. Pass a name as the 'connection' argument of any other tool to run that tool against that database"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", json::object()}
+	      }}
 	  }
 	}}
     };
+
+    // Every tool accepts an optional `connection`. Injecting it here keeps the
+    // ~40 tool definitions and their method signatures untouched; the name is
+    // resolved once per request in handle_request.
+    json conn_prop = {
+      {"type", "string"},
+      {"description", "name of a configured connection (see listConnections); "
+                      "defaults to \"" + registry_.default_name() + "\""}
+    };
+    for (auto& tool : list["tools"]) {
+      if (tool["name"] == "listConnections") continue;
+      tool["inputSchema"]["properties"]["connection"] = conn_prop;
+    }
+    return list;
   }
 
   const json schemas() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(nspname,
@@ -505,13 +653,13 @@ private:
       LEFT JOIN LATERAL (SELECT JSONB_AGG(relname ORDER BY relname) AS relnames
                          FROM pg_class
                          WHERE relnamespace = pg_namespace.oid
-                           AND relkind IN ('r','m','f','p','v')) ON true
+                           AND relkind IN ('r','m','f','p','v')) _lat1 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(grantee, privs) AS roles
                          FROM (SELECT COALESCE(r.rolname, 'PUBLIC') AS grantee,
                                       JSONB_AGG(a.privilege_type ORDER BY a.privilege_type) AS privs
                                FROM aclexplode(pg_namespace.nspacl) AS a
                                LEFT JOIN pg_roles AS r ON r.oid = a.grantee
-                               GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) ON true
+                               GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) _lat2 ON true
       WHERE nspname NOT LIKE 'pg_%'
         AND nspname <> 'information_schema'
         AND relnames IS NOT NULL;
@@ -528,7 +676,8 @@ private:
   }
 
   const json tables(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(c.relname,
@@ -553,14 +702,14 @@ private:
                        FROM pg_attribute AS a
                        WHERE a.attnum > 0
                          AND a.attrelid = c.oid
-                         AND NOT a.attisdropped) ON true
+                         AND NOT a.attisdropped) _lat3 ON true
       LEFT JOIN LATERAL (SELECT COUNT(*) AS index_count
                          FROM pg_indexes AS i
                          WHERE i.schemaname = $1
-                           AND i.tablename = c.relname) ON true
+                           AND i.tablename = c.relname) _lat4 ON true
       LEFT JOIN LATERAL (SELECT COUNT(*) AS constraint_count
                          FROM pg_constraint
-                         WHERE conrelid = c.oid) ON true
+                         WHERE conrelid = c.oid) _lat5 ON true
       WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
         AND c.relkind IN ('r', 'p', 'm', 'v');
     )";
@@ -576,7 +725,8 @@ private:
   }
 
   const json search(const std::string& web_search) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(c.relnamespace::regnamespace::name || '.' || c.relname,
@@ -606,21 +756,21 @@ private:
                          FROM pg_attribute AS a
                          WHERE a.attnum > 0
                            AND a.attrelid = c.oid
-                           AND NOT a.attisdropped) ON true
+                           AND NOT a.attisdropped) _lat6 ON true
       LEFT JOIN LATERAL (SELECT COUNT(*) AS index_count
                          FROM pg_indexes AS i
                          WHERE i.schemaname = c.relnamespace::regnamespace::name
-                           AND i.tablename = c.relname) ON true
+                           AND i.tablename = c.relname) _lat7 ON true
       LEFT JOIN LATERAL (SELECT COUNT(*) AS constraint_count
                          FROM pg_constraint
-                         WHERE conrelid = c.oid) ON true
+                         WHERE conrelid = c.oid) _lat8 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(grantee, privs) AS roles,
                                 STRING_AGG(grantee, ' ' ORDER BY grantee) AS role_names
                          FROM (SELECT COALESCE(r.rolname, 'PUBLIC') AS grantee,
                                       JSONB_AGG(a.privilege_type ORDER BY a.privilege_type) AS privs
                                FROM aclexplode(c.relacl) AS a
                                LEFT JOIN pg_roles AS r ON r.oid = a.grantee
-                               GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) ON true
+                               GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) _lat9 ON true
       LEFT JOIN LATERAL (
           SELECT STRING_AGG(
               REGEXP_REPLACE(REGEXP_REPLACE(et.typname, '_', ' ', 'g'), '([[:upper:]])', ' \1', 'g') || ' ' ||
@@ -631,9 +781,9 @@ private:
           LEFT JOIN LATERAL (
               SELECT STRING_AGG(ev.enumlabel, ' ') AS values_text
               FROM pg_enum AS ev WHERE ev.enumtypid = et.oid
-          ) ON true
+          ) _lat10 ON true
           WHERE a.attnum > 0 AND NOT a.attisdropped AND a.attrelid = c.oid
-      ) ON true
+      ) _lat11 ON true
       WHERE TO_TSVECTOR('english',
               REGEXP_REPLACE(REGEXP_REPLACE(c.relname, '_', ' ', 'g'), '([[:upper:]])', ' \1', 'g') || ' ' ||
               REGEXP_REPLACE(REGEXP_REPLACE(c.relnamespace::regnamespace::name, '_', ' ', 'g'), '([[:upper:]])', ' \1', 'g') || ' ' ||
@@ -659,7 +809,8 @@ private:
   }
 
   const json functions(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -692,7 +843,8 @@ private:
   }
 
   const json function_detail(const std::string& schema, const std::string& func_name) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -721,13 +873,13 @@ private:
                  )) AS used_in_triggers
           FROM   pg_trigger AS t
           WHERE  t.tgfoid = p.oid AND NOT t.tgisinternal
-      ) ON true
+      ) _lat12 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(grantee, privs) AS roles
                          FROM (SELECT COALESCE(r.rolname, 'PUBLIC') AS grantee,
                                       JSONB_AGG(a.privilege_type ORDER BY a.privilege_type) AS privs
                                FROM aclexplode(p.proacl) AS a
                                LEFT JOIN pg_roles AS r ON r.oid = a.grantee
-                               GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) ON true
+                               GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) _lat13 ON true
       WHERE  p.pronamespace = $1::regnamespace
         AND  p.proname = $2
         AND  p.prokind IN ('f', 'p');
@@ -748,7 +900,8 @@ private:
       return {};
     }
 
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -772,7 +925,7 @@ private:
           SELECT JSONB_AGG(t.tgname) AS trigger_names
           FROM   pg_trigger AS t
           WHERE  t.tgfoid = p.oid AND NOT t.tgisinternal
-      ) ON true
+      ) _lat14 ON true
       WHERE  p.prokind IN ('f', 'p')
         AND (
             TO_TSVECTOR('english',
@@ -802,7 +955,8 @@ private:
   }
 
   const json server_settings() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(category, settings ORDER BY category)
@@ -834,7 +988,8 @@ private:
   }
 
   const json extensions() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -860,7 +1015,8 @@ private:
   }
 
   const json activity() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(pid::text,
@@ -893,7 +1049,8 @@ private:
   }
 
   const json locks() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_AGG(
@@ -933,7 +1090,8 @@ private:
   }
 
   const json replication_slots() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     // retained_wal_bytes is the key diagnostic: a lagging or unused slot holds
     // back WAL cleanup indefinitely, a common cause of disk bloat incidents.
@@ -964,7 +1122,8 @@ private:
   }
 
   const json database_stats() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(datname,
@@ -1002,7 +1161,8 @@ private:
   }
 
   const json statement_stats(int limit) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_AGG(row_json)
@@ -1050,8 +1210,398 @@ private:
     }
   }
 
+  // A plan is read-only iff no ModifyTable node appears anywhere in the tree.
+  // Checking the whole tree rather than just the root is what catches a
+  // data-modifying CTE -- WITH d AS (DELETE ... RETURNING *) SELECT * FROM d --
+  // where the ModifyTable is nested under a CTE subplan.
+  static bool plan_has_modify(const json& node) {
+    if (node.is_array()) {
+      for (const auto& e : node) if (plan_has_modify(e)) return true;
+      return false;
+    }
+    if (!node.is_object()) return false;
+    auto it = node.find("Node Type");
+    if (it != node.end() && it->is_string() && it->get<std::string>() == "ModifyTable")
+      return true;
+    for (const auto& e : node.items()) if (plan_has_modify(e.value())) return true;
+    return false;
+  }
+
+  // First keyword of a statement, uppercased, skipping leading whitespace and
+  // comments. pg_stat_statements also tracks utility statements (CREATE
+  // DATABASE, SET, VACUUM, ...), and EXPLAIN cannot take those at all --
+  // "EXPLAIN SET work_mem='4MB'" is a syntax error, not a graceful failure.
+  static std::string leading_keyword(const std::string& sql) {
+    size_t i = 0;
+    for (;;) {
+      while (i < sql.size() && std::isspace(static_cast<unsigned char>(sql[i]))) i++;
+      if (i + 1 < sql.size() && sql[i] == '-' && sql[i + 1] == '-') {
+        while (i < sql.size() && sql[i] != '\n') i++;
+      } else if (i + 1 < sql.size() && sql[i] == '/' && sql[i + 1] == '*') {
+        size_t e = sql.find("*/", i + 2);
+        if (e == std::string::npos) return "";
+        i = e + 2;
+      } else {
+        break;
+      }
+    }
+    // A leading "(" means a parenthesised SELECT, e.g. (SELECT ...) UNION ...
+    if (i < sql.size() && sql[i] == '(') return "SELECT";
+    size_t s = i;
+    while (i < sql.size() && std::isalpha(static_cast<unsigned char>(sql[i]))) i++;
+    std::string kw = sql.substr(s, i - s);
+    for (char& c : kw) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return kw;
+  }
+
+  // Strip one trailing semicolon; reject anything that looks like a second
+  // statement. pqxx uses the simple protocol for exec(), which would happily
+  // run "SELECT 1; DROP TABLE t" as two statements once concatenated after
+  // EXPLAIN, so caller-supplied text must be proven to be a single statement.
+  static std::string require_single_statement(const std::string& sql) {
+    std::string t = sql;
+    size_t end = t.find_last_not_of(" \t\r\n");
+    if (end != std::string::npos) t = t.substr(0, end + 1);
+    if (!t.empty() && t.back() == ';') {
+      t.pop_back();
+      size_t e2 = t.find_last_not_of(" \t\r\n");
+      t = (e2 == std::string::npos) ? "" : t.substr(0, e2 + 1);
+    }
+    if (t.find(';') != std::string::npos)
+      throw std::runtime_error(
+        "sql must be a single statement; found an embedded ';'");
+    return t;
+  }
+
+  // Build the literal list for EXECUTE. EXECUTE arguments are parsed as
+  // expressions and cannot be bind parameters, so the values have to appear in
+  // the SQL text. Every non-null value is emitted as a quoted string literal of
+  // unknown type and left for PostgreSQL to coerce into the prepared
+  // statement's inferred parameter type. That is deliberate: it means there is
+  // exactly one escaping path (txn.quote, i.e. libpq's escaping) rather than
+  // one per JSON type, and no numeric or boolean value is ever spliced in raw.
+  static std::string build_execute_literals(pqxx::work& txn, const json& params) {
+    std::string lits;
+    for (size_t i = 0; i < params.size(); i++) {
+      if (i > 0) lits += ", ";
+      const json& v = params[i];
+      if (v.is_null())          lits += "NULL";
+      else if (v.is_string())   lits += txn.quote(v.get<std::string>());
+      else if (v.is_boolean())  lits += txn.quote(std::string(v.get<bool>() ? "true" : "false"));
+      else                      lits += txn.quote(v.dump());
+    }
+    return lits;
+  }
+
+  // json::value() throws if a key exists but holds null, which happens
+  // routinely here: pg_stat_statements keeps entries for dropped databases, so
+  // the LEFT JOIN to pg_database yields a null name, and query text can be null
+  // when the caller lacks permission to read it.
+  static std::string json_str(const json& j, const char* key,
+                              const std::string& fallback = "") {
+    auto it = j.find(key);
+    if (it == j.end() || !it->is_string()) return fallback;
+    return it->get<std::string>();
+  }
+
+  const json explain_query(const std::string& queryid, const std::string& sql_in,
+                           const json& params, bool analyze, int timeout_ms) {
+    // --- argument validation (caller errors -> isError:true via dispatch) ---
+    if (queryid.empty() && sql_in.empty())
+      throw std::runtime_error("one of queryid or sql is required");
+    if (!queryid.empty() && !sql_in.empty())
+      throw std::runtime_error("queryid and sql are mutually exclusive");
+    if (!params.is_array())
+      throw std::runtime_error("params must be an array");
+    if (params.size() > 64)
+      throw std::runtime_error("params has " + std::to_string(params.size()) +
+                               " entries; at most 64 are supported");
+    if (!queryid.empty()) {
+      bool ok = !queryid.empty() && queryid.size() <= 20;
+      for (size_t i = 0; ok && i < queryid.size(); i++) {
+        if (i == 0 && queryid[i] == '-') { ok = queryid.size() > 1; continue; }
+        if (!std::isdigit(static_cast<unsigned char>(queryid[i]))) ok = false;
+      }
+      if (!ok)
+        throw std::runtime_error("queryid must be a decimal integer string");
+    }
+    // EXPLAIN ANALYZE really executes the statement, and these are by
+    // construction the slowest queries in the cluster. The caller must state a
+    // bound consciously rather than inherit a default.
+    if (analyze && timeout_ms <= 0)
+      throw std::runtime_error(
+        "analyze requires an explicit timeout_ms (100-30000): EXPLAIN ANALYZE "
+        "executes the statement, and statements recovered from "
+        "pg_stat_statements are the slowest ones in the cluster");
+
+    int tmo = timeout_ms > 0 ? timeout_ms : 5000;
+    if (tmo < 100)   tmo = 100;
+    if (tmo > 30000) tmo = 30000;
+
+    Session sess{active_cfg(), tmo};
+    pqxx::work& txn = sess.txn();
+
+    // --- resolve the statement text ---
+    std::string sql = sql_in;
+    json stats = nullptr;
+
+    if (!queryid.empty()) {
+      // Full, untruncated text: recovering it is the whole point of the
+      // queryid path, so this deliberately omits statementStats' LEFT(query,500).
+      std::string q = R"(
+        SELECT JSONB_BUILD_OBJECT(
+                 'query',            pss.query,
+                 'query_id',         pss.queryid,
+                 'calls',            pss.calls,
+                 'total_exec_ms',    pss.total_exec_time,
+                 'mean_exec_ms',     pss.mean_exec_time,
+                 'min_exec_ms',      pss.min_exec_time,
+                 'max_exec_ms',      pss.max_exec_time,
+                 'rows',             pss.rows,
+                 'shared_blks_hit',  pss.shared_blks_hit,
+                 'shared_blks_read', pss.shared_blks_read,
+                 'user',             r.rolname,
+                 'database',         d.datname,
+                 -- oid serialises to JSON as a string, so make it text
+                 -- explicitly rather than leave the type to chance.
+                 'database_oid',     pss.dbid::text,
+                 'is_current_db',    COALESCE(d.datname = current_database(), false)
+               )
+        FROM pg_stat_statements AS pss
+        LEFT JOIN pg_roles AS r ON r.oid = pss.userid
+        LEFT JOIN pg_database AS d ON d.oid = pss.dbid
+        WHERE pss.queryid = $1::bigint
+        ORDER BY (d.datname = current_database()) DESC NULLS LAST,
+                 pss.total_exec_time DESC
+        LIMIT 1;
+      )";
+
+      try {
+        pqxx::result res = pqxx_exec(txn, q, pqxx::params{queryid});
+        if (res.empty() || res[0][0].is_null()) {
+          return {
+            {"error", "no pg_stat_statements entry for queryid " + queryid},
+            {"hint", "queryids are reset by pg_stat_statements_reset() and evicted "
+                     "once pg_stat_statements.max is exceeded; re-run statementStats "
+                     "for a current queryid"}
+          };
+        }
+        stats = json::parse(res[0][0].as<std::string>());
+      } catch (const pqxx::sql_error& e) {
+        if (e.sqlstate() == "42P01") { // undefined_table
+          return {
+            {"error", "pg_stat_statements is not installed"},
+            {"hint", "Add 'pg_stat_statements' to shared_preload_libraries in "
+                     "postgresql.conf, restart PostgreSQL, then run: "
+                     "CREATE EXTENSION pg_stat_statements;"}
+          };
+        }
+        throw;
+      }
+
+      // Planning a statement from another database against this one's catalogs
+      // gives a plan that is either an error or, worse, silently wrong.
+      if (!stats.value("is_current_db", false)) {
+        // A null name means the database has since been dropped;
+        // pg_stat_statements keeps the entry regardless.
+        std::string db = json_str(stats, "database");
+        bool dropped = db.empty();
+        return {
+          {"error", "queryid " + queryid + " belongs to " +
+                    (dropped ? "a database that no longer exists (oid " +
+                               json_str(stats, "database_oid", "?") + ")"
+                             : "database \"" + db + "\"") +
+                    ", not the connected database"},
+          {"hint", dropped
+             ? "pg_stat_statements retains entries for dropped databases; there is "
+               "nothing to explain. Re-run statementStats for a current queryid"
+             : "point pg-licht at that database with the 'connection' argument "
+               "(see listConnections), or pass the statement text via 'sql'"},
+          {"statement", stats}
+        };
+      }
+
+      sql = json_str(stats, "query");
+      if (sql.empty()) {
+        return {
+          {"error", "pg_stat_statements has no query text for queryid " + queryid},
+          {"hint", "the text is hidden unless you are a superuser or a member of "
+                   "pg_read_all_stats, and it can be evicted under memory pressure; "
+                   "pass the statement via the 'sql' argument instead"},
+          {"statement", stats}
+        };
+      }
+    }
+
+    sql = require_single_statement(sql);
+    if (sql.empty())
+      throw std::runtime_error("the statement is empty");
+
+    static const std::set<std::string> EXPLAINABLE = {
+      "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "WITH", "TABLE", "VALUES"
+    };
+    std::string kw = leading_keyword(sql);
+    if (!EXPLAINABLE.count(kw))
+      throw std::runtime_error(
+        "statement cannot be EXPLAINed: it starts with \"" +
+        (kw.empty() ? std::string("(nothing)") : kw) +
+        "\". EXPLAIN accepts only SELECT/INSERT/UPDATE/DELETE/MERGE/WITH/TABLE/"
+        "VALUES; pg_stat_statements also tracks utility statements (SET, CREATE, "
+        "VACUUM, ...), which have no plan");
+
+    std::string prepared;
+    std::string lits;
+    json plan;
+    bool generic = false;
+
+    try {
+      // --- Phase A: produce a plan without executing anything ---
+      if (params.empty()) {
+        try {
+          // A savepoint, so that the expected failure below leaves the
+          // transaction usable rather than aborted.
+          pqxx::subtransaction sub{txn};
+          pqxx::result r = sub.exec("EXPLAIN (FORMAT JSON) " + sql);
+          plan = json::parse(r[0][0].as<std::string>());
+          sub.commit();
+        } catch (const pqxx::sql_error& e) {
+          // 42P02 undefined_parameter: the statement has $n placeholders and no
+          // values were supplied. Whether that is the case is decided by
+          // PostgreSQL rather than by scanning for "$n" ourselves, which would
+          // false-positive inside string literals and dollar-quoted bodies.
+          if (e.sqlstate() != "42P02") throw;
+          // GENERIC_PLAN is PostgreSQL 16+. On older servers attempting it
+          // yields a confusing "unrecognized EXPLAIN option" rather than the
+          // real problem, so short-circuit with the actionable hint instead.
+          if (sess.server_version() < 160000) {
+            json out = {
+              {"error", "the statement has $n placeholders and no params were supplied"},
+              {"hint", "supply values via the params argument so the statement can be "
+                       "prepared and planned; planning a normalized statement without "
+                       "params needs EXPLAIN (GENERIC_PLAN), which requires PostgreSQL 16+"}
+            };
+            // On the queryid path the statement was already recovered; return it
+            // so the caller still gets the stats and can retry with params.
+            if (!stats.is_null()) out["statement"] = stats;
+            return out;
+          }
+          pqxx::result r = txn.exec("EXPLAIN (GENERIC_PLAN, FORMAT JSON) " + sql);
+          plan = json::parse(r[0][0].as<std::string>());
+          generic = true;
+        }
+      } else {
+        prepared = "pg_licht_explain_" + std::to_string(static_cast<long long>(::getpid())) +
+                   "_" + std::to_string(++explain_seq_);
+        txn.exec("PREPARE " + prepared + " AS " + sql);
+
+        pqxx::result pr = pqxx_exec(
+          txn,
+          "SELECT COALESCE(array_length(parameter_types, 1), 0) "
+          "FROM pg_prepared_statements WHERE name = $1",
+          pqxx::params{prepared});
+        size_t want = (pr.empty() || pr[0][0].is_null())
+                        ? 0u : static_cast<size_t>(pr[0][0].as<long long>());
+        if (want != params.size())
+          throw std::runtime_error("statement takes " + std::to_string(want) +
+                                   " parameter(s), got " + std::to_string(params.size()));
+
+        lits = build_execute_literals(txn, params);
+        pqxx::result r = txn.exec(
+          "EXPLAIN (FORMAT JSON) EXECUTE " + prepared + "(" + lits + ")");
+        plan = json::parse(r[0][0].as<std::string>());
+      }
+
+      // --- the write gate ---
+      bool read_only = !plan_has_modify(plan);
+      bool analyzed = false;
+      std::string note;
+
+      // --- Phase B: optionally execute, only once proven safe ---
+      if (analyze) {
+        if (!read_only) {
+          note = "not analyzed: the plan contains a ModifyTable node, so the "
+                 "statement modifies data; only the plan is returned";
+        } else if (generic) {
+          note = "not analyzed: the statement has $n placeholders and no params "
+                 "were supplied, so only a generic plan could be produced; supply "
+                 "params to get a real plan and enable ANALYZE";
+        } else {
+          std::string target = prepared.empty()
+            ? sql : ("EXECUTE " + prepared + "(" + lits + ")");
+          pqxx::result r = txn.exec(
+            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + target);
+          plan = json::parse(r[0][0].as<std::string>());
+          analyzed = true;
+        }
+      }
+
+      if (!prepared.empty()) txn.exec("DEALLOCATE " + prepared);
+
+      json out = {
+        {"plan",       plan},
+        {"generic",    generic},
+        {"analyzed",   analyzed},
+        {"read_only",  read_only},
+        {"timeout_ms", tmo},
+        {"source",     queryid.empty() ? "sql" : "pg_stat_statements"},
+        {"sql",        sql}
+      };
+      if (!note.empty())    out["note"] = note;
+      if (!stats.is_null()) out["statement"] = stats;
+      return out;
+
+    } catch (const pqxx::sql_error& e) {
+      // Returned as successful results with error/hint, matching the pattern
+      // used for missing extensions: the caller needs to read the reason and
+      // retry differently, not just be told something failed.
+      // Direct-init, not copy-init: libpqxx 8's sqlstate() returns
+      // std::string_view (explicit conversion to std::string), while 7.x
+      // returns std::string. Parens accept both.
+      std::string ss(e.sqlstate());
+      if (ss == "42601")
+        return {{"error", "the statement could not be parsed"},
+                {"hint", "pg_stat_statements truncates query text at "
+                         "track_activity_query_size; raise that setting, or pass "
+                         "the full statement via the 'sql' argument"},
+                {"detail", e.what()}};
+      if (ss == "42P18")
+        return {{"error", "PostgreSQL could not infer the type of one or more parameters"},
+                {"hint", "add an explicit cast in the statement, e.g. "
+                         "WHERE col = $1::uuid, and retry"},
+                {"detail", e.what()}};
+      if (ss == "57014")
+        return {{"error", "the explain exceeded the statement timeout of " +
+                          std::to_string(tmo) + " ms"},
+                {"hint", "this is expected for a genuinely slow statement; raise "
+                         "timeout_ms (max 30000), or omit analyze to plan without "
+                         "executing"}};
+      if (ss == "25006")
+        return {{"error", "the statement attempted to write in a read-only transaction"},
+                {"hint", "pg-licht never executes data-modifying statements; only "
+                         "the plan can be returned"},
+                {"detail", e.what()}};
+      if (ss == "0A000")
+        return {{"error", "this statement cannot be explained on this server"},
+                {"hint", "EXPLAIN (GENERIC_PLAN) requires PostgreSQL 16 or newer; "
+                         "supply concrete values via params instead"},
+                {"detail", e.what()}};
+      if (ss == "42P02")
+        return {{"error", "the statement has parameters that could not be planned generically"},
+                {"hint", "supply values via the params argument"},
+                {"detail", e.what()}};
+      if (ss == "42P01")
+        return {{"error", "a relation referenced by the statement does not exist"},
+                {"hint", "the statement may target a different database; check "
+                         "listTables, or select another database with the "
+                         "'connection' argument"},
+                {"detail", e.what()}};
+      return {{"error", "explain failed"}, {"sqlstate", ss}, {"detail", e.what()}};
+    }
+  }
+
   const json table_bloat(const std::string& schema, const std::string& table_name, bool exact) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     // pgstattuple() does a full sequential scan (real I/O on large tables);
     // pgstattuple_approx() uses the visibility map for a cheap estimate.
@@ -1117,7 +1667,8 @@ private:
   }
 
   const json database_size() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_BUILD_OBJECT(
@@ -1139,7 +1690,8 @@ private:
     if (!values.is_array())
       throw std::runtime_error("values must be an array");
 
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     // Step 1: fetch PK column names, types, and type schemas
     pqxx::result pk_res = txn.exec(
@@ -1228,7 +1780,8 @@ private:
   }
 
   const json enums(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1243,7 +1796,7 @@ private:
           SELECT JSONB_AGG(e.enumlabel ORDER BY e.enumsortorder) AS values
           FROM pg_enum AS e
           WHERE e.enumtypid = t.oid
-      ) ON true
+      ) _lat15 ON true
       WHERE t.typnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
         AND t.typtype = 'e';
     )";
@@ -1258,7 +1811,8 @@ private:
   }
 
   const json enum_detail(const std::string& schema, const std::string& enum_name) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_BUILD_OBJECT(
@@ -1271,7 +1825,7 @@ private:
           SELECT JSONB_AGG(e.enumlabel ORDER BY e.enumsortorder) AS values
           FROM pg_enum AS e
           WHERE e.enumtypid = t.oid
-      ) ON true
+      ) _lat16 ON true
       LEFT JOIN LATERAL (
           SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
                    'table', c.relnamespace::regnamespace::text || '.' || c.relname,
@@ -1283,7 +1837,7 @@ private:
             AND a.attnum > 0
             AND NOT a.attisdropped
             AND c.relkind IN ('r', 'p', 'm', 'v')
-      ) ON true
+      ) _lat17 ON true
       WHERE t.typnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
         AND t.typname = $2
         AND t.typtype = 'e';
@@ -1303,7 +1857,8 @@ private:
       return {};
     }
 
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1319,7 +1874,7 @@ private:
                  STRING_AGG(e.enumlabel, ' ') AS values_text
           FROM pg_enum AS e
           WHERE e.enumtypid = t.oid
-      ) ON true
+      ) _lat18 ON true
       WHERE t.typtype = 'e'
         AND t.typnamespace NOT IN (
             SELECT oid FROM pg_namespace
@@ -1345,7 +1900,8 @@ private:
   }
 
   const json types(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1373,13 +1929,13 @@ private:
             AND a.attnum > 0
             AND NOT a.attisdropped
             AND t.typtype = 'c'
-      ) ON true
+      ) _lat19 ON true
       LEFT JOIN LATERAL (
           SELECT JSONB_AGG(pg_get_constraintdef(con.oid)) AS constraints
           FROM pg_constraint AS con
           WHERE con.contypid = t.oid
             AND t.typtype = 'd'
-      ) ON true
+      ) _lat20 ON true
       LEFT JOIN LATERAL (
           SELECT r.rngsubtype::regtype::text AS subtype,
                  CASE WHEN r.rngsubdiff != 0 THEN r.rngsubdiff::regproc::text END AS subtype_diff,
@@ -1406,7 +1962,8 @@ private:
   }
 
   const json type_detail(const std::string& schema, const std::string& type_name) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_BUILD_OBJECT(
@@ -1432,13 +1989,13 @@ private:
             AND a.attnum > 0
             AND NOT a.attisdropped
             AND t.typtype = 'c'
-      ) ON true
+      ) _lat21 ON true
       LEFT JOIN LATERAL (
           SELECT JSONB_AGG(pg_get_constraintdef(con.oid)) AS constraints
           FROM pg_constraint AS con
           WHERE con.contypid = t.oid
             AND t.typtype = 'd'
-      ) ON true
+      ) _lat22 ON true
       LEFT JOIN LATERAL (
           SELECT r.rngsubtype::regtype::text AS subtype,
                  CASE WHEN r.rngsubdiff != 0 THEN r.rngsubdiff::regproc::text END AS subtype_diff,
@@ -1458,7 +2015,7 @@ private:
             AND a.attnum > 0
             AND NOT a.attisdropped
             AND c.relkind IN ('r', 'p', 'm', 'v')
-      ) ON true
+      ) _lat23 ON true
       WHERE t.typnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
         AND t.typname = $2
         AND (
@@ -1478,7 +2035,8 @@ private:
   }
 
   const json roles() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1503,7 +2061,7 @@ private:
           FROM pg_auth_members AS m
           JOIN pg_roles AS g ON g.oid = m.roleid
           WHERE m.member = r.oid
-      ) ON true;
+      ) _lat24 ON true;
     )";
 
     pqxx::result res = txn.exec(query);
@@ -1516,7 +2074,8 @@ private:
   }
 
   const json foreign_tables(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     // Deliberately excludes user mapping options: pg_user_mapping/pg_user_mappings
     // expose credentials (e.g. password) in cleartext to superusers, which would
@@ -1542,7 +2101,7 @@ private:
           WHERE a.attrelid = c.oid
             AND a.attnum > 0
             AND NOT a.attisdropped
-      ) ON true
+      ) _lat25 ON true
       WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1);
     )";
 
@@ -1556,7 +2115,8 @@ private:
   }
 
   const json foreign_servers() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     // Server options only (host/port/dbname-style); never user mapping credentials.
     std::string query = R"(
@@ -1584,7 +2144,8 @@ private:
   }
 
   const json tablespaces() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1609,7 +2170,8 @@ private:
   }
 
   const json collations(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     // Restrict to collations usable in this database's encoding (collencoding = -1
     // means "any encoding"); otherwise libc ships many same-named rows per locale,
@@ -1641,7 +2203,8 @@ private:
   }
 
   const json event_triggers() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1668,7 +2231,8 @@ private:
   }
 
   const json publications() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1688,7 +2252,7 @@ private:
           SELECT JSONB_AGG(pt.schemaname || '.' || pt.tablename) AS tables
           FROM pg_publication_tables AS pt
           WHERE pt.pubname = p.pubname
-      ) ON true;
+      ) _lat26 ON true;
     )";
 
     pqxx::result res = txn.exec(query);
@@ -1701,28 +2265,28 @@ private:
   }
 
   const json subscriptions() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     // Deliberately excludes subconninfo: pg_subscription is a shared (cluster-wide)
     // catalog and that column holds the full connection string, which may embed a
     // password. Scoped to the current database via subdbid to avoid leaking
     // subscriptions that belong to other databases in the same cluster.
-    std::string query = R"(
-      SELECT JSONB_OBJECT_AGG(
-               subname,
-               JSONB_BUILD_OBJECT(
-                 'owner',              subowner::regrole::text,
-                 'enabled',            subenabled,
-                 'publications',       subpublications,
-                 'slot_name',          subslotname,
-                 'synchronous_commit', subsynccommit,
-                 'two_phase',          subtwophasestate,
-                 'binary',             subbinary
-               )
-             )
-      FROM pg_subscription
-      WHERE subdbid = (SELECT oid FROM pg_database WHERE datname = current_database());
-    )";
+    // subtwophasestate is PostgreSQL 15+; omit it on older servers rather than
+    // fail with an undefined-column error. subbinary is PG14, the supported floor.
+    std::string two_phase =
+      sess.server_version() >= 150000 ? ", 'two_phase', subtwophasestate" : "";
+    std::string query =
+      "SELECT JSONB_OBJECT_AGG(subname, JSONB_BUILD_OBJECT("
+      "  'owner',              subowner::regrole::text"
+      ", 'enabled',            subenabled"
+      ", 'publications',       subpublications"
+      ", 'slot_name',          subslotname"
+      ", 'synchronous_commit', subsynccommit"
+      ", 'binary',             subbinary" + two_phase +
+      ")) "
+      "FROM pg_subscription "
+      "WHERE subdbid = (SELECT oid FROM pg_database WHERE datname = current_database());";
 
     pqxx::result res = txn.exec(query);
 
@@ -1734,7 +2298,8 @@ private:
   }
 
   const json languages() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1760,7 +2325,8 @@ private:
   }
 
   const json extended_statistics(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1778,12 +2344,12 @@ private:
           FROM pg_attribute
           WHERE attrelid = s.stxrelid
             AND attnum = ANY(s.stxkeys)
-      ) ON true
+      ) _lat27 ON true
       LEFT JOIN LATERAL (
           SELECT JSONB_AGG(CASE k WHEN 'd' THEN 'ndistinct' WHEN 'f' THEN 'dependencies'
                                    WHEN 'm' THEN 'mcv' WHEN 'e' THEN 'expressions' END) AS kinds
           FROM unnest(s.stxkind) AS k
-      ) ON true
+      ) _lat28 ON true
       WHERE s.stxnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1);
     )";
 
@@ -1797,7 +2363,8 @@ private:
   }
 
   const json operators(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1825,7 +2392,8 @@ private:
   }
 
   const json operator_classes(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1852,7 +2420,8 @@ private:
   }
 
   const json access_methods() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1876,7 +2445,8 @@ private:
   }
 
   const json casts() {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     // Filtered to casts involving at least one user-defined type; unfiltered this
     // returns hundreds of built-in numeric/string coercions that are pure noise
@@ -1909,7 +2479,8 @@ private:
   }
 
   const json text_search_configs(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1947,7 +2518,8 @@ private:
   }
 
   const json sequences(const std::string& schema) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(
@@ -1990,7 +2562,8 @@ private:
   }
 
   const json table(const std::string& schema, const std::string& table) {
-    pqxx::work txn{conn};
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
 
     std::string query = R"(
       SELECT JSONB_BUILD_OBJECT(
@@ -2047,7 +2620,7 @@ private:
                        LEFT JOIN pg_stats AS ps ON ps.schemaname = $1 AND ps.tablename = $2 AND ps.attname = a.attname
                        WHERE attnum > 0
                          AND attrelid = c.oid
-                         AND NOT attisdropped) ON true
+                         AND NOT attisdropped) _lat29 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(indexname,
                           JSONB_BUILD_OBJECT(
                            'definition', indexdef, 'size', pg_relation_size(si.indexrelid), 'index_uses', idx_scan, 'last_use', last_idx_scan)) AS indexes
@@ -2056,17 +2629,17 @@ private:
                                                       AND si.schemaname = i.schemaname
                                                       AND si.relname = i.tablename
                          WHERE i.schemaname = $1
-                           AND i.tablename = c.relname) ON true
+                           AND i.tablename = c.relname) _lat30 ON true
       LEFT JOIN LATERAL (SELECT JSONB_AGG(a.attname ORDER BY array_position(pk.conkey, a.attnum)) AS primary_key
                          FROM pg_constraint pk
                          JOIN pg_attribute a ON a.attrelid = pk.conrelid AND a.attnum = ANY(pk.conkey)
-                         WHERE pk.conrelid = c.oid AND pk.contype = 'p') ON true
+                         WHERE pk.conrelid = c.oid AND pk.contype = 'p') _lat31 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(conname,
                           JSONB_BUILD_OBJECT(
                            'definition', pg_get_constraintdef(oid))) AS constraints
                          FROM pg_constraint
                          WHERE conrelid = c.oid
-                           AND contype != 'f') ON true
+                           AND contype != 'f') _lat32 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(fk.conname,
                           JSONB_BUILD_OBJECT(
                            'target_table', fk.confrelid::regclass::text,
@@ -2075,7 +2648,7 @@ private:
                            'definition', pg_get_constraintdef(fk.oid))) AS foreign_keys
                          FROM pg_constraint fk
                          WHERE fk.conrelid = c.oid
-                           AND fk.contype = 'f') ON true
+                           AND fk.contype = 'f') _lat33 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(fk.conrelid::regclass::text || '.' || fk.conname,
                           JSONB_BUILD_OBJECT(
                            'source_table', fk.conrelid::regclass::text,
@@ -2084,7 +2657,7 @@ private:
                            'definition', pg_get_constraintdef(fk.oid))) AS referenced_by
                          FROM pg_constraint fk
                          WHERE fk.confrelid = c.oid
-                           AND fk.contype = 'f') ON true
+                           AND fk.contype = 'f') _lat34 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(t.tgname,
                           JSONB_BUILD_OBJECT(
                            'function',    p.proname,
@@ -2109,7 +2682,7 @@ private:
                          JOIN   pg_proc AS p ON p.oid = t.tgfoid
                          JOIN   pg_language AS l ON l.oid = p.prolang
                          WHERE  t.tgrelid = c.oid
-                           AND  NOT t.tgisinternal) ON true
+                           AND  NOT t.tgisinternal) _lat35 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(r.rulename,
                           JSONB_BUILD_OBJECT(
                            'event',      CASE r.ev_type WHEN '1' THEN 'SELECT' WHEN '2' THEN 'UPDATE'
@@ -2118,7 +2691,7 @@ private:
                            'definition', pg_get_ruledef(r.oid))) AS rules
                          FROM pg_rewrite AS r
                          WHERE r.ev_class = c.oid
-                           AND r.rulename != '_RETURN') ON true
+                           AND r.rulename != '_RETURN') _lat36 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(pol.polname,
                           JSONB_BUILD_OBJECT(
                            'command',     CASE pol.polcmd WHEN 'r' THEN 'SELECT' WHEN 'a' THEN 'INSERT'
@@ -2129,16 +2702,26 @@ private:
                            'using',       pg_get_expr(pol.polqual, pol.polrelid),
                            'with_check',  pg_get_expr(pol.polwithcheck, pol.polrelid))) AS policies
                          FROM pg_policy AS pol
-                         WHERE pol.polrelid = c.oid) ON true
+                         WHERE pol.polrelid = c.oid) _lat37 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(grantee, privs) AS roles
                          FROM (SELECT COALESCE(r.rolname, 'PUBLIC') AS grantee,
                                       JSONB_AGG(a.privilege_type ORDER BY a.privilege_type) AS privs
                                FROM aclexplode(c.relacl) AS a
                                LEFT JOIN pg_roles AS r ON r.oid = a.grantee
-                               GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) ON true
+                               GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) _lat38 ON true
       WHERE c.relnamespace = $1::regnamespace
         AND c.relname = $2;
     )";
+
+    // pg_stat_user_indexes.last_idx_scan is PostgreSQL 16+; drop the index
+    // 'last_use' field on older servers so the query still parses. If this
+    // literal ever drifts from the query above, the pg14/pg15 CI jobs fail
+    // loudly with an undefined-column error rather than silently.
+    if (sess.server_version() < 160000) {
+      const std::string frag = ", 'last_use', last_idx_scan";
+      auto pos = query.find(frag);
+      if (pos != std::string::npos) query.erase(pos, frag.size());
+    }
 
     pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, table});
 
@@ -2180,7 +2763,17 @@ private:
       try {
 	json result_content;
 
-	if (tool_name == "listSchemas") {
+	// Resolve the target connection once, before dispatch. get() throws a
+	// message listing the configured names if this one is unknown, so a
+	// typo fails here rather than as a confusing connect error later.
+	active_ = arguments.contains("connection") && arguments["connection"].is_string()
+	  ? arguments["connection"].get<std::string>() : std::string{};
+	(void)registry_.get(active_);
+
+	if (tool_name == "listConnections") {
+	  result_content = connections();
+	}
+	else if (tool_name == "listSchemas") {
 	  result_content = schemas();
 	}
 	else if (tool_name == "listTables") {
@@ -2322,6 +2915,23 @@ private:
 	  std::string target_table  = arguments.contains("table")  ? arguments["table"].get<std::string>()  : "";
 	  json vals = arguments.contains("values") ? arguments["values"] : json::array();
 	  result_content = check_key(target_schema, target_table, vals);
+	}
+	else if (tool_name == "explainQuery") {
+	  // queryid is documented as a string because a 64-bit value does not
+	  // survive JSON number precision, but accept a number too rather than
+	  // fail with a raw nlohmann type error.
+	  std::string qid;
+	  if (arguments.contains("queryid")) {
+	    if (arguments["queryid"].is_string())
+	      qid = arguments["queryid"].get<std::string>();
+	    else if (arguments["queryid"].is_number_integer())
+	      qid = std::to_string(arguments["queryid"].get<long long>());
+	  }
+	  std::string sql = arguments.contains("sql") ? arguments["sql"].get<std::string>() : "";
+	  json prms = arguments.contains("params") ? arguments["params"] : json::array();
+	  bool do_analyze = arguments.contains("analyze") ? arguments["analyze"].get<bool>() : false;
+	  int tmo = arguments.contains("timeout_ms") ? arguments["timeout_ms"].get<int>() : 0;
+	  result_content = explain_query(qid, sql, prms, do_analyze, tmo);
 	}
 	else {
 	  send_error(req["id"], -32601, "Tool not found: " + tool_name);

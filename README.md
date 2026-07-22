@@ -8,7 +8,9 @@ Motivation to create another PostgreSQL MCP:
 - Allow to describe database model and routines based on what is in the database
 - Fast inspection of available indexes and relationships when analyzing a query plan
 
-Every query is parameterized (`$1`/`$2` bindings or `::regnamespace`/`::regclass` casts) — no schema, table, or search-term argument is ever concatenated into SQL text. On connect, the session sets `default_transaction_read_only = on`, so even a bug that let a query attempt a write would still fail rather than succeed silently.
+Every query is parameterized (`$1`/`$2` bindings or `::regnamespace`/`::regclass` casts) — no schema, table, or search-term argument is ever concatenated into SQL text. The one deliberate exception is `explainQuery`, which has to place the statement under analysis into the `EXPLAIN` text because `EXPLAIN` cannot take a bind parameter; it is guarded by a leading-keyword whitelist, a single-statement check, `PREPARE`d parameter binding with every value escaped through libpq, a `ModifyTable` gate that refuses to execute anything that writes, and a bounded `statement_timeout`. Every tool call runs inside its own `READ ONLY` transaction, so even a bug that let a query attempt a write would still fail (SQLSTATE `25006`) rather than succeed silently.
+
+The read-only guard is deliberately *transaction*-scoped rather than session-scoped. Under a connection pooler in transaction mode (PgBouncer's `pool_mode = transaction` with `server_reset_query = DISCARD ALL`), the server connection is returned to the pool at commit and its session state is wiped — so a `SET` issued once at startup silently stops applying to later calls. Transaction scope is the scope a pooler preserves. The setting cannot be pushed into the connection string either: PgBouncer rejects GUCs in the startup packet outright (`unsupported startup parameter in options: ...`).
 
 ## Tools
 
@@ -52,6 +54,10 @@ Every query is parameterized (`$1`/`$2` bindings or `::regnamespace`/`::regclass
 | `statementStats` | The slowest tracked queries by total execution time (`pg_stat_statements`), with calls, timing, row counts, and buffer usage; returns a clear error with setup instructions if the extension is not installed |
 | `tableBloat` | Physical storage bloat for a table (`pgstattuple`/`pgstattuple_approx`): live/dead tuple counts and percentages, free space and percentage. Defaults to the cheap visibility-map-based approximation; `exact: true` runs a precise but I/O-heavy full table scan. More accurate than the ANALYZE-time estimates in `listTables`/`tableDetails`. Returns a clear error with setup instructions if the extension is not installed |
 | `checkKey` | Check if a row exists by primary key (single or composite); validates value types against PK column types before querying |
+| `explainQuery` | Raw `EXPLAIN (FORMAT JSON)` plan for a statement, recovered from `pg_stat_statements` by `queryid` (full untruncated text) or supplied directly as `sql`. Runs in a read-only transaction bounded by `statement_timeout`. Statements with `$n` placeholders are planned with `GENERIC_PLAN`; supply `params` to have the statement `PREPARE`d and planned with real values. `analyze: true` runs `EXPLAIN (ANALYZE, BUFFERS)` — but only after the plan is proven free of any `ModifyTable` node, so data-modifying statements (including data-modifying CTEs) are never executed, and it requires an explicit `timeout_ms`. Returns the plan verbatim plus `generic`/`analyzed`/`read_only` flags and the `pg_stat_statements` row; no heuristics and no generated DDL — the plan is yours to interpret |
+| `listConnections` | The configured database connections by name, with the libpq `service` name or host/port/dbname/user for each, and which is the default. Passwords are never returned and a service file is never expanded |
+
+Every tool also accepts an optional `connection` argument naming one of the configured connections (see [Configuration](#configuration)); omit it to use the default.
 
 ## Install
 
@@ -122,7 +128,56 @@ DATABASE_URL="host=localhost port=5432 dbname=mydb" ./pg_licht_mcp
 
 # or as an argument
 ./pg_licht_mcp "postgresql://user:pass@host/dbname"
+
+# or several named databases from a config file
+./pg_licht_mcp --config ~/.config/pg_licht/connections.ini
 ```
+
+## Configuration
+
+A single database needs nothing beyond `DATABASE_URL`. To reach several databases from one
+server, list them in an INI file:
+
+```ini
+[default]
+port    = 6432
+dbname  = pglicht
+user    = daniel
+sslmode = prefer
+; no password here — use ~/.pgpass or a service file
+
+[prod]
+; a libpq service name, resolved from ~/.pg_service.conf,
+; $PGSERVICEFILE, or $PGSYSCONFDIR/pg_service.conf
+service = db01_ro
+
+[staging]
+service = db01_ro        ; the service supplies the defaults…
+dbname  = db01_staging   ; …and explicit keys override them
+```
+
+Pass a section name as the `connection` argument of any tool to run it against that
+database; omit it to use `[default]` (or, if there is no `[default]`, the first section).
+`listConnections` reports what is configured.
+
+Keys are passed through to libpq, so anything libpq accepts works — including `service`,
+which may be used on its own in place of `host`/`port`/`dbname`/`user`. Each section must
+set either `service` or at least `dbname`. `options` is rejected, because PgBouncer refuses
+GUCs in the startup packet; pg-licht sets what it needs per transaction instead.
+
+The file is resolved in this order: `--config <path>`, `$PG_LICHT_CONFIG`,
+`~/.config/pg_licht/connections.ini` (only if it exists), then `DATABASE_URL`, then
+`argv[1]`.
+
+Because sections may carry passwords, the file must not be group- or world-accessible —
+pg-licht refuses to load it otherwise, the same rule libpq applies to `~/.pgpass`:
+
+```bash
+chmod 600 ~/.config/pg_licht/connections.ini
+```
+
+Note that libpq enforces that rule on `~/.pgpass` but *not* on `pg_service.conf`, so if a
+service file holds a password, its permissions are yours to manage.
 
 ## Test
 
@@ -133,6 +188,35 @@ DATABASE_URL="port=5432 dbname=mydb" ctest --test-dir cpp/build --output-on-fail
 ```
 
 Tests create and destroy a temporary database named `pg_licht_test_<PID>` automatically.
+
+### Through a connection pooler
+
+Because the read-only guard is transaction-scoped specifically so it survives a
+transaction-mode pooler, there is a script that verifies exactly that. It stands up a
+throwaway PostgreSQL cluster and a companion PgBouncer (`pool_mode=transaction`,
+`server_reset_query=DISCARD ALL`) in a temp directory, runs the full suite both directly
+and through the pooler, and tears everything down — touching nothing else on the machine:
+
+```bash
+cmake --build cpp/build          # the script needs the test binary built
+cpp/test/run-pooled-tests.sh
+```
+
+Requires `initdb`/`pg_ctl` (PostgreSQL 14+) and `pgbouncer` on the machine; it picks the
+newest installed PostgreSQL and free defaults, all overridable via environment
+(`PG_BINDIR`, `PGBOUNCER`, `PG_PORT`, `BOUNCER_PORT`). CI runs it across PostgreSQL
+14, 15, 16, 17, and 18.
+
+## PostgreSQL version support
+
+Supports **PostgreSQL 14 and newer**, verified in CI on 14–18. One feature degrades
+gracefully below 16: `explainQuery` can only produce a plan for a `pg_stat_statements`
+statement (whose text is normalized to `$1`/`$2`) by using `EXPLAIN (GENERIC_PLAN)`, which
+is PostgreSQL 16+. On 14/15 that path returns an actionable hint instead — supplying
+`params` (which prepares and plans the statement with real values) works on every supported
+version. Two catalog fields are simply omitted where the column doesn't exist: index
+`last_use` (`pg_stat_user_indexes.last_idx_scan`, PG16+) and subscription `two_phase`
+(`pg_subscription.subtwophasestate`, PG15+).
 
 ## Debugging with MCP Inspector
 

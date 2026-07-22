@@ -3,8 +3,6 @@ cpp/build/
 cpp/build_*/
 cpp/Testing/
 cpp/dist/
-typescript/dist/
-typescript/node_modules/
 
 # IDE
 .vscode/
@@ -17,12 +15,8 @@ typescript/node_modules/
 .DS_Store
 Thumbs.db
 
-# Dependencies (optional - see below)
-# node_modules/
-
 # Logs
 *.log
-npm-debug.log*
 
 # Environment
 .env
