@@ -1554,7 +1554,10 @@ private:
       // Returned as successful results with error/hint, matching the pattern
       // used for missing extensions: the caller needs to read the reason and
       // retry differently, not just be told something failed.
-      std::string ss = e.sqlstate();
+      // Direct-init, not copy-init: libpqxx 8's sqlstate() returns
+      // std::string_view (explicit conversion to std::string), while 7.x
+      // returns std::string. Parens accept both.
+      std::string ss(e.sqlstate());
       if (ss == "42601")
         return {{"error", "the statement could not be parsed"},
                 {"hint", "pg_stat_statements truncates query text at "

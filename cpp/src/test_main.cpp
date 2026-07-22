@@ -1874,6 +1874,16 @@ protected:
         t.commit();
       }
       {
+        // CREATE EXTENSION succeeds even when the library is not in
+        // shared_preload_libraries (e.g. the stock postgres Docker image), but
+        // *reading* the view then fails at runtime with "must be loaded via
+        // shared_preload_libraries". Probe the view itself so the suite skips
+        // in that case instead of failing every test body.
+        pqxx::work t(c);
+        t.exec("SELECT 1 FROM pg_stat_statements LIMIT 1");
+        t.commit();
+      }
+      {
         // Generate a statement with a placeholder so the recovered text is
         // normalised, which is the case the tool has to cope with.
         pqxx::work t(c);
