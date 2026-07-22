@@ -27,8 +27,13 @@
 - **Connect-execute-release.** Connections are opened per tool call and closed afterwards rather than held open, which suits a pooler and leaves no idle backends or lingering session state.
 - Config files must not be group- or world-accessible (the `~/.pgpass` rule), since sections may carry credentials. `options` is rejected with an explanation, as PgBouncer refuses it.
 
+### Compatibility
+
+- **Supports PostgreSQL 14 and newer** (previously effectively 16+), verified in CI on 14 through 18. The blocker was pervasive: ~40 catalog queries used aliasless `LEFT JOIN LATERAL (...) ON true`, which only PostgreSQL 16+ accepts — every such subquery now carries an alias, valid on all versions. Three version-gated catalog fields are handled too: `explainQuery`'s `GENERIC_PLAN` path (PG16+) returns an actionable hint on 14/15 instead of failing (supplying `params` works everywhere); index `last_use` (`last_idx_scan`, PG16+) and subscription `two_phase` (`subtwophasestate`, PG15+) are omitted where the column doesn't exist. Server version is read from the connection handshake (no extra round trip) and gates per connection, so mixed-version multi-database setups are correct.
+
 ### Testing
 
+- The CI matrix (sanitizers, valgrind, pooled) now spans PostgreSQL 14, 15, 16, 17, and 18.
 - **`cpp/test/run-pooled-tests.sh`** — stands up a throwaway PostgreSQL cluster and a companion PgBouncer in transaction mode (`server_reset_query=DISCARD ALL`) in a temp directory, runs the full suite both directly and through the pooler, and tears it all down. This is the end-to-end proof that the transaction-scoped read-only guard holds under transaction pooling — the deployment a session-scoped guard silently fails on. Verified: 176/176 tests pass in both modes on PostgreSQL 18.
 - The main test fixture now drops its scratch database with `WITH (FORCE)`, so teardown succeeds even when a transaction pooler is still holding idle server connections to it.
 

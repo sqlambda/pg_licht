@@ -66,6 +66,12 @@ public:
 
   pqxx::work& txn() { return txn_; }
 
+  // Server version as an integer (e.g. 160004 for 16.4), from the startup
+  // handshake -- no round trip. Used to gate catalog columns and SQL features
+  // that don't exist on older majors; correct per connection, which matters
+  // when different configured connections point at different-version servers.
+  int server_version() const { return conn_.server_version(); }
+
   // txn_ is destroyed before conn_, rolling back; conn_ then disconnects.
   ~Session() = default;
 
@@ -647,13 +653,13 @@ private:
       LEFT JOIN LATERAL (SELECT JSONB_AGG(relname ORDER BY relname) AS relnames
                          FROM pg_class
                          WHERE relnamespace = pg_namespace.oid
-                           AND relkind IN ('r','m','f','p','v')) ON true
+                           AND relkind IN ('r','m','f','p','v')) _lat1 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(grantee, privs) AS roles
                          FROM (SELECT COALESCE(r.rolname, 'PUBLIC') AS grantee,
                                       JSONB_AGG(a.privilege_type ORDER BY a.privilege_type) AS privs
                                FROM aclexplode(pg_namespace.nspacl) AS a
                                LEFT JOIN pg_roles AS r ON r.oid = a.grantee
-                               GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) ON true
+                               GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) _lat2 ON true
       WHERE nspname NOT LIKE 'pg_%'
         AND nspname <> 'information_schema'
         AND relnames IS NOT NULL;
@@ -696,14 +702,14 @@ private:
                        FROM pg_attribute AS a
                        WHERE a.attnum > 0
                          AND a.attrelid = c.oid
-                         AND NOT a.attisdropped) ON true
+                         AND NOT a.attisdropped) _lat3 ON true
       LEFT JOIN LATERAL (SELECT COUNT(*) AS index_count
                          FROM pg_indexes AS i
                          WHERE i.schemaname = $1
-                           AND i.tablename = c.relname) ON true
+                           AND i.tablename = c.relname) _lat4 ON true
       LEFT JOIN LATERAL (SELECT COUNT(*) AS constraint_count
                          FROM pg_constraint
-                         WHERE conrelid = c.oid) ON true
+                         WHERE conrelid = c.oid) _lat5 ON true
       WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
         AND c.relkind IN ('r', 'p', 'm', 'v');
     )";
@@ -750,21 +756,21 @@ private:
                          FROM pg_attribute AS a
                          WHERE a.attnum > 0
                            AND a.attrelid = c.oid
-                           AND NOT a.attisdropped) ON true
+                           AND NOT a.attisdropped) _lat6 ON true
       LEFT JOIN LATERAL (SELECT COUNT(*) AS index_count
                          FROM pg_indexes AS i
                          WHERE i.schemaname = c.relnamespace::regnamespace::name
-                           AND i.tablename = c.relname) ON true
+                           AND i.tablename = c.relname) _lat7 ON true
       LEFT JOIN LATERAL (SELECT COUNT(*) AS constraint_count
                          FROM pg_constraint
-                         WHERE conrelid = c.oid) ON true
+                         WHERE conrelid = c.oid) _lat8 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(grantee, privs) AS roles,
                                 STRING_AGG(grantee, ' ' ORDER BY grantee) AS role_names
                          FROM (SELECT COALESCE(r.rolname, 'PUBLIC') AS grantee,
                                       JSONB_AGG(a.privilege_type ORDER BY a.privilege_type) AS privs
                                FROM aclexplode(c.relacl) AS a
                                LEFT JOIN pg_roles AS r ON r.oid = a.grantee
-                               GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) ON true
+                               GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) _lat9 ON true
       LEFT JOIN LATERAL (
           SELECT STRING_AGG(
               REGEXP_REPLACE(REGEXP_REPLACE(et.typname, '_', ' ', 'g'), '([[:upper:]])', ' \1', 'g') || ' ' ||
@@ -775,9 +781,9 @@ private:
           LEFT JOIN LATERAL (
               SELECT STRING_AGG(ev.enumlabel, ' ') AS values_text
               FROM pg_enum AS ev WHERE ev.enumtypid = et.oid
-          ) ON true
+          ) _lat10 ON true
           WHERE a.attnum > 0 AND NOT a.attisdropped AND a.attrelid = c.oid
-      ) ON true
+      ) _lat11 ON true
       WHERE TO_TSVECTOR('english',
               REGEXP_REPLACE(REGEXP_REPLACE(c.relname, '_', ' ', 'g'), '([[:upper:]])', ' \1', 'g') || ' ' ||
               REGEXP_REPLACE(REGEXP_REPLACE(c.relnamespace::regnamespace::name, '_', ' ', 'g'), '([[:upper:]])', ' \1', 'g') || ' ' ||
@@ -867,13 +873,13 @@ private:
                  )) AS used_in_triggers
           FROM   pg_trigger AS t
           WHERE  t.tgfoid = p.oid AND NOT t.tgisinternal
-      ) ON true
+      ) _lat12 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(grantee, privs) AS roles
                          FROM (SELECT COALESCE(r.rolname, 'PUBLIC') AS grantee,
                                       JSONB_AGG(a.privilege_type ORDER BY a.privilege_type) AS privs
                                FROM aclexplode(p.proacl) AS a
                                LEFT JOIN pg_roles AS r ON r.oid = a.grantee
-                               GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) ON true
+                               GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) _lat13 ON true
       WHERE  p.pronamespace = $1::regnamespace
         AND  p.proname = $2
         AND  p.prokind IN ('f', 'p');
@@ -919,7 +925,7 @@ private:
           SELECT JSONB_AGG(t.tgname) AS trigger_names
           FROM   pg_trigger AS t
           WHERE  t.tgfoid = p.oid AND NOT t.tgisinternal
-      ) ON true
+      ) _lat14 ON true
       WHERE  p.prokind IN ('f', 'p')
         AND (
             TO_TSVECTOR('english',
@@ -1464,6 +1470,21 @@ private:
           // PostgreSQL rather than by scanning for "$n" ourselves, which would
           // false-positive inside string literals and dollar-quoted bodies.
           if (e.sqlstate() != "42P02") throw;
+          // GENERIC_PLAN is PostgreSQL 16+. On older servers attempting it
+          // yields a confusing "unrecognized EXPLAIN option" rather than the
+          // real problem, so short-circuit with the actionable hint instead.
+          if (sess.server_version() < 160000) {
+            json out = {
+              {"error", "the statement has $n placeholders and no params were supplied"},
+              {"hint", "supply values via the params argument so the statement can be "
+                       "prepared and planned; planning a normalized statement without "
+                       "params needs EXPLAIN (GENERIC_PLAN), which requires PostgreSQL 16+"}
+            };
+            // On the queryid path the statement was already recovered; return it
+            // so the caller still gets the stats and can retry with params.
+            if (!stats.is_null()) out["statement"] = stats;
+            return out;
+          }
           pqxx::result r = txn.exec("EXPLAIN (GENERIC_PLAN, FORMAT JSON) " + sql);
           plan = json::parse(r[0][0].as<std::string>());
           generic = true;
@@ -1772,7 +1793,7 @@ private:
           SELECT JSONB_AGG(e.enumlabel ORDER BY e.enumsortorder) AS values
           FROM pg_enum AS e
           WHERE e.enumtypid = t.oid
-      ) ON true
+      ) _lat15 ON true
       WHERE t.typnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
         AND t.typtype = 'e';
     )";
@@ -1801,7 +1822,7 @@ private:
           SELECT JSONB_AGG(e.enumlabel ORDER BY e.enumsortorder) AS values
           FROM pg_enum AS e
           WHERE e.enumtypid = t.oid
-      ) ON true
+      ) _lat16 ON true
       LEFT JOIN LATERAL (
           SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
                    'table', c.relnamespace::regnamespace::text || '.' || c.relname,
@@ -1813,7 +1834,7 @@ private:
             AND a.attnum > 0
             AND NOT a.attisdropped
             AND c.relkind IN ('r', 'p', 'm', 'v')
-      ) ON true
+      ) _lat17 ON true
       WHERE t.typnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
         AND t.typname = $2
         AND t.typtype = 'e';
@@ -1850,7 +1871,7 @@ private:
                  STRING_AGG(e.enumlabel, ' ') AS values_text
           FROM pg_enum AS e
           WHERE e.enumtypid = t.oid
-      ) ON true
+      ) _lat18 ON true
       WHERE t.typtype = 'e'
         AND t.typnamespace NOT IN (
             SELECT oid FROM pg_namespace
@@ -1905,13 +1926,13 @@ private:
             AND a.attnum > 0
             AND NOT a.attisdropped
             AND t.typtype = 'c'
-      ) ON true
+      ) _lat19 ON true
       LEFT JOIN LATERAL (
           SELECT JSONB_AGG(pg_get_constraintdef(con.oid)) AS constraints
           FROM pg_constraint AS con
           WHERE con.contypid = t.oid
             AND t.typtype = 'd'
-      ) ON true
+      ) _lat20 ON true
       LEFT JOIN LATERAL (
           SELECT r.rngsubtype::regtype::text AS subtype,
                  CASE WHEN r.rngsubdiff != 0 THEN r.rngsubdiff::regproc::text END AS subtype_diff,
@@ -1965,13 +1986,13 @@ private:
             AND a.attnum > 0
             AND NOT a.attisdropped
             AND t.typtype = 'c'
-      ) ON true
+      ) _lat21 ON true
       LEFT JOIN LATERAL (
           SELECT JSONB_AGG(pg_get_constraintdef(con.oid)) AS constraints
           FROM pg_constraint AS con
           WHERE con.contypid = t.oid
             AND t.typtype = 'd'
-      ) ON true
+      ) _lat22 ON true
       LEFT JOIN LATERAL (
           SELECT r.rngsubtype::regtype::text AS subtype,
                  CASE WHEN r.rngsubdiff != 0 THEN r.rngsubdiff::regproc::text END AS subtype_diff,
@@ -1991,7 +2012,7 @@ private:
             AND a.attnum > 0
             AND NOT a.attisdropped
             AND c.relkind IN ('r', 'p', 'm', 'v')
-      ) ON true
+      ) _lat23 ON true
       WHERE t.typnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
         AND t.typname = $2
         AND (
@@ -2037,7 +2058,7 @@ private:
           FROM pg_auth_members AS m
           JOIN pg_roles AS g ON g.oid = m.roleid
           WHERE m.member = r.oid
-      ) ON true;
+      ) _lat24 ON true;
     )";
 
     pqxx::result res = txn.exec(query);
@@ -2077,7 +2098,7 @@ private:
           WHERE a.attrelid = c.oid
             AND a.attnum > 0
             AND NOT a.attisdropped
-      ) ON true
+      ) _lat25 ON true
       WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1);
     )";
 
@@ -2228,7 +2249,7 @@ private:
           SELECT JSONB_AGG(pt.schemaname || '.' || pt.tablename) AS tables
           FROM pg_publication_tables AS pt
           WHERE pt.pubname = p.pubname
-      ) ON true;
+      ) _lat26 ON true;
     )";
 
     pqxx::result res = txn.exec(query);
@@ -2248,22 +2269,21 @@ private:
     // catalog and that column holds the full connection string, which may embed a
     // password. Scoped to the current database via subdbid to avoid leaking
     // subscriptions that belong to other databases in the same cluster.
-    std::string query = R"(
-      SELECT JSONB_OBJECT_AGG(
-               subname,
-               JSONB_BUILD_OBJECT(
-                 'owner',              subowner::regrole::text,
-                 'enabled',            subenabled,
-                 'publications',       subpublications,
-                 'slot_name',          subslotname,
-                 'synchronous_commit', subsynccommit,
-                 'two_phase',          subtwophasestate,
-                 'binary',             subbinary
-               )
-             )
-      FROM pg_subscription
-      WHERE subdbid = (SELECT oid FROM pg_database WHERE datname = current_database());
-    )";
+    // subtwophasestate is PostgreSQL 15+; omit it on older servers rather than
+    // fail with an undefined-column error. subbinary is PG14, the supported floor.
+    std::string two_phase =
+      sess.server_version() >= 150000 ? ", 'two_phase', subtwophasestate" : "";
+    std::string query =
+      "SELECT JSONB_OBJECT_AGG(subname, JSONB_BUILD_OBJECT("
+      "  'owner',              subowner::regrole::text"
+      ", 'enabled',            subenabled"
+      ", 'publications',       subpublications"
+      ", 'slot_name',          subslotname"
+      ", 'synchronous_commit', subsynccommit"
+      ", 'binary',             subbinary" + two_phase +
+      ")) "
+      "FROM pg_subscription "
+      "WHERE subdbid = (SELECT oid FROM pg_database WHERE datname = current_database());";
 
     pqxx::result res = txn.exec(query);
 
@@ -2321,12 +2341,12 @@ private:
           FROM pg_attribute
           WHERE attrelid = s.stxrelid
             AND attnum = ANY(s.stxkeys)
-      ) ON true
+      ) _lat27 ON true
       LEFT JOIN LATERAL (
           SELECT JSONB_AGG(CASE k WHEN 'd' THEN 'ndistinct' WHEN 'f' THEN 'dependencies'
                                    WHEN 'm' THEN 'mcv' WHEN 'e' THEN 'expressions' END) AS kinds
           FROM unnest(s.stxkind) AS k
-      ) ON true
+      ) _lat28 ON true
       WHERE s.stxnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1);
     )";
 
@@ -2597,7 +2617,7 @@ private:
                        LEFT JOIN pg_stats AS ps ON ps.schemaname = $1 AND ps.tablename = $2 AND ps.attname = a.attname
                        WHERE attnum > 0
                          AND attrelid = c.oid
-                         AND NOT attisdropped) ON true
+                         AND NOT attisdropped) _lat29 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(indexname,
                           JSONB_BUILD_OBJECT(
                            'definition', indexdef, 'size', pg_relation_size(si.indexrelid), 'index_uses', idx_scan, 'last_use', last_idx_scan)) AS indexes
@@ -2606,17 +2626,17 @@ private:
                                                       AND si.schemaname = i.schemaname
                                                       AND si.relname = i.tablename
                          WHERE i.schemaname = $1
-                           AND i.tablename = c.relname) ON true
+                           AND i.tablename = c.relname) _lat30 ON true
       LEFT JOIN LATERAL (SELECT JSONB_AGG(a.attname ORDER BY array_position(pk.conkey, a.attnum)) AS primary_key
                          FROM pg_constraint pk
                          JOIN pg_attribute a ON a.attrelid = pk.conrelid AND a.attnum = ANY(pk.conkey)
-                         WHERE pk.conrelid = c.oid AND pk.contype = 'p') ON true
+                         WHERE pk.conrelid = c.oid AND pk.contype = 'p') _lat31 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(conname,
                           JSONB_BUILD_OBJECT(
                            'definition', pg_get_constraintdef(oid))) AS constraints
                          FROM pg_constraint
                          WHERE conrelid = c.oid
-                           AND contype != 'f') ON true
+                           AND contype != 'f') _lat32 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(fk.conname,
                           JSONB_BUILD_OBJECT(
                            'target_table', fk.confrelid::regclass::text,
@@ -2625,7 +2645,7 @@ private:
                            'definition', pg_get_constraintdef(fk.oid))) AS foreign_keys
                          FROM pg_constraint fk
                          WHERE fk.conrelid = c.oid
-                           AND fk.contype = 'f') ON true
+                           AND fk.contype = 'f') _lat33 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(fk.conrelid::regclass::text || '.' || fk.conname,
                           JSONB_BUILD_OBJECT(
                            'source_table', fk.conrelid::regclass::text,
@@ -2634,7 +2654,7 @@ private:
                            'definition', pg_get_constraintdef(fk.oid))) AS referenced_by
                          FROM pg_constraint fk
                          WHERE fk.confrelid = c.oid
-                           AND fk.contype = 'f') ON true
+                           AND fk.contype = 'f') _lat34 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(t.tgname,
                           JSONB_BUILD_OBJECT(
                            'function',    p.proname,
@@ -2659,7 +2679,7 @@ private:
                          JOIN   pg_proc AS p ON p.oid = t.tgfoid
                          JOIN   pg_language AS l ON l.oid = p.prolang
                          WHERE  t.tgrelid = c.oid
-                           AND  NOT t.tgisinternal) ON true
+                           AND  NOT t.tgisinternal) _lat35 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(r.rulename,
                           JSONB_BUILD_OBJECT(
                            'event',      CASE r.ev_type WHEN '1' THEN 'SELECT' WHEN '2' THEN 'UPDATE'
@@ -2668,7 +2688,7 @@ private:
                            'definition', pg_get_ruledef(r.oid))) AS rules
                          FROM pg_rewrite AS r
                          WHERE r.ev_class = c.oid
-                           AND r.rulename != '_RETURN') ON true
+                           AND r.rulename != '_RETURN') _lat36 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(pol.polname,
                           JSONB_BUILD_OBJECT(
                            'command',     CASE pol.polcmd WHEN 'r' THEN 'SELECT' WHEN 'a' THEN 'INSERT'
@@ -2679,16 +2699,26 @@ private:
                            'using',       pg_get_expr(pol.polqual, pol.polrelid),
                            'with_check',  pg_get_expr(pol.polwithcheck, pol.polrelid))) AS policies
                          FROM pg_policy AS pol
-                         WHERE pol.polrelid = c.oid) ON true
+                         WHERE pol.polrelid = c.oid) _lat37 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(grantee, privs) AS roles
                          FROM (SELECT COALESCE(r.rolname, 'PUBLIC') AS grantee,
                                       JSONB_AGG(a.privilege_type ORDER BY a.privilege_type) AS privs
                                FROM aclexplode(c.relacl) AS a
                                LEFT JOIN pg_roles AS r ON r.oid = a.grantee
-                               GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) ON true
+                               GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) _lat38 ON true
       WHERE c.relnamespace = $1::regnamespace
         AND c.relname = $2;
     )";
+
+    // pg_stat_user_indexes.last_idx_scan is PostgreSQL 16+; drop the index
+    // 'last_use' field on older servers so the query still parses. If this
+    // literal ever drifts from the query above, the pg14/pg15 CI jobs fail
+    // loudly with an undefined-column error rather than silently.
+    if (sess.server_version() < 160000) {
+      const std::string frag = ", 'last_use', last_idx_scan";
+      auto pos = query.find(frag);
+      if (pos != std::string::npos) query.erase(pos, frag.size());
+    }
 
     pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, table});
 

@@ -11,7 +11,7 @@
 # created with initdb, a private PgBouncer is started alongside it, and both
 # are torn down on exit.
 #
-# Requirements: initdb/pg_ctl/createdb (PostgreSQL 16+), pgbouncer, and a built
+# Requirements: initdb/pg_ctl/createdb (PostgreSQL 14+), pgbouncer, and a built
 # test binary (cmake --build cpp/build).
 #
 # Overridable via environment:
@@ -30,8 +30,9 @@ find_pg_bindir() {
   [ -n "${PG_BINDIR:-}" ] && { echo "$PG_BINDIR"; return; }
   # Prefer the newest installed major version. Sort by the version initdb
   # reports, not by path: layouts differ (/usr/lib/postgresql/18/bin vs
-  # /usr/pgsql-16/bin), so a path sort would pick the wrong one. explainQuery's
-  # GENERIC_PLAN path needs PostgreSQL 16+ and the project targets 18.
+  # /usr/pgsql-16/bin), so a path sort would pick the wrong one. The server
+  # supports PostgreSQL 14+; newest is preferred so a plain dev run exercises
+  # the latest, and CI pins each supported major via PG_BINDIR.
   local d v best="" bestv=0
   for d in /usr/lib/postgresql/*/bin /usr/pgsql-*/bin \
            /opt/homebrew/opt/postgresql*/bin; do

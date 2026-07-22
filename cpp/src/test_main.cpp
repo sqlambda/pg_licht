@@ -17,6 +17,14 @@
 #endif
 #include "server.h"
 
+// Server version as libpq reports it (e.g. 160004 for 16.4), for gating tests
+// on features that require a minimum PostgreSQL major -- explainQuery's
+// GENERIC_PLAN path needs 16+.
+static int pg_server_version_num(const std::string& url) {
+  pqxx::connection c(url);
+  return c.server_version();
+}
+
 class PostgresMCPServerTest : public ::testing::Test {
 protected:
   static pqxx::connection* admin_conn;
@@ -1670,17 +1678,28 @@ TEST_F(PostgresMCPServerTest, ExplainQueryAnalyzeRequiresExplicitTimeout) {
 TEST_F(PostgresMCPServerTest, ExplainQueryPlaceholdersFallBackToGenericPlan) {
   json r = srv->call_explain_query("", "SELECT * FROM grocery.users WHERE id = $1",
                                    json::array(), false, 0);
-  ASSERT_TRUE(r.contains("plan")) << r.dump(2);
-  EXPECT_TRUE(r["generic"].get<bool>());
-  EXPECT_FALSE(r["analyzed"].get<bool>());
+  if (pg_server_version_num(test_url) >= 160000) {
+    ASSERT_TRUE(r.contains("plan")) << r.dump(2);
+    EXPECT_TRUE(r["generic"].get<bool>());
+    EXPECT_FALSE(r["analyzed"].get<bool>());
+  } else {
+    // GENERIC_PLAN is PG16+; older servers return an actionable hint instead.
+    ASSERT_TRUE(r.contains("error")) << r.dump(2);
+    EXPECT_TRUE(r.contains("hint"));
+  }
 }
 
 TEST_F(PostgresMCPServerTest, ExplainQueryGenericPlanIsNeverAnalyzed) {
   json r = srv->call_explain_query("", "SELECT * FROM grocery.users WHERE id = $1",
                                    json::array(), true, 5000);
-  EXPECT_TRUE(r["generic"].get<bool>());
-  EXPECT_FALSE(r["analyzed"].get<bool>());
-  ASSERT_TRUE(r.contains("note"));
+  if (pg_server_version_num(test_url) >= 160000) {
+    EXPECT_TRUE(r["generic"].get<bool>());
+    EXPECT_FALSE(r["analyzed"].get<bool>());
+    ASSERT_TRUE(r.contains("note"));
+  } else {
+    ASSERT_TRUE(r.contains("error")) << r.dump(2);
+    EXPECT_TRUE(r.contains("hint"));
+  }
 }
 
 TEST_F(PostgresMCPServerTest, ExplainQueryWithParamsGivesRealPlanAndAnalyzes) {
@@ -1909,11 +1928,18 @@ TEST_F(PgssMCPServerTest, RecoversStatementByQueryIdAndPlansItGenerically) {
   ASSERT_FALSE(qid.empty());
 
   json r = srv->call_explain_query(qid, "", json::array(), false, 0);
-  ASSERT_TRUE(r.contains("plan")) << r.dump(2);
-  EXPECT_EQ(r["source"].get<std::string>(), "pg_stat_statements");
-  // The recovered text is normalised, so it can only be planned generically.
-  EXPECT_TRUE(r["generic"].get<bool>());
-  EXPECT_NE(r["sql"].get<std::string>().find("$1"), std::string::npos);
+  if (pg_server_version_num(url) >= 160000) {
+    ASSERT_TRUE(r.contains("plan")) << r.dump(2);
+    EXPECT_EQ(r["source"].get<std::string>(), "pg_stat_statements");
+    // The recovered text is normalised, so it can only be planned generically.
+    EXPECT_TRUE(r["generic"].get<bool>());
+    EXPECT_NE(r["sql"].get<std::string>().find("$1"), std::string::npos);
+  } else {
+    // GENERIC_PLAN is PG16+; the normalized statement can't be planned without
+    // params, but the recovered stats still come back.
+    ASSERT_TRUE(r.contains("error")) << r.dump(2);
+    EXPECT_TRUE(r.contains("hint"));
+  }
   ASSERT_TRUE(r.contains("statement"));
   EXPECT_GT(r["statement"]["calls"].get<long long>(), 0);
 }

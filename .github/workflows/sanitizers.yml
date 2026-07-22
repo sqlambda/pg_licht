@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: [16, 17, 18]
+        pg: [14, 15, 16, 17, 18]
         sanitizer:
           - name: address-undefined
             flag: ADDRESS_UNDEFINED
@@ -71,7 +71,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: [16, 17, 18]
+        pg: [14, 15, 16, 17, 18]
     services:
       postgres:
         image: postgres:${{ matrix.pg }}
@@ -127,7 +127,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: [16, 17, 18]
+        pg: [14, 15, 16, 17, 18]
 
     steps:
       - uses: actions/checkout@v4

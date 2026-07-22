@@ -202,9 +202,21 @@ cmake --build cpp/build          # the script needs the test binary built
 cpp/test/run-pooled-tests.sh
 ```
 
-Requires `initdb`/`pg_ctl` (PostgreSQL 16+) and `pgbouncer` on the machine; it picks the
+Requires `initdb`/`pg_ctl` (PostgreSQL 14+) and `pgbouncer` on the machine; it picks the
 newest installed PostgreSQL and free defaults, all overridable via environment
-(`PG_BINDIR`, `PGBOUNCER`, `PG_PORT`, `BOUNCER_PORT`).
+(`PG_BINDIR`, `PGBOUNCER`, `PG_PORT`, `BOUNCER_PORT`). CI runs it across PostgreSQL
+14, 15, 16, 17, and 18.
+
+## PostgreSQL version support
+
+Supports **PostgreSQL 14 and newer**, verified in CI on 14–18. One feature degrades
+gracefully below 16: `explainQuery` can only produce a plan for a `pg_stat_statements`
+statement (whose text is normalized to `$1`/`$2`) by using `EXPLAIN (GENERIC_PLAN)`, which
+is PostgreSQL 16+. On 14/15 that path returns an actionable hint instead — supplying
+`params` (which prepares and plans the statement with real values) works on every supported
+version. Two catalog fields are simply omitted where the column doesn't exist: index
+`last_use` (`pg_stat_user_indexes.last_idx_scan`, PG16+) and subscription `two_phase`
+(`pg_subscription.subtwophasestate`, PG15+).
 
 ## Debugging with MCP Inspector
 
