@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.2.0 (unreleased)
+
+### Documentation
+
+- **`pg_licht_mcp(1)` manual page.** Configuration, connection strings, all 40 operations with their arguments, MCP client setup, environment, files, diagnostics, and compatibility now live in a real man page, readable from the terminal where the server actually runs. It is hand-written mdoc (FreeBSD style), installed to `share/man/man1` by every channel — Homebrew, deb, rpm, and tarball — so `man pg_licht_mcp` works after any install. A `manpage_lint` ctest gates it with `mandoc -Tlint -Wwarning`.
+- **README split by audience.** `README.md` drops from 297 to ~70 lines and now covers only purpose, safety summary, quick start, and links. Installing pre-built packages moved to `INSTALL.md`; building from source, testing, sanitizers, CI, and the release process moved to `BUILD.md`.
+- **Release tarballs now carry the man page.** They are staged through `cmake --install` instead of being tarred out of the build tree, so they contain `bin/pg_licht_mcp` + `share/man/man1/pg_licht_mcp.1` and can be unpacked straight onto a prefix (`sudo tar -xzf … -C /usr/local`). This changes the archive layout from a single flat binary.
+- `--help` output is now English and points at `pg_licht_mcp(1)`.
+
 ## 2.1.0 (2026-07-22)
 
 ### Security

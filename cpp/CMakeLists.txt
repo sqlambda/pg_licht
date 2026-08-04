@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
-project(pg_licht_mcp VERSION 2.1.0 LANGUAGES CXX)
+project(pg_licht_mcp VERSION 2.2.0 LANGUAGES CXX)
+
+# Standard bin/ and share/man/ layout, so `cmake --install` produces a tree that
+# can be dropped onto a prefix as-is: the release tarballs are staged this way,
+# CPack lays the same tree under /usr for the deb and rpm, and Homebrew installs
+# it into its keg. In every case share/man/man1 is already on the default
+# MANPATH, so `man pg_licht_mcp` works with no further setup.
+include(GNUInstallDirs)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,7 +35,13 @@ target_link_libraries(pg_licht_mcp
 )
 pglicht_harden(pg_licht_mcp)
 pglicht_apply_sanitizers(pg_licht_mcp)
-install(TARGETS pg_licht_mcp DESTINATION bin)
+install(TARGETS pg_licht_mcp RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+# The man page is checked in rather than generated: the release containers
+# (debian:trixie, rockylinux:9) carry no doc toolchain, and the release build
+# runs `--target pg_licht_mcp` rather than `all`, so a generator target would
+# never run and CPack would then fail on a missing install file.
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/man/pg_licht_mcp.1
+        DESTINATION ${CMAKE_INSTALL_MANDIR}/man1)
 
 option(BUILD_TESTING "Build the test suite" ON)
 if(BUILD_TESTING)
@@ -47,6 +60,19 @@ if(BUILD_TESTING)
     pglicht_apply_sanitizers(pg_licht_mcp_test)
     add_test(NAME mcp_test COMMAND pg_licht_mcp_test)
     pglicht_add_valgrind_test(pg_licht_mcp_test)
+
+    # Since the man page is hand-written, lint it here rather than trusting
+    # review. -Wwarning (not -Wall) is deliberate: it fails on real WARNINGs but
+    # ignores STYLE notes such as "referenced manual not found: Xr libpq 3",
+    # which fire on any machine without PostgreSQL's own man pages installed.
+    find_program(MANDOC_EXECUTABLE mandoc)
+    if(MANDOC_EXECUTABLE)
+        add_test(NAME manpage_lint
+                 COMMAND ${MANDOC_EXECUTABLE} -Tlint -Wwarning
+                         ${CMAKE_CURRENT_SOURCE_DIR}/man/pg_licht_mcp.1)
+    else()
+        message(STATUS "mandoc not found: skipping the manpage_lint test")
+    endif()
 endif()
 
 message(STATUS "Using compiler: ${CMAKE_CXX_COMPILER} (${CMAKE_CXX_COMPILER_ID})")

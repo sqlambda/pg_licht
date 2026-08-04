@@ -43,7 +43,9 @@ jobs:
           echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
             | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update -q
-          sudo apt-get install -y cmake libpq-dev nlohmann-json3-dev libgtest-dev pkg-config
+          # mandoc is only needed for the manpage_lint ctest; the build itself
+          # has no doc-toolchain dependency, since the man page is checked in.
+          sudo apt-get install -y cmake libpq-dev nlohmann-json3-dev libgtest-dev pkg-config mandoc
           curl -fsSL https://github.com/jtv/libpqxx/archive/refs/tags/8.0.2.tar.gz | tar -xz -C /tmp
           cmake -S /tmp/libpqxx-8.0.2 -B /tmp/libpqxx-build \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
