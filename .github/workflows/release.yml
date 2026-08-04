@@ -138,7 +138,20 @@ jobs:
 
       - name: Package (tar.gz)
         if: matrix.extension == 'tar.gz'
-        run: tar -czf ${{ matrix.artifact }}.tar.gz -C cpp/build pg_licht_mcp
+        env:
+          # BSD tar on macOS otherwise stores AppleDouble (._*) sidecars for
+          # extended attributes, which show up as junk on extraction.
+          COPYFILE_DISABLE: "1"
+        run: |
+          rm -rf stage
+          # Stage through the install rules rather than tarring the build tree,
+          # so the archive carries the same bin/ + share/man/ layout the .deb,
+          # .rpm, and Homebrew keg get. The binary was already stripped above,
+          # and `cmake --install` needs no target beyond pg_licht_mcp.
+          cmake --install cpp/build --prefix "$PWD/stage"
+          tar -czf ${{ matrix.artifact }}.tar.gz -C stage bin share
+          tar -tzf ${{ matrix.artifact }}.tar.gz | sort
+          test -f stage/share/man/man1/pg_licht_mcp.1
 
       - name: Package (deb)
         if: matrix.extension == 'deb'

@@ -18,14 +18,16 @@ bool file_exists(const std::string& path) {
 
 void usage(const char* argv0) {
   std::cerr
-    << "Uso: " << argv0 << " [--config <arquivo.ini>] [database_url]" << std::endl
+    << "Usage: " << argv0 << " [--config <file.ini>] [database_url]" << std::endl
     << std::endl
-    << "Ordem de resolucao:" << std::endl
-    << "  1. --config <arquivo>" << std::endl
+    << "Resolution order:" << std::endl
+    << "  1. --config <file>" << std::endl
     << "  2. $PG_LICHT_CONFIG" << std::endl
-    << "  3. ~/.config/pg_licht/connections.ini (se existir)" << std::endl
+    << "  3. ~/.config/pg_licht/connections.ini (if present)" << std::endl
     << "  4. $DATABASE_URL" << std::endl
-    << "  5. argv[1]" << std::endl;
+    << "  5. argv[1]" << std::endl
+    << std::endl
+    << "See pg_licht_mcp(1) for the full manual." << std::endl;
 }
 
 }  // namespace
@@ -38,7 +40,7 @@ int main(int argc, char *argv[]) {
     std::string arg = argv[i];
     if (arg == "--config" || arg == "-c") {
       if (i + 1 >= argc) {
-        std::cerr << "--config requer um caminho de arquivo." << std::endl;
+        std::cerr << "--config requires a file path." << std::endl;
         return 1;
       }
       config_path = argv[++i];

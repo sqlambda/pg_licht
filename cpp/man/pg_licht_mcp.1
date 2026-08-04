@@ -1,0 +1,745 @@
+.\" Copyright (c) 2026 Daniel Cristian.
+.\" Licensed under the Apache License, Version 2.0; see LICENSE.
+.\"
+.Dd August 3, 2026
+.Dt PG_LICHT_MCP 1
+.Os pg-licht
+.Sh NAME
+.Nm pg_licht_mcp
+.Nd read-only PostgreSQL catalog exploration server for the Model Context Protocol
+.Sh SYNOPSIS
+.Nm
+.Op Fl c Ar file.ini
+.Op Ar database_url
+.Nm
+.Fl h
+.Sh DESCRIPTION
+.Nm
+is a Model Context Protocol server that exposes the PostgreSQL system catalog to
+an MCP client over JSON-RPC 2.0 on standard input and standard output.
+It is meant to be launched by the client, not run interactively.
+.Pp
+.Nm
+queries the catalog only: schemas, tables, columns, functions, types, roles, and
+the statistics views.
+It does not read user table data, with the single narrow exception of
+.Ic checkKey ,
+which tests a primary key for existence.
+Every tool call runs inside its own
+.Ql READ ONLY
+transaction; see
+.Sx SECURITY CONSIDERATIONS .
+.Pp
+The options are as follows:
+.Bl -tag -width Ds
+.It Fl c Ar file.ini , Fl -config Ar file.ini
+Read named database connections from the INI file
+.Ar file.ini
+instead of taking a single connection string from the environment.
+See
+.Sx CONFIGURATION .
+.It Fl h , Fl -help
+Print a usage summary and the connection resolution order, then exit.
+.El
+.Pp
+A single positional
+.Ar database_url
+argument is used as the connection string when neither a configuration file nor
+.Ev DATABASE_URL
+is present.
+.Ss Selecting a database
+When a configuration file defines more than one connection, every operation
+accepts an optional
+.Va connection
+argument naming one of its sections; omitting it uses the default section.
+.Ic listConnections
+reports what is configured.
+.Sh CONFIGURATION
+.Ss Connection strings
+A connection string is handed to libpq unchanged, so both accepted forms work:
+.Bd -literal -offset indent
+postgresql://user:pass@host:5432/dbname?sslmode=require
+host=localhost port=5432 dbname=mydb user=daniel
+.Ed
+.Pp
+A single database needs nothing beyond
+.Ev DATABASE_URL .
+.Ss The connections file
+To reach several databases from one server, list them as INI sections:
+.Bd -literal -offset indent
+[default]
+port    = 6432
+dbname  = pglicht
+user    = daniel
+sslmode = prefer
+; no password here \(em use ~/.pgpass or a service file
+
+[prod]
+; a libpq service name, resolved from ~/.pg_service.conf,
+; $PGSERVICEFILE, or $PGSYSCONFDIR/pg_service.conf
+service = db01_ro
+
+[staging]
+service = db01_ro        ; the service supplies the defaults
+dbname  = db01_staging   ; and explicit keys override them
+.Ed
+.Pp
+Pass a section name as the
+.Va connection
+argument of any operation to run it against that database; omit it to use
+.Sy [default] ,
+or, if there is no
+.Sy [default] ,
+the first section in the file.
+.Ss libpq passthrough and services
+Keys are passed through to libpq, so anything libpq accepts works, including
+.Va service ,
+which may be used on its own in place of
+.Va host ,
+.Va port ,
+.Va dbname ,
+and
+.Va user .
+A service name is resolved from
+.Pa ~/.pg_service.conf ,
+.Ev PGSERVICEFILE ,
+or
+.Pa $PGSYSCONFDIR/pg_service.conf .
+.Pp
+Each section must set either
+.Va service
+or at least
+.Va dbname ;
+a section with neither is reported by name at startup rather than failing later
+with an obscure libpq error.
+.Pp
+The key
+.Va options
+is rejected.
+PgBouncer refuses GUCs in the startup packet, so
+.Nm
+sets what it needs per transaction instead; see
+.Sx SECURITY CONSIDERATIONS .
+.Ss Resolution order
+The connection source is resolved in this order:
+.Bl -enum -width 2n
+.It
+.Fl -config Ar file
+.It
+.Ev PG_LICHT_CONFIG
+.It
+.Pa ~/.config/pg_licht/connections.ini ,
+only if it exists
+.It
+.Ev DATABASE_URL
+.It
+the positional
+.Ar database_url
+argument
+.El
+.Ss File permissions
+Because sections may carry passwords, the configuration file must not be group-
+or world-accessible.
+.Nm
+refuses to load it otherwise, the same rule libpq applies to
+.Pa ~/.pgpass :
+.Bd -literal -offset indent
+chmod 600 ~/.config/pg_licht/connections.ini
+.Ed
+.Pp
+Note that libpq enforces that rule on
+.Pa ~/.pgpass
+but not on
+.Pa pg_service.conf ,
+so if a service file holds a password its permissions are yours to manage.
+.Sh OPERATIONS
+Every operation below except
+.Ic listConnections
+also accepts an optional
+.Va connection
+argument naming a section of the configuration file; omit it to use the default
+connection.
+Arguments shown as
+.Ar name
+are required.
+.Ss Schema exploration
+.Bl -tag -width Ds
+.It Ic listSchemas
+All schemas with their table and view names and role grants.
+.It Ic listTables Ar schema
+Tables and views in
+.Ar schema
+with kind, row counts, sizes, scan stats, autovacuum stats (dead and live
+tuples, mods-since-analyze, inserts-since-vacuum, last vacuum and analyze,
+per-table reloptions), columns (name, description, per-column index count), and
+index and constraint counts.
+Full index and constraint definitions live in
+.Ic tableDetails ,
+not here; this operation is deliberately light for browsing a schema.
+.It Ic tableDetails Ar schema Ar table
+Columns (types, nullability, defaults,
+.Li pg_stats
+histograms, per-column TOAST storage strategy and compression method), TOAST
+table (name, size, index size;
+.Dv null
+if the table has no toastable columns), primary key as an ordered column list,
+indexes (size, usage counts), constraints, foreign keys, inbound foreign keys
+.Pq Va referenced_by ,
+triggers (timing, events, when condition, language), rules (excluding the
+implicit view
+.Li _RETURN
+rule), row-level security status and policies, view definition, scan stats, and
+role grants.
+.It Ic listFunctions Ar schema
+Functions and procedures in
+.Ar schema
+with kind, language, return type, arguments, volatility,
+.Va security_definer ,
+and
+.Va is_strict .
+.It Ic functionDetails Ar schema Ar function
+Source code, full definition, arguments, volatility, trigger usage, and role
+grants.
+.It Ic listEnums Ar schema
+Enum types in
+.Ar schema
+with their ordered values and descriptions.
+.It Ic enumDetails Ar schema Ar enum
+Ordered values and every column, across all tables, that references the enum.
+.It Ic listTypes Ar schema
+Composite types, domains, and range types in
+.Ar schema .
+Excludes enums, implicit table and view row types, and the auto-generated
+multirange companion of each range type.
+Composites include their attribute list, domains include base type, nullability,
+default, and constraints, and ranges include the subtype and multirange type
+name.
+.It Ic typeDetails Ar schema Ar type
+Attributes, constraints, or subtype of a composite type, domain, or range type,
+and which columns use it.
+.It Ic listSequences Ar schema
+Sequences in
+.Ar schema
+with data type, range, increment, cycle, cache size, current value, and owning
+table and column for
+.Ic SERIAL
+and
+.Ic IDENTITY
+columns.
+.It Ic listExtendedStatistics Ar schema
+Extended statistics objects
+.Pq Ic CREATE STATISTICS
+for
+.Ar schema
+with target table, columns, statistics kinds (ndistinct, dependencies, mcv), and
+description.
+.El
+.Ss Catalog search
+.Bl -tag -width Ds
+.It Ic searchTables Ar web_search
+Full-text search across table and schema names, descriptions, column names and
+descriptions, enum values used by columns, and role names.
+Returns the same fields as
+.Ic listTables
+plus
+.Va roles .
+.It Ic searchFunctions Ar web_search
+Full-text search across function names, source code, language, trigger names,
+and descriptions.
+.It Ic searchEnums Ar web_search
+Full-text search across enum names, values, and descriptions.
+.El
+.Ss Cluster-wide objects
+.Bl -tag -width Ds
+.It Ic listRoles
+Cluster-wide roles with kind (login or group), attributes (superuser,
+create_role, create_db, replication, bypass_rls, connection_limit, valid_until),
+and group memberships.
+.It Ic listTablespaces
+Cluster-wide tablespaces with owner, filesystem location, options, and
+description.
+.It Ic listEventTriggers
+Cluster-wide event triggers with event type, tags, function, owner, enabled
+status, and description.
+.It Ic listLanguages
+Procedural languages installed in the current database, such as
+.Li plpgsql
+or
+.Li plpython3u ,
+with owner, trusted and procedural flags, handler function, and description.
+.It Ic listAccessMethods
+Index and table access methods available in the cluster (btree, gist, gin, heap,
+and so on) with type and handler function.
+.It Ic listCasts
+Type casts involving at least one user-defined type, excluding
+built-in-to-built-in casts, with source and target types, context, and method.
+.It Ic listExtensions
+Installed extensions with version, schema, relocatable flag, and description.
+.El
+.Ss Extensibility and text search
+.Bl -tag -width Ds
+.It Ic listCollations Ar schema
+Collations usable in the current database's encoding for
+.Ar schema ,
+with provider, locale settings, and determinism flag.
+.It Ic listOperators Ar schema
+Custom operators in
+.Ar schema
+with left and right operand types, result type, and implementing function.
+Mostly relevant for schemas using extensions with custom types, such as PostGIS.
+.It Ic listOperatorClasses Ar schema
+Operator classes in
+.Ar schema
+with their index access method, input type, and default flag.
+Describes which index types a given type supports.
+.It Ic listTextSearchConfigs Ar schema
+Full-text search configurations for
+.Ar schema
+with parser and the token-type-to-dictionary mapping.
+.El
+.Ss Foreign data and replication
+.Bl -tag -width Ds
+.It Ic listForeignTables Ar schema
+Foreign tables in
+.Ar schema
+with their foreign server, foreign data wrapper, options, and columns.
+User mapping credentials are never exposed.
+.It Ic listForeignServers
+Cluster-wide foreign servers with foreign data wrapper, owner, and options;
+host, port, and dbname-style options only, never user mapping credentials.
+.It Ic listPublications
+Logical replication publications with owner, all-tables flag, per-operation
+flags, and member tables.
+.It Ic listSubscriptions
+Logical replication subscriptions for the current database with owner, enabled
+status, publications, slot name, and sync settings.
+The connection string is never exposed, as it may contain credentials.
+.It Ic replicationSlots
+Replication slots with retained WAL bytes.
+A lagging or unused slot holds back WAL indefinitely and is a common cause of
+disk bloat incidents.
+.El
+.Ss Monitoring and statistics
+.Bl -tag -width Ds
+.It Ic databaseSize
+Current database name and total disk size.
+.It Ic serverSettings
+All server settings
+.Pq Li pg_settings
+grouped by category, each with current value, unit, description, context, type,
+source, and
+.Va pending_restart
+flag.
+.It Ic currentActivity
+Current server connections and running queries
+.Pq Li pg_stat_activity
+across all databases: pid, database, user, application_name, backend_type,
+state, wait event, and query text.
+.It Ic currentLocks
+Current locks
+.Pq Li pg_locks
+joined with the holding backend's query and user, plus which pids are blocking
+each waiting lock.
+Use to diagnose lock contention.
+.It Ic databaseStats
+Per-database statistics
+.Pq Li pg_stat_database
+for every database in the cluster: connections, commits and rollbacks, block hit
+ratio inputs, tuple counts, conflicts, deadlocks, temp file usage, and checksum
+failures.
+.It Ic statementStats Op Va limit
+The slowest tracked queries by total execution time
+.Pq Li pg_stat_statements ,
+with calls, timing, row counts, and buffer usage.
+Returns a clear error with setup instructions if the extension is not installed.
+.Pp
+.Bl -tag -width "timeout_ms" -compact
+.It Va limit
+Maximum number of statements to return.
+Defaults to 20.
+.El
+.El
+.Ss Diagnostics and query planning
+.Bl -tag -width Ds
+.It Ic tableBloat Ar schema Ar table Op Va exact
+Physical storage bloat for a table
+.Pq Li pgstattuple No or Li pgstattuple_approx :
+table size, live and dead tuple counts and percentages, free space and
+percentage.
+More accurate than the ANALYZE-time estimates in
+.Ic listTables
+and
+.Ic tableDetails .
+Returns a clear error with setup instructions if the extension is not installed.
+.Pp
+.Bl -tag -width "timeout_ms" -compact
+.It Va exact
+Run a precise but I/O-heavy full table scan instead of the cheap
+visibility-map-based approximation.
+Default
+.Dv false .
+.El
+.It Ic checkKey Ar schema Ar table Ar values
+Check whether a row exists by primary key, single or composite.
+Value types are validated against the primary key column types before querying.
+.Pp
+.Bl -tag -width "timeout_ms" -compact
+.It Va values
+Ordered array of primary key values, matching the key columns in order.
+.El
+.It Ic explainQuery Op Va queryid | Va sql
+Raw
+.Ql "EXPLAIN (FORMAT JSON)"
+plan for a statement, recovered from
+.Li pg_stat_statements
+by
+.Va queryid
+or supplied directly as
+.Va sql .
+Runs in a read-only transaction bounded by
+.Va statement_timeout .
+Returns the plan verbatim plus
+.Va generic ,
+.Va analyzed ,
+and
+.Va read_only
+flags and the
+.Li pg_stat_statements
+row.
+There are no heuristics and no generated DDL; the plan is yours to interpret.
+.Pp
+.Bl -tag -width "timeout_ms" -compact
+.It Va queryid
+A
+.Li pg_stat_statements
+queryid, as a decimal string.
+It is a 64-bit value and does not survive JSON number precision.
+Mutually exclusive with
+.Va sql .
+.It Va sql
+A single
+.Ic SELECT , INSERT , UPDATE , DELETE , MERGE , WITH , TABLE ,
+or
+.Ic VALUES
+statement.
+Utility statements are rejected.
+Mutually exclusive with
+.Va queryid .
+.It Va params
+Concrete values for the statement's
+.Ar $1
+through
+.Ar $n
+placeholders, in order.
+Statements recovered from
+.Li pg_stat_statements
+are normalized, so without params they are planned with
+.Ql GENERIC_PLAN ;
+supplying params has the statement
+.Ic PREPARE Ns d
+and planned with real values.
+.It Va analyze
+Run
+.Ql "EXPLAIN (ANALYZE, BUFFERS)" ,
+which really executes the statement.
+Honoured only after the plan is proven free of any
+.Li ModifyTable
+node, so data-modifying statements, including data-modifying CTEs, are never
+executed.
+Requires
+.Va timeout_ms .
+Default
+.Dv false .
+.It Va timeout_ms
+Statement timeout in milliseconds, clamped to 100 through 30000.
+Defaults to 5000 for plan-only calls.
+.El
+.El
+.Ss Connections
+.Bl -tag -width Ds
+.It Ic listConnections
+The configured database connections by name, with the libpq
+.Va service
+name or host, port, dbname, and user for each, and which is the default.
+Passwords are never returned and a service file is never expanded.
+This is the only operation that does not take a
+.Va connection
+argument.
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width ".Ev PG_LICHT_CONFIG"
+.It Ev DATABASE_URL
+Connection string used when no configuration file is found.
+Accepts either libpq form.
+.It Ev PG_LICHT_CONFIG
+Path to a connections INI file, consulted after
+.Fl -config
+and before
+.Pa ~/.config/pg_licht/connections.ini .
+.It Ev PGSERVICEFILE
+Path to a libpq service file, used to resolve a
+.Va service
+key.
+.It Ev PGSYSCONFDIR
+Directory holding the system-wide
+.Pa pg_service.conf .
+.It Ev PGPASSFILE
+Path to a libpq password file; defaults to
+.Pa ~/.pgpass .
+.It Ev HOME
+Used to locate
+.Pa ~/.config/pg_licht/connections.ini .
+.El
+.Pp
+Any other libpq environment variable is honoured as usual, since connection
+strings are passed through unchanged.
+.Sh FILES
+.Bl -tag -width ".Pa ~/.config/pg_licht/connections.ini"
+.It Pa ~/.config/pg_licht/connections.ini
+Default connections file, used only if it exists.
+Must not be group- or world-accessible.
+.It Pa ~/.pg_service.conf
+libpq service definitions, referenced by the
+.Va service
+key.
+.It Pa ~/.pgpass
+libpq password file, the recommended place for passwords.
+.It Pa .mcp.json
+Project-scoped MCP client configuration, in a repository root.
+.It Pa ~/.claude.json
+Local- and user-scoped MCP client configuration.
+.It Pa ~/.grok/config.toml
+Grok Build MCP client configuration.
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Pp
+.Nm
+exits non-zero when no connection source is given, when the configuration file
+cannot be parsed or has unsafe permissions, or when the default connection
+cannot be reached at startup.
+.Sh EXAMPLES
+.Ss Standalone
+Run against a single database given by the environment:
+.Bd -literal -offset indent
+DATABASE_URL="postgresql://user:pass@host/dbname" pg_licht_mcp
+.Ed
+.Pp
+The libpq key-value form works too, as does a positional argument or a
+configuration file:
+.Bd -literal -offset indent
+DATABASE_URL="host=localhost port=5432 dbname=mydb" pg_licht_mcp
+pg_licht_mcp "postgresql://user:pass@host/dbname"
+pg_licht_mcp --config ~/.config/pg_licht/connections.ini
+.Ed
+.Ss Claude Code
+Register the server with
+.Ic claude mcp add :
+.Bd -literal -offset indent
+claude mcp add --transport stdio pg-licht \e
+  -e DATABASE_URL="postgresql://user:pass@host/dbname" \e
+  -- /usr/local/bin/pg_licht_mcp
+.Ed
+.Pp
+The
+.Fl -scope
+flag controls where the configuration is written:
+.Bl -column "Local (default)" "--scope project" "~/.claude.json" -offset indent
+.It Sy Scope Ta Sy Flag Ta Sy Stored in
+.It "Local (default)" Ta Fl -scope Cm local Ta Pa ~/.claude.json
+.It Project Ta Fl -scope Cm project Ta Pa .mcp.json
+.It User Ta Fl -scope Cm user Ta Pa ~/.claude.json
+.El
+.Pp
+Local scope is personal and limited to the current project, project scope is
+shared with the team through version control, and user scope applies across all
+of your projects.
+.Ss Project configuration
+A project-scoped server lives in
+.Pa .mcp.json
+at the repository root; commit it to share it with the team:
+.Bd -literal -offset indent
+{
+  "mcpServers": {
+    "pg-licht": {
+      "command": "/usr/local/bin/pg_licht_mcp",
+      "args": [],
+      "env": {
+        "DATABASE_URL": "postgresql://user:pass@host/dbname"
+      }
+    }
+  }
+}
+.Ed
+.Pp
+Local- and user-scoped servers live in
+.Pa ~/.claude.json
+instead.
+Edit that file with
+.Ic claude mcp add
+or
+.Ic claude mcp add-json
+rather than by hand, since it also holds per-project state.
+.Ss Claude Desktop
+Add the same JSON block under
+.Va mcpServers
+in
+.Pa claude_desktop_config.json .
+.Ss Grok Build
+Grok Build reads
+.Pa .mcp.json
+and
+.Pa ~/.claude.json
+for compatibility, so a server already configured for Claude Code is picked up
+automatically.
+To configure it directly:
+.Bd -literal -offset indent
+grok mcp add pg-licht -- /usr/local/bin/pg_licht_mcp
+.Ed
+.Pp
+Environment variables for stdio servers are set in the configuration file rather
+than on the command line.
+.Fl -scope Cm project
+writes to
+.Pa .grok/config.toml
+in the project; omit it for the user-level
+.Pa ~/.grok/config.toml :
+.Bd -literal -offset indent
+[mcp_servers.pg-licht]
+command = "/usr/local/bin/pg_licht_mcp"
+env = { DATABASE_URL = "postgresql://user:pass@host/dbname" }
+.Ed
+.Pp
+Verify with
+.Ic grok mcp list
+or
+.Ic grok mcp doctor pg-licht .
+.Sh DIAGNOSTICS
+.Bl -tag -width Ds
+.It Sy Fatal DB Error No at startup
+The default connection could not be reached, or the configuration file could not
+be parsed.
+The libpq or parser message follows.
+.It Sy config file ... is group/world accessible
+The connections file has unsafe permissions; see
+.Sx File permissions .
+.It Sy [section] must set either 'service' or at least 'dbname'
+A configuration section is incomplete.
+The offending section is named.
+.It Sy unknown connection ...
+The
+.Va connection
+argument does not match any configured section.
+The message lists the configured names.
+.It Sy pg_stat_statements is not installed
+.Ic statementStats
+and the
+.Va queryid
+path of
+.Ic explainQuery
+require the extension.
+The returned hint gives the setup steps.
+An equivalent error is returned for
+.Li pgstattuple
+by
+.Ic tableBloat .
+.It Sy SQLSTATE Er 25006
+A statement attempted to write inside the read-only transaction.
+This is the backstop described in
+.Sx SECURITY CONSIDERATIONS
+and should not occur in normal use.
+.It Sy unsupported startup parameter in options
+PgBouncer rejected a GUC in the startup packet.
+Remove the
+.Va options
+key from the configuration file.
+.El
+.Sh COMPATIBILITY
+.Nm
+supports PostgreSQL 14 and newer, and is verified on 14 through 18.
+.Pp
+One feature degrades gracefully below 16.
+.Ic explainQuery
+can only plan a normalized
+.Li pg_stat_statements
+statement by using
+.Ql "EXPLAIN (GENERIC_PLAN)" ,
+which requires PostgreSQL 16.
+On 14 and 15 that path returns an actionable hint instead; supplying
+.Va params ,
+which prepares and plans the statement with real values, works on every
+supported version.
+.Pp
+Two catalog fields are omitted where the underlying column does not exist: the
+index
+.Va last_use
+field
+.Pq Li pg_stat_user_indexes.last_idx_scan , No PostgreSQL 16 and newer
+and the subscription
+.Va two_phase
+field
+.Pq Li pg_subscription.subtwophasestate , No PostgreSQL 15 and newer .
+.Sh SEE ALSO
+.Xr pgbouncer 1 ,
+.Xr psql 1 ,
+.Xr libpq 3
+.Pp
+.Lk https://github.com/sqlambda/pg_licht "pg-licht source and releases"
+.Pp
+.Lk https://modelcontextprotocol.io/ "Model Context Protocol specification"
+.Sh HISTORY
+.Nm
+first appeared in 2025.
+Version 2.0 extended it to full pgAdmin-shaped catalog parity.
+Version 2.1 made the read-only guard per transaction rather than per session,
+added named multi-database connections, and added
+.Ic explainQuery .
+.Sh AUTHORS
+.An Daniel Cristian Aq Mt danielcristian@gmail.com
+.Sh SECURITY CONSIDERATIONS
+Every catalog query is parameterized, using
+.Ar $1
+and
+.Ar $2
+bindings or
+.Li ::regnamespace
+and
+.Li ::regclass
+casts.
+No schema, table, or search-term argument is ever concatenated into SQL text.
+.Pp
+The one deliberate exception is
+.Ic explainQuery ,
+which must place the statement under analysis into the
+.Ic EXPLAIN
+text because
+.Ic EXPLAIN
+cannot take a bind parameter.
+It is guarded by a leading-keyword whitelist, a single-statement check,
+.Ic PREPARE Ns d
+parameter binding with every value escaped through libpq, a
+.Li ModifyTable
+gate that refuses to execute anything that writes, and a bounded
+.Va statement_timeout .
+.Pp
+Every tool call runs inside its own
+.Ql READ ONLY
+transaction, so even a bug that let a query attempt a write would fail with
+SQLSTATE
+.Er 25006
+rather than succeed silently.
+.Pp
+That guard is deliberately transaction-scoped rather than session-scoped.
+Under a connection pooler in transaction mode, such as PgBouncer with
+.Li pool_mode = transaction
+and
+.Li server_reset_query = DISCARD ALL ,
+the server connection is returned to the pool at commit and its session state is
+wiped, so a
+.Ic SET
+issued once at startup silently stops applying to later calls.
+Transaction scope is the scope a pooler preserves.
+The setting cannot be pushed into the connection string either: PgBouncer
+rejects GUCs in the startup packet outright, which is why the
+.Va options
+configuration key is refused.
