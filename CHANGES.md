@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.2.0 (unreleased)
+## 2.2.0 (2026-08-04)
 
 ### Documentation
 
