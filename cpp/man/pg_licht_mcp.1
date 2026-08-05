@@ -120,6 +120,54 @@ PgBouncer refuses GUCs in the startup packet, so
 .Nm
 sets what it needs per transaction instead; see
 .Sx SECURITY CONSIDERATIONS .
+.Ss Host capacity
+Total RAM and vCPU count belong to the machine, not to the cluster.
+PostgreSQL has no catalog for them, and a backend could not read them portably
+in any case \(em it would read the client's host, which is the wrong machine.
+They are therefore injected, and
+.Ic hostCapacity
+correlates them with
+.Va shared_buffers , Va work_mem ,
+and the rest.
+Four optional keys per section carry them:
+.Bd -literal -offset indent
+[prod]
+service      = db01_ro
+host_ram_mb  = 65536
+host_vcpus   = 16
+host_storage = local nvme          ; free text, never interpreted
+host_note    = shared with the app ; free text, never interpreted
+.Ed
+.Pp
+These keys are consumed by
+.Nm
+and never reach libpq, which would reject the whole connection string over an
+unrecognised keyword.
+.Va host_ram_mb
+and
+.Va host_vcpus
+must be positive integers; anything else is rejected at startup naming the
+section and the key, because
+.Ql 64GB
+where megabytes are meant would be wrong by three orders of magnitude and would
+silently invalidate every derived ratio.
+.Pp
+There are two other ways in.
+The environment variables under
+.Sx ENVIRONMENT
+apply to the single-connection
+.Ev DATABASE_URL
+form only, where there is no question which host they describe; with a
+connections file each section declares its own, since the sections may well
+live on different machines.
+And an agent that inspects the host at run time \(em over SSH, say \(em can
+pass
+.Va ram_mb
+and
+.Va vcpus
+straight to
+.Ic hostCapacity ,
+which takes precedence over both.
 .Ss Resolution order
 The connection source is resolved in this order:
 .Bl -enum -width 2n
@@ -358,9 +406,157 @@ Returns a clear error with setup instructions if the extension is not installed.
 Maximum number of statements to return.
 Defaults to 20.
 .El
+.It Ic wraparoundStatus Op Va schema , Va limit
+Transaction id and multixact wraparound headroom.
+For every database:
+.Li age(datfrozenxid) ,
+.Li age(datminmxid) ,
+and each as a percentage of
+.Va autovacuum_freeze_max_age
+and of the hard limit of 2146483647 transactions, at which the cluster stops
+accepting commands that assign a new transaction id.
+For tables: the oldest by
+.Li age(relfrozenxid) ,
+with the effective
+.Va autovacuum_freeze_max_age
+and whether it came from the table's storage parameters or the server, plus
+last vacuum times and dead tuple counts.
+.Pp
+TOAST tables are included, labelled with the table they belong to.
+They carry their own
+.Va relfrozenxid ,
+do not appear in
+.Li pg_stat_user_tables ,
+and are frequently the relation actually holding the horizon back.
+.Pp
+.Bl -tag -width "timeout_ms" -compact
+.It Va schema
+Restrict the table list to one schema.
+Omit it to cover the whole database, which is the scope wraparound risk is
+actually measured over.
+.It Va limit
+Maximum number of tables to return, oldest first.
+Defaults to 20.
+.El
+.It Ic checkpointStats
+Checkpoint, write-ahead log, and background writer activity: timed against
+requested checkpoint counts and the ratio between them, write and sync time,
+buffers written by the checkpointer, by the background writer, and directly by
+backends, the
+.Li pg_stat_wal
+record, full-page-image, and byte counters, and the settings that govern all of
+it
+.Pq Va checkpoint_timeout , Va max_wal_size , Va checkpoint_completion_target , No the Va bgwriter No knobs .
+.Pp
+The source views differ by major version: PostgreSQL 17 split the checkpointer
+counters into
+.Li pg_stat_checkpointer
+and moved the backend-written buffer counts to
+.Li pg_stat_io ,
+while earlier versions keep everything in
+.Li pg_stat_bgwriter .
+Field names are normalized across both, so a caller never branches on the
+version; the
+.Va source
+field names the views that produced the numbers.
+.It Ic tableIOStats Ar schema Op Va table , Va limit
+Buffer cache hit ratios per object
+.Pq Li pg_statio_all_tables :
+.Va heap_blks_read
+against
+.Va heap_blks_hit ,
+.Va idx_blks_read
+against
+.Va idx_blks_hit ,
+the TOAST and TOAST-index pairs, and a combined ratio, with relation size and
+scan counts for context.
+.Pp
+A ratio is null, not zero, for an object that has seen no reads at all, so
+.Dq no traffic
+is never mistaken for
+.Dq every read missed the cache .
+.Pp
+.Bl -tag -width "timeout_ms" -compact
+.It Va table
+A single table.
+Only a named table gets the per-index breakdown from
+.Li pg_statio_all_indexes ;
+over a whole schema it would multiply the payload by the index count without
+making the table-level ratios any easier to read.
+.It Va limit
+Maximum number of tables to return, most physical reads first.
+Defaults to 20.
+.El
+.It Ic hostCapacity Op Va ram_mb , Va vcpus , Va storage
+Memory and parallelism settings correlated with the capacity of the machine
+PostgreSQL runs on.
+Returns every memory-related setting resolved to bytes, whatever unit it is
+counted in, and derived ratios:
+.Va shared_buffers
+and
+.Va effective_cache_size
+as a percentage of RAM,
+.Va work_mem
+times
+.Va max_connections ,
+.Va maintenance_work_mem
+times
+.Va autovacuum_max_workers ,
+their combined total, and parallel workers per vCPU.
+.Pp
+Total RAM and vCPU count are properties of the host, not of the cluster: no
+catalog holds them, so they have to be injected.
+See
+.Sx Host capacity .
+The reported
+.Va source
+says which of the three paths supplied them.
+Every ratio that needs RAM is null when none was supplied, together with a hint
+naming the three ways to provide it.
+Nothing is ever guessed: a wrong memory figure would silently invalidate every
+number derived from it.
+.Pp
+.Bl -tag -width "timeout_ms" -compact
+.It Va ram_mb
+Total host memory in megabytes, overriding any configured value.
+.It Va vcpus
+Number of vCPUs or cores available to the host, overriding any configured value.
+.It Va storage
+Free-text description of the storage, echoed back and never interpreted.
+.El
 .El
 .Ss Diagnostics and query planning
 .Bl -tag -width Ds
+.It Ic duplicateIndexes Ar schema Op Va table
+Indexes that duplicate, or are covered by, another index on the same table.
+.Pp
+.Va identical
+groups indexes whose key columns, operator classes, collations, sort order,
+.Ic INCLUDE
+columns, and partial predicate all match.
+.Va redundant
+reports an index whose key columns are a leading prefix of a wider index that
+also covers its
+.Ic INCLUDE
+columns.
+.Pp
+Comparison is by column expression rather than attribute number, so two
+different expression indexes are not confused with each other, and
+.Li (a DESC)
+is not treated as covered by
+.Li (a, b) .
+A unique index is never reported as redundant for being a prefix: dropping it
+would drop a constraint the wider index does not enforce.
+Each entry carries size,
+.Va idx_scan ,
+the name of any backing constraint, and the replica identity and validity
+flags, since those decide whether the index can be dropped at all.
+.Pp
+.Bl -tag -width "timeout_ms" -compact
+.It Va table
+Restrict the check to one table.
+Omit it to check every table in the schema.
+.El
 .It Ic tableBloat Ar schema Ar table Op Va exact
 Physical storage bloat for a table
 .Pq Li pgstattuple No or Li pgstattuple_approx :
@@ -476,6 +672,22 @@ Path to a connections INI file, consulted after
 .Fl -config
 and before
 .Pa ~/.config/pg_licht/connections.ini .
+.It Ev PG_LICHT_HOST_RAM_MB
+Total host memory in megabytes, read by
+.Ic hostCapacity .
+Honoured only with the single-connection
+.Ev DATABASE_URL
+form; with a connections file, use
+.Va host_ram_mb
+in the section instead.
+See
+.Sx Host capacity .
+.It Ev PG_LICHT_HOST_VCPUS
+Number of vCPUs or cores on the host, under the same rule.
+.It Ev PG_LICHT_HOST_STORAGE
+Free-text storage description, under the same rule.
+.It Ev PG_LICHT_HOST_NOTE
+Free-text note about the host, under the same rule.
 .It Ev PGSERVICEFILE
 Path to a libpq service file, used to resolve a
 .Va service

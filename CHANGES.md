@@ -1,5 +1,39 @@
 # Changelog
 
+## 2.3.0 (unreleased)
+
+### New tools
+
+- **`wraparoundStatus`** — transaction id and multixact headroom, the one failure mode where a monitoring gap ends in a full cluster outage rather than a slowdown. Reports `age(datfrozenxid)` and `age(datminmxid)` for every database and the oldest tables by `age(relfrozenxid)`, each expressed both as a percentage of `autovacuum_freeze_max_age` (where an anti-wraparound autovacuum is forced) and of the hard limit of 2 146 483 647 (where the cluster stops accepting commands that assign a transaction id) — two thresholds that are an order of magnitude apart and are routinely confused.
+
+  Per-table freeze storage parameters are resolved, so a table with its own `autovacuum_freeze_max_age` is measured against *its* limit, not the server's, and the output says which one applied. TOAST tables are included and labelled with the table they belong to: they carry their own `relfrozenxid`, never appear in `pg_stat_user_tables`, and are frequently the relation actually holding the horizon back.
+
+- **`duplicateIndexes`** — indexes that duplicate, or are covered by, another index on the same table. `identical` groups indexes matching on key columns, operator classes, collations, sort order, `INCLUDE` columns and partial predicate; `redundant` reports an index whose keys are a leading prefix of a wider index that also covers its `INCLUDE` columns.
+
+  The comparison key is a per-column signature built from the column *expression* rather than `indkey`. Comparing attribute numbers instead would call any two expression indexes identical (an expression column is attnum 0) and would treat `(a DESC)` as covered by `(a, b)`, which it cannot serve. A unique index is never reported as redundant for being a prefix — dropping it would drop a constraint the wider index does not enforce. Each entry carries size, `idx_scan`, the backing constraint name, and the replica identity and validity flags, since those decide whether the index can be dropped at all.
+
+- **`checkpointStats`** — checkpoint, WAL and background writer activity: timed against requested checkpoints and the ratio between them, write and sync time, buffers written by the checkpointer, by the background writer, and directly by backends, plus `pg_stat_wal` volume and the settings that govern all of it.
+
+  PostgreSQL 17 split the checkpointer counters out of `pg_stat_bgwriter` into `pg_stat_checkpointer`, renamed them, and moved the backend-written buffer counts to `pg_stat_io`; PostgreSQL 18 dropped four more columns from `pg_stat_wal`. All of that is gated on the server version and normalized to one set of field names, so a caller never branches on the major; a `source` field names the views that produced the numbers.
+
+- **`tableIOStats`** — buffer cache hit ratio per object from `pg_statio_all_tables`: `heap_blks_read` against `heap_blks_hit`, the index pair, the TOAST and TOAST-index pairs, and a combined ratio, with relation size and scan counts. Naming a single table adds a per-index breakdown. A ratio is null rather than zero for an object that has seen no reads, so "no traffic" is not misread as "every read missed the cache".
+
+- **`hostCapacity`** — memory and parallelism settings correlated with the machine PostgreSQL runs on. Every memory-related setting is resolved to bytes whatever unit it is counted in (8kB pages for `shared_buffers`, kB for `work_mem`, …), alongside `shared_buffers` and `effective_cache_size` as a percentage of RAM, `work_mem × max_connections`, `maintenance_work_mem × autovacuum_max_workers`, their combined total, and parallel workers per vCPU.
+
+  Numbers only, no verdicts, matching `explainQuery`'s stance that interpretation belongs to the caller — with two factual caveats returned inline, since the worst-case figures are easy to misread: `work_mem` is a per-node rather than per-connection limit, and the OS page cache is not counted.
+
+### Configuration
+
+- **Host capacity injection.** Total RAM and vCPU count are properties of the host, not of the cluster: no catalog holds them, and a backend could not read them portably in any case — it would read the *client's* host. Three paths supply them, and `hostCapacity` reports which one did:
+
+  - `host_ram_mb`, `host_vcpus`, `host_storage` and `host_note` keys per section of the connections file. They are consumed by pg-licht and never reach libpq, which would reject the whole connection string over an unrecognised keyword. A non-numeric or non-positive value is rejected at startup naming the section and the key: `64GB` where megabytes are meant would be wrong by three orders of magnitude and would silently invalidate every derived ratio.
+  - `PG_LICHT_HOST_RAM_MB`, `PG_LICHT_HOST_VCPUS`, `PG_LICHT_HOST_STORAGE` and `PG_LICHT_HOST_NOTE`, honoured only with the single-connection `DATABASE_URL` form, where there is no question which host they describe. With a connections file each section declares its own, since the sections may live on different machines.
+  - `ram_mb` and `vcpus` arguments to `hostCapacity` itself, taking precedence over both — the path for an agent that inspects the host at run time.
+
+  Nothing is ever inferred: with no RAM figure, every ratio that needs one is null and the result carries a hint naming the three ways to supply it.
+
+- **`listConnections`** now echoes the configured host capacity per connection, so a caller can see which ones still need it injected.
+
 ## 2.2.0 (2026-08-04)
 
 ### Documentation

@@ -37,6 +37,14 @@ protected:
     const char* env_url = std::getenv("DATABASE_URL");
     base_url = env_url;
 
+    // from_url picks host capacity up from the environment, so a developer who
+    // exports these for their own cluster would otherwise change what the
+    // hostCapacity tests see.
+    ::unsetenv("PG_LICHT_HOST_RAM_MB");
+    ::unsetenv("PG_LICHT_HOST_VCPUS");
+    ::unsetenv("PG_LICHT_HOST_STORAGE");
+    ::unsetenv("PG_LICHT_HOST_NOTE");
+
     try {
       admin_conn = new pqxx::connection(base_url);
 
@@ -244,6 +252,35 @@ protected:
       );
 
       txn.exec("CREATE TEXT SEARCH CONFIGURATION grocery.simple_english (COPY = pg_catalog.english)");
+
+      // A table of its own for duplicateIndexes, so the index counts the other
+      // tests assert on stay untouched. It carries one of every case the
+      // detector has to get right: an exact duplicate, a prefix-redundant
+      // index, and three near-misses that must NOT be reported -- a reversed
+      // sort order, a partial index, and a unique index that happens to be a
+      // prefix of a wider one.
+      txn.exec(
+        "CREATE TABLE grocery.index_zoo ("
+        "  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+        "  a  INT,"
+        "  b  INT,"
+        "  c  TEXT,"
+        "  d  TEXT"
+        ")"
+      );
+      txn.exec("CREATE INDEX zoo_a_b     ON grocery.index_zoo (a, b)");
+      txn.exec("CREATE INDEX zoo_a       ON grocery.index_zoo (a)");
+      txn.exec("CREATE INDEX zoo_a_again ON grocery.index_zoo (a)");
+      txn.exec("CREATE INDEX zoo_a_desc  ON grocery.index_zoo (a DESC)");
+      txn.exec("CREATE INDEX zoo_a_part  ON grocery.index_zoo (a) WHERE b > 0");
+      txn.exec("CREATE UNIQUE INDEX zoo_c_uq ON grocery.index_zoo (c)");
+      txn.exec("CREATE UNIQUE INDEX zoo_c_d_uq ON grocery.index_zoo (c, d)");
+      txn.exec("CREATE INDEX zoo_lower_c  ON grocery.index_zoo (lower(c))");
+      txn.exec("CREATE INDEX zoo_lower_c2 ON grocery.index_zoo (lower(c))");
+
+      // A per-table freeze override, so wraparoundStatus can be checked to
+      // report the storage parameter rather than the server-wide default.
+      txn.exec("ALTER TABLE grocery.index_zoo SET (autovacuum_freeze_max_age = 100000000)");
 
       txn.exec("GRANT USAGE ON SCHEMA grocery TO PUBLIC");
       txn.exec("GRANT SELECT ON grocery.users TO PUBLIC");
@@ -1649,6 +1686,320 @@ TEST_F(PostgresMCPServerTest, TableBloatUnknownTableReturnsEmpty) {
   EXPECT_TRUE(result.empty());
 }
 
+// --- wraparoundStatus ---
+
+namespace {
+
+// The 'tables' array keyed by name, for the assertions below.
+const json* find_table(const json& tables, const std::string& name) {
+  for (const auto& t : tables)
+    if (t.value("name", "") == name) return &t;
+  return nullptr;
+}
+
+}  // namespace
+
+TEST_F(PostgresMCPServerTest, WraparoundStatusReportsLimitsAndDatabases) {
+  json r = srv->call_wraparound_status("", 20);
+  ASSERT_TRUE(r.contains("limits")) << r.dump(2);
+  EXPECT_TRUE(r["limits"].contains("autovacuum_freeze_max_age"));
+  EXPECT_TRUE(r["limits"].contains("autovacuum_multixact_freeze_max_age"));
+  EXPECT_TRUE(r["limits"].contains("vacuum_failsafe_age"));
+  // The hard limit is the outage threshold, and is what the percentages that
+  // actually matter are taken against.
+  EXPECT_EQ(r["limits"]["wraparound_limit"].get<long long>(), 2146483647LL);
+
+  ASSERT_TRUE(r.contains("databases"));
+  ASSERT_TRUE(r["databases"].contains(test_dbname));
+  auto& db = r["databases"][test_dbname];
+  EXPECT_GE(db["xid_age"].get<long long>(), 0);
+  EXPECT_GE(db["mxid_age"].get<long long>(), 0);
+  EXPECT_LT(db["xid_percent_of_wraparound_limit"].get<double>(), 100.0);
+  EXPECT_GT(db["xids_until_wraparound_limit"].get<long long>(), 0);
+}
+
+TEST_F(PostgresMCPServerTest, WraparoundStatusReportsPerTableFreezeOverride) {
+  json r = srv->call_wraparound_status("grocery", 50);
+  ASSERT_TRUE(r.contains("tables"));
+  ASSERT_TRUE(r["tables"].is_array());
+
+  const json* zoo = find_table(r["tables"], "index_zoo");
+  ASSERT_NE(zoo, nullptr) << r["tables"].dump(2);
+  // The fixture sets autovacuum_freeze_max_age on this table, so the effective
+  // limit must come from reloptions rather than the server-wide setting.
+  EXPECT_EQ((*zoo)["freeze_max_age"].get<long long>(), 100000000LL);
+  EXPECT_EQ((*zoo)["freeze_max_age_source"].get<std::string>(), "reloptions");
+
+  const json* users = find_table(r["tables"], "users");
+  ASSERT_NE(users, nullptr);
+  EXPECT_EQ((*users)["freeze_max_age_source"].get<std::string>(), "server");
+  EXPECT_EQ((*users)["kind"].get<std::string>(), "table");
+  EXPECT_TRUE((*users)["toast_for"].is_null());
+}
+
+TEST_F(PostgresMCPServerTest, WraparoundStatusIncludesToastTables) {
+  // A TOAST table carries its own relfrozenxid and is invisible in
+  // pg_stat_user_tables, yet is frequently the relation holding the horizon
+  // back; leaving it out would understate the risk.
+  json r = srv->call_wraparound_status("", 5000);
+  bool found_toast = false;
+  for (const auto& t : r["tables"]) {
+    if (t.value("kind", "") == "toast table") {
+      found_toast = true;
+      EXPECT_FALSE(t["toast_for"].is_null());
+      break;
+    }
+  }
+  EXPECT_TRUE(found_toast);
+}
+
+TEST_F(PostgresMCPServerTest, WraparoundStatusHonoursLimit) {
+  json r = srv->call_wraparound_status("", 3);
+  EXPECT_LE(r["tables"].size(), 3u);
+}
+
+// --- duplicateIndexes ---
+
+namespace {
+
+// Names of every index in an 'identical' group that contains `name`.
+std::vector<std::string> identical_group_of(const json& r, const std::string& name) {
+  for (const auto& g : r["identical"]) {
+    std::vector<std::string> names;
+    for (const auto& i : g["indexes"]) names.push_back(i["name"].get<std::string>());
+    if (std::find(names.begin(), names.end(), name) != names.end()) return names;
+  }
+  return {};
+}
+
+bool is_reported_redundant(const json& r, const std::string& name) {
+  for (const auto& e : r["redundant"])
+    if (e["index"].get<std::string>() == name) return true;
+  return false;
+}
+
+}  // namespace
+
+TEST_F(PostgresMCPServerTest, DuplicateIndexesGroupsExactDuplicates) {
+  json r = srv->call_duplicate_indexes("grocery", "index_zoo");
+  ASSERT_TRUE(r.contains("identical")) << r.dump(2);
+
+  auto group = identical_group_of(r, "zoo_a");
+  ASSERT_EQ(group.size(), 2u) << r["identical"].dump(2);
+  EXPECT_NE(std::find(group.begin(), group.end(), "zoo_a_again"), group.end());
+}
+
+TEST_F(PostgresMCPServerTest, DuplicateIndexesGroupsIdenticalExpressionIndexes) {
+  // Expression columns have attnum 0 in indkey, so a detector comparing indkey
+  // alone would call any two expression indexes duplicates. These two really
+  // are duplicates, and the next test proves two different ones are not.
+  json r = srv->call_duplicate_indexes("grocery", "index_zoo");
+  auto group = identical_group_of(r, "zoo_lower_c");
+  ASSERT_EQ(group.size(), 2u) << r["identical"].dump(2);
+  EXPECT_NE(std::find(group.begin(), group.end(), "zoo_lower_c2"), group.end());
+}
+
+TEST_F(PostgresMCPServerTest, DuplicateIndexesReportsPrefixRedundancy) {
+  json r = srv->call_duplicate_indexes("grocery", "index_zoo");
+  ASSERT_TRUE(r.contains("redundant")) << r.dump(2);
+
+  bool found = false;
+  for (const auto& e : r["redundant"]) {
+    if (e["index"].get<std::string>() == "zoo_a") {
+      found = true;
+      EXPECT_EQ(e["covered_by"].get<std::string>(), "zoo_a_b");
+      EXPECT_NE(e["reason"].get<std::string>().find("leading prefix"), std::string::npos);
+      EXPECT_TRUE(e.contains("size"));
+      EXPECT_TRUE(e.contains("idx_scan"));
+      EXPECT_TRUE(e["valid"].get<bool>());
+      break;
+    }
+  }
+  EXPECT_TRUE(found) << r["redundant"].dump(2);
+}
+
+TEST_F(PostgresMCPServerTest, DuplicateIndexesSkipsDifferentSortOrder) {
+  // (a DESC) cannot serve a query that wants (a, b) in ascending order, so it
+  // is not covered by zoo_a_b however much the column list suggests otherwise.
+  json r = srv->call_duplicate_indexes("grocery", "index_zoo");
+  EXPECT_FALSE(is_reported_redundant(r, "zoo_a_desc")) << r["redundant"].dump(2);
+  EXPECT_TRUE(identical_group_of(r, "zoo_a_desc").empty());
+}
+
+TEST_F(PostgresMCPServerTest, DuplicateIndexesSkipsPartialIndex) {
+  // A partial index covers a different row set entirely.
+  json r = srv->call_duplicate_indexes("grocery", "index_zoo");
+  EXPECT_FALSE(is_reported_redundant(r, "zoo_a_part")) << r["redundant"].dump(2);
+}
+
+TEST_F(PostgresMCPServerTest, DuplicateIndexesNeverCallsAUniqueIndexRedundant) {
+  // zoo_c_uq is a prefix of zoo_c_d_uq, but dropping it would drop the
+  // uniqueness constraint on c, which the wider index does not enforce.
+  json r = srv->call_duplicate_indexes("grocery", "index_zoo");
+  EXPECT_FALSE(is_reported_redundant(r, "zoo_c_uq")) << r["redundant"].dump(2);
+}
+
+TEST_F(PostgresMCPServerTest, DuplicateIndexesFindsNothingOnACleanTable) {
+  json r = srv->call_duplicate_indexes("grocery", "users");
+  EXPECT_TRUE(r["identical"].empty()) << r["identical"].dump(2);
+  EXPECT_TRUE(r["redundant"].empty()) << r["redundant"].dump(2);
+}
+
+TEST_F(PostgresMCPServerTest, DuplicateIndexesWholeSchemaFindsTheZooTable) {
+  json r = srv->call_duplicate_indexes("grocery", "");
+  bool found = false;
+  for (const auto& g : r["identical"])
+    if (g["table"].get<std::string>() == "grocery.index_zoo") found = true;
+  EXPECT_TRUE(found) << r["identical"].dump(2);
+}
+
+// --- checkpointStats ---
+
+TEST_F(PostgresMCPServerTest, CheckpointStatsNormalizesAcrossServerVersions) {
+  json r = srv->call_checkpoint_stats();
+  ASSERT_TRUE(r.contains("source")) << r.dump(2);
+
+  // Whichever view supplied them, the caller sees the same field names.
+  ASSERT_TRUE(r.contains("checkpointer"));
+  auto& c = r["checkpointer"];
+  EXPECT_TRUE(c.contains("checkpoints_timed"));
+  EXPECT_TRUE(c.contains("checkpoints_requested"));
+  EXPECT_TRUE(c.contains("checkpoints_total"));
+  EXPECT_TRUE(c.contains("timed_percent"));
+  EXPECT_TRUE(c.contains("write_time_ms"));
+  EXPECT_TRUE(c.contains("sync_time_ms"));
+  EXPECT_TRUE(c.contains("buffers_written"));
+
+  ASSERT_TRUE(r.contains("bgwriter"));
+  EXPECT_TRUE(r["bgwriter"].contains("buffers_clean"));
+  EXPECT_TRUE(r["bgwriter"].contains("buffers_alloc"));
+
+  ASSERT_TRUE(r.contains("wal"));
+  EXPECT_TRUE(r["wal"].contains("wal_records"));
+  EXPECT_TRUE(r["wal"].contains("wal_bytes"));
+  EXPECT_TRUE(r["wal"].contains("wal_buffers_full"));
+
+  ASSERT_TRUE(r.contains("settings"));
+  EXPECT_TRUE(r["settings"].contains("checkpoint_timeout"));
+  EXPECT_TRUE(r["settings"].contains("max_wal_size"));
+  EXPECT_TRUE(r["settings"].contains("checkpoint_completion_target"));
+}
+
+TEST_F(PostgresMCPServerTest, CheckpointStatsReportsBackendWritesWhereverTheyLive) {
+  json r = srv->call_checkpoint_stats();
+  // Before 17 they are columns of pg_stat_bgwriter; from 17 they moved to
+  // pg_stat_io. Either way the count has to be reachable.
+  if (pg_server_version_num(test_url) >= 170000) {
+    ASSERT_TRUE(r.contains("backend_io")) << r.dump(2);
+    ASSERT_TRUE(r["backend_io"].contains("client backend")) << r["backend_io"].dump(2);
+    EXPECT_TRUE(r["backend_io"]["client backend"].contains("writes"));
+  } else {
+    EXPECT_TRUE(r["bgwriter"].contains("buffers_backend")) << r["bgwriter"].dump(2);
+    EXPECT_TRUE(r["bgwriter"].contains("buffers_backend_fsync"));
+  }
+}
+
+// --- tableIOStats ---
+
+TEST_F(PostgresMCPServerTest, TableIOStatsReportsPerObjectHitRatios) {
+  json r = srv->call_table_io_stats("grocery", "", 50);
+  ASSERT_TRUE(r.contains("grocery.users")) << r.dump(2);
+  auto& u = r["grocery.users"];
+  EXPECT_TRUE(u.contains("heap_blks_read"));
+  EXPECT_TRUE(u.contains("heap_blks_hit"));
+  EXPECT_TRUE(u.contains("heap_hit_percent"));
+  EXPECT_TRUE(u.contains("idx_blks_read"));
+  EXPECT_TRUE(u.contains("idx_hit_percent"));
+  EXPECT_TRUE(u.contains("total_hit_percent"));
+  EXPECT_TRUE(u.contains("size"));
+  // No per-index breakdown for a whole-schema sweep.
+  EXPECT_TRUE(u["indexes"].is_null());
+}
+
+TEST_F(PostgresMCPServerTest, TableIOStatsAddsPerIndexBreakdownForANamedTable) {
+  json r = srv->call_table_io_stats("grocery", "users", 20);
+  ASSERT_EQ(r.size(), 1u);
+  ASSERT_TRUE(r.contains("grocery.users"));
+  auto& idx = r["grocery.users"]["indexes"];
+  ASSERT_TRUE(idx.is_object()) << r.dump(2);
+  ASSERT_TRUE(idx.contains("users_pkey")) << idx.dump(2);
+  EXPECT_TRUE(idx["users_pkey"].contains("idx_blks_read"));
+  EXPECT_TRUE(idx["users_pkey"].contains("idx_hit_percent"));
+  EXPECT_TRUE(idx["users_pkey"].contains("idx_scan"));
+  EXPECT_TRUE(idx["users_pkey"].contains("size"));
+}
+
+TEST_F(PostgresMCPServerTest, TableIOStatsRatioIsNullNotZeroWithoutTraffic) {
+  // An untouched table has read 0 and hit 0. Reporting 0% would read as "every
+  // access missed the cache", which is the opposite of what happened.
+  pqxx::connection c(test_url);
+  pqxx::work t(c);
+  t.exec("CREATE TABLE grocery.never_read (id INT)");
+  t.commit();
+
+  json r = srv->call_table_io_stats("grocery", "never_read", 20);
+  ASSERT_TRUE(r.contains("grocery.never_read")) << r.dump(2);
+  EXPECT_TRUE(r["grocery.never_read"]["heap_hit_percent"].is_null());
+
+  pqxx::work drop(c);
+  drop.exec("DROP TABLE grocery.never_read");
+  drop.commit();
+}
+
+// --- hostCapacity ---
+
+TEST_F(PostgresMCPServerTest, HostCapacitySaysSoWhenNoHardwareWasInjected) {
+  json r = srv->call_host_capacity(0, 0, "");
+  ASSERT_TRUE(r.contains("host")) << r.dump(2);
+  EXPECT_FALSE(r["host"]["configured"].get<bool>());
+  ASSERT_TRUE(r.contains("hint"));
+  EXPECT_NE(r["hint"].get<std::string>().find("PG_LICHT_HOST_RAM_MB"), std::string::npos);
+
+  // The settings are still readable; only the ratios that need RAM are null.
+  ASSERT_TRUE(r["settings"].contains("shared_buffers"));
+  EXPECT_TRUE(r["derived"]["shared_buffers_percent_of_ram"].is_null());
+  // ... and the ones that don't need it are still computed.
+  EXPECT_FALSE(r["derived"]["work_mem_times_max_connections_bytes"].is_null());
+}
+
+TEST_F(PostgresMCPServerTest, HostCapacityComputesRatiosFromInjectedHardware) {
+  json r = srv->call_host_capacity(4096, 8, "local nvme");
+  ASSERT_TRUE(r["host"]["configured"].get<bool>()) << r.dump(2);
+  EXPECT_EQ(r["host"]["ram_mb"].get<long long>(), 4096);
+  EXPECT_EQ(r["host"]["ram_bytes"].get<long long>(), 4096LL * 1048576);
+  EXPECT_EQ(r["host"]["vcpus"].get<int>(), 8);
+  EXPECT_EQ(r["host"]["storage"].get<std::string>(), "local nvme");
+  EXPECT_EQ(r["host"]["source"].get<std::string>(), "argument");
+  EXPECT_FALSE(r.contains("hint"));
+
+  auto& d = r["derived"];
+  EXPECT_FALSE(d["shared_buffers_percent_of_ram"].is_null());
+  EXPECT_GT(d["shared_buffers_percent_of_ram"].get<double>(), 0.0);
+  EXPECT_FALSE(d["max_parallel_workers_per_vcpu"].is_null());
+  EXPECT_FALSE(d["committed_worst_case_percent_of_ram"].is_null());
+}
+
+TEST_F(PostgresMCPServerTest, HostCapacityResolvesByteUnitsPerSetting) {
+  json r = srv->call_host_capacity(0, 0, "");
+  auto& s = r["settings"];
+  // shared_buffers is counted in 8kB pages, work_mem in kB; both must come
+  // back as bytes so a caller never has to know which.
+  ASSERT_TRUE(s["shared_buffers"]["bytes"].is_number());
+  EXPECT_EQ(s["shared_buffers"]["bytes"].get<long long>(),
+            s["shared_buffers"]["setting"].get<std::string>().empty()
+              ? 0 : std::stoll(s["shared_buffers"]["setting"].get<std::string>()) * 8192);
+  ASSERT_TRUE(s["work_mem"]["bytes"].is_number());
+  EXPECT_EQ(s["work_mem"]["bytes"].get<long long>(),
+            std::stoll(s["work_mem"]["setting"].get<std::string>()) * 1024);
+  // max_connections has no unit, so it has no byte count -- null, not zero.
+  EXPECT_TRUE(s["max_connections"]["bytes"].is_null());
+  // A "-1" setting means "derived from another GUC", not a negative size.
+  if (s.contains("autovacuum_work_mem") &&
+      s["autovacuum_work_mem"]["setting"].get<std::string>() == "-1") {
+    EXPECT_TRUE(s["autovacuum_work_mem"]["bytes"].is_null());
+  }
+}
+
 // --- explainQuery ---
 
 TEST_F(PostgresMCPServerTest, ExplainQueryReturnsAPlan) {
@@ -2162,6 +2513,72 @@ TEST(ConnectionConfigTest, FromUrlBuildsASingleDefault) {
   EXPECT_EQ(reg.names().size(), 1u);
   EXPECT_NE(reg.get("default").conninfo.find("application_name=app/1"),
             std::string::npos);
+}
+
+TEST(ConnectionConfigTest, HostCapacityKeysAreParsedAndKeptOutOfTheConninfo) {
+  auto reg = load("[default]\ndbname = one\nhost_ram_mb = 65536\nhost_vcpus = 16\n"
+                  "host_storage = local nvme\nhost_note = shared with the app server\n");
+  const auto& c = reg.get("default");
+  EXPECT_EQ(c.capacity.ram_mb, 65536);
+  EXPECT_EQ(c.capacity.vcpus, 16);
+  EXPECT_EQ(c.capacity.storage, "local nvme");
+  EXPECT_EQ(c.capacity.note, "shared with the app server");
+  EXPECT_EQ(c.capacity.source, "config file");
+  // libpq would reject the whole conninfo over an unknown keyword, so these
+  // must be consumed here rather than passed through.
+  EXPECT_EQ(c.conninfo.find("host_ram_mb"), std::string::npos);
+  EXPECT_EQ(c.conninfo.find("host_vcpus"), std::string::npos);
+  EXPECT_EQ(c.conninfo.find("nvme"), std::string::npos);
+}
+
+TEST(ConnectionConfigTest, HostCapacityIsUnsetWhenNotDeclared) {
+  auto reg = load("[default]\ndbname = one\n");
+  const auto& c = reg.get("default");
+  EXPECT_FALSE(c.capacity.configured());
+  EXPECT_EQ(c.capacity.ram_mb, 0);
+  EXPECT_EQ(c.capacity.source, "");
+}
+
+TEST(ConnectionConfigTest, NonNumericHostRamIsRejectedNamingTheSection) {
+  // "64GB" where megabytes are meant would be off by three orders of
+  // magnitude and silently invalidate every ratio derived from it.
+  try {
+    load("[prod]\ndbname = one\nhost_ram_mb = 64GB\n");
+    FAIL() << "expected a rejection";
+  } catch (const std::exception& e) {
+    std::string msg = e.what();
+    EXPECT_NE(msg.find("prod"), std::string::npos);
+    EXPECT_NE(msg.find("host_ram_mb"), std::string::npos);
+    EXPECT_NE(msg.find("64GB"), std::string::npos);
+  }
+}
+
+TEST(ConnectionConfigTest, ZeroOrNegativeHostVcpusIsRejected) {
+  EXPECT_THROW(load("[default]\ndbname = one\nhost_vcpus = 0\n"), std::exception);
+  EXPECT_THROW(load("[default]\ndbname = one\nhost_vcpus = -4\n"), std::exception);
+}
+
+TEST(ConnectionConfigTest, HostCapacityComesFromTheEnvironmentForASingleConnection) {
+  ::setenv("PG_LICHT_HOST_RAM_MB", "8192", 1);
+  ::setenv("PG_LICHT_HOST_VCPUS", "4", 1);
+  ::setenv("PG_LICHT_HOST_STORAGE", "gp3", 1);
+  auto reg = pglicht::ConnectionRegistry::from_url("dbname=x", "app/1");
+  ::unsetenv("PG_LICHT_HOST_RAM_MB");
+  ::unsetenv("PG_LICHT_HOST_VCPUS");
+  ::unsetenv("PG_LICHT_HOST_STORAGE");
+
+  const auto& c = reg.get("default");
+  EXPECT_EQ(c.capacity.ram_mb, 8192);
+  EXPECT_EQ(c.capacity.vcpus, 4);
+  EXPECT_EQ(c.capacity.storage, "gp3");
+  EXPECT_EQ(c.capacity.source, "environment");
+}
+
+TEST(ConnectionConfigTest, EnvironmentHostCapacityDoesNotLeakIntoTheConninfo) {
+  ::setenv("PG_LICHT_HOST_RAM_MB", "8192", 1);
+  auto reg = pglicht::ConnectionRegistry::from_url("dbname=x", "app/1");
+  ::unsetenv("PG_LICHT_HOST_RAM_MB");
+  EXPECT_EQ(reg.get("default").conninfo.find("8192"), std::string::npos);
 }
 
 TEST(ConnectionConfigTest, FromUrlLeavesUriFormUntouched) {

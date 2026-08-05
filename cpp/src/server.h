@@ -162,6 +162,20 @@ public:
     return check_key(schema, table_name, values);
   }
 
+  const json call_wraparound_status(const std::string& schema, int limit) {
+    return wraparound_status(schema, limit);
+  }
+  const json call_duplicate_indexes(const std::string& schema, const std::string& table_name) {
+    return duplicate_indexes(schema, table_name);
+  }
+  const json call_checkpoint_stats() { return checkpoint_stats(); }
+  const json call_table_io_stats(const std::string& schema, const std::string& table_name, int limit) {
+    return table_io_stats(schema, table_name, limit);
+  }
+  const json call_host_capacity(long long ram_mb, int vcpus, const std::string& storage) {
+    return host_capacity(ram_mb, vcpus, storage);
+  }
+
   const json call_connections() { return connections(); }
   const json call_explain_query(const std::string& queryid, const std::string& sql,
                                 const json& params, bool analyze, int timeout_ms) {
@@ -203,6 +217,12 @@ private:
       if (!c.port.empty())    entry["port"]    = c.port;
       if (!c.dbname.empty())  entry["dbname"]  = c.dbname;
       if (!c.user.empty())    entry["user"]    = c.user;
+      // Host capacity, so a caller can see at a glance which connections still
+      // need it injected before hostCapacity can compute anything.
+      if (c.capacity.ram_mb > 0)        entry["host_ram_mb"]  = c.capacity.ram_mb;
+      if (c.capacity.vcpus > 0)         entry["host_vcpus"]   = c.capacity.vcpus;
+      if (!c.capacity.storage.empty())  entry["host_storage"] = c.capacity.storage;
+      if (!c.capacity.note.empty())     entry["host_note"]    = c.capacity.note;
       out.push_back(entry);
     }
     return out;
@@ -557,6 +577,86 @@ private:
 		{"properties", {
 		    {"limit", {{"type", "integer"}}}
 		  }}
+	      }}
+	  },
+	  {
+	    {"name", "wraparoundStatus"},
+	    {"description", "return transaction id and multixact wraparound headroom: age(datfrozenxid) and age(datminmxid) for every database, the oldest tables by age(relfrozenxid) including TOAST tables (often the relation actually holding the horizon back), each age as a percentage of the effective autovacuum_freeze_max_age and of the 2^31 hard limit at which the cluster stops accepting write transactions, plus the per-table freeze storage parameters and last vacuum times"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", {
+		    {"schema", {
+			{"type", "string"},
+			{"description", "restrict the table list to one schema; omit to cover the whole database, which is what wraparound risk is actually measured over"}
+		      }},
+		    {"limit", {
+			{"type", "integer"},
+			{"description", "how many tables to return, oldest first. Defaults to 20"}
+		      }}
+		  }}
+	      }}
+	  },
+	  {
+	    {"name", "checkpointStats"},
+	    {"description", "return checkpoint, WAL, and background writer activity (pg_stat_checkpointer and pg_stat_bgwriter on PostgreSQL 17+, pg_stat_bgwriter alone before that, plus pg_stat_wal) with field names normalized across both shapes: timed versus requested checkpoint counts and the ratio between them, write and sync time, buffers written by the checkpointer, by the background writer, and directly by backends, WAL record/FPI/byte counts, and the related settings (checkpoint_timeout, max_wal_size, checkpoint_completion_target, the bgwriter knobs)"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", json::object()}
+	      }}
+	  },
+	  {
+	    {"name", "tableIOStats"},
+	    {"description", "return per-object buffer cache hit ratios (pg_statio_all_tables): heap_blks_read versus heap_blks_hit, idx_blks_read versus idx_blks_hit, the TOAST and TOAST-index pairs, and a combined ratio, with relation size and scan counts. Naming a single table adds a per-index breakdown from pg_statio_all_indexes. Ratios are null, not zero, for an object that has seen no reads at all"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", {
+		    {"schema", {{"type", "string"}}},
+		    {"table",  {
+			{"type", "string"},
+			{"description", "a single table; omit to sweep the schema. Only a named table gets the per-index breakdown"}
+		      }},
+		    {"limit", {
+			{"type", "integer"},
+			{"description", "how many tables to return, most physical reads first. Defaults to 20"}
+		      }}
+		  }},
+		{"required", {"schema"}}
+	      }}
+	  },
+	  {
+	    {"name", "hostCapacity"},
+	    {"description", "correlate memory and parallelism settings with the capacity of the machine PostgreSQL runs on. Host RAM and vCPU count exist outside the catalog, so they must be injected: pass them as arguments, set host_ram_mb/host_vcpus in the connection's section of the connections file, or export PG_LICHT_HOST_RAM_MB/PG_LICHT_HOST_VCPUS. Returns the host facts with the source they came from, every memory-related setting resolved to bytes, and derived ratios (shared_buffers and effective_cache_size as a percentage of RAM, work_mem times max_connections, maintenance_work_mem times autovacuum_max_workers, parallel workers per vCPU). Ratios are null when no RAM figure was supplied; nothing is ever guessed"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", {
+		    {"ram_mb", {
+			{"type", "integer"},
+			{"description", "total host memory in megabytes, overriding any configured value"}
+		      }},
+		    {"vcpus", {
+			{"type", "integer"},
+			{"description", "number of vCPUs or cores available to the host, overriding any configured value"}
+		      }},
+		    {"storage", {
+			{"type", "string"},
+			{"description", "free-text description of the storage, e.g. \"local nvme\" or \"gp3 3000 iops\"; echoed back, never interpreted"}
+		      }}
+		  }}
+	      }}
+	  },
+	  {
+	    {"name", "duplicateIndexes"},
+	    {"description", "return indexes that duplicate or are covered by another index on the same table. 'identical' groups indexes whose key columns, operator classes, collations, sort order, INCLUDE columns and partial predicate all match; 'redundant' reports an index whose key columns are a leading prefix of a wider index that also covers its INCLUDE columns. Comparison is by column expression rather than attribute number, so expression indexes and differing sort orders are handled correctly, and a unique index is never called redundant for being a prefix. Each entry carries size, idx_scan, the backing constraint name, and the replica identity and validity flags, since those decide whether it can be dropped at all"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", {
+		    {"schema", {{"type", "string"}}},
+		    {"table",  {
+			{"type", "string"},
+			{"description", "restrict to one table; omit to check every table in the schema"}
+		      }}
+		  }},
+		{"required", {"schema"}}
 	      }}
 	  },
 	  {
@@ -1208,6 +1308,588 @@ private:
       }
       throw;
     }
+  }
+
+  const json wraparound_status(const std::string& schema, int limit) {
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
+
+    // 2^31 - 1000000: the point at which PostgreSQL stops accepting commands
+    // that assign new transaction ids. It is the outage threshold, and is
+    // distinct from autovacuum_freeze_max_age, which is merely where an
+    // anti-wraparound autovacuum is forced.
+    //
+    // TOAST tables are included deliberately. They carry their own
+    // relfrozenxid, are invisible in pg_stat_user_tables, and a TOAST or
+    // catalog relation is very often the one actually holding the horizon
+    // back; excluding them would report the risk as lower than it is.
+    std::string query = R"(
+      SELECT JSONB_BUILD_OBJECT(
+        'limits',
+          (SELECT JSONB_OBJECT_AGG(name, setting::bigint)
+             FROM pg_settings
+            WHERE name IN ('autovacuum_freeze_max_age', 'autovacuum_multixact_freeze_max_age',
+                           'vacuum_freeze_min_age', 'vacuum_freeze_table_age',
+                           'vacuum_multixact_freeze_min_age', 'vacuum_multixact_freeze_table_age',
+                           'vacuum_failsafe_age', 'vacuum_multixact_failsafe_age'))
+          || JSONB_BUILD_OBJECT('wraparound_limit', 2146483647::bigint),
+        'databases',
+          (SELECT JSONB_OBJECT_AGG(d.datname, JSONB_BUILD_OBJECT(
+                    'xid_age', age(d.datfrozenxid),
+                    'xid_percent_of_freeze_max_age',
+                      round(100.0 * age(d.datfrozenxid)
+                            / NULLIF(current_setting('autovacuum_freeze_max_age')::bigint, 0), 1),
+                    'xid_percent_of_wraparound_limit',
+                      round(100.0 * age(d.datfrozenxid) / 2146483647, 3),
+                    'xids_until_wraparound_limit', 2146483647 - age(d.datfrozenxid),
+                    'mxid_age', mxid_age(d.datminmxid),
+                    'mxid_percent_of_freeze_max_age',
+                      round(100.0 * mxid_age(d.datminmxid)
+                            / NULLIF(current_setting('autovacuum_multixact_freeze_max_age')::bigint, 0), 1),
+                    'datfrozenxid', d.datfrozenxid::text,
+                    'datminmxid', d.datminmxid::text))
+             FROM pg_database AS d
+            WHERE d.datallowconn),
+        'tables', COALESCE((
+          SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                   'schema', r.schema,
+                   'name', r.name,
+                   'kind', r.kind,
+                   'toast_for', r.toast_for,
+                   'xid_age', r.xid_age,
+                   'xid_percent_of_freeze_max_age',
+                     round(100.0 * r.xid_age / NULLIF(r.freeze_max_age, 0), 1),
+                   'xid_percent_of_wraparound_limit',
+                     round(100.0 * r.xid_age / 2146483647, 3),
+                   'mxid_age', r.mxid_age,
+                   'relfrozenxid', r.relfrozenxid::text,
+                   'freeze_max_age', r.freeze_max_age,
+                   'freeze_max_age_source', r.freeze_max_age_source,
+                   'size', r.size,
+                   'last_vacuum', r.last_vacuum,
+                   'last_autovacuum', r.last_autovacuum,
+                   'n_dead_tup', r.n_dead_tup) ORDER BY r.xid_age DESC)
+          FROM (
+            SELECT n.nspname AS schema,
+                   c.relname AS name,
+                   CASE c.relkind WHEN 'r' THEN 'table'
+                                  WHEN 'm' THEN 'materialized view'
+                                  WHEN 't' THEN 'toast table' END AS kind,
+                   CASE WHEN c.relkind = 't' THEN tn.nspname || '.' || tp.relname END AS toast_for,
+                   age(c.relfrozenxid) AS xid_age,
+                   mxid_age(c.relminmxid) AS mxid_age,
+                   c.relfrozenxid,
+                   COALESCE(o.option_value::bigint,
+                            current_setting('autovacuum_freeze_max_age')::bigint) AS freeze_max_age,
+                   CASE WHEN o.option_value IS NOT NULL THEN 'reloptions' ELSE 'server' END
+                     AS freeze_max_age_source,
+                   pg_relation_size(c.oid) AS size,
+                   s.last_vacuum, s.last_autovacuum, s.n_dead_tup
+            FROM pg_class AS c
+            JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            LEFT JOIN pg_class AS tp ON c.relkind = 't' AND tp.reltoastrelid = c.oid
+            LEFT JOIN pg_namespace AS tn ON tn.oid = tp.relnamespace
+            LEFT JOIN pg_stat_all_tables AS s ON s.relid = c.oid
+            LEFT JOIN LATERAL (SELECT option_value
+                                 FROM pg_options_to_table(c.reloptions)
+                                WHERE option_name = 'autovacuum_freeze_max_age') AS o ON true
+            WHERE c.relkind IN ('r', 'm', 't')
+              AND c.relfrozenxid <> '0'::xid
+              AND ($1 = '' OR COALESCE(tn.nspname, n.nspname) = $1)
+            ORDER BY age(c.relfrozenxid) DESC
+            LIMIT $2
+          ) AS r), '[]'::jsonb)
+      );
+    )";
+
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, limit});
+
+    if (!res.empty() && !res[0][0].is_null()) {
+      return json::parse(res[0][0].as<std::string>());
+    } else {
+      return {};
+    }
+  }
+
+  const json duplicate_indexes(const std::string& schema, const std::string& table_name) {
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
+
+    // Two indexes are interchangeable only if every property the planner cares
+    // about matches, so the comparison key is a per-column signature: the
+    // column or expression text, its operator class, its collation, and its
+    // indoption bits (DESC / NULLS FIRST). Comparing indkey alone would call
+    // (a) and (a DESC) duplicates, and two different expression indexes
+    // identical -- an expression column has attnum 0 in indkey.
+    //
+    // key_columns is the same list without opclass/collation/ordering, and is
+    // what the INCLUDE coverage test compares against: an included column is
+    // covered by a key column of the wider index regardless of how that key is
+    // sorted or compared.
+    std::string query = R"(
+      WITH idx AS (
+        SELECT i.indexrelid,
+               i.indrelid,
+               n.nspname  AS schema,
+               tc.relname AS table_name,
+               ic.relname AS index_name,
+               am.amname  AS access_method,
+               i.indisunique     AS is_unique,
+               i.indisprimary    AS is_primary,
+               i.indisvalid      AS is_valid,
+               i.indisreplident  AS is_replica_identity,
+               con.conname       AS constraint_name,
+               pg_get_expr(i.indpred, i.indrelid, true) AS predicate,
+               pg_get_indexdef(i.indexrelid)  AS definition,
+               pg_relation_size(i.indexrelid) AS size,
+               s.idx_scan,
+               (SELECT ARRAY_AGG(pg_get_indexdef(i.indexrelid, k::int, true) ORDER BY k)
+                  FROM generate_series(1, i.indnkeyatts) AS k) AS key_columns,
+               (SELECT ARRAY_AGG(pg_get_indexdef(i.indexrelid, k::int, true) || ' '
+                                 || COALESCE((SELECT op.opcname FROM pg_opclass AS op
+                                               WHERE op.oid = i.indclass[k - 1]), '?')
+                                 || ' '
+                                 || COALESCE(NULLIF(i.indcollation[k - 1], 0)::regcollation::text, '')
+                                 || ' ' || i.indoption[k - 1]::text
+                                 ORDER BY k)
+                  FROM generate_series(1, i.indnkeyatts) AS k) AS key_signature,
+               (SELECT COALESCE(ARRAY_AGG(pg_get_indexdef(i.indexrelid, k::int, true)
+                                          ORDER BY k), '{}')
+                  FROM generate_series(i.indnkeyatts + 1, i.indnatts) AS k) AS included_columns
+        FROM pg_index AS i
+        JOIN pg_class AS ic ON ic.oid = i.indexrelid
+        JOIN pg_class AS tc ON tc.oid = i.indrelid
+        JOIN pg_namespace AS n ON n.oid = tc.relnamespace
+        JOIN pg_am AS am ON am.oid = ic.relam
+        LEFT JOIN pg_constraint AS con
+               ON con.conindid = i.indexrelid AND con.contype IN ('p', 'u', 'x')
+        LEFT JOIN pg_stat_all_indexes AS s ON s.indexrelid = i.indexrelid
+        WHERE n.nspname = $1
+          AND ($2 = '' OR tc.relname = $2)
+      )
+      SELECT JSONB_BUILD_OBJECT(
+        'identical', COALESCE((
+          SELECT JSONB_AGG(g ORDER BY g->>'table')
+          FROM (
+            SELECT JSONB_BUILD_OBJECT(
+                     'table', a.schema || '.' || a.table_name,
+                     'access_method', a.access_method,
+                     'key_columns', a.key_columns,
+                     'included_columns', a.included_columns,
+                     'predicate', a.predicate,
+                     'indexes', JSONB_AGG(JSONB_BUILD_OBJECT(
+                                  'name', a.index_name,
+                                  'definition', a.definition,
+                                  'size', a.size,
+                                  'idx_scan', a.idx_scan,
+                                  'unique', a.is_unique,
+                                  'primary_key', a.is_primary,
+                                  'constraint', a.constraint_name,
+                                  'replica_identity', a.is_replica_identity,
+                                  'valid', a.is_valid) ORDER BY a.index_name)) AS g
+            FROM idx AS a
+            GROUP BY a.indrelid, a.schema, a.table_name, a.access_method,
+                     a.key_columns, a.key_signature, a.included_columns, a.predicate
+            HAVING COUNT(*) > 1
+          ) AS dup), '[]'::jsonb),
+        'redundant', COALESCE((
+          SELECT JSONB_AGG(red.r ORDER BY red.size DESC)
+          FROM (
+            SELECT DISTINCT ON (a.indexrelid) JSONB_BUILD_OBJECT(
+                     'table', a.schema || '.' || a.table_name,
+                     'index', a.index_name,
+                     'definition', a.definition,
+                     'size', a.size,
+                     'idx_scan', a.idx_scan,
+                     'covered_by', b.index_name,
+                     'covered_by_definition', b.definition,
+                     'covered_by_size', b.size,
+                     'covered_by_idx_scan', b.idx_scan,
+                     'reason',
+                       CASE WHEN array_length(a.key_signature, 1) < array_length(b.key_signature, 1)
+                            THEN 'key columns are a leading prefix of ' || b.index_name
+                            ELSE 'same key columns, and ' || b.index_name ||
+                                 ' also covers the included columns'
+                       END,
+                     'constraint', a.constraint_name,
+                     'replica_identity', a.is_replica_identity,
+                     'valid', a.is_valid) AS r,
+                   a.size
+            FROM idx AS a
+            JOIN idx AS b
+              ON b.indrelid = a.indrelid
+             AND b.indexrelid <> a.indexrelid
+             AND b.access_method = a.access_method
+             AND a.predicate IS NOT DISTINCT FROM b.predicate
+             AND array_length(a.key_signature, 1) <= array_length(b.key_signature, 1)
+             AND b.key_signature[1:array_length(a.key_signature, 1)] = a.key_signature
+             AND a.included_columns <@ (b.key_columns || b.included_columns)
+             -- With equal key lists the wider index must cover something the
+             -- narrower one does not, otherwise the two would report each
+             -- other and the pair belongs in 'identical' anyway.
+             AND (array_length(a.key_signature, 1) < array_length(b.key_signature, 1)
+                  OR NOT (b.included_columns <@ (a.key_columns || a.included_columns)))
+            -- A unique index is never redundant merely for being a prefix: it
+            -- enforces a constraint the wider index does not.
+            WHERE NOT a.is_unique
+            ORDER BY a.indexrelid, b.size
+          ) AS red), '[]'::jsonb)
+      );
+    )";
+
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, table_name});
+
+    if (!res.empty() && !res[0][0].is_null()) {
+      return json::parse(res[0][0].as<std::string>());
+    } else {
+      return {};
+    }
+  }
+
+  const json checkpoint_stats() {
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
+
+    // PostgreSQL 17 split the checkpointer counters out of pg_stat_bgwriter
+    // into pg_stat_checkpointer, renamed them, and moved the backend-written
+    // buffer counts to pg_stat_io. Field names are normalized across both
+    // shapes so a caller never has to branch on the server version; 'source'
+    // says which views produced the numbers.
+    const bool split = sess.server_version() >= 170000;
+
+    // pg_stat_wal lost wal_write/wal_sync and their timings in PostgreSQL 18,
+    // where they moved to pg_stat_io. The remaining four columns exist on
+    // every supported major.
+    const std::string wal_timing = sess.server_version() < 180000
+      ? R"(, 'wal_write', w.wal_write,
+            'wal_sync', w.wal_sync,
+            'wal_write_time_ms', w.wal_write_time,
+            'wal_sync_time_ms', w.wal_sync_time)"
+      : "";
+
+    const std::string checkpointer = split ? R"(
+        'source', 'pg_stat_checkpointer + pg_stat_bgwriter + pg_stat_io',
+        'checkpointer', (SELECT JSONB_BUILD_OBJECT(
+             'checkpoints_timed',        c.num_timed,
+             'checkpoints_requested',    c.num_requested,
+             'checkpoints_total',        c.num_timed + c.num_requested,
+             'timed_percent',            round(100.0 * c.num_timed
+                                               / NULLIF(c.num_timed + c.num_requested, 0), 1),
+             'restartpoints_timed',      c.restartpoints_timed,
+             'restartpoints_requested',  c.restartpoints_req,
+             'restartpoints_done',       c.restartpoints_done,
+             'write_time_ms',            c.write_time,
+             'sync_time_ms',             c.sync_time,
+             'buffers_written',          c.buffers_written,
+             'stats_reset',              c.stats_reset,
+             'seconds_since_reset',      round(EXTRACT(EPOCH FROM now() - c.stats_reset)),
+             'checkpoints_per_hour',     round((c.num_timed + c.num_requested)
+                                               / NULLIF(EXTRACT(EPOCH FROM now() - c.stats_reset)
+                                                        / 3600.0, 0), 2),
+             'mean_seconds_between_checkpoints',
+                                         round(EXTRACT(EPOCH FROM now() - c.stats_reset)
+                                               / NULLIF(c.num_timed + c.num_requested, 0))
+           ) FROM pg_stat_checkpointer AS c),
+        'bgwriter', (SELECT JSONB_BUILD_OBJECT(
+             'buffers_clean',    b.buffers_clean,
+             'maxwritten_clean', b.maxwritten_clean,
+             'buffers_alloc',    b.buffers_alloc,
+             'stats_reset',      b.stats_reset
+           ) FROM pg_stat_bgwriter AS b),
+        -- buffers_backend and buffers_backend_fsync were removed from
+        -- pg_stat_bgwriter in 17; this is the same measurement, per backend
+        -- type, from where it now lives.
+        'backend_io', (SELECT JSONB_OBJECT_AGG(backend_type, JSONB_BUILD_OBJECT(
+             'writes', writes, 'fsyncs', fsyncs, 'extends', extends,
+             'evictions', evictions, 'reads', reads))
+           FROM (SELECT backend_type,
+                        SUM(writes) AS writes, SUM(fsyncs) AS fsyncs,
+                        SUM(extends) AS extends, SUM(evictions) AS evictions,
+                        SUM(reads) AS reads
+                 FROM pg_stat_io
+                 WHERE object = 'relation'
+                 GROUP BY backend_type) AS io),
+    )" : R"(
+        'source', 'pg_stat_bgwriter',
+        'checkpointer', (SELECT JSONB_BUILD_OBJECT(
+             'checkpoints_timed',        b.checkpoints_timed,
+             'checkpoints_requested',    b.checkpoints_req,
+             'checkpoints_total',        b.checkpoints_timed + b.checkpoints_req,
+             'timed_percent',            round(100.0 * b.checkpoints_timed
+                                               / NULLIF(b.checkpoints_timed + b.checkpoints_req, 0), 1),
+             'write_time_ms',            b.checkpoint_write_time,
+             'sync_time_ms',             b.checkpoint_sync_time,
+             'buffers_written',          b.buffers_checkpoint,
+             'stats_reset',              b.stats_reset,
+             'seconds_since_reset',      round(EXTRACT(EPOCH FROM now() - b.stats_reset)),
+             'checkpoints_per_hour',     round((b.checkpoints_timed + b.checkpoints_req)
+                                               / NULLIF(EXTRACT(EPOCH FROM now() - b.stats_reset)
+                                                        / 3600.0, 0), 2),
+             'mean_seconds_between_checkpoints',
+                                         round(EXTRACT(EPOCH FROM now() - b.stats_reset)
+                                               / NULLIF(b.checkpoints_timed + b.checkpoints_req, 0))
+           ) FROM pg_stat_bgwriter AS b),
+        'bgwriter', (SELECT JSONB_BUILD_OBJECT(
+             'buffers_clean',          b.buffers_clean,
+             'maxwritten_clean',       b.maxwritten_clean,
+             'buffers_backend',        b.buffers_backend,
+             'buffers_backend_fsync',  b.buffers_backend_fsync,
+             'buffers_alloc',          b.buffers_alloc,
+             'stats_reset',            b.stats_reset
+           ) FROM pg_stat_bgwriter AS b),
+    )";
+
+    std::string query = R"(
+      SELECT JSONB_BUILD_OBJECT(
+    )" + checkpointer + R"(
+        'wal', (SELECT JSONB_BUILD_OBJECT(
+             'wal_records',      w.wal_records,
+             'wal_fpi',          w.wal_fpi,
+             'wal_bytes',        w.wal_bytes,
+             'wal_buffers_full', w.wal_buffers_full,
+             'stats_reset',      w.stats_reset
+           )" + wal_timing + R"(
+           ) FROM pg_stat_wal AS w),
+        'settings', (SELECT JSONB_OBJECT_AGG(name, JSONB_BUILD_OBJECT(
+             'setting', setting, 'unit', unit))
+           FROM pg_settings
+          WHERE name IN ('checkpoint_timeout', 'checkpoint_completion_target',
+                         'checkpoint_flush_after', 'checkpoint_warning',
+                         'max_wal_size', 'min_wal_size', 'wal_buffers',
+                         'wal_writer_delay', 'wal_writer_flush_after',
+                         'wal_level', 'wal_compression', 'full_page_writes',
+                         'synchronous_commit', 'fsync',
+                         'bgwriter_delay', 'bgwriter_lru_maxpages',
+                         'bgwriter_lru_multiplier', 'bgwriter_flush_after',
+                         'shared_buffers'))
+      );
+    )";
+
+    pqxx::result res = txn.exec(query);
+
+    if (!res.empty() && !res[0][0].is_null()) {
+      return json::parse(res[0][0].as<std::string>());
+    } else {
+      return {};
+    }
+  }
+
+  const json table_io_stats(const std::string& schema, const std::string& table_name, int limit) {
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
+
+    // A per-index breakdown is attached only when a single table was named:
+    // over a whole schema it multiplies the payload by the index count without
+    // making the table-level ratios any easier to read.
+    //
+    // Ratios are null rather than 0 when nothing has been read yet, so "no
+    // traffic" is never mistaken for "every read missed the cache".
+    std::string query = R"(
+      SELECT JSONB_OBJECT_AGG(r.schemaname || '.' || r.relname, JSONB_BUILD_OBJECT(
+               'heap_blks_read', r.heap_blks_read,
+               'heap_blks_hit',  r.heap_blks_hit,
+               'heap_hit_percent',
+                 round(100.0 * r.heap_blks_hit
+                       / NULLIF(r.heap_blks_hit + r.heap_blks_read, 0), 2),
+               'idx_blks_read', r.idx_blks_read,
+               'idx_blks_hit',  r.idx_blks_hit,
+               'idx_hit_percent',
+                 round(100.0 * r.idx_blks_hit
+                       / NULLIF(r.idx_blks_hit + r.idx_blks_read, 0), 2),
+               'toast_blks_read', r.toast_blks_read,
+               'toast_blks_hit',  r.toast_blks_hit,
+               'tidx_blks_read',  r.tidx_blks_read,
+               'tidx_blks_hit',   r.tidx_blks_hit,
+               'total_blks_read', r.total_read,
+               'total_blks_hit',  r.total_hit,
+               'total_hit_percent',
+                 round(100.0 * r.total_hit / NULLIF(r.total_hit + r.total_read, 0), 2),
+               'size',       r.size,
+               'seq_scan',   r.seq_scan,
+               'idx_scan',   r.idx_scan,
+               'n_live_tup', r.n_live_tup,
+               'indexes',    r.indexes))
+      FROM (
+        SELECT io.schemaname, io.relname,
+               io.heap_blks_read, io.heap_blks_hit,
+               io.idx_blks_read, io.idx_blks_hit,
+               io.toast_blks_read, io.toast_blks_hit,
+               io.tidx_blks_read, io.tidx_blks_hit,
+               COALESCE(io.heap_blks_read, 0) + COALESCE(io.idx_blks_read, 0)
+                 + COALESCE(io.toast_blks_read, 0) + COALESCE(io.tidx_blks_read, 0) AS total_read,
+               COALESCE(io.heap_blks_hit, 0) + COALESCE(io.idx_blks_hit, 0)
+                 + COALESCE(io.toast_blks_hit, 0) + COALESCE(io.tidx_blks_hit, 0) AS total_hit,
+               pg_total_relation_size(io.relid) AS size,
+               st.seq_scan, st.idx_scan, st.n_live_tup,
+               CASE WHEN $2 <> '' THEN (
+                 SELECT JSONB_OBJECT_AGG(ix.indexrelname, JSONB_BUILD_OBJECT(
+                          'idx_blks_read', ix.idx_blks_read,
+                          'idx_blks_hit',  ix.idx_blks_hit,
+                          'idx_hit_percent',
+                            round(100.0 * ix.idx_blks_hit
+                                  / NULLIF(ix.idx_blks_hit + ix.idx_blks_read, 0), 2),
+                          'idx_scan', si.idx_scan,
+                          'idx_tup_read', si.idx_tup_read,
+                          'idx_tup_fetch', si.idx_tup_fetch,
+                          'size', pg_relation_size(ix.indexrelid)))
+                 FROM pg_statio_all_indexes AS ix
+                 LEFT JOIN pg_stat_all_indexes AS si ON si.indexrelid = ix.indexrelid
+                 WHERE ix.relid = io.relid
+               ) END AS indexes
+        FROM pg_statio_all_tables AS io
+        LEFT JOIN pg_stat_all_tables AS st ON st.relid = io.relid
+        WHERE io.schemaname = $1
+          AND ($2 = '' OR io.relname = $2)
+        ORDER BY COALESCE(io.heap_blks_read, 0) + COALESCE(io.idx_blks_read, 0)
+                 + COALESCE(io.toast_blks_read, 0) + COALESCE(io.tidx_blks_read, 0) DESC
+        LIMIT $3
+      ) AS r;
+    )";
+
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, table_name, limit});
+
+    if (!res.empty() && !res[0][0].is_null()) {
+      return json::parse(res[0][0].as<std::string>());
+    } else {
+      return {};
+    }
+  }
+
+  // Host RAM and vCPU count are not in any catalog, so they arrive from
+  // outside: a hostCapacity argument (an agent that just inspected the box),
+  // the connections file, or the environment. Whichever is used is named in
+  // 'source', because every derived ratio is only as good as that figure.
+  const json host_capacity(long long ram_mb_arg, int vcpus_arg,
+                           const std::string& storage_arg) {
+    pglicht::HostCapacity cap = active_cfg().capacity;
+    if (ram_mb_arg > 0 || vcpus_arg > 0 || !storage_arg.empty()) {
+      // Arguments win over configuration, and are reported as a distinct
+      // source: a value passed per call is a claim about right now, while the
+      // file may have been written for a machine that has since been resized.
+      pglicht::HostCapacity from_args;
+      from_args.ram_mb  = ram_mb_arg > 0 ? ram_mb_arg : cap.ram_mb;
+      from_args.vcpus   = vcpus_arg  > 0 ? vcpus_arg  : cap.vcpus;
+      from_args.storage = !storage_arg.empty() ? storage_arg : cap.storage;
+      from_args.note    = cap.note;
+      from_args.source  = cap.configured() ? "argument (over " + cap.source + ")" : "argument";
+      cap = from_args;
+    }
+
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
+
+    // Byte-valued GUCs are reported in their own unit (8kB pages for
+    // shared_buffers, kB for work_mem, ...), so the multiplier is applied here
+    // rather than leaving every caller to rediscover it. A negative setting
+    // means "derive from another GUC" (autovacuum_work_mem = -1) and yields a
+    // null byte count rather than a negative one.
+    std::string query = R"(
+      WITH host AS (
+        SELECT NULLIF($1, '')::bigint AS ram_bytes,
+               NULLIF($2, '')::int    AS vcpus
+      ),
+      g AS (
+        SELECT name, setting, unit,
+               CASE WHEN setting::bigint < 0 THEN NULL
+                    ELSE setting::bigint * CASE unit
+                                             WHEN 'B'   THEN 1
+                                             WHEN 'kB'  THEN 1024
+                                             WHEN 'MB'  THEN 1048576
+                                             WHEN 'GB'  THEN 1073741824
+                                             WHEN '8kB' THEN 8192
+                                           END
+               END AS bytes
+        FROM pg_settings
+        WHERE vartype = 'integer'
+          AND name IN ('shared_buffers', 'work_mem', 'maintenance_work_mem',
+                       'autovacuum_work_mem', 'temp_buffers', 'wal_buffers',
+                       'effective_cache_size', 'min_wal_size', 'max_wal_size',
+                       'logical_decoding_work_mem',
+                       'max_connections', 'superuser_reserved_connections',
+                       'max_worker_processes', 'max_parallel_workers',
+                       'max_parallel_workers_per_gather',
+                       'max_parallel_maintenance_workers', 'autovacuum_max_workers',
+                       'effective_io_concurrency', 'maintenance_io_concurrency')
+      ),
+      v AS (
+        SELECT (SELECT bytes   FROM g WHERE name = 'shared_buffers')       AS shared_buffers,
+               (SELECT bytes   FROM g WHERE name = 'work_mem')             AS work_mem,
+               (SELECT bytes   FROM g WHERE name = 'maintenance_work_mem') AS maint_work_mem,
+               (SELECT bytes   FROM g WHERE name = 'effective_cache_size') AS effective_cache_size,
+               (SELECT setting::bigint FROM g WHERE name = 'max_connections')        AS max_connections,
+               (SELECT setting::bigint FROM g WHERE name = 'autovacuum_max_workers') AS av_workers
+      )
+      SELECT JSONB_BUILD_OBJECT(
+        'server', JSONB_BUILD_OBJECT(
+          'version', current_setting('server_version'),
+          'database', current_database()),
+        'settings', (SELECT JSONB_OBJECT_AGG(name, JSONB_BUILD_OBJECT(
+                        'setting', setting, 'unit', unit, 'bytes', bytes)) FROM g),
+        'derived', (SELECT JSONB_BUILD_OBJECT(
+          'shared_buffers_percent_of_ram',
+            round(100.0 * v.shared_buffers / NULLIF(host.ram_bytes, 0), 1),
+          'effective_cache_size_percent_of_ram',
+            round(100.0 * v.effective_cache_size / NULLIF(host.ram_bytes, 0), 1),
+          'work_mem_times_max_connections_bytes',
+            v.work_mem * v.max_connections,
+          'work_mem_times_max_connections_percent_of_ram',
+            round(100.0 * v.work_mem * v.max_connections / NULLIF(host.ram_bytes, 0), 1),
+          'maintenance_work_mem_times_autovacuum_workers_bytes',
+            v.maint_work_mem * v.av_workers,
+          'maintenance_work_mem_times_autovacuum_workers_percent_of_ram',
+            round(100.0 * v.maint_work_mem * v.av_workers / NULLIF(host.ram_bytes, 0), 1),
+          'committed_worst_case_bytes',
+            v.shared_buffers + v.work_mem * v.max_connections
+              + v.maint_work_mem * v.av_workers,
+          'committed_worst_case_percent_of_ram',
+            round(100.0 * (v.shared_buffers + v.work_mem * v.max_connections
+                           + v.maint_work_mem * v.av_workers)
+                  / NULLIF(host.ram_bytes, 0), 1),
+          'max_parallel_workers_per_vcpu',
+            round((SELECT setting::numeric FROM g WHERE name = 'max_parallel_workers')
+                  / NULLIF(host.vcpus, 0), 2),
+          'max_worker_processes_per_vcpu',
+            round((SELECT setting::numeric FROM g WHERE name = 'max_worker_processes')
+                  / NULLIF(host.vcpus, 0), 2))
+          FROM v, host),
+        'notes', JSONB_BUILD_ARRAY(
+          'work_mem is a per-node limit, not a per-connection one: a single query '
+          'with several sorts or hash joins can use a multiple of it, and parallel '
+          'workers each get their own. work_mem_times_max_connections is therefore a '
+          'floor on the worst case, not a ceiling.',
+          'shared_buffers is counted once here; the operating system page cache is '
+          'not, which is what effective_cache_size is meant to describe.')
+      );
+    )";
+
+    pqxx::result res = pqxx_exec(
+      txn, query,
+      pqxx::params{cap.ram_mb > 0 ? std::to_string(cap.ram_mb * 1048576LL) : std::string{},
+                   cap.vcpus  > 0 ? std::to_string(cap.vcpus)              : std::string{}});
+
+    json out = (!res.empty() && !res[0][0].is_null())
+      ? json::parse(res[0][0].as<std::string>()) : json::object();
+
+    json host = {{"configured", cap.configured()}};
+    if (cap.ram_mb > 0) {
+      host["ram_mb"]    = cap.ram_mb;
+      host["ram_bytes"] = cap.ram_mb * 1048576LL;
+    }
+    if (cap.vcpus > 0)        host["vcpus"]   = cap.vcpus;
+    if (!cap.storage.empty()) host["storage"] = cap.storage;
+    if (!cap.note.empty())    host["note"]    = cap.note;
+    if (!cap.source.empty())  host["source"]  = cap.source;
+    out["host"] = host;
+
+    if (cap.ram_mb <= 0) {
+      out["hint"] =
+        "no host RAM is configured, so every percent_of_ram field is null. Supply "
+        "ram_mb (and vcpus) as arguments to this tool, set host_ram_mb/host_vcpus "
+        "in the connection's section of the connections file, or export "
+        "PG_LICHT_HOST_RAM_MB/PG_LICHT_HOST_VCPUS. PostgreSQL cannot report the "
+        "host's memory itself, and pg-licht will not guess it";
+    }
+    return out;
   }
 
   // A plan is read-only iff no ModifyTable node appears anywhere in the tree.
@@ -2903,6 +3585,36 @@ private:
 	else if (tool_name == "statementStats") {
 	  int limit = arguments.contains("limit") ? arguments["limit"].get<int>() : 20;
 	  result_content = statement_stats(limit);
+	}
+	else if (tool_name == "wraparoundStatus") {
+	  // No schema default here: wraparound is a whole-database property, and
+	  // silently scoping it to "public" would understate the risk.
+	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "";
+	  int limit = arguments.contains("limit") ? arguments["limit"].get<int>() : 20;
+	  result_content = wraparound_status(target_schema, limit);
+	}
+	else if (tool_name == "checkpointStats") {
+	  result_content = checkpoint_stats();
+	}
+	else if (tool_name == "tableIOStats") {
+	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+	  std::string target_table  = arguments.contains("table")  ? arguments["table"].get<std::string>()  : "";
+	  int limit = arguments.contains("limit") ? arguments["limit"].get<int>() : 20;
+	  result_content = table_io_stats(target_schema, target_table, limit);
+	}
+	else if (tool_name == "hostCapacity") {
+	  long long ram_mb = arguments.contains("ram_mb") && arguments["ram_mb"].is_number_integer()
+	    ? arguments["ram_mb"].get<long long>() : 0;
+	  int vcpus = arguments.contains("vcpus") && arguments["vcpus"].is_number_integer()
+	    ? arguments["vcpus"].get<int>() : 0;
+	  std::string storage = arguments.contains("storage") && arguments["storage"].is_string()
+	    ? arguments["storage"].get<std::string>() : "";
+	  result_content = host_capacity(ram_mb, vcpus, storage);
+	}
+	else if (tool_name == "duplicateIndexes") {
+	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+	  std::string target_table  = arguments.contains("table")  ? arguments["table"].get<std::string>()  : "";
+	  result_content = duplicate_indexes(target_schema, target_table);
 	}
 	else if (tool_name == "tableBloat") {
 	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
