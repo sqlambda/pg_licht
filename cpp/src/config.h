@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <stdexcept>
@@ -23,6 +24,30 @@
 
 namespace pglicht {
 
+// Capacity of the machine the server runs on.
+//
+// Total RAM and vCPU count are properties of the host, not of the cluster:
+// PostgreSQL has no catalog for them, and a backend cannot read them portably
+// (and would read the *client's* host anyway, which is the wrong machine).
+// They therefore have to be injected by whoever knows -- the operator, via the
+// connections file or the environment, or an agent that inspects the host over
+// SSH and passes them as arguments to hostCapacity.
+//
+// Zero means "not configured" and is reported as such. Nothing here is ever
+// guessed: a wrong RAM figure would silently invalidate every ratio derived
+// from it.
+struct HostCapacity {
+  long long ram_mb = 0;
+  int vcpus = 0;
+  std::string storage;   // free text, e.g. "nvme", "gp3", "spinning rust"
+  std::string note;      // free text, e.g. "shared with the app server"
+  std::string source;    // where the values came from, for the caller to judge
+
+  bool configured() const {
+    return ram_mb > 0 || vcpus > 0 || !storage.empty() || !note.empty();
+  }
+};
+
 // One named connection.
 struct ConnConfig {
   std::string name;
@@ -35,6 +60,8 @@ struct ConnConfig {
   std::string port;
   std::string dbname;
   std::string user;
+
+  HostCapacity capacity;
 };
 
 namespace detail {
@@ -67,6 +94,27 @@ inline std::string quote_conninfo(const std::string& v) {
   return out + "'";
 }
 
+// Parse a strictly positive integer, or throw with the caller's context. Used
+// for the host capacity keys, where a typo ("64GB" where megabytes are meant)
+// must fail loudly at startup rather than silently produce ratios that are off
+// by three orders of magnitude.
+inline long long positive_int(const std::string& v, const std::string& where) {
+  if (v.empty())
+    throw std::runtime_error(where + ": expected a positive integer, got an empty value");
+  for (char c : v) {
+    if (!std::isdigit(static_cast<unsigned char>(c)))
+      throw std::runtime_error(where + ": expected a positive integer, got \"" + v + "\"");
+  }
+  try {
+    long long n = std::stoll(v);
+    if (n <= 0)
+      throw std::runtime_error(where + ": expected a positive integer, got \"" + v + "\"");
+    return n;
+  } catch (const std::out_of_range&) {
+    throw std::runtime_error(where + ": value out of range: \"" + v + "\"");
+  }
+}
+
 }  // namespace detail
 
 // A set of named connections, plus which one is the default.
@@ -87,6 +135,12 @@ public:
         url.find("application_name") == std::string::npos) {
       cfg.conninfo += " application_name=" + detail::quote_conninfo(app_name);
     }
+    // Host capacity from the environment. Deliberately only on this path:
+    // there is exactly one connection here, so there is no question which host
+    // the variables describe. With a connections file each section declares
+    // its own, since the sections may well live on different machines.
+    cfg.capacity = capacity_from_env();
+
     reg.order_.push_back("default");
     reg.conns_["default"] = cfg;
     reg.default_name_ = "default";
@@ -190,6 +244,25 @@ public:
   const std::vector<std::string>& names() const { return order_; }
   const std::string& default_name() const { return default_name_; }
 
+  // PG_LICHT_HOST_RAM_MB / _VCPUS / _STORAGE / _NOTE, for the single-connection
+  // form. Exposed for the test suite; from_url is its only caller.
+  static HostCapacity capacity_from_env() {
+    HostCapacity cap;
+    auto env = [](const char* n) -> std::string {
+      const char* v = std::getenv(n);
+      return v ? detail::trim(v) : std::string{};
+    };
+    std::string ram = env("PG_LICHT_HOST_RAM_MB");
+    std::string cpu = env("PG_LICHT_HOST_VCPUS");
+    if (!ram.empty()) cap.ram_mb = detail::positive_int(ram, "PG_LICHT_HOST_RAM_MB");
+    if (!cpu.empty()) cap.vcpus = static_cast<int>(
+                        detail::positive_int(cpu, "PG_LICHT_HOST_VCPUS"));
+    cap.storage = env("PG_LICHT_HOST_STORAGE");
+    cap.note    = env("PG_LICHT_HOST_NOTE");
+    if (cap.configured()) cap.source = "environment";
+    return cap;
+  }
+
 private:
   std::map<std::string, ConnConfig> conns_;
   std::vector<std::string> order_;
@@ -215,6 +288,21 @@ private:
           "unsupported startup parameter. pg-licht sets what it needs per "
           "transaction (BEGIN READ ONLY, SET LOCAL statement_timeout) instead");
 
+      // Host capacity keys describe the machine, not the connection. They are
+      // consumed here and never reach the conninfo -- libpq would reject the
+      // whole string as an invalid option otherwise.
+      if (key == "host_ram_mb") {
+        cfg.capacity.ram_mb = detail::positive_int(val, path + ": [" + name + "] host_ram_mb");
+        continue;
+      }
+      if (key == "host_vcpus") {
+        cfg.capacity.vcpus = static_cast<int>(
+          detail::positive_int(val, path + ": [" + name + "] host_vcpus"));
+        continue;
+      }
+      if (key == "host_storage") { cfg.capacity.storage = val; continue; }
+      if (key == "host_note")    { cfg.capacity.note = val;    continue; }
+
       if (key == "service") cfg.service = val;
       else if (key == "host")   cfg.host   = val;
       else if (key == "port")   cfg.port   = val;
@@ -238,6 +326,8 @@ private:
       if (!conninfo.empty()) conninfo += " ";
       conninfo += "application_name=" + detail::quote_conninfo(app_name);
     }
+
+    if (cfg.capacity.configured()) cfg.capacity.source = "config file";
 
     cfg.conninfo = conninfo;
     return cfg;

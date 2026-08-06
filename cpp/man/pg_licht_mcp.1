@@ -120,6 +120,54 @@ PgBouncer refuses GUCs in the startup packet, so
 .Nm
 sets what it needs per transaction instead; see
 .Sx SECURITY CONSIDERATIONS .
+.Ss Host capacity
+Total RAM and vCPU count belong to the machine, not to the cluster.
+PostgreSQL has no catalog for them, and a backend could not read them portably
+in any case \(em it would read the client's host, which is the wrong machine.
+They are therefore injected, and
+.Ic hostCapacity
+correlates them with
+.Va shared_buffers , Va work_mem ,
+and the rest.
+Four optional keys per section carry them:
+.Bd -literal -offset indent
+[prod]
+service      = db01_ro
+host_ram_mb  = 65536
+host_vcpus   = 16
+host_storage = local nvme          ; free text, never interpreted
+host_note    = shared with the app ; free text, never interpreted
+.Ed
+.Pp
+These keys are consumed by
+.Nm
+and never reach libpq, which would reject the whole connection string over an
+unrecognised keyword.
+.Va host_ram_mb
+and
+.Va host_vcpus
+must be positive integers; anything else is rejected at startup naming the
+section and the key, because
+.Ql 64GB
+where megabytes are meant would be wrong by three orders of magnitude and would
+silently invalidate every derived ratio.
+.Pp
+There are two other ways in.
+The environment variables under
+.Sx ENVIRONMENT
+apply to the single-connection
+.Ev DATABASE_URL
+form only, where there is no question which host they describe; with a
+connections file each section declares its own, since the sections may well
+live on different machines.
+And an agent that inspects the host at run time \(em over SSH, say \(em can
+pass
+.Va ram_mb
+and
+.Va vcpus
+straight to
+.Ic hostCapacity ,
+which takes precedence over both.
 .Ss Resolution order
 The connection source is resolved in this order:
 .Bl -enum -width 2n
@@ -318,6 +366,29 @@ The connection string is never exposed, as it may contain credentials.
 Replication slots with retained WAL bytes.
 A lagging or unused slot holds back WAL indefinitely and is a common cause of
 disk bloat incidents.
+.Pp
+.Va wal_status
+is the verdict that retained WAL bytes only hint at:
+.Ql extended
+means the slot is already past
+.Va max_wal_size ,
+and
+.Ql lost
+means the WAL it needs is gone and the slot is unusable.
+.Va safe_wal_size
+is how much more WAL may be written before that happens.
+.Pp
+The spill and stream counters come from
+.Li pg_stat_replication_slots ,
+a different view: they show logical decoding spilling large transactions to
+disk, which is invisible in the slot's own row and is a common, silent
+throughput cliff.
+PostgreSQL 16 adds
+.Va conflicting ,
+and 17 adds
+.Va invalidation_reason
+and
+.Va inactive_since .
 .El
 .Ss Monitoring and statistics
 .Bl -tag -width Ds
@@ -330,37 +401,389 @@ grouped by category, each with current value, unit, description, context, type,
 source, and
 .Va pending_restart
 flag.
-.It Ic currentActivity
+.It Ic currentActivity Op Va pid , Va query_id , Va min_duration_s , Va state
 Current server connections and running queries
 .Pq Li pg_stat_activity
 across all databases: pid, database, user, application_name, backend_type,
-state, wait event, and query text.
-.It Ic currentLocks
+state, wait event, query text, transaction and query duration, leader pid for
+parallel workers, and the backend's xid and xmin.
+.Pp
+.Va query_id
+is the join key to
+.Ic statementStats
+and
+.Ic explainQuery ,
+which is what turns
+.Dq this is running now
+into
+.Dq this is its plan .
+It is returned as text, since a 64-bit value does not survive JSON number
+precision, and is null unless
+.Va compute_query_id
+is enabled; the default
+.Ql auto
+enables it when
+.Li pg_stat_statements
+is loaded.
+On PostgreSQL 17 and newer each wait event also carries its prose description
+from
+.Li pg_wait_events .
+.Pp
+All four filters are optional and combine; with none of them the whole view is
+returned, which on a busy server is mostly idle connections and internal
+processes.
+.Pp
+.Bl -tag -width "min_duration_s" -compact
+.It Va pid
+A single backend, together with its parallel workers, matched on
+.Va leader_pid .
+Being shown a leader without its workers hides where the work is happening,
+which is the reason for asking.
+.It Va query_id
+Only backends running this
+.Va query_id ,
+as a decimal string.
+This is how a statement identified by
+.Ic statementStats
+is traced to whoever is running it now.
+.It Va min_duration_s
+Only backends whose current query has been running at least this many seconds.
+Plain idle backends are excluded, since their
+.Va query_start
+dates a statement that already finished.
+.It Va state
+Only backends in this state, e.g.
+.Ql active
+or
+.Ql "idle in transaction" .
+.El
+.It Ic currentLocks Op Va pid
 Current locks
 .Pq Li pg_locks
 joined with the holding backend's query and user, plus which pids are blocking
 each waiting lock.
 Use to diagnose lock contention.
+.Pp
+.Bl -tag -width "min_duration_s" -compact
+.It Va pid
+Restrict the result to this backend and every backend blocking it,
+transitively, resolved through
+.Fn pg_blocking_pids .
+Each row is tagged with
+.Va chain_depth :
+0 is the backend asked about, and the largest depth is the one at the root of
+the pile-up, which is the one to look at first.
+Omit it for every lock in the cluster.
+.El
 .It Ic databaseStats
 Per-database statistics
 .Pq Li pg_stat_database
 for every database in the cluster: connections, commits and rollbacks, block hit
 ratio inputs, tuple counts, conflicts, deadlocks, temp file usage, and checksum
 failures.
-.It Ic statementStats Op Va limit
+.Pp
+The session counters
+.Pq Va session_time , Va active_time , Va idle_in_transaction_time , Va sessions , Va sessions_abandoned , Va sessions_fatal , Va sessions_killed
+distinguish a database that is busy from one merely holding transactions open,
+which the commit and rollback counts alone cannot tell apart.
+PostgreSQL 18 adds
+.Va parallel_workers_to_launch
+and
+.Va parallel_workers_launched ;
+a shortfall between them means queries planned for parallelism ran without it.
+.It Ic statementStats Op Va limit , Va query_id , Va order_by , Va min_calls
 The slowest tracked queries by total execution time
 .Pq Li pg_stat_statements ,
-with calls, timing, row counts, and buffer usage.
+with calls, timing, row counts, buffer usage, temporary block I/O, and WAL
+volume, under
+.Va statements ,
+alongside an
+.Va info
+block from
+.Li pg_stat_statements_info .
 Returns a clear error with setup instructions if the extension is not installed.
 .Pp
-.Bl -tag -width "timeout_ms" -compact
+.Va info.dealloc
+counts how often the extension has evicted its least-used entries because
+.Va pg_stat_statements.max
+was exceeded.
+A non-zero value means this list is not the slowest queries in the cluster but
+the slowest of those that survived eviction \(em a distinction that cannot be
+drawn from the rows themselves, which is why it is returned beside them.
+.Pp
+.Va query_id
+is text, not a number: it is a 64-bit value that a client parsing JSON numbers
+as doubles would round, and the rounded value would then not be found by
+.Ic explainQuery .
+.Pp
+.Bl -tag -width "min_duration_s" -compact
 .It Va limit
 Maximum number of statements to return.
 Defaults to 20.
+.It Va query_id
+Only statements with this queryid, as a decimal string; their query text comes
+back whole rather than truncated.
+.Li pg_stat_statements
+keeps one entry per user and database, so a queryid can match more than one row.
+.It Va order_by
+Ranking column:
+.Va total_exec_time
+(the default),
+.Va mean_exec_time , Va max_exec_time , Va calls , Va rows ,
+.Va shared_blks_read , Va temp_blks_written ,
+or
+.Va wal_bytes .
+Ranking by total time buries a statement called twice at 40 seconds under one
+called ten million times at 2 milliseconds;
+.Va mean_exec_time
+is the other question, and there was previously no way to ask it.
+Anything outside this list is rejected: the sort column cannot be a bind
+parameter, so it is resolved through a fixed table rather than reaching the SQL.
+.It Va min_calls
+Ignore statements called fewer times than this, to keep one-off maintenance
+queries out of a
+.Va mean_exec_time
+ranking.
+.El
+.It Ic progressStats Op Va pid , Va relation
+Every long-running maintenance command currently reporting progress:
+.Li VACUUM , ANALYZE , CREATE INDEX , CLUSTER , COPY ,
+and base backups.
+Each carries its phase, blocks or tuples done against the total, a completion
+percentage, and how long it has been running.
+Use it to decide whether a
+.Li VACUUM
+will finish before wraparound \(em the natural companion to
+.Ic wraparoundStatus
+\(em or whether a
+.Li CREATE INDEX
+is stuck waiting on a locker.
+.Pp
+All six categories are always present, empty when nothing is running, so an
+absent key never has to be read as either
+.Dq idle
+or
+.Dq unsupported here .
+PostgreSQL 17 renamed the vacuum dead-tuple columns from counts to bytes;
+both are reported under their own names, with
+.Va dead_tuple_unit
+saying which the server produced, because they measure different things.
+.Pp
+.Bl -tag -width "min_duration_s" -compact
+.It Va pid
+Only the command running in this backend; pair it with the pid from
+.Ic currentActivity .
+.It Va relation
+Only commands operating on this table, named bare or schema-qualified.
+A base backup has no relation, so this excludes that category entirely.
+A name that matches nothing yields an empty result rather than an error.
+.El
+.It Ic ioStats Op Va pid , Va backend_type , Va object , Va context
+Cumulative I/O statistics per backend type, object, and context
+.Pq Li pg_stat_io :
+reads, writes, extends, hits, evictions, reuses, fsyncs, their timings, and a
+hit percentage.
+This is where buffers written directly by backends, vacuum's ring-buffer
+reuse, and bulk read and write I/O become visible separately from the aggregate
+counters in
+.Ic checkpointStats .
+Rows with no activity at all are omitted, since the view is a dense matrix of
+combinations most of which are structurally impossible.
+Byte counters are reported on PostgreSQL 18 and newer, where they replaced the
+former
+.Va op_bytes
+column.
+.Pp
+Requires PostgreSQL 16 or newer; older servers get a clear error naming the
+alternatives.
+.Pp
+.Bl -tag -width "min_duration_s" -compact
+.It Va pid
+Report this one backend instead of the cluster-wide aggregate, via
+.Fn pg_stat_get_backend_io ,
+together with its WAL volume from
+.Fn pg_stat_get_backend_wal :
+a backend can be quiet in I/O and still be generating WAL heavily.
+.Li pg_stat_io
+has no pid column at all, so this is a different source rather than a filter,
+and it requires PostgreSQL 18.
+.It Va backend_type
+Only this backend type, e.g.
+.Ql "client backend"
+or
+.Ql "autovacuum worker" .
+.It Va object
+Only this object class, e.g.
+.Ql relation
+or
+.Ql "temp relation" .
+.It Va context
+Only this I/O context, e.g.
+.Ql normal , Ql vacuum , Ql bulkread ,
+or
+.Ql bulkwrite .
+.El
+.It Ic wraparoundStatus Op Va schema , Va limit
+Transaction id and multixact wraparound headroom.
+For every database:
+.Li age(datfrozenxid) ,
+.Li age(datminmxid) ,
+and each as a percentage of
+.Va autovacuum_freeze_max_age
+and of the hard limit of 2146483647 transactions, at which the cluster stops
+accepting commands that assign a new transaction id.
+For tables: the oldest by
+.Li age(relfrozenxid) ,
+with the effective
+.Va autovacuum_freeze_max_age
+and whether it came from the table's storage parameters or the server, plus
+last vacuum times and dead tuple counts.
+.Pp
+TOAST tables are included, labelled with the table they belong to.
+They carry their own
+.Va relfrozenxid ,
+do not appear in
+.Li pg_stat_user_tables ,
+and are frequently the relation actually holding the horizon back.
+.Pp
+On PostgreSQL 18 and newer each table also reports
+.Va frozen_percent
+.Pq Li pg_class.relallfrozen
+and its cumulative vacuum and autovacuum times.
+Those turn an age into an estimate of the work remaining: an old
+.Va relfrozenxid
+on a table that is already almost entirely frozen is a different problem from
+the same age with nothing frozen, and the timings say whether autovacuum has
+been trying and failing to keep up or has simply never run.
+.Pp
+.Bl -tag -width "timeout_ms" -compact
+.It Va schema
+Restrict the table list to one schema.
+Omit it to cover the whole database, which is the scope wraparound risk is
+actually measured over.
+.It Va limit
+Maximum number of tables to return, oldest first.
+Defaults to 20.
+.El
+.It Ic checkpointStats
+Checkpoint, write-ahead log, and background writer activity: timed against
+requested checkpoint counts and the ratio between them, write and sync time,
+buffers written by the checkpointer, by the background writer, and directly by
+backends, the
+.Li pg_stat_wal
+record, full-page-image, and byte counters, and the settings that govern all of
+it
+.Pq Va checkpoint_timeout , Va max_wal_size , Va checkpoint_completion_target , No the Va bgwriter No knobs .
+.Pp
+The source views differ by major version: PostgreSQL 17 split the checkpointer
+counters into
+.Li pg_stat_checkpointer
+and moved the backend-written buffer counts to
+.Li pg_stat_io ,
+while earlier versions keep everything in
+.Li pg_stat_bgwriter .
+Field names are normalized across both, so a caller never branches on the
+version; the
+.Va source
+field names the views that produced the numbers.
+.It Ic tableIOStats Ar schema Op Va table , Va limit
+Buffer cache hit ratios per object
+.Pq Li pg_statio_all_tables :
+.Va heap_blks_read
+against
+.Va heap_blks_hit ,
+.Va idx_blks_read
+against
+.Va idx_blks_hit ,
+the TOAST and TOAST-index pairs, and a combined ratio, with relation size and
+scan counts for context.
+.Pp
+A ratio is null, not zero, for an object that has seen no reads at all, so
+.Dq no traffic
+is never mistaken for
+.Dq every read missed the cache .
+.Pp
+.Bl -tag -width "timeout_ms" -compact
+.It Va table
+A single table.
+Only a named table gets the per-index breakdown from
+.Li pg_statio_all_indexes ;
+over a whole schema it would multiply the payload by the index count without
+making the table-level ratios any easier to read.
+.It Va limit
+Maximum number of tables to return, most physical reads first.
+Defaults to 20.
+.El
+.It Ic hostCapacity Op Va ram_mb , Va vcpus , Va storage
+Memory and parallelism settings correlated with the capacity of the machine
+PostgreSQL runs on.
+Returns every memory-related setting resolved to bytes, whatever unit it is
+counted in, and derived ratios:
+.Va shared_buffers
+and
+.Va effective_cache_size
+as a percentage of RAM,
+.Va work_mem
+times
+.Va max_connections ,
+.Va maintenance_work_mem
+times
+.Va autovacuum_max_workers ,
+their combined total, and parallel workers per vCPU.
+.Pp
+Total RAM and vCPU count are properties of the host, not of the cluster: no
+catalog holds them, so they have to be injected.
+See
+.Sx Host capacity .
+The reported
+.Va source
+says which of the three paths supplied them.
+Every ratio that needs RAM is null when none was supplied, together with a hint
+naming the three ways to provide it.
+Nothing is ever guessed: a wrong memory figure would silently invalidate every
+number derived from it.
+.Pp
+.Bl -tag -width "timeout_ms" -compact
+.It Va ram_mb
+Total host memory in megabytes, overriding any configured value.
+.It Va vcpus
+Number of vCPUs or cores available to the host, overriding any configured value.
+.It Va storage
+Free-text description of the storage, echoed back and never interpreted.
 .El
 .El
 .Ss Diagnostics and query planning
 .Bl -tag -width Ds
+.It Ic duplicateIndexes Ar schema Op Va table
+Indexes that duplicate, or are covered by, another index on the same table.
+.Pp
+.Va identical
+groups indexes whose key columns, operator classes, collations, sort order,
+.Ic INCLUDE
+columns, and partial predicate all match.
+.Va redundant
+reports an index whose key columns are a leading prefix of a wider index that
+also covers its
+.Ic INCLUDE
+columns.
+.Pp
+Comparison is by column expression rather than attribute number, so two
+different expression indexes are not confused with each other, and
+.Li (a DESC)
+is not treated as covered by
+.Li (a, b) .
+A unique index is never reported as redundant for being a prefix: dropping it
+would drop a constraint the wider index does not enforce.
+Each entry carries size,
+.Va idx_scan ,
+the name of any backing constraint, and the replica identity and validity
+flags, since those decide whether the index can be dropped at all.
+.Pp
+.Bl -tag -width "timeout_ms" -compact
+.It Va table
+Restrict the check to one table.
+Omit it to check every table in the schema.
+.El
 .It Ic tableBloat Ar schema Ar table Op Va exact
 Physical storage bloat for a table
 .Pq Li pgstattuple No or Li pgstattuple_approx :
@@ -476,6 +899,22 @@ Path to a connections INI file, consulted after
 .Fl -config
 and before
 .Pa ~/.config/pg_licht/connections.ini .
+.It Ev PG_LICHT_HOST_RAM_MB
+Total host memory in megabytes, read by
+.Ic hostCapacity .
+Honoured only with the single-connection
+.Ev DATABASE_URL
+form; with a connections file, use
+.Va host_ram_mb
+in the section instead.
+See
+.Sx Host capacity .
+.It Ev PG_LICHT_HOST_VCPUS
+Number of vCPUs or cores on the host, under the same rule.
+.It Ev PG_LICHT_HOST_STORAGE
+Free-text storage description, under the same rule.
+.It Ev PG_LICHT_HOST_NOTE
+Free-text note about the host, under the same rule.
 .It Ev PGSERVICEFILE
 Path to a libpq service file, used to resolve a
 .Va service
@@ -670,15 +1109,71 @@ On 14 and 15 that path returns an actionable hint instead; supplying
 which prepares and plans the statement with real values, works on every
 supported version.
 .Pp
-Two catalog fields are omitted where the underlying column does not exist: the
+.Ic ioStats
+requires PostgreSQL 16, where
+.Li pg_stat_io
+was introduced, and returns an error naming the alternatives on older servers.
+.Pp
+Elsewhere, a field is simply omitted where the underlying column does not
+exist, and normalized where it was renamed.
+Every operation returns its full result on every supported version; only these
+individual fields vary:
+.Bl -tag -width "PostgreSQL 18" -compact
+.It PostgreSQL 15
+subscription
+.Va two_phase
+.Pq Li pg_subscription.subtwophasestate .
+.It PostgreSQL 16
 index
 .Va last_use
-field
-.Pq Li pg_stat_user_indexes.last_idx_scan , No PostgreSQL 16 and newer
-and the subscription
-.Va two_phase
-field
-.Pq Li pg_subscription.subtwophasestate , No PostgreSQL 15 and newer .
+.Pq Li pg_stat_user_indexes.last_idx_scan ;
+table
+.Va n_tup_newpage_upd
+and
+.Va last_seq_scan ;
+slot
+.Va conflicting .
+.It PostgreSQL 17
+wait event descriptions
+.Pq Li pg_wait_events ;
+slot
+.Va invalidation_reason
+and
+.Va inactive_since ;
+statement
+.Va stats_since
+and
+.Va minmax_stats_since .
+.It PostgreSQL 18
+table
+.Va frozen_percent , Va relallfrozen ,
+and the cumulative vacuum timings;
+.Va checkpoints_done
+and
+.Va slru_written ;
+database
+.Va parallel_workers_to_launch
+and
+.Va parallel_workers_launched ;
+.Li pg_stat_io
+byte counters.
+.El
+.Pp
+Two views changed shape upstream and are normalized rather than passed through.
+.Ic checkpointStats
+reads
+.Li pg_stat_checkpointer
+on PostgreSQL 17 and newer and
+.Li pg_stat_bgwriter
+before it, reporting one set of field names either way and naming its sources
+in
+.Va source ;
+it also drops the four
+.Li pg_stat_wal
+timing columns that PostgreSQL 18 removed.
+.Ic progressStats
+reports the PostgreSQL 17 vacuum dead-tuple columns under their own names and
+labels the unit, since the old and new columns count different things.
 .Sh SEE ALSO
 .Xr pgbouncer 1 ,
 .Xr psql 1 ,
