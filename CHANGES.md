@@ -2,6 +2,12 @@
 
 ## 2.3.0 (unreleased)
 
+### Breaking
+
+- **`statementStats` now returns an object, not an array.** The rows moved under `statements`, joined by an `info` block from `pg_stat_statements_info` and the configured `max`. The reason is `info.dealloc`: it counts how often the extension has evicted its least-used entries, and a non-zero value means the returned list is not the slowest queries in the cluster but the slowest of those that survived eviction. That cannot be inferred from the rows themselves, and a caller reading the old array had no way to know it was looking at a truncated picture.
+
+- **`query_id` is now text everywhere.** `statementStats` previously returned it as a JSON number. A queryid is 64-bit, so any client parsing JSON numbers as doubles — every JavaScript-based MCP client — silently rounded it, and the rounded value would then not be found by `explainQuery`, which has always documented the field as a string for exactly this reason. `explainQuery`'s own echoed `statement.query_id` changed with it, and the new `currentActivity.query_id` follows the same rule.
+
 ### New tools
 
 - **`wraparoundStatus`** — transaction id and multixact headroom, the one failure mode where a monitoring gap ends in a full cluster outage rather than a slowdown. Reports `age(datfrozenxid)` and `age(datminmxid)` for every database and the oldest tables by `age(relfrozenxid)`, each expressed both as a percentage of `autovacuum_freeze_max_age` (where an anti-wraparound autovacuum is forced) and of the hard limit of 2 146 483 647 (where the cluster stops accepting commands that assign a transaction id) — two thresholds that are an order of magnitude apart and are routinely confused.
@@ -21,6 +27,28 @@
 - **`hostCapacity`** — memory and parallelism settings correlated with the machine PostgreSQL runs on. Every memory-related setting is resolved to bytes whatever unit it is counted in (8kB pages for `shared_buffers`, kB for `work_mem`, …), alongside `shared_buffers` and `effective_cache_size` as a percentage of RAM, `work_mem × max_connections`, `maintenance_work_mem × autovacuum_max_workers`, their combined total, and parallel workers per vCPU.
 
   Numbers only, no verdicts, matching `explainQuery`'s stance that interpretation belongs to the caller — with two factual caveats returned inline, since the worst-case figures are easy to misread: `work_mem` is a per-node rather than per-connection limit, and the OS page cache is not counted.
+
+- **`progressStats`** — every long-running maintenance command currently reporting progress: `VACUUM`, `ANALYZE`, `CREATE INDEX`, `CLUSTER`, `COPY`, and base backups, each with its phase, blocks or tuples done against the total, a completion percentage, and elapsed time. This is the companion to `wraparoundStatus`: knowing an XID age is only half of "will the vacuum finish in time". All six categories are always present, empty when nothing is running, so an absent key never has to be read as either "idle" or "unsupported here".
+
+  PostgreSQL 17 renamed the vacuum dead-tuple columns from counts to bytes (`max_dead_tuples` → `max_dead_tuple_bytes`, `num_dead_tuples` → `num_dead_item_ids`). Both are reported under their own names with a `dead_tuple_unit` label rather than forced into one field, because they measure genuinely different things.
+
+- **`ioStats`** — `pg_stat_io` per backend type, object and context: reads, writes, extends, hits, evictions, reuses, fsyncs and their timings, with a hit percentage. This is where buffers written directly by backends, vacuum's ring-buffer reuse, and bulk read/write I/O become visible separately from the aggregate counters. Rows with no activity are omitted, since the view is a dense matrix of combinations most of which are structurally impossible. Requires PostgreSQL 16, and says so plainly on older servers rather than failing with an undefined-table error.
+
+### Enriched existing tools
+
+- **`currentActivity`** now returns `query_id`, the join key to `statementStats` and `explainQuery` — without it there was no route from "this statement is running now" to "this is its plan". Also added: `leader_pid` (which parallel worker belongs to which query), `backend_xid` and `backend_xmin`, and pre-computed transaction and query durations. On PostgreSQL 17+ each wait event carries its prose description from `pg_wait_events`, turning a bare `BufFileRead` into something actionable without leaving the output.
+
+- **`replicationSlots`** now returns `wal_status` and `safe_wal_size` — the verdict that `retained_wal_bytes` only hints at, since `extended` means the slot is already past `max_wal_size` and `lost` means the WAL it needs is gone and the slot is unusable. It also joins `pg_stat_replication_slots`, a different view entirely, for the spill and stream counters: logical decoding spilling large transactions to disk is invisible in the slot's own row and is a common, silent throughput cliff. Plus `two_phase`, `conflicting` (16+), and `invalidation_reason` / `inactive_since` (17+).
+
+- **`databaseStats`** now returns the session counters `session_time`, `active_time`, `idle_in_transaction_time`, `sessions`, `sessions_abandoned`, `sessions_fatal` and `sessions_killed`, which distinguish a database that is busy from one merely holding transactions open — something the commit and rollback counts cannot tell apart. On PostgreSQL 18, `parallel_workers_to_launch` and `parallel_workers_launched`, whose shortfall means queries planned for parallelism ran without it.
+
+- **`statementStats`** now also returns temporary block I/O and WAL volume per statement, plus `stats_since` / `minmax_stats_since` (17+) and `wal_buffers_full` and the parallel worker counters (18+).
+
+- **`listTables` and `tableDetails`** now return `n_tup_newpage_upd` and `last_seq_scan` on PostgreSQL 16 and newer. The first counts updates that had to move the row to another page — the direct measure of failed HOT updates, usually a too-high fillfactor or an index on a frequently updated column. The second dates the last sequential scan, which turns a large `seq_scan` count into something you can act on.
+
+- **`wraparoundStatus`** now returns `frozen_percent` (from `pg_class.relallfrozen`) and the cumulative vacuum and autovacuum times per table on PostgreSQL 18. These turn an age into an estimate of work remaining: an old `relfrozenxid` on a table that is already almost entirely frozen is a different problem from the same age with nothing frozen, and the timings say whether autovacuum has been trying and failing or has simply never run.
+
+- **`checkpointStats`** now returns `checkpoints_done` and `slru_written` on PostgreSQL 18.
 
 ### Configuration
 

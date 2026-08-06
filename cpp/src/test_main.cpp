@@ -1686,6 +1686,232 @@ TEST_F(PostgresMCPServerTest, TableBloatUnknownTableReturnsEmpty) {
   EXPECT_TRUE(result.empty());
 }
 
+// --- currentActivity enrichment ---
+
+TEST_F(PostgresMCPServerTest, ActivityCarriesQueryIdAsTextForExplainQuery) {
+  // query_id is the join key from a running statement to statementStats and
+  // explainQuery. It must be text: a 64-bit value does not survive JSON
+  // number precision, and explainQuery takes it as a string.
+  pqxx::connection other(test_url);
+  pqxx::work t(other);
+  t.exec("SELECT pg_sleep(0)");
+
+  json r = srv->call_activity();
+  ASSERT_TRUE(r.is_object());
+
+  bool saw_backend = false;
+  for (auto& [pid, b] : r.items()) {
+    (void)pid;
+    ASSERT_TRUE(b.contains("query_id")) << b.dump(2);
+    EXPECT_TRUE(b["query_id"].is_string() || b["query_id"].is_null());
+    EXPECT_TRUE(b.contains("leader_pid"));
+    EXPECT_TRUE(b.contains("backend_xid"));
+    EXPECT_TRUE(b.contains("backend_xmin"));
+    EXPECT_TRUE(b.contains("xact_duration_s"));
+    EXPECT_TRUE(b.contains("query_duration_s"));
+    saw_backend = true;
+  }
+  EXPECT_TRUE(saw_backend);
+  t.abort();
+}
+
+TEST_F(PostgresMCPServerTest, ActivityDescribesWaitEventsOnPg17AndLater) {
+  json r = srv->call_activity();
+  const bool expected = pg_server_version_num(test_url) >= 170000;
+  bool found = false;
+  for (auto& [pid, b] : r.items()) {
+    (void)pid;
+    if (b.contains("wait_event_description")) found = true;
+  }
+  // pg_wait_events, the source of the descriptions, is PostgreSQL 17+.
+  EXPECT_EQ(found, expected);
+}
+
+// --- replicationSlots enrichment ---
+
+TEST_F(PostgresMCPServerTest, ReplicationSlotsReportsWalStatusAndSpillCounters) {
+  pqxx::connection c(test_url);
+  {
+    pqxx::nontransaction n(c);
+    n.exec("SELECT pg_create_physical_replication_slot('pg_licht_probe_slot')");
+  }
+
+  json r = srv->call_replication_slots();
+  ASSERT_TRUE(r.contains("pg_licht_probe_slot")) << r.dump(2);
+  auto& s = r["pg_licht_probe_slot"];
+  EXPECT_EQ(s["slot_type"].get<std::string>(), "physical");
+  // wal_status is the verdict that retained_wal_bytes only hints at:
+  // 'extended' is past max_wal_size, 'lost' means the slot is unusable.
+  EXPECT_TRUE(s.contains("wal_status"));
+  EXPECT_TRUE(s.contains("safe_wal_size"));
+  EXPECT_TRUE(s.contains("two_phase"));
+  // From pg_stat_replication_slots, a different view: logical decoding
+  // spilling to disk is invisible in the slot's own row.
+  EXPECT_TRUE(s.contains("spill_txns"));
+  EXPECT_TRUE(s.contains("spill_bytes"));
+  EXPECT_TRUE(s.contains("total_bytes"));
+
+  if (pg_server_version_num(test_url) >= 160000) {
+    EXPECT_TRUE(s.contains("conflicting"));
+  }
+  if (pg_server_version_num(test_url) >= 170000) {
+    EXPECT_TRUE(s.contains("invalidation_reason"));
+    EXPECT_TRUE(s.contains("inactive_since"));
+  }
+
+  pqxx::nontransaction drop(c);
+  drop.exec("SELECT pg_drop_replication_slot('pg_licht_probe_slot')");
+}
+
+// --- databaseStats enrichment ---
+
+TEST_F(PostgresMCPServerTest, DatabaseStatsIncludesSessionCounters) {
+  json r = srv->call_database_stats();
+  ASSERT_TRUE(r.contains(test_dbname));
+  auto& s = r[test_dbname];
+  // These distinguish a database that is busy from one merely holding
+  // transactions open; the commit/rollback counts cannot tell them apart.
+  EXPECT_TRUE(s.contains("session_time"));
+  EXPECT_TRUE(s.contains("active_time"));
+  EXPECT_TRUE(s.contains("idle_in_transaction_time"));
+  EXPECT_TRUE(s.contains("sessions"));
+  EXPECT_TRUE(s.contains("sessions_abandoned"));
+  EXPECT_TRUE(s.contains("sessions_fatal"));
+  EXPECT_TRUE(s.contains("sessions_killed"));
+
+  const bool pg18 = pg_server_version_num(test_url) >= 180000;
+  EXPECT_EQ(s.contains("parallel_workers_to_launch"), pg18);
+  EXPECT_EQ(s.contains("parallel_workers_launched"), pg18);
+}
+
+// --- listTables / tableDetails version-gated columns ---
+
+TEST_F(PostgresMCPServerTest, TableStatsIncludeFailedHotUpdatesOnPg16AndLater) {
+  const bool pg16 = pg_server_version_num(test_url) >= 160000;
+
+  json tables = srv->call_tables("grocery");
+  ASSERT_TRUE(tables.contains("users"));
+  // n_tup_newpage_upd counts updates that had to move the row to another
+  // page: the direct measure of failed HOT updates.
+  EXPECT_EQ(tables["users"].contains("n_tup_newpage_upd"), pg16);
+  EXPECT_EQ(tables["users"].contains("last_seq_scan"), pg16);
+
+  json detail = srv->call_table("grocery", "users");
+  EXPECT_EQ(detail.contains("n_tup_newpage_upd"), pg16);
+  EXPECT_EQ(detail.contains("last_seq_scan"), pg16);
+}
+
+// --- progressStats ---
+
+TEST_F(PostgresMCPServerTest, ProgressStatsReportsEveryCommandCategory) {
+  json r = srv->call_progress_stats();
+  // All six categories are always present, empty when nothing is running, so
+  // a caller never has to guess whether a missing key means "idle" or
+  // "unsupported on this version".
+  for (const char* k : {"vacuum", "analyze", "create_index", "cluster", "copy", "basebackup"}) {
+    ASSERT_TRUE(r.contains(k)) << r.dump(2);
+    EXPECT_TRUE(r[k].is_array()) << k;
+  }
+}
+
+TEST_F(PostgresMCPServerTest, ProgressStatsReportsARunningVacuum) {
+  // Enough dead tuples, and a slow enough vacuum, that it is still running
+  // when the tool is called.
+  pqxx::connection setup(test_url);
+  {
+    pqxx::work w(setup);
+    w.exec("CREATE TABLE grocery.vacuum_me AS "
+           "SELECT g AS id, repeat('x', 200) AS pad FROM generate_series(1, 60000) g");
+    w.exec("UPDATE grocery.vacuum_me SET pad = pad");
+    w.commit();
+  }
+
+  // A separate connection, so the vacuum runs while this thread polls.
+  pqxx::connection vac(test_url);
+  {
+    pqxx::nontransaction n(vac);
+    n.exec("SET vacuum_cost_delay = 100");
+    n.exec("SET vacuum_cost_limit = 10");
+  }
+  // pqxx has no async exec, so the vacuum is issued on a pipeline and the
+  // tool is called while it is in flight.
+  pqxx::nontransaction n(vac);
+  pqxx::pipeline p(n);
+  p.insert("VACUUM grocery.vacuum_me");
+
+  json found;
+  for (int i = 0; i < 40 && found.is_null(); i++) {
+    json r = srv->call_progress_stats();
+    for (const auto& v : r["vacuum"])
+      if (v.value("relation", "") == "grocery.vacuum_me") found = v;
+  }
+
+  // Cancel rather than wait: the vacuum was deliberately slowed to be
+  // observable, so letting it run to completion would cost the suite a minute
+  // for no extra coverage.
+  if (!found.is_null()) {
+    pqxx::connection killer(test_url);
+    pqxx::nontransaction k(killer);
+    k.exec("SELECT pg_cancel_backend(" + std::to_string(found["pid"].get<int>()) + ")");
+  }
+  try {
+    p.complete();
+  } catch (const pqxx::sql_error&) {
+    // Expected: the cancellation above surfaces here.
+  }
+
+  pqxx::connection cleanup(test_url);
+  pqxx::work drop(cleanup);
+  drop.exec("DROP TABLE grocery.vacuum_me");
+  drop.commit();
+
+  if (found.is_null()) GTEST_SKIP() << "the vacuum finished before it could be observed";
+
+  EXPECT_TRUE(found.contains("phase"));
+  EXPECT_TRUE(found.contains("heap_blks_total"));
+  EXPECT_TRUE(found.contains("scanned_percent"));
+  EXPECT_TRUE(found.contains("elapsed_s"));
+  EXPECT_EQ(found["query"].get<std::string>(), "VACUUM grocery.vacuum_me");
+  // The PostgreSQL 17 rename is normalized behind a unit label rather than
+  // pretended away: the old and new columns measure different things.
+  if (pg_server_version_num(test_url) >= 170000) {
+    EXPECT_EQ(found["dead_tuple_unit"].get<std::string>(), "bytes");
+    EXPECT_TRUE(found.contains("max_dead_tuple_bytes"));
+    EXPECT_TRUE(found.contains("num_dead_item_ids"));
+    EXPECT_TRUE(found.contains("indexes_total"));
+  } else {
+    EXPECT_EQ(found["dead_tuple_unit"].get<std::string>(), "tuples");
+    EXPECT_TRUE(found.contains("max_dead_tuples"));
+    EXPECT_TRUE(found.contains("num_dead_tuples"));
+  }
+}
+
+// --- ioStats ---
+
+TEST_F(PostgresMCPServerTest, IoStatsReturnsRowsOrAVersionError) {
+  json r = srv->call_io_stats();
+
+  if (pg_server_version_num(test_url) < 160000) {
+    ASSERT_TRUE(r.contains("error")) << r.dump(2);
+    EXPECT_NE(r["error"].get<std::string>().find("PostgreSQL 16"), std::string::npos);
+    EXPECT_TRUE(r.contains("hint"));
+    return;
+  }
+
+  ASSERT_TRUE(r.is_array()) << r.dump(2);
+  ASSERT_FALSE(r.empty());
+  auto& row = r[0];
+  EXPECT_TRUE(row.contains("backend_type"));
+  EXPECT_TRUE(row.contains("object"));
+  EXPECT_TRUE(row.contains("context"));
+  EXPECT_TRUE(row.contains("reads"));
+  EXPECT_TRUE(row.contains("writes"));
+  EXPECT_TRUE(row.contains("hit_percent"));
+  // The byte counters replaced op_bytes in PostgreSQL 18; before that there
+  // is no honest way to report them.
+  EXPECT_EQ(row.contains("read_bytes"), pg_server_version_num(test_url) >= 180000);
+}
+
 // --- wraparoundStatus ---
 
 namespace {
@@ -1735,6 +1961,14 @@ TEST_F(PostgresMCPServerTest, WraparoundStatusReportsPerTableFreezeOverride) {
   EXPECT_EQ((*users)["freeze_max_age_source"].get<std::string>(), "server");
   EXPECT_EQ((*users)["kind"].get<std::string>(), "table");
   EXPECT_TRUE((*users)["toast_for"].is_null());
+
+  // relallfrozen and the cumulative vacuum timings are PostgreSQL 18+. They
+  // turn an age into an estimate of the work left: an old relfrozenxid on a
+  // table that is already fully frozen is a different problem entirely.
+  const bool pg18 = pg_server_version_num(test_url) >= 180000;
+  EXPECT_EQ(users->contains("frozen_percent"), pg18);
+  EXPECT_EQ(users->contains("relallfrozen"), pg18);
+  EXPECT_EQ(users->contains("total_autovacuum_time_ms"), pg18);
 }
 
 TEST_F(PostgresMCPServerTest, WraparoundStatusIncludesToastTables) {
@@ -2314,6 +2548,42 @@ TEST_F(PgssMCPServerTest, ParamsTurnARecoveredStatementIntoARealAnalyzedPlan) {
   EXPECT_FALSE(r["generic"].get<bool>());
   EXPECT_TRUE(r["analyzed"].get<bool>());
   EXPECT_TRUE(r["plan"][0].contains("Execution Time"));
+}
+
+TEST_F(PgssMCPServerTest, StatementStatsCarriesEvictionInfoAlongsideTheRows) {
+  json r = srv->call_statement_stats(5);
+  ASSERT_TRUE(r.is_object()) << r.dump(2);
+  ASSERT_TRUE(r.contains("statements"));
+  ASSERT_TRUE(r["statements"].is_array());
+  ASSERT_FALSE(r["statements"].empty());
+
+  // dealloc is what says whether this list is "the slowest queries" or only
+  // "the slowest of those not yet evicted" -- a distinction that cannot be
+  // drawn from the rows themselves.
+  ASSERT_TRUE(r.contains("info")) << r.dump(2);
+  EXPECT_TRUE(r["info"].contains("dealloc"));
+  EXPECT_TRUE(r["info"].contains("stats_reset"));
+  EXPECT_TRUE(r.contains("max"));
+}
+
+TEST_F(PgssMCPServerTest, StatementStatsQueryIdIsTextAndFeedsExplainQuery) {
+  json r = srv->call_statement_stats(5);
+  ASSERT_FALSE(r["statements"].empty());
+  const json& first = r["statements"][0];
+
+  // A queryid is 64-bit. Emitted as a JSON number it would be rounded by any
+  // client that parses numbers as doubles, and the round-tripped value would
+  // then not be found by explainQuery.
+  ASSERT_TRUE(first["query_id"].is_string()) << first.dump(2);
+  std::string qid = first["query_id"].get<std::string>();
+
+  json e = srv->call_explain_query(qid, "", json::array(), false, 0);
+  // Whatever the outcome, it must not be "no entry for that queryid": the id
+  // came straight out of the same view a moment ago.
+  if (e.contains("error")) {
+    EXPECT_EQ(e["error"].get<std::string>().find("no pg_stat_statements entry"),
+              std::string::npos) << e.dump(2);
+  }
 }
 
 TEST_F(PgssMCPServerTest, UnknownQueryIdReturnsHint) {

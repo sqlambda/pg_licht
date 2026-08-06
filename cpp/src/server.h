@@ -169,6 +169,8 @@ public:
     return duplicate_indexes(schema, table_name);
   }
   const json call_checkpoint_stats() { return checkpoint_stats(); }
+  const json call_progress_stats() { return progress_stats(); }
+  const json call_io_stats() { return io_stats(); }
   const json call_table_io_stats(const std::string& schema, const std::string& table_name, int limit) {
     return table_io_stats(schema, table_name, limit);
   }
@@ -597,6 +599,22 @@ private:
 	      }}
 	  },
 	  {
+	    {"name", "progressStats"},
+	    {"description", "return every long-running maintenance command currently reporting progress (pg_stat_progress_vacuum, _analyze, _create_index, _cluster, _copy, _basebackup), with the phase, the blocks or tuples done against the total, a completion percentage, and how long it has been running. Use it to decide whether a VACUUM will finish before wraparound, or whether a CREATE INDEX is stuck waiting on a locker. The PostgreSQL 17 rename of the vacuum dead-tuple columns is normalized, and 'dead_tuple_unit' says whether the server counts tuples or bytes"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", json::object()}
+	      }}
+	  },
+	  {
+	    {"name", "ioStats"},
+	    {"description", "return cumulative I/O statistics per backend type, object and context (pg_stat_io, PostgreSQL 16+): reads, writes, extends, hits, evictions, reuses, fsyncs and their timings, with a hit percentage. This is where backend-written buffers, vacuum's ring-buffer reuse, and bulk read/write I/O become visible separately from the aggregate counters. Rows with no activity are omitted. Returns a clear error on PostgreSQL 15 and older, where the view does not exist"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", json::object()}
+	      }}
+	  },
+	  {
 	    {"name", "checkpointStats"},
 	    {"description", "return checkpoint, WAL, and background writer activity (pg_stat_checkpointer and pg_stat_bgwriter on PostgreSQL 17+, pg_stat_bgwriter alone before that, plus pg_stat_wal) with field names normalized across both shapes: timed versus requested checkpoint counts and the ratio between them, write and sync time, buffers written by the checkpointer, by the background writer, and directly by backends, WAL record/FPI/byte counts, and the related settings (checkpoint_timeout, max_wal_size, checkpoint_completion_target, the bgwriter knobs)"},
 	    {"inputSchema", {
@@ -779,6 +797,16 @@ private:
     Session sess{active_cfg()};
     pqxx::work& txn = sess.txn();
 
+    // PostgreSQL 16 additions. n_tup_newpage_upd counts updates that had to
+    // move the row to another page, which is the direct measure of failed HOT
+    // updates -- the usual cause is a too-high fillfactor or an index on a
+    // frequently updated column. last_seq_scan dates the last sequential scan,
+    // which turns a large seq_scan count into something you can act on.
+    const std::string pg16 = sess.server_version() >= 160000
+      ? R"(, 'n_tup_newpage_upd', s.n_tup_newpage_upd,
+            'last_seq_scan', s.last_seq_scan)"
+      : "";
+
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(c.relname,
               JSONB_BUILD_OBJECT(
@@ -790,7 +818,8 @@ private:
                'n_mod_since_analyze', s.n_mod_since_analyze, 'n_ins_since_vacuum', s.n_ins_since_vacuum,
                'last_vacuum', GREATEST(s.last_vacuum, s.last_autovacuum), 'last_analyze', GREATEST(s.last_analyze, s.last_autoanalyze),
                'reloptions', c.reloptions,
-               'columns', columns, 'index_count', COALESCE(index_count, 0), 'constraint_count', COALESCE(constraint_count, 0)))
+               'columns', columns, 'index_count', COALESCE(index_count, 0), 'constraint_count', COALESCE(constraint_count, 0))" + pg16 + R"(
+               ))
       FROM pg_class AS c
       LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(a.attname,
@@ -1118,25 +1147,50 @@ private:
     Session sess{active_cfg()};
     pqxx::work& txn = sess.txn();
 
+    // pg_wait_events (PostgreSQL 17+) carries a prose description of every
+    // wait event, which is what turns an opaque name like "BufFileRead" into
+    // something actionable without leaving the tool output.
+    const std::string wait_desc = sess.server_version() >= 170000
+      ? ", 'wait_event_description', we.description" : "";
+    const std::string wait_join = sess.server_version() >= 170000
+      ? R"(LEFT JOIN pg_wait_events AS we
+             ON we.type = a.wait_event_type AND we.name = a.wait_event)"
+      : "";
+
+    // query_id is the join key to pg_stat_statements and explainQuery: without
+    // it there is no route from "this is running now" to "this is its plan".
+    // It is emitted as text because it is a 64-bit value that does not survive
+    // JSON number precision, matching explainQuery's queryid argument.
+    //
+    // It is null unless compute_query_id is on (the default, 'auto', enables it
+    // when pg_stat_statements is loaded); serverSettings reports that GUC.
     std::string query = R"(
-      SELECT JSONB_OBJECT_AGG(pid::text,
+      SELECT JSONB_OBJECT_AGG(a.pid::text,
                JSONB_BUILD_OBJECT(
-                 'database',         datname,
-                 'user',             usename,
-                 'application_name', application_name,
-                 'client_addr',      client_addr::text,
-                 'backend_type',     backend_type,
-                 'state',            state,
-                 'wait_event_type',  wait_event_type,
-                 'wait_event',       wait_event,
-                 'backend_start',    backend_start,
-                 'xact_start',       xact_start,
-                 'query_start',      query_start,
-                 'state_change',     state_change,
-                 'query',            query
+                 'database',         a.datname,
+                 'user',             a.usename,
+                 'application_name', a.application_name,
+                 'client_addr',      a.client_addr::text,
+                 'backend_type',     a.backend_type,
+                 'state',            a.state,
+                 'wait_event_type',  a.wait_event_type,
+                 'wait_event',       a.wait_event,
+                 'backend_start',    a.backend_start,
+                 'xact_start',       a.xact_start,
+                 'query_start',      a.query_start,
+                 'state_change',     a.state_change,
+                 'xact_duration_s',  round(EXTRACT(EPOCH FROM now() - a.xact_start)::numeric, 3),
+                 'query_duration_s', round(EXTRACT(EPOCH FROM now() - a.query_start)::numeric, 3),
+                 'query_id',         a.query_id::text,
+                 'leader_pid',       a.leader_pid,
+                 'backend_xid',      a.backend_xid::text,
+                 'backend_xmin',     a.backend_xmin::text,
+                 'query',            a.query
+               )" + wait_desc + R"(
                ))
-      FROM pg_stat_activity
-      WHERE pid != pg_backend_pid();
+      FROM pg_stat_activity AS a
+      )" + wait_join + R"(
+      WHERE a.pid != pg_backend_pid();
     )";
 
     pqxx::result res = txn.exec(query);
@@ -1195,21 +1249,51 @@ private:
 
     // retained_wal_bytes is the key diagnostic: a lagging or unused slot holds
     // back WAL cleanup indefinitely, a common cause of disk bloat incidents.
+    //
+    // wal_status is the verdict retained_wal_bytes only hints at: 'extended'
+    // means the slot is already past max_wal_size, and 'lost' means the WAL it
+    // needs is gone and the slot is unusable. safe_wal_size is how much more
+    // WAL can be written before that happens, and goes negative once it has.
+    //
+    // The spill and stream counters come from pg_stat_replication_slots
+    // (PostgreSQL 14+), a different view from pg_replication_slots: they show
+    // logical decoding spilling large transactions to disk, which is invisible
+    // in the slot's own row and is a common, silent throughput cliff.
+    const std::string conflicting = sess.server_version() >= 160000
+      ? ", 'conflicting', s.conflicting" : "";
+    const std::string invalidation = sess.server_version() >= 170000
+      ? ", 'invalidation_reason', s.invalidation_reason, 'inactive_since', s.inactive_since"
+      : "";
+
     std::string query = R"(
-      SELECT JSONB_OBJECT_AGG(slot_name,
+      SELECT JSONB_OBJECT_AGG(s.slot_name,
                JSONB_BUILD_OBJECT(
-                 'plugin',              plugin,
-                 'slot_type',           slot_type,
-                 'database',            database,
-                 'temporary',           temporary,
-                 'active',              active,
-                 'active_pid',          active_pid,
-                 'restart_lsn',         restart_lsn::text,
-                 'confirmed_flush_lsn', confirmed_flush_lsn::text,
-                 'retained_wal_bytes',  CASE WHEN restart_lsn IS NOT NULL
-                                           THEN pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) END
+                 'plugin',              s.plugin,
+                 'slot_type',           s.slot_type,
+                 'database',            s.database,
+                 'temporary',           s.temporary,
+                 'two_phase',           s.two_phase,
+                 'active',              s.active,
+                 'active_pid',          s.active_pid,
+                 'restart_lsn',         s.restart_lsn::text,
+                 'confirmed_flush_lsn', s.confirmed_flush_lsn::text,
+                 'wal_status',          s.wal_status,
+                 'safe_wal_size',       s.safe_wal_size,
+                 'retained_wal_bytes',  CASE WHEN s.restart_lsn IS NOT NULL
+                                           THEN pg_wal_lsn_diff(pg_current_wal_lsn(), s.restart_lsn) END,
+                 'spill_txns',          st.spill_txns,
+                 'spill_count',         st.spill_count,
+                 'spill_bytes',         st.spill_bytes,
+                 'stream_txns',         st.stream_txns,
+                 'stream_count',        st.stream_count,
+                 'stream_bytes',        st.stream_bytes,
+                 'total_txns',          st.total_txns,
+                 'total_bytes',         st.total_bytes,
+                 'stats_reset',         st.stats_reset
+               )" + conflicting + invalidation + R"(
                ))
-      FROM pg_replication_slots;
+      FROM pg_replication_slots AS s
+      LEFT JOIN pg_stat_replication_slots AS st ON st.slot_name = s.slot_name;
     )";
 
     pqxx::result res = txn.exec(query);
@@ -1224,6 +1308,19 @@ private:
   const json database_stats() {
     Session sess{active_cfg()};
     pqxx::work& txn = sess.txn();
+
+    // The session counters (PostgreSQL 14+) are what distinguish a database
+    // that is busy from one that is merely holding transactions open:
+    // idle_in_transaction_time and sessions_abandoned name the two failure
+    // modes that the commit/rollback counts alone cannot tell apart.
+    //
+    // parallel_workers_launched falling short of parallel_workers_to_launch
+    // (PostgreSQL 18+) means queries planned for parallelism ran without it,
+    // because max_parallel_workers was exhausted.
+    const std::string parallel = sess.server_version() >= 180000
+      ? R"(, 'parallel_workers_to_launch', parallel_workers_to_launch,
+            'parallel_workers_launched',  parallel_workers_launched)"
+      : "";
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(datname,
@@ -1245,7 +1342,15 @@ private:
                  'checksum_failures', checksum_failures,
                  'blk_read_time',     blk_read_time,
                  'blk_write_time',    blk_write_time,
+                 'session_time',              session_time,
+                 'active_time',               active_time,
+                 'idle_in_transaction_time',  idle_in_transaction_time,
+                 'sessions',                  sessions,
+                 'sessions_abandoned',        sessions_abandoned,
+                 'sessions_fatal',            sessions_fatal,
+                 'sessions_killed',           sessions_killed,
                  'stats_reset',       stats_reset
+               )" + parallel + R"(
                ))
       FROM pg_stat_database
       WHERE datname IS NOT NULL;
@@ -1264,29 +1369,65 @@ private:
     Session sess{active_cfg()};
     pqxx::work& txn = sess.txn();
 
+    // pg_stat_statements_info.dealloc counts how many times the extension has
+    // evicted its least-used entries because pg_stat_statements.max was
+    // exceeded. A climbing dealloc means this list is not the slowest queries
+    // in the cluster but the slowest of those that survived eviction -- a
+    // difference that cannot be inferred from the rows themselves, which is
+    // why it is returned alongside them.
+    const std::string since = sess.server_version() >= 170000
+      ? ", 'stats_since', pss.stats_since, 'minmax_stats_since', pss.minmax_stats_since"
+      : "";
+    const std::string pg18 = sess.server_version() >= 180000
+      ? R"(, 'wal_buffers_full', pss.wal_buffers_full,
+            'parallel_workers_to_launch', pss.parallel_workers_to_launch,
+            'parallel_workers_launched', pss.parallel_workers_launched)"
+      : "";
+
     std::string query = R"(
-      SELECT JSONB_AGG(row_json)
-      FROM (
-          SELECT JSONB_BUILD_OBJECT(
-                   'query_id',         pss.queryid,
-                   'query',            LEFT(pss.query, 500),
-                   'calls',            pss.calls,
-                   'total_exec_ms',    pss.total_exec_time,
-                   'mean_exec_ms',     pss.mean_exec_time,
-                   'min_exec_ms',      pss.min_exec_time,
-                   'max_exec_ms',      pss.max_exec_time,
-                   'rows',             pss.rows,
-                   'shared_blks_hit',  pss.shared_blks_hit,
-                   'shared_blks_read', pss.shared_blks_read,
-                   'user',             r.rolname,
-                   'database',         d.datname
-                 ) AS row_json
-          FROM pg_stat_statements AS pss
-          LEFT JOIN pg_roles AS r ON r.oid = pss.userid
-          LEFT JOIN pg_database AS d ON d.oid = pss.dbid
-          ORDER BY pss.total_exec_time DESC
-          LIMIT $1
-      ) sub;
+      SELECT JSONB_BUILD_OBJECT(
+        'statements', COALESCE((
+          SELECT JSONB_AGG(row_json)
+          FROM (
+              SELECT JSONB_BUILD_OBJECT(
+                       -- As text, not a number: a queryid is 64-bit and does
+                       -- not survive JSON number precision in a client that
+                       -- parses numbers as doubles. explainQuery already takes
+                       -- it as a string for that reason, and a value that
+                       -- silently changed between the two tools would be
+                       -- looked up and not found.
+                       'query_id',         pss.queryid::text,
+                       'query',            LEFT(pss.query, 500),
+                       'calls',            pss.calls,
+                       'total_exec_ms',    pss.total_exec_time,
+                       'mean_exec_ms',     pss.mean_exec_time,
+                       'min_exec_ms',      pss.min_exec_time,
+                       'max_exec_ms',      pss.max_exec_time,
+                       'rows',             pss.rows,
+                       'shared_blks_hit',  pss.shared_blks_hit,
+                       'shared_blks_read', pss.shared_blks_read,
+                       'temp_blks_read',   pss.temp_blks_read,
+                       'temp_blks_written', pss.temp_blks_written,
+                       'wal_records',      pss.wal_records,
+                       'wal_fpi',          pss.wal_fpi,
+                       'wal_bytes',        pss.wal_bytes,
+                       'user',             r.rolname,
+                       'database',         d.datname
+                     )" + since + pg18 + R"(
+                     ) AS row_json
+              FROM pg_stat_statements AS pss
+              LEFT JOIN pg_roles AS r ON r.oid = pss.userid
+              LEFT JOIN pg_database AS d ON d.oid = pss.dbid
+              ORDER BY pss.total_exec_time DESC
+              LIMIT $1
+          ) sub), '[]'::jsonb),
+        'info', (SELECT JSONB_BUILD_OBJECT(
+                   'dealloc', i.dealloc, 'stats_reset', i.stats_reset)
+                 FROM pg_stat_statements_info AS i),
+        -- missing_ok, so a server where the GUC is absent yields null rather
+        -- than an error that would mask the real result.
+        'max', current_setting('pg_stat_statements.max', true)
+      );
     )";
 
     try {
@@ -1295,7 +1436,7 @@ private:
       if (!res.empty() && !res[0][0].is_null()) {
         return json::parse(res[0][0].as<std::string>());
       } else {
-        return json::array();
+        return {{"statements", json::array()}};
       }
     } catch (const pqxx::sql_error& e) {
       if (e.sqlstate() == "42P01") { // undefined_table
@@ -1307,6 +1448,211 @@ private:
         };
       }
       throw;
+    }
+  }
+
+  const json progress_stats() {
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
+
+    // PostgreSQL 17 renamed three pg_stat_progress_vacuum columns:
+    // max_dead_tuples -> max_dead_tuple_bytes, num_dead_tuples ->
+    // num_dead_item_ids, and added dead_tuple_bytes. The old and new names
+    // measure different things (tuple counts against bytes), so they are
+    // reported under their own names rather than pretended to be one field,
+    // with 'dead_tuple_unit' saying which the server produced.
+    const bool v17 = sess.server_version() >= 170000;
+    const std::string vacuum_dead = v17
+      ? R"('dead_tuple_unit',     'bytes',
+           'max_dead_tuple_bytes', v.max_dead_tuple_bytes,
+           'dead_tuple_bytes',     v.dead_tuple_bytes,
+           'num_dead_item_ids',    v.num_dead_item_ids,
+           'indexes_total',        v.indexes_total,
+           'indexes_processed',    v.indexes_processed)"
+      : R"('dead_tuple_unit',  'tuples',
+           'max_dead_tuples',  v.max_dead_tuples,
+           'num_dead_tuples',  v.num_dead_tuples)";
+
+    // Percentages are the point of a progress view: "1.2 million of 4 million
+    // blocks" is only useful once it is 30%.
+    std::string query = R"(
+      SELECT JSONB_BUILD_OBJECT(
+        'vacuum', COALESCE((
+          SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                   'pid',               v.pid,
+                   'database',          v.datname,
+                   'relation',          v.relid::regclass::text,
+                   'phase',             v.phase,
+                   'heap_blks_total',   v.heap_blks_total,
+                   'heap_blks_scanned', v.heap_blks_scanned,
+                   'heap_blks_vacuumed', v.heap_blks_vacuumed,
+                   'scanned_percent',
+                     round(100.0 * v.heap_blks_scanned / NULLIF(v.heap_blks_total, 0), 1),
+                   'vacuumed_percent',
+                     round(100.0 * v.heap_blks_vacuumed / NULLIF(v.heap_blks_total, 0), 1),
+                   'index_vacuum_count', v.index_vacuum_count,
+                   'query',             a.query,
+                   'started',           a.query_start,
+                   'elapsed_s',         round(EXTRACT(EPOCH FROM now() - a.query_start)::numeric, 1),
+                   )" + vacuum_dead + R"())
+          FROM pg_stat_progress_vacuum AS v
+          LEFT JOIN pg_stat_activity AS a ON a.pid = v.pid), '[]'::jsonb),
+        'analyze', COALESCE((
+          SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                   'pid',                   an.pid,
+                   'database',              an.datname,
+                   'relation',              an.relid::regclass::text,
+                   'phase',                 an.phase,
+                   'sample_blks_total',     an.sample_blks_total,
+                   'sample_blks_scanned',   an.sample_blks_scanned,
+                   'scanned_percent',
+                     round(100.0 * an.sample_blks_scanned / NULLIF(an.sample_blks_total, 0), 1),
+                   'ext_stats_total',       an.ext_stats_total,
+                   'ext_stats_computed',    an.ext_stats_computed,
+                   'child_tables_total',    an.child_tables_total,
+                   'child_tables_done',     an.child_tables_done,
+                   'elapsed_s',             round(EXTRACT(EPOCH FROM now() - a.query_start)::numeric, 1)))
+          FROM pg_stat_progress_analyze AS an
+          LEFT JOIN pg_stat_activity AS a ON a.pid = an.pid), '[]'::jsonb),
+        'create_index', COALESCE((
+          SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                   'pid',              ci.pid,
+                   'database',         ci.datname,
+                   'relation',         ci.relid::regclass::text,
+                   'index',            NULLIF(ci.index_relid, 0)::regclass::text,
+                   'command',          ci.command,
+                   'phase',            ci.phase,
+                   'blocks_total',     ci.blocks_total,
+                   'blocks_done',      ci.blocks_done,
+                   'blocks_percent',
+                     round(100.0 * ci.blocks_done / NULLIF(ci.blocks_total, 0), 1),
+                   'tuples_total',     ci.tuples_total,
+                   'tuples_done',      ci.tuples_done,
+                   'lockers_total',    ci.lockers_total,
+                   'lockers_done',     ci.lockers_done,
+                   'current_locker_pid', ci.current_locker_pid,
+                   'elapsed_s',        round(EXTRACT(EPOCH FROM now() - a.query_start)::numeric, 1)))
+          FROM pg_stat_progress_create_index AS ci
+          LEFT JOIN pg_stat_activity AS a ON a.pid = ci.pid), '[]'::jsonb),
+        'cluster', COALESCE((
+          SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                   'pid',                cl.pid,
+                   'database',           cl.datname,
+                   'relation',           cl.relid::regclass::text,
+                   'command',            cl.command,
+                   'phase',              cl.phase,
+                   'heap_tuples_scanned', cl.heap_tuples_scanned,
+                   'heap_tuples_written', cl.heap_tuples_written,
+                   'heap_blks_total',    cl.heap_blks_total,
+                   'heap_blks_scanned',  cl.heap_blks_scanned,
+                   'scanned_percent',
+                     round(100.0 * cl.heap_blks_scanned / NULLIF(cl.heap_blks_total, 0), 1),
+                   'index_rebuild_count', cl.index_rebuild_count,
+                   'elapsed_s',          round(EXTRACT(EPOCH FROM now() - a.query_start)::numeric, 1)))
+          FROM pg_stat_progress_cluster AS cl
+          LEFT JOIN pg_stat_activity AS a ON a.pid = cl.pid), '[]'::jsonb),
+        'copy', COALESCE((
+          SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                   'pid',            c.pid,
+                   'database',       c.datname,
+                   'relation',       NULLIF(c.relid, 0)::regclass::text,
+                   'command',        c.command,
+                   'type',           c.type,
+                   'bytes_processed', c.bytes_processed,
+                   'bytes_total',    c.bytes_total,
+                   'bytes_percent',
+                     round(100.0 * c.bytes_processed / NULLIF(c.bytes_total, 0), 1),
+                   'tuples_processed', c.tuples_processed,
+                   'tuples_excluded',  c.tuples_excluded,
+                   'elapsed_s',      round(EXTRACT(EPOCH FROM now() - a.query_start)::numeric, 1)))
+          FROM pg_stat_progress_copy AS c
+          LEFT JOIN pg_stat_activity AS a ON a.pid = c.pid), '[]'::jsonb),
+        'basebackup', COALESCE((
+          SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                   'pid',                b.pid,
+                   'phase',              b.phase,
+                   'backup_total',       b.backup_total,
+                   'backup_streamed',    b.backup_streamed,
+                   'streamed_percent',
+                     round(100.0 * b.backup_streamed / NULLIF(b.backup_total, 0), 1),
+                   'tablespaces_total',  b.tablespaces_total,
+                   'tablespaces_streamed', b.tablespaces_streamed))
+          FROM pg_stat_progress_basebackup AS b), '[]'::jsonb)
+      );
+    )";
+
+    pqxx::result res = txn.exec(query);
+
+    if (!res.empty() && !res[0][0].is_null()) {
+      return json::parse(res[0][0].as<std::string>());
+    } else {
+      return {};
+    }
+  }
+
+  const json io_stats() {
+    Session sess{active_cfg()};
+
+    // pg_stat_io arrived in PostgreSQL 16. Saying so plainly beats an
+    // undefined-table error, and matches how a missing extension is reported.
+    if (sess.server_version() < 160000) {
+      return {
+        {"error", "pg_stat_io requires PostgreSQL 16 or newer"},
+        {"hint", "this server is older; use checkpointStats for the "
+                 "pg_stat_bgwriter counters, which include buffers_backend "
+                 "and buffers_backend_fsync on these versions, and "
+                 "tableIOStats for per-object cache hit ratios"}
+      };
+    }
+
+    pqxx::work& txn = sess.txn();
+
+    // Byte counters replaced the single op_bytes column in PostgreSQL 18;
+    // before that, a block count times op_bytes was the only way to get bytes,
+    // and op_bytes itself is gone in 18. Reporting the byte columns only where
+    // they exist avoids inventing a number on older servers.
+    const std::string bytes = sess.server_version() >= 180000
+      ? R"(, 'read_bytes', read_bytes, 'write_bytes', write_bytes,
+            'extend_bytes', extend_bytes)"
+      : "";
+
+    // Rows where nothing has happened at all are dropped: pg_stat_io is a
+    // dense matrix of backend_type x object x context, and most combinations
+    // are structurally impossible, so an unfiltered dump is mostly nulls.
+    std::string query = R"(
+      SELECT COALESCE(JSONB_AGG(JSONB_BUILD_OBJECT(
+               'backend_type', backend_type,
+               'object',       object,
+               'context',      context,
+               'reads',        reads,
+               'read_time_ms', read_time,
+               'writes',       writes,
+               'write_time_ms', write_time,
+               'writebacks',   writebacks,
+               'writeback_time_ms', writeback_time,
+               'extends',      extends,
+               'extend_time_ms', extend_time,
+               'hits',         hits,
+               'evictions',    evictions,
+               'reuses',       reuses,
+               'fsyncs',       fsyncs,
+               'fsync_time_ms', fsync_time,
+               'hit_percent',  round(100.0 * hits / NULLIF(hits + reads, 0), 2),
+               'stats_reset',  stats_reset
+             )" + bytes + R"(
+             ) ORDER BY backend_type, object, context), '[]'::jsonb)
+      FROM pg_stat_io
+      WHERE COALESCE(reads, 0) > 0 OR COALESCE(writes, 0) > 0
+         OR COALESCE(extends, 0) > 0 OR COALESCE(hits, 0) > 0
+         OR COALESCE(evictions, 0) > 0 OR COALESCE(fsyncs, 0) > 0;
+    )";
+
+    pqxx::result res = txn.exec(query);
+
+    if (!res.empty() && !res[0][0].is_null()) {
+      return json::parse(res[0][0].as<std::string>());
+    } else {
+      return json::array();
     }
   }
 
@@ -1323,6 +1669,24 @@ private:
     // relfrozenxid, are invisible in pg_stat_user_tables, and a TOAST or
     // catalog relation is very often the one actually holding the horizon
     // back; excluding them would report the risk as lower than it is.
+    //
+    // relallfrozen (PostgreSQL 18+) turns an age into an estimate of the work
+    // left to do: an old relfrozenxid on a table that is already 99% frozen is
+    // a very different problem from the same age with nothing frozen.
+    // total_autovacuum_time answers the next question -- whether autovacuum
+    // has been trying and failing to keep up, or has simply never run.
+    const std::string pg18_cols = sess.server_version() >= 180000
+      ? R"(, 'frozen_percent',
+              round(100.0 * r.relallfrozen / NULLIF(r.relpages, 0), 1),
+            'relallfrozen', r.relallfrozen,
+            'total_vacuum_time_ms', r.total_vacuum_time,
+            'total_autovacuum_time_ms', r.total_autovacuum_time)"
+      : "";
+    const std::string pg18_sel = sess.server_version() >= 180000
+      ? R"(, c.relallfrozen, c.relpages,
+            s.total_vacuum_time, s.total_autovacuum_time)"
+      : "";
+
     std::string query = R"(
       SELECT JSONB_BUILD_OBJECT(
         'limits',
@@ -1368,7 +1732,8 @@ private:
                    'size', r.size,
                    'last_vacuum', r.last_vacuum,
                    'last_autovacuum', r.last_autovacuum,
-                   'n_dead_tup', r.n_dead_tup) ORDER BY r.xid_age DESC)
+                   'n_dead_tup', r.n_dead_tup)" + pg18_cols + R"(
+                   ) ORDER BY r.xid_age DESC)
           FROM (
             SELECT n.nspname AS schema,
                    c.relname AS name,
@@ -1384,7 +1749,7 @@ private:
                    CASE WHEN o.option_value IS NOT NULL THEN 'reloptions' ELSE 'server' END
                      AS freeze_max_age_source,
                    pg_relation_size(c.oid) AS size,
-                   s.last_vacuum, s.last_autovacuum, s.n_dead_tup
+                   s.last_vacuum, s.last_autovacuum, s.n_dead_tup)" + pg18_sel + R"(
             FROM pg_class AS c
             JOIN pg_namespace AS n ON n.oid = c.relnamespace
             LEFT JOIN pg_class AS tp ON c.relkind = 't' AND tp.reltoastrelid = c.oid
@@ -1567,6 +1932,12 @@ private:
             'wal_sync_time_ms', w.wal_sync_time)"
       : "";
 
+    // num_done and slru_written are PostgreSQL 18 additions to
+    // pg_stat_checkpointer; the rest of the view is unchanged since 17.
+    const std::string ckpt_pg18 = sess.server_version() >= 180000
+      ? "'checkpoints_done', c.num_done, 'slru_written', c.slru_written,"
+      : "";
+
     const std::string checkpointer = split ? R"(
         'source', 'pg_stat_checkpointer + pg_stat_bgwriter + pg_stat_io',
         'checkpointer', (SELECT JSONB_BUILD_OBJECT(
@@ -1581,6 +1952,7 @@ private:
              'write_time_ms',            c.write_time,
              'sync_time_ms',             c.sync_time,
              'buffers_written',          c.buffers_written,
+             )" + ckpt_pg18 + R"(
              'stats_reset',              c.stats_reset,
              'seconds_since_reset',      round(EXTRACT(EPOCH FROM now() - c.stats_reset)),
              'checkpoints_per_hour',     round((c.num_timed + c.num_requested)
@@ -2033,7 +2405,8 @@ private:
       std::string q = R"(
         SELECT JSONB_BUILD_OBJECT(
                  'query',            pss.query,
-                 'query_id',         pss.queryid,
+                 -- text for the same reason as in statementStats
+                 'query_id',         pss.queryid::text,
                  'calls',            pss.calls,
                  'total_exec_ms',    pss.total_exec_time,
                  'mean_exec_ms',     pss.mean_exec_time,
@@ -3247,6 +3620,12 @@ private:
     Session sess{active_cfg()};
     pqxx::work& txn = sess.txn();
 
+    // Same PostgreSQL 16 additions as listTables: failed HOT updates and the
+    // date of the last sequential scan.
+    const std::string pg16_tbl = sess.server_version() >= 160000
+      ? R"( 'n_tup_newpage_upd', s.n_tup_newpage_upd, 'last_seq_scan', s.last_seq_scan,)"
+      : "";
+
     std::string query = R"(
       SELECT JSONB_BUILD_OBJECT(
                'table', c.relname, 'rows', c.reltuples, 'size', pg_table_size(c.oid), 'indexes_size', pg_indexes_size(c.oid),
@@ -3257,7 +3636,7 @@ private:
                'seq_scan', s.seq_scan, 'idx_scan', s.idx_scan, 'n_live_tup', s.n_live_tup, 'n_dead_tup', s.n_dead_tup,
                'n_mod_since_analyze', s.n_mod_since_analyze, 'n_ins_since_vacuum', s.n_ins_since_vacuum,
                'last_vacuum', GREATEST(s.last_vacuum, s.last_autovacuum), 'last_analyze', GREATEST(s.last_analyze, s.last_autoanalyze),
-               'reloptions', c.reloptions,
+               'reloptions', c.reloptions,)" + pg16_tbl + R"(
                'columns', columns,
                'toast', CASE WHEN c.reltoastrelid != 0 THEN
                           JSONB_BUILD_OBJECT(
@@ -3595,6 +3974,12 @@ private:
 	}
 	else if (tool_name == "checkpointStats") {
 	  result_content = checkpoint_stats();
+	}
+	else if (tool_name == "progressStats") {
+	  result_content = progress_stats();
+	}
+	else if (tool_name == "ioStats") {
+	  result_content = io_stats();
 	}
 	else if (tool_name == "tableIOStats") {
 	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
