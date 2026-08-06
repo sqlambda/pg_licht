@@ -1727,6 +1727,113 @@ TEST_F(PostgresMCPServerTest, ActivityDescribesWaitEventsOnPg17AndLater) {
   EXPECT_EQ(found, expected);
 }
 
+TEST_F(PostgresMCPServerTest, ActivityFiltersByPidAndState) {
+  pqxx::connection other(test_url);
+  pqxx::work t(other);
+  int pid = t.exec("SELECT pg_backend_pid()")[0][0].as<int>();
+
+  json r = srv->call_activity(pid, "", 0, "");
+  ASSERT_EQ(r.size(), 1u) << r.dump(2);
+  ASSERT_TRUE(r.contains(std::to_string(pid)));
+
+  // A state that backend cannot be in, so the filter must exclude it rather
+  // than being ignored.
+  json none = srv->call_activity(pid, "", 0, "no such state");
+  EXPECT_TRUE(none.is_object());
+  EXPECT_TRUE(none.empty()) << none.dump(2);
+
+  t.abort();
+}
+
+TEST_F(PostgresMCPServerTest, ActivityFiltersByMinDuration) {
+  pqxx::connection other(test_url);
+  pqxx::work t(other);
+  int pid = t.exec("SELECT pg_backend_pid()")[0][0].as<int>();
+
+  // That backend is idle in transaction with a query that finished instantly,
+  // so an hour-long threshold must not match it. This is the regression guard
+  // for measuring duration off a stale query_start.
+  json r = srv->call_activity(pid, "", 3600, "");
+  EXPECT_TRUE(r.empty()) << r.dump(2);
+
+  // And a zero-ish threshold does match, so the filter is not simply broken.
+  json any = srv->call_activity(pid, "", 0, "");
+  EXPECT_FALSE(any.empty());
+
+  t.abort();
+}
+
+TEST_F(PostgresMCPServerTest, ActivityFilterExcludesUnrelatedBackends) {
+  pqxx::connection a(test_url), b(test_url);
+  pqxx::work ta(a), tb(b);
+  int pid_a = ta.exec("SELECT pg_backend_pid()")[0][0].as<int>();
+  int pid_b = tb.exec("SELECT pg_backend_pid()")[0][0].as<int>();
+  ASSERT_NE(pid_a, pid_b);
+
+  json r = srv->call_activity(pid_a, "", 0, "");
+  EXPECT_TRUE(r.contains(std::to_string(pid_a)));
+  EXPECT_FALSE(r.contains(std::to_string(pid_b))) << r.dump(2);
+
+  ta.abort();
+  tb.abort();
+}
+
+// --- currentLocks blocking chain ---
+
+TEST_F(PostgresMCPServerTest, LocksResolveTheTransitiveBlockingChain) {
+  // holder takes the table; waiter then asks for a conflicting lock and
+  // blocks. Asking about the waiter must surface the holder, which is the
+  // whole point: a flat lock dump makes you reconstruct that yourself.
+  pqxx::connection holder(test_url);
+  pqxx::work hold(holder);
+  hold.exec("LOCK TABLE grocery.users IN ACCESS EXCLUSIVE MODE");
+  int holder_pid = hold.exec("SELECT pg_backend_pid()")[0][0].as<int>();
+
+  pqxx::connection waiter(test_url);
+  pqxx::work wait_txn(waiter);
+  int waiter_pid = wait_txn.exec("SELECT pg_backend_pid()")[0][0].as<int>();
+
+  pqxx::pipeline p(wait_txn);
+  p.insert("LOCK TABLE grocery.users IN ACCESS EXCLUSIVE MODE");
+
+  json chain;
+  for (int i = 0; i < 40 && chain.is_null(); i++) {
+    json r = srv->call_locks(waiter_pid);
+    if (!r.is_array()) continue;
+    for (const auto& l : r) {
+      if (l.contains("chain_depth") && l["chain_depth"].get<int>() > 0) chain = r;
+    }
+  }
+
+  // Release the holder so the waiter can proceed, whatever the assertions do.
+  hold.abort();
+  try {
+    p.complete();
+  } catch (const pqxx::sql_error&) {
+  }
+  wait_txn.abort();
+
+  if (chain.is_null()) GTEST_SKIP() << "the lock wait could not be observed";
+
+  bool saw_waiter = false, saw_holder = false;
+  for (const auto& l : chain) {
+    int pid = l["pid"].get<int>();
+    if (pid == waiter_pid) {
+      saw_waiter = true;
+      EXPECT_EQ(l["chain_depth"].get<int>(), 0);
+    }
+    if (pid == holder_pid) {
+      saw_holder = true;
+      // Depth 1: one hop up the chain from the backend asked about.
+      EXPECT_EQ(l["chain_depth"].get<int>(), 1);
+    }
+    // Nothing outside the chain may appear.
+    EXPECT_TRUE(pid == waiter_pid || pid == holder_pid) << l.dump(2);
+  }
+  EXPECT_TRUE(saw_waiter) << chain.dump(2);
+  EXPECT_TRUE(saw_holder) << chain.dump(2);
+}
+
 // --- replicationSlots enrichment ---
 
 TEST_F(PostgresMCPServerTest, ReplicationSlotsReportsWalStatusAndSpillCounters) {
@@ -1839,11 +1946,19 @@ TEST_F(PostgresMCPServerTest, ProgressStatsReportsARunningVacuum) {
   pqxx::pipeline p(n);
   p.insert("VACUUM grocery.vacuum_me");
 
-  json found;
+  json found, by_relation, by_pid, by_wrong_relation;
   for (int i = 0; i < 40 && found.is_null(); i++) {
     json r = srv->call_progress_stats();
-    for (const auto& v : r["vacuum"])
-      if (v.value("relation", "") == "grocery.vacuum_me") found = v;
+    for (const auto& v : r["vacuum"]) {
+      if (v.value("relation", "") == "grocery.vacuum_me") {
+        found = v;
+        // Exercise the filters while the command is genuinely in flight;
+        // there is no other moment at which they can be observed working.
+        by_relation = srv->call_progress_stats(0, "vacuum_me");
+        by_pid = srv->call_progress_stats(v["pid"].get<int>(), "");
+        by_wrong_relation = srv->call_progress_stats(0, "grocery.users");
+      }
+    }
   }
 
   // Cancel rather than wait: the vacuum was deliberately slowed to be
@@ -1884,6 +1999,24 @@ TEST_F(PostgresMCPServerTest, ProgressStatsReportsARunningVacuum) {
     EXPECT_TRUE(found.contains("max_dead_tuples"));
     EXPECT_TRUE(found.contains("num_dead_tuples"));
   }
+
+  // The bare relation name matches, and so does the pid.
+  EXPECT_EQ(by_relation["vacuum"].size(), 1u) << by_relation.dump(2);
+  EXPECT_EQ(by_pid["vacuum"].size(), 1u) << by_pid.dump(2);
+  // A different table does not.
+  EXPECT_TRUE(by_wrong_relation["vacuum"].empty()) << by_wrong_relation.dump(2);
+  // A base backup has no relation, so a relation filter excludes that
+  // category rather than matching everything in it.
+  EXPECT_TRUE(by_relation["basebackup"].empty());
+}
+
+TEST_F(PostgresMCPServerTest, ProgressStatsUnknownRelationIsEmptyNotAnError) {
+  // A regclass cast would raise "relation does not exist"; a diagnostic tool
+  // should answer "nothing is running on that" instead.
+  json r = srv->call_progress_stats(0, "no_such_table_anywhere");
+  ASSERT_TRUE(r.contains("vacuum")) << r.dump(2);
+  EXPECT_TRUE(r["vacuum"].empty());
+  EXPECT_TRUE(r["create_index"].empty());
 }
 
 // --- ioStats ---
@@ -1898,9 +2031,10 @@ TEST_F(PostgresMCPServerTest, IoStatsReturnsRowsOrAVersionError) {
     return;
   }
 
-  ASSERT_TRUE(r.is_array()) << r.dump(2);
-  ASSERT_FALSE(r.empty());
-  auto& row = r[0];
+  ASSERT_TRUE(r.contains("io")) << r.dump(2);
+  ASSERT_TRUE(r["io"].is_array());
+  ASSERT_FALSE(r["io"].empty());
+  auto& row = r["io"][0];
   EXPECT_TRUE(row.contains("backend_type"));
   EXPECT_TRUE(row.contains("object"));
   EXPECT_TRUE(row.contains("context"));
@@ -1910,6 +2044,50 @@ TEST_F(PostgresMCPServerTest, IoStatsReturnsRowsOrAVersionError) {
   // The byte counters replaced op_bytes in PostgreSQL 18; before that there
   // is no honest way to report them.
   EXPECT_EQ(row.contains("read_bytes"), pg_server_version_num(test_url) >= 180000);
+}
+
+TEST_F(PostgresMCPServerTest, IoStatsFiltersByBackendTypeAndContext) {
+  if (pg_server_version_num(test_url) < 160000)
+    GTEST_SKIP() << "pg_stat_io requires PostgreSQL 16";
+
+  json r = srv->call_io_stats(0, "checkpointer", "", "");
+  ASSERT_TRUE(r.contains("io")) << r.dump(2);
+  for (const auto& row : r["io"])
+    EXPECT_EQ(row["backend_type"].get<std::string>(), "checkpointer");
+
+  json c = srv->call_io_stats(0, "", "", "vacuum");
+  for (const auto& row : c["io"])
+    EXPECT_EQ(row["context"].get<std::string>(), "vacuum");
+}
+
+TEST_F(PostgresMCPServerTest, IoStatsPerBackendNeedsPg18AndSaysSo) {
+  if (pg_server_version_num(test_url) < 160000)
+    GTEST_SKIP() << "pg_stat_io requires PostgreSQL 16";
+
+  // A live backend of our own, so the pid certainly exists.
+  pqxx::connection victim(test_url);
+  pqxx::work t(victim);
+  int pid = t.exec("SELECT pg_backend_pid()")[0][0].as<int>();
+
+  json r = srv->call_io_stats(pid, "", "", "");
+
+  if (pg_server_version_num(test_url) < 180000) {
+    // pg_stat_io has no pid column at all; the per-backend function is 18+.
+    ASSERT_TRUE(r.contains("error")) << r.dump(2);
+    EXPECT_NE(r["error"].get<std::string>().find("PostgreSQL 18"), std::string::npos);
+    EXPECT_TRUE(r.contains("hint"));
+  } else {
+    EXPECT_EQ(r["pid"].get<int>(), pid);
+    ASSERT_TRUE(r.contains("io")) << r.dump(2);
+    // WAL is a separate function: a backend can be quiet in I/O and still be
+    // writing WAL heavily, so it is reported alongside rather than inferred.
+    ASSERT_TRUE(r.contains("wal")) << r.dump(2);
+    EXPECT_TRUE(r["wal"].contains("wal_records"));
+    EXPECT_TRUE(r["wal"].contains("wal_bytes"));
+    for (const auto& row : r["io"])
+      EXPECT_EQ(row["backend_type"].get<std::string>(), "client backend");
+  }
+  t.abort();
 }
 
 // --- wraparoundStatus ---
@@ -2564,6 +2742,64 @@ TEST_F(PgssMCPServerTest, StatementStatsCarriesEvictionInfoAlongsideTheRows) {
   EXPECT_TRUE(r["info"].contains("dealloc"));
   EXPECT_TRUE(r["info"].contains("stats_reset"));
   EXPECT_TRUE(r.contains("max"));
+}
+
+TEST_F(PgssMCPServerTest, StatementStatsRanksByTheRequestedColumn) {
+  json by_calls = srv->call_statement_stats(50, "", "calls", 0);
+  ASSERT_TRUE(by_calls.contains("statements")) << by_calls.dump(2);
+  EXPECT_EQ(by_calls["order_by"].get<std::string>(), "calls");
+
+  long long prev = -1;
+  for (const auto& s : by_calls["statements"]) {
+    long long c = s["calls"].get<long long>();
+    if (prev >= 0) { EXPECT_LE(c, prev) << by_calls.dump(2); }
+    prev = c;
+  }
+
+  // Ranking by total time buries a statement called twice at 40s under one
+  // called ten million times at 2ms; mean_exec_time is the other question,
+  // and it must produce a genuinely different ordering key.
+  json by_mean = srv->call_statement_stats(50, "", "mean_exec_time", 0);
+  EXPECT_EQ(by_mean["order_by"].get<std::string>(), "mean_exec_time");
+  double prev_mean = -1;
+  for (const auto& s : by_mean["statements"]) {
+    double m = s["mean_exec_ms"].get<double>();
+    if (prev_mean >= 0) { EXPECT_LE(m, prev_mean + 1e-9); }
+    prev_mean = m;
+  }
+}
+
+TEST_F(PgssMCPServerTest, StatementStatsRejectsAnUnknownOrderByColumn) {
+  // The sort column cannot be a bind parameter, so it is resolved through a
+  // fixed table. Anything else must be refused rather than reach the SQL.
+  try {
+    srv->call_statement_stats(5, "", "1; DROP TABLE x", 0);
+    FAIL() << "expected an unknown order_by to be rejected";
+  } catch (const std::exception& e) {
+    std::string msg = e.what();
+    EXPECT_NE(msg.find("unknown order_by"), std::string::npos);
+    EXPECT_NE(msg.find("mean_exec_time"), std::string::npos) << msg;
+  }
+}
+
+TEST_F(PgssMCPServerTest, StatementStatsFiltersByQueryIdAndReturnsFullText) {
+  json all = srv->call_statement_stats(20, "", "", 0);
+  ASSERT_FALSE(all["statements"].empty());
+  std::string qid = all["statements"][0]["query_id"].get<std::string>();
+
+  json one = srv->call_statement_stats(20, qid, "", 0);
+  // Not necessarily a single row: pg_stat_statements keeps one entry per
+  // (user, database) pair, so one queryid can legitimately match several.
+  ASSERT_FALSE(one["statements"].empty()) << one.dump(2);
+  EXPECT_LT(one["statements"].size(), all["statements"].size());
+  for (const auto& s : one["statements"])
+    EXPECT_EQ(s["query_id"].get<std::string>(), qid) << one.dump(2);
+}
+
+TEST_F(PgssMCPServerTest, StatementStatsMinCallsExcludesOneOffStatements) {
+  json r = srv->call_statement_stats(50, "", "mean_exec_time", 1000000000LL);
+  // Nothing in a fresh test database has been called a billion times.
+  EXPECT_TRUE(r["statements"].empty()) << r.dump(2);
 }
 
 TEST_F(PgssMCPServerTest, StatementStatsQueryIdIsTextAndFeedsExplainQuery) {

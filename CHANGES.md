@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.3.0 (unreleased)
+## 3.0.0 (unreleased)
 
 ### Breaking
 
@@ -33,6 +33,27 @@
   PostgreSQL 17 renamed the vacuum dead-tuple columns from counts to bytes (`max_dead_tuples` → `max_dead_tuple_bytes`, `num_dead_tuples` → `num_dead_item_ids`). Both are reported under their own names with a `dead_tuple_unit` label rather than forced into one field, because they measure genuinely different things.
 
 - **`ioStats`** — `pg_stat_io` per backend type, object and context: reads, writes, extends, hits, evictions, reuses, fsyncs and their timings, with a hit percentage. This is where buffers written directly by backends, vacuum's ring-buffer reuse, and bulk read/write I/O become visible separately from the aggregate counters. Rows with no activity are omitted, since the view is a dense matrix of combinations most of which are structurally impossible. Requires PostgreSQL 16, and says so plainly on older servers rather than failing with an undefined-table error.
+
+### Targeted lookups
+
+The monitoring tools were all-or-nothing: they returned the whole view, which is fine on a test box and unusable on a server with several hundred backends. They now take optional filters, all of which preserve the unfiltered shape when omitted. There are only two correlation keys in play, `pid` and `query_id`, and threading both through turns the tool set into a path rather than a pile:
+
+```
+statementStats → query_id → currentActivity(query_id) → pid → currentLocks(pid)
+                                                            → progressStats(pid)
+                                                            → ioStats(pid)
+                                                            → explainQuery(query_id)
+```
+
+- **`currentActivity`** takes `pid`, `query_id`, `min_duration_s` and `state`. A `pid` brings that backend's parallel workers with it, matched on `leader_pid` — being shown a leader without its workers hides where the work is happening, which is the reason for asking. `min_duration_s` excludes plain idle backends, since an idle connection's `query_start` dates a statement that already finished and would otherwise be reported as a long-running query.
+
+- **`currentLocks`** takes `pid`, and resolves the **transitive** blocking chain through `pg_blocking_pids` rather than merely filtering rows. Each row is tagged with `chain_depth`: 0 is the backend asked about, and the largest depth is the one at the root of the pile-up. A flat lock dump left you to reconstruct that graph by hand, which is the work the tool should be doing. The recursion carries a path array, because a deadlock is a cycle in that graph and would otherwise not terminate.
+
+- **`ioStats`** takes `pid`, `backend_type`, `object` and `context`. With a `pid` it reports one backend via `pg_stat_get_backend_io`, plus its WAL volume from `pg_stat_get_backend_wal` — a backend can be quiet in I/O and still be generating WAL heavily. That is a different source rather than a filter, since `pg_stat_io` has no pid column at all, and it requires PostgreSQL 18.
+
+- **`statementStats`** takes `query_id`, `order_by` and `min_calls`. `order_by` is arguably a bug fix: the list was hardcoded to `total_exec_time DESC`, which buries a statement called twice at 40 seconds under one called ten million times at 2 ms, and there was no way to ask the other question. The sort column cannot be a bind parameter, so it is resolved through a fixed table and anything outside it is rejected — nothing caller-supplied reaches the SQL text. Naming a `query_id` also returns the query text whole instead of truncated.
+
+- **`progressStats`** takes `pid` and `relation`. A relation is matched by name against `pg_class` rather than cast to `regclass`, so a name that matches nothing comes back as an empty result rather than as an error.
 
 ### Enriched existing tools
 

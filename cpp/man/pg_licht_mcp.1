@@ -401,7 +401,7 @@ grouped by category, each with current value, unit, description, context, type,
 source, and
 .Va pending_restart
 flag.
-.It Ic currentActivity
+.It Ic currentActivity Op Va pid , Va query_id , Va min_duration_s , Va state
 Current server connections and running queries
 .Pq Li pg_stat_activity
 across all databases: pid, database, user, application_name, backend_type,
@@ -428,12 +428,53 @@ is loaded.
 On PostgreSQL 17 and newer each wait event also carries its prose description
 from
 .Li pg_wait_events .
-.It Ic currentLocks
+.Pp
+All four filters are optional and combine; with none of them the whole view is
+returned, which on a busy server is mostly idle connections and internal
+processes.
+.Pp
+.Bl -tag -width "min_duration_s" -compact
+.It Va pid
+A single backend, together with its parallel workers, matched on
+.Va leader_pid .
+Being shown a leader without its workers hides where the work is happening,
+which is the reason for asking.
+.It Va query_id
+Only backends running this
+.Va query_id ,
+as a decimal string.
+This is how a statement identified by
+.Ic statementStats
+is traced to whoever is running it now.
+.It Va min_duration_s
+Only backends whose current query has been running at least this many seconds.
+Plain idle backends are excluded, since their
+.Va query_start
+dates a statement that already finished.
+.It Va state
+Only backends in this state, e.g.
+.Ql active
+or
+.Ql "idle in transaction" .
+.El
+.It Ic currentLocks Op Va pid
 Current locks
 .Pq Li pg_locks
 joined with the holding backend's query and user, plus which pids are blocking
 each waiting lock.
 Use to diagnose lock contention.
+.Pp
+.Bl -tag -width "min_duration_s" -compact
+.It Va pid
+Restrict the result to this backend and every backend blocking it,
+transitively, resolved through
+.Fn pg_blocking_pids .
+Each row is tagged with
+.Va chain_depth :
+0 is the backend asked about, and the largest depth is the one at the root of
+the pile-up, which is the one to look at first.
+Omit it for every lock in the cluster.
+.El
 .It Ic databaseStats
 Per-database statistics
 .Pq Li pg_stat_database
@@ -450,7 +491,7 @@ PostgreSQL 18 adds
 and
 .Va parallel_workers_launched ;
 a shortfall between them means queries planned for parallelism ran without it.
-.It Ic statementStats Op Va limit
+.It Ic statementStats Op Va limit , Va query_id , Va order_by , Va min_calls
 The slowest tracked queries by total execution time
 .Pq Li pg_stat_statements ,
 with calls, timing, row counts, buffer usage, temporary block I/O, and WAL
@@ -475,12 +516,36 @@ is text, not a number: it is a 64-bit value that a client parsing JSON numbers
 as doubles would round, and the rounded value would then not be found by
 .Ic explainQuery .
 .Pp
-.Bl -tag -width "timeout_ms" -compact
+.Bl -tag -width "min_duration_s" -compact
 .It Va limit
 Maximum number of statements to return.
 Defaults to 20.
+.It Va query_id
+Only statements with this queryid, as a decimal string; their query text comes
+back whole rather than truncated.
+.Li pg_stat_statements
+keeps one entry per user and database, so a queryid can match more than one row.
+.It Va order_by
+Ranking column:
+.Va total_exec_time
+(the default),
+.Va mean_exec_time , Va max_exec_time , Va calls , Va rows ,
+.Va shared_blks_read , Va temp_blks_written ,
+or
+.Va wal_bytes .
+Ranking by total time buries a statement called twice at 40 seconds under one
+called ten million times at 2 milliseconds;
+.Va mean_exec_time
+is the other question, and there was previously no way to ask it.
+Anything outside this list is rejected: the sort column cannot be a bind
+parameter, so it is resolved through a fixed table rather than reaching the SQL.
+.It Va min_calls
+Ignore statements called fewer times than this, to keep one-off maintenance
+queries out of a
+.Va mean_exec_time
+ranking.
 .El
-.It Ic progressStats
+.It Ic progressStats Op Va pid , Va relation
 Every long-running maintenance command currently reporting progress:
 .Li VACUUM , ANALYZE , CREATE INDEX , CLUSTER , COPY ,
 and base backups.
@@ -503,7 +568,17 @@ PostgreSQL 17 renamed the vacuum dead-tuple columns from counts to bytes;
 both are reported under their own names, with
 .Va dead_tuple_unit
 saying which the server produced, because they measure different things.
-.It Ic ioStats
+.Pp
+.Bl -tag -width "min_duration_s" -compact
+.It Va pid
+Only the command running in this backend; pair it with the pid from
+.Ic currentActivity .
+.It Va relation
+Only commands operating on this table, named bare or schema-qualified.
+A base backup has no relation, so this excludes that category entirely.
+A name that matches nothing yields an empty result rather than an error.
+.El
+.It Ic ioStats Op Va pid , Va backend_type , Va object , Va context
 Cumulative I/O statistics per backend type, object, and context
 .Pq Li pg_stat_io :
 reads, writes, extends, hits, evictions, reuses, fsyncs, their timings, and a
@@ -521,6 +596,33 @@ column.
 .Pp
 Requires PostgreSQL 16 or newer; older servers get a clear error naming the
 alternatives.
+.Pp
+.Bl -tag -width "min_duration_s" -compact
+.It Va pid
+Report this one backend instead of the cluster-wide aggregate, via
+.Fn pg_stat_get_backend_io ,
+together with its WAL volume from
+.Fn pg_stat_get_backend_wal :
+a backend can be quiet in I/O and still be generating WAL heavily.
+.Li pg_stat_io
+has no pid column at all, so this is a different source rather than a filter,
+and it requires PostgreSQL 18.
+.It Va backend_type
+Only this backend type, e.g.
+.Ql "client backend"
+or
+.Ql "autovacuum worker" .
+.It Va object
+Only this object class, e.g.
+.Ql relation
+or
+.Ql "temp relation" .
+.It Va context
+Only this I/O context, e.g.
+.Ql normal , Ql vacuum , Ql bulkread ,
+or
+.Ql bulkwrite .
+.El
 .It Ic wraparoundStatus Op Va schema , Va limit
 Transaction id and multixact wraparound headroom.
 For every database:

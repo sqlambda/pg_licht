@@ -2,6 +2,7 @@
 
 #include <cctype>
 #include <iostream>
+#include <map>
 #include <set>
 #include <string>
 #include <unistd.h>
@@ -150,11 +151,22 @@ public:
   const json call_extensions() { return extensions(); }
   const json call_database_size() { return database_size(); }
   const json call_server_settings() { return server_settings(); }
-  const json call_activity() { return activity(); }
-  const json call_locks() { return locks(); }
+  const json call_activity() { return activity(0, "", 0, ""); }
+  const json call_activity(int pid, const std::string& query_id,
+                           double min_duration_s, const std::string& state) {
+    return activity(pid, query_id, min_duration_s, state);
+  }
+  const json call_locks() { return locks(0); }
+  const json call_locks(int pid) { return locks(pid); }
   const json call_replication_slots() { return replication_slots(); }
   const json call_database_stats() { return database_stats(); }
-  const json call_statement_stats(int limit) { return statement_stats(limit); }
+  const json call_statement_stats(int limit) {
+    return statement_stats(limit, "", "", 0);
+  }
+  const json call_statement_stats(int limit, const std::string& query_id,
+                                  const std::string& order_by, long long min_calls) {
+    return statement_stats(limit, query_id, order_by, min_calls);
+  }
   const json call_table_bloat(const std::string& schema, const std::string& table_name, bool exact) {
     return table_bloat(schema, table_name, exact);
   }
@@ -169,8 +181,15 @@ public:
     return duplicate_indexes(schema, table_name);
   }
   const json call_checkpoint_stats() { return checkpoint_stats(); }
-  const json call_progress_stats() { return progress_stats(); }
-  const json call_io_stats() { return io_stats(); }
+  const json call_progress_stats() { return progress_stats(0, ""); }
+  const json call_progress_stats(int pid, const std::string& relation) {
+    return progress_stats(pid, relation);
+  }
+  const json call_io_stats() { return io_stats(0, "", "", ""); }
+  const json call_io_stats(int pid, const std::string& backend_type,
+                           const std::string& object, const std::string& context) {
+    return io_stats(pid, backend_type, object, context);
+  }
   const json call_table_io_stats(const std::string& schema, const std::string& table_name, int limit) {
     return table_io_stats(schema, table_name, limit);
   }
@@ -541,18 +560,40 @@ private:
 	  },
 	  {
 	    {"name", "currentActivity"},
-	    {"description", "return current server connections and running queries (pg_stat_activity) across all databases: pid, database, user, application_name, backend_type, state, wait event, and query text"},
+	    {"description", "return current server connections and running queries (pg_stat_activity) across all databases: pid, database, user, application_name, backend_type, state, wait event, query text, transaction and query duration, leader_pid for parallel workers, and the backend's xid and xmin. query_id is returned as a decimal string and is the join key to statementStats and explainQuery, so a statement seen running here can be looked up and planned. All filters are optional and combine; with none the whole view is returned, which on a busy server is mostly idle connections and internal processes"},
 	    {"inputSchema", {
 		{"type", "object"},
-		{"properties", json::object()}
+		{"properties", {
+		    {"pid", {
+			{"type", "integer"},
+			{"description", "a single backend, together with its parallel workers (any backend whose leader_pid is this pid)"}
+		      }},
+		    {"query_id", {
+			{"type", "string"},
+			{"description", "only backends running this query_id, as a decimal string; use it to find who is running a statement identified by statementStats. Requires compute_query_id to be enabled (the default 'auto' enables it when pg_stat_statements is loaded)"}
+		      }},
+		    {"min_duration_s", {
+			{"type", "number"},
+			{"description", "only backends whose current query has been running at least this many seconds. Plain idle backends are excluded, since their query_start dates a statement that already finished"}
+		      }},
+		    {"state", {
+			{"type", "string"},
+			{"description", "only backends in this pg_stat_activity state, e.g. \"active\" or \"idle in transaction\""}
+		      }}
+		  }}
 	      }}
 	  },
 	  {
 	    {"name", "currentLocks"},
-	    {"description", "return current locks (pg_locks) joined with the holding backend's query and user, plus which pids are blocking each waiting lock; use to diagnose lock contention"},
+	    {"description", "return current locks (pg_locks) joined with the holding backend's query and user, plus which pids are blocking each waiting lock; use to diagnose lock contention. Given a pid, returns that backend's locks together with every backend blocking it transitively, each tagged with chain_depth: 0 is the pid asked about, and the largest depth is the backend at the root of the pile-up, which is the one to look at first"},
 	    {"inputSchema", {
 		{"type", "object"},
-		{"properties", json::object()}
+		{"properties", {
+		    {"pid", {
+			{"type", "integer"},
+			{"description", "restrict to this backend and its transitive blockers, resolved through pg_blocking_pids. Omit for every lock in the cluster"}
+		      }}
+		  }}
 	      }}
 	  },
 	  {
@@ -573,11 +614,23 @@ private:
 	  },
 	  {
 	    {"name", "statementStats"},
-	    {"description", "return the slowest tracked queries by total execution time (pg_stat_statements), with calls, timing, row counts, and buffer usage; returns a clear error with setup instructions if the extension is not installed"},
+	    {"description", "return tracked queries from pg_stat_statements under 'statements', with calls, timing, row counts, buffer usage, temporary block I/O and WAL volume, alongside an 'info' block from pg_stat_statements_info whose dealloc counter says whether entries are being evicted -- if it is climbing, this is not the slowest queries in the cluster but the slowest of those that survived eviction. query_id is a decimal string, ready to pass to explainQuery. Returns a clear error with setup instructions if the extension is not installed"},
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", {
-		    {"limit", {{"type", "integer"}}}
+		    {"limit", {{"type", "integer"}, {"description", "how many statements to return. Defaults to 20"}}},
+		    {"query_id", {
+			{"type", "string"},
+			{"description", "only statements with this queryid, as a decimal string; their query text is returned whole rather than truncated. pg_stat_statements keeps one entry per user and database, so a queryid can match more than one row"}
+		      }},
+		    {"order_by", {
+			{"type", "string"},
+			{"description", "ranking column: total_exec_time (default), mean_exec_time, max_exec_time, calls, rows, shared_blks_read, temp_blks_written, or wal_bytes. Ranking by total time buries a statement called twice at 40s under one called ten million times at 2ms; mean_exec_time is the other question"}
+		      }},
+		    {"min_calls", {
+			{"type", "integer"},
+			{"description", "ignore statements called fewer times than this, to keep one-off maintenance queries out of a mean_exec_time ranking"}
+		      }}
 		  }}
 	      }}
 	  },
@@ -603,15 +656,41 @@ private:
 	    {"description", "return every long-running maintenance command currently reporting progress (pg_stat_progress_vacuum, _analyze, _create_index, _cluster, _copy, _basebackup), with the phase, the blocks or tuples done against the total, a completion percentage, and how long it has been running. Use it to decide whether a VACUUM will finish before wraparound, or whether a CREATE INDEX is stuck waiting on a locker. The PostgreSQL 17 rename of the vacuum dead-tuple columns is normalized, and 'dead_tuple_unit' says whether the server counts tuples or bytes"},
 	    {"inputSchema", {
 		{"type", "object"},
-		{"properties", json::object()}
+		{"properties", {
+		    {"pid", {
+			{"type", "integer"},
+			{"description", "only the command running in this backend; pair with the pid from currentActivity"}
+		      }},
+		    {"relation", {
+			{"type", "string"},
+			{"description", "only commands operating on this table, named bare or schema-qualified. A base backup has no relation, so this excludes that category entirely"}
+		      }}
+		  }}
 	      }}
 	  },
 	  {
 	    {"name", "ioStats"},
-	    {"description", "return cumulative I/O statistics per backend type, object and context (pg_stat_io, PostgreSQL 16+): reads, writes, extends, hits, evictions, reuses, fsyncs and their timings, with a hit percentage. This is where backend-written buffers, vacuum's ring-buffer reuse, and bulk read/write I/O become visible separately from the aggregate counters. Rows with no activity are omitted. Returns a clear error on PostgreSQL 15 and older, where the view does not exist"},
+	    {"description", "return cumulative I/O statistics under 'io', per backend type, object and context (pg_stat_io, PostgreSQL 16+): reads, writes, extends, hits, evictions, reuses, fsyncs and their timings, with a hit percentage. This is where backend-written buffers, vacuum's ring-buffer reuse, and bulk read/write I/O become visible separately from the aggregate counters in checkpointStats. Rows with no activity are omitted unless a filter was given. Given a pid, reports that one backend instead, via pg_stat_get_backend_io, plus its WAL volume under 'wal' -- a backend can be quiet in I/O and still be generating WAL heavily; that requires PostgreSQL 18, since pg_stat_io itself has no pid column. Returns a clear error on PostgreSQL 15 and older, where the view does not exist"},
 	    {"inputSchema", {
 		{"type", "object"},
-		{"properties", json::object()}
+		{"properties", {
+		    {"pid", {
+			{"type", "integer"},
+			{"description", "report this one backend's I/O and WAL instead of the cluster-wide aggregate. PostgreSQL 18 and newer only"}
+		      }},
+		    {"backend_type", {
+			{"type", "string"},
+			{"description", "only this backend type, e.g. \"client backend\", \"autovacuum worker\", \"checkpointer\""}
+		      }},
+		    {"object", {
+			{"type", "string"},
+			{"description", "only this object class, e.g. \"relation\" or \"temp relation\""}
+		      }},
+		    {"context", {
+			{"type", "string"},
+			{"description", "only this I/O context, e.g. \"normal\", \"vacuum\", \"bulkread\", \"bulkwrite\""}
+		      }}
+		  }}
 	      }}
 	  },
 	  {
@@ -1143,7 +1222,12 @@ private:
     }
   }
 
-  const json activity() {
+  // All four filters are optional and independent; omitting every one returns
+  // the whole of pg_stat_activity, as before. They matter because the
+  // unfiltered view on a busy server is mostly idle connections and internal
+  // processes, and the entry the caller wants is one row in several hundred.
+  const json activity(int pid, const std::string& query_id,
+                      double min_duration_s, const std::string& state) {
     Session sess{active_cfg()};
     pqxx::work& txn = sess.txn();
 
@@ -1190,23 +1274,76 @@ private:
                ))
       FROM pg_stat_activity AS a
       )" + wait_join + R"(
-      WHERE a.pid != pg_backend_pid();
+      WHERE a.pid != pg_backend_pid()
+        -- A pid brings its parallel workers with it. Asking about a leader and
+        -- being shown only the leader hides where the work is actually
+        -- happening, which is the reason for asking in the first place.
+        AND ($1 = '' OR a.pid = $1::int OR a.leader_pid = $1::int)
+        AND ($2 = '' OR a.query_id = $2::bigint)
+        -- Duration is measured on the current query, and plain idle backends
+        -- are excluded: an idle connection's query_start dates its last
+        -- statement, so including them would report every long-idle session as
+        -- a long-running query.
+        AND ($3 = '' OR (a.state IS DISTINCT FROM 'idle'
+                         AND a.query_start IS NOT NULL
+                         AND now() - a.query_start
+                             >= make_interval(secs => $3::double precision)))
+        AND ($4 = '' OR a.state = $4);
     )";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result res = pqxx_exec(
+      txn, query,
+      pqxx::params{pid > 0 ? std::to_string(pid) : std::string{},
+                   query_id,
+                   min_duration_s > 0 ? std::to_string(min_duration_s) : std::string{},
+                   state});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
     } else {
-      return {};
+      // An empty object, not null: with filters applied, "no backend matched"
+      // is a normal answer and should read as an empty set rather than as a
+      // missing result.
+      return json::object();
     }
   }
 
-  const json locks() {
+  // With a pid, this returns that backend's locks together with every backend
+  // blocking it, transitively. A flat list of locks is the wrong shape during
+  // a pile-up: what you need is the pid at the root of the chain, and
+  // reconstructing that graph by hand from the full dump is exactly the work
+  // the tool should be doing.
+  const json locks(int pid) {
     Session sess{active_cfg()};
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    // chain_depth is 0 for the pid asked about, 1 for what blocks it, and so
+    // on; the largest depth is the backend to look at first. The path array is
+    // a cycle guard -- a deadlock is a cycle in this graph, and without it the
+    // recursion would not terminate.
+    const std::string chain_cte = pid > 0 ? R"(
+      WITH RECURSIVE chain(pid, depth, path) AS (
+          SELECT $1::int, 0, ARRAY[$1::int]
+        UNION ALL
+          SELECT b.pid, c.depth + 1, c.path || b.pid
+          FROM chain AS c,
+               LATERAL unnest(pg_blocking_pids(c.pid)) AS b(pid)
+          WHERE NOT b.pid = ANY(c.path)
+            AND c.depth < 16
+      ),
+      chain_min AS (
+          SELECT pid, MIN(depth) AS depth FROM chain GROUP BY pid
+      )
+    )" : "";
+
+    const std::string chain_field = pid > 0 ? ", 'chain_depth', ch.depth" : "";
+    const std::string chain_join  = pid > 0
+      ? "JOIN chain_min AS ch ON ch.pid = l.pid" : "";
+    const std::string order_by = pid > 0
+      ? "ORDER BY ch.depth, l.granted ASC, l.pid"
+      : "ORDER BY l.granted ASC, l.pid";
+
+    std::string query = chain_cte + R"(
       SELECT JSONB_AGG(
                JSONB_BUILD_OBJECT(
                  'pid',              l.pid,
@@ -1219,9 +1356,11 @@ private:
                  'query',            a.query,
                  'user',             a.usename,
                  'application_name', a.application_name
-               ) ORDER BY l.granted ASC, l.pid
+               )" + chain_field + R"(
+               ) )" + order_by + R"(
              )
       FROM pg_locks AS l
+      )" + chain_join + R"(
       LEFT JOIN pg_stat_activity AS a ON a.pid = l.pid
       LEFT JOIN LATERAL (
           SELECT c.relnamespace::regnamespace::text || '.' || c.relname AS relname
@@ -1234,7 +1373,9 @@ private:
       WHERE l.pid != pg_backend_pid();
     )";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result res = pid > 0
+      ? pqxx_exec(txn, query, pqxx::params{pid})
+      : txn.exec(query);
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -1365,7 +1506,39 @@ private:
     }
   }
 
-  const json statement_stats(int limit) {
+  const json statement_stats(int limit, const std::string& query_id,
+                             const std::string& order_by, long long min_calls) {
+    // The sort column cannot be a bind parameter, so it is resolved through a
+    // fixed table rather than interpolated. Nothing caller-supplied reaches the
+    // SQL text: an unknown name is rejected here, listing what is accepted.
+    static const std::map<std::string, std::string> ORDERINGS = {
+      {"total_exec_time",   "pss.total_exec_time DESC"},
+      {"mean_exec_time",    "pss.mean_exec_time DESC"},
+      {"max_exec_time",     "pss.max_exec_time DESC"},
+      {"calls",             "pss.calls DESC"},
+      {"rows",              "pss.rows DESC"},
+      {"shared_blks_read",  "pss.shared_blks_read DESC"},
+      {"temp_blks_written", "pss.temp_blks_written DESC"},
+      {"wal_bytes",         "pss.wal_bytes DESC"},
+    };
+    std::string key = order_by.empty() ? "total_exec_time" : order_by;
+    auto ord = ORDERINGS.find(key);
+    if (ord == ORDERINGS.end()) {
+      std::string valid;
+      for (const auto& [k, v] : ORDERINGS) { (void)v; valid += (valid.empty() ? "" : ", ") + k; }
+      throw std::runtime_error("unknown order_by \"" + order_by +
+                               "\"; valid values are: " + valid);
+    }
+
+    if (!query_id.empty()) {
+      bool ok = query_id.size() <= 20;
+      for (size_t i = 0; ok && i < query_id.size(); i++) {
+        if (i == 0 && query_id[i] == '-') { ok = query_id.size() > 1; continue; }
+        if (!std::isdigit(static_cast<unsigned char>(query_id[i]))) ok = false;
+      }
+      if (!ok) throw std::runtime_error("query_id must be a decimal integer string");
+    }
+
     Session sess{active_cfg()};
     pqxx::work& txn = sess.txn();
 
@@ -1397,7 +1570,12 @@ private:
                        -- silently changed between the two tools would be
                        -- looked up and not found.
                        'query_id',         pss.queryid::text,
-                       'query',            LEFT(pss.query, 500),
+                       -- Truncated in a list, whole when one statement was
+                       -- asked for by id: the point of naming a queryid is to
+                       -- get at the statement, and truncation is what makes
+                       -- the list readable, not something the caller wants.
+                       'query',            CASE WHEN $2 = '' THEN LEFT(pss.query, 500)
+                                                ELSE pss.query END,
                        'calls',            pss.calls,
                        'total_exec_ms',    pss.total_exec_time,
                        'mean_exec_ms',     pss.mean_exec_time,
@@ -1418,8 +1596,10 @@ private:
               FROM pg_stat_statements AS pss
               LEFT JOIN pg_roles AS r ON r.oid = pss.userid
               LEFT JOIN pg_database AS d ON d.oid = pss.dbid
-              ORDER BY pss.total_exec_time DESC
-              LIMIT $1
+              WHERE ($2 = '' OR pss.queryid = $2::bigint)
+                AND ($3 = '' OR pss.calls >= $3::bigint)
+              ORDER BY )" + ord->second + R"(
+              LIMIT $1::bigint
           ) sub), '[]'::jsonb),
         'info', (SELECT JSONB_BUILD_OBJECT(
                    'dealloc', i.dealloc, 'stats_reset', i.stats_reset)
@@ -1431,12 +1611,17 @@ private:
     )";
 
     try {
-      pqxx::result res = pqxx_exec(txn, query, pqxx::params{limit});
+      pqxx::result res = pqxx_exec(
+        txn, query,
+        pqxx::params{std::to_string(limit), query_id,
+                     min_calls > 0 ? std::to_string(min_calls) : std::string{}});
 
       if (!res.empty() && !res[0][0].is_null()) {
-        return json::parse(res[0][0].as<std::string>());
+        json out = json::parse(res[0][0].as<std::string>());
+        out["order_by"] = key;
+        return out;
       } else {
-        return {{"statements", json::array()}};
+        return {{"statements", json::array()}, {"order_by", key}};
       }
     } catch (const pqxx::sql_error& e) {
       if (e.sqlstate() == "42P01") { // undefined_table
@@ -1451,9 +1636,35 @@ private:
     }
   }
 
-  const json progress_stats() {
+  const json progress_stats(int pid, const std::string& relation) {
     Session sess{active_cfg()};
     pqxx::work& txn = sess.txn();
+
+    // The relation is matched by name against pg_class rather than by casting
+    // the argument to regclass: a regclass cast of a name that does not exist
+    // raises an error, and "no such table" should come back as an empty result
+    // from a diagnostic tool, not as a failure. Both the bare and the
+    // schema-qualified form are accepted.
+    // pc/pn rather than c/n: the COPY subquery already binds c, and an alias
+    // collision here would silently resolve to the wrong relation.
+    // Deliberately not a raw string. This fragment ends in two parentheses,
+    // and a raw string's terminator is )delimiter" -- so both R"(...))" and
+    // R"SQL(...))SQL" swallow one of them and produce SQL that fails to parse
+    // only when the filter is actually used. Plain literals have no such trap.
+    auto rel_filter = [](const std::string& alias) {
+      return " AND ($2 = '' OR " + alias + ".relid IN ("
+             " SELECT pc.oid FROM pg_class AS pc"
+             " JOIN pg_namespace AS pn ON pn.oid = pc.relnamespace"
+             " WHERE pc.relname = $2 OR pn.nspname || '.' || pc.relname = $2))";
+    };
+    const std::string pid_v  = " AND ($1 = '' OR v.pid = $1::int)";
+    const std::string pid_an = " AND ($1 = '' OR an.pid = $1::int)";
+    const std::string pid_ci = " AND ($1 = '' OR ci.pid = $1::int)";
+    const std::string pid_cl = " AND ($1 = '' OR cl.pid = $1::int)";
+    const std::string pid_c  = " AND ($1 = '' OR c.pid = $1::int)";
+    // A base backup has no relation at all, so a relation filter excludes it
+    // entirely rather than matching everything.
+    const std::string bb_filter = " AND ($1 = '' OR b.pid = $1::int) AND $2 = ''";
 
     // PostgreSQL 17 renamed three pg_stat_progress_vacuum columns:
     // max_dead_tuples -> max_dead_tuple_bytes, num_dead_tuples ->
@@ -1496,7 +1707,8 @@ private:
                    'elapsed_s',         round(EXTRACT(EPOCH FROM now() - a.query_start)::numeric, 1),
                    )" + vacuum_dead + R"())
           FROM pg_stat_progress_vacuum AS v
-          LEFT JOIN pg_stat_activity AS a ON a.pid = v.pid), '[]'::jsonb),
+          LEFT JOIN pg_stat_activity AS a ON a.pid = v.pid
+          WHERE true)" + pid_v + rel_filter("v") + R"(), '[]'::jsonb),
         'analyze', COALESCE((
           SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
                    'pid',                   an.pid,
@@ -1513,7 +1725,8 @@ private:
                    'child_tables_done',     an.child_tables_done,
                    'elapsed_s',             round(EXTRACT(EPOCH FROM now() - a.query_start)::numeric, 1)))
           FROM pg_stat_progress_analyze AS an
-          LEFT JOIN pg_stat_activity AS a ON a.pid = an.pid), '[]'::jsonb),
+          LEFT JOIN pg_stat_activity AS a ON a.pid = an.pid
+          WHERE true)" + pid_an + rel_filter("an") + R"(), '[]'::jsonb),
         'create_index', COALESCE((
           SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
                    'pid',              ci.pid,
@@ -1533,7 +1746,8 @@ private:
                    'current_locker_pid', ci.current_locker_pid,
                    'elapsed_s',        round(EXTRACT(EPOCH FROM now() - a.query_start)::numeric, 1)))
           FROM pg_stat_progress_create_index AS ci
-          LEFT JOIN pg_stat_activity AS a ON a.pid = ci.pid), '[]'::jsonb),
+          LEFT JOIN pg_stat_activity AS a ON a.pid = ci.pid
+          WHERE true)" + pid_ci + rel_filter("ci") + R"(), '[]'::jsonb),
         'cluster', COALESCE((
           SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
                    'pid',                cl.pid,
@@ -1550,7 +1764,8 @@ private:
                    'index_rebuild_count', cl.index_rebuild_count,
                    'elapsed_s',          round(EXTRACT(EPOCH FROM now() - a.query_start)::numeric, 1)))
           FROM pg_stat_progress_cluster AS cl
-          LEFT JOIN pg_stat_activity AS a ON a.pid = cl.pid), '[]'::jsonb),
+          LEFT JOIN pg_stat_activity AS a ON a.pid = cl.pid
+          WHERE true)" + pid_cl + rel_filter("cl") + R"(), '[]'::jsonb),
         'copy', COALESCE((
           SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
                    'pid',            c.pid,
@@ -1566,7 +1781,8 @@ private:
                    'tuples_excluded',  c.tuples_excluded,
                    'elapsed_s',      round(EXTRACT(EPOCH FROM now() - a.query_start)::numeric, 1)))
           FROM pg_stat_progress_copy AS c
-          LEFT JOIN pg_stat_activity AS a ON a.pid = c.pid), '[]'::jsonb),
+          LEFT JOIN pg_stat_activity AS a ON a.pid = c.pid
+          WHERE true)" + pid_c + rel_filter("c") + R"(), '[]'::jsonb),
         'basebackup', COALESCE((
           SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
                    'pid',                b.pid,
@@ -1577,11 +1793,14 @@ private:
                      round(100.0 * b.backup_streamed / NULLIF(b.backup_total, 0), 1),
                    'tablespaces_total',  b.tablespaces_total,
                    'tablespaces_streamed', b.tablespaces_streamed))
-          FROM pg_stat_progress_basebackup AS b), '[]'::jsonb)
+          FROM pg_stat_progress_basebackup AS b
+          WHERE true)" + bb_filter + R"(), '[]'::jsonb)
       );
     )";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result res = pqxx_exec(
+      txn, query,
+      pqxx::params{pid > 0 ? std::to_string(pid) : std::string{}, relation});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -1590,7 +1809,8 @@ private:
     }
   }
 
-  const json io_stats() {
+  const json io_stats(int pid, const std::string& backend_type,
+                      const std::string& object, const std::string& context) {
     Session sess{active_cfg()};
 
     // pg_stat_io arrived in PostgreSQL 16. Saying so plainly beats an
@@ -1602,6 +1822,18 @@ private:
                  "pg_stat_bgwriter counters, which include buffers_backend "
                  "and buffers_backend_fsync on these versions, and "
                  "tableIOStats for per-object cache hit ratios"}
+      };
+    }
+    // Per-backend I/O is not a filter over pg_stat_io -- the view has no pid
+    // column at all. It is a separate function, added in PostgreSQL 18.
+    if (pid > 0 && sess.server_version() < 180000) {
+      return {
+        {"error", "per-backend I/O statistics require PostgreSQL 18 or newer"},
+        {"hint", "pg_stat_io is aggregated across backends and has no pid "
+                 "column; pg_stat_get_backend_io(), which reports one "
+                 "backend, was added in 18. Omit pid for the cluster-wide "
+                 "view, or use currentActivity to see what the backend is "
+                 "doing"}
       };
     }
 
@@ -1616,9 +1848,30 @@ private:
             'extend_bytes', extend_bytes)"
       : "";
 
+    // One backend, or the whole cluster: the row shape is identical either
+    // way, so only the source relation changes.
+    //
+    // Both branches reference $1, which keeps one parameter list across them.
+    // PostgreSQL rejects a bind that supplies more parameters than the
+    // statement uses, so the cluster-wide branch cannot simply leave it out;
+    // the predicate it carries is the invariant that this branch is the one
+    // taken when no pid was given.
+    const std::string source = pid > 0
+      ? "pg_stat_get_backend_io($1::int)" : "pg_stat_io";
+    const std::string pid_guard = pid > 0 ? "" : " AND $1 = ''";
+
     // Rows where nothing has happened at all are dropped: pg_stat_io is a
     // dense matrix of backend_type x object x context, and most combinations
     // are structurally impossible, so an unfiltered dump is mostly nulls.
+    // With an explicit filter the rows are kept regardless, since "this
+    // context did nothing" is then the answer to the question asked.
+    const std::string activity_filter =
+      (backend_type.empty() && object.empty() && context.empty())
+        ? R"(AND (COALESCE(reads, 0) > 0 OR COALESCE(writes, 0) > 0
+                  OR COALESCE(extends, 0) > 0 OR COALESCE(hits, 0) > 0
+                  OR COALESCE(evictions, 0) > 0 OR COALESCE(fsyncs, 0) > 0))"
+        : "";
+
     std::string query = R"(
       SELECT COALESCE(JSONB_AGG(JSONB_BUILD_OBJECT(
                'backend_type', backend_type,
@@ -1641,19 +1894,40 @@ private:
                'stats_reset',  stats_reset
              )" + bytes + R"(
              ) ORDER BY backend_type, object, context), '[]'::jsonb)
-      FROM pg_stat_io
-      WHERE COALESCE(reads, 0) > 0 OR COALESCE(writes, 0) > 0
-         OR COALESCE(extends, 0) > 0 OR COALESCE(hits, 0) > 0
-         OR COALESCE(evictions, 0) > 0 OR COALESCE(fsyncs, 0) > 0;
-    )";
+      FROM )" + source + R"(
+      WHERE ($2 = '' OR backend_type = $2)
+        AND ($3 = '' OR object = $3)
+        AND ($4 = '' OR context = $4)
+      )" + pid_guard + activity_filter + ";";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result res = pqxx_exec(
+      txn, query,
+      pqxx::params{pid > 0 ? std::to_string(pid) : std::string{},
+                   backend_type, object, context});
 
-    if (!res.empty() && !res[0][0].is_null()) {
-      return json::parse(res[0][0].as<std::string>());
-    } else {
-      return json::array();
+    json out = json::object();
+    if (pid > 0) out["pid"] = pid;
+    out["io"] = (!res.empty() && !res[0][0].is_null())
+      ? json::parse(res[0][0].as<std::string>()) : json::array();
+
+    // WAL is a separate per-backend function, and is the other half of "what
+    // is this backend doing to the disk": a backend can be quiet in pg_stat_io
+    // and still be generating WAL heavily.
+    if (pid > 0) {
+      pqxx::result w = pqxx_exec(
+        txn,
+        R"(SELECT JSONB_BUILD_OBJECT(
+             'wal_records',      wal_records,
+             'wal_fpi',          wal_fpi,
+             'wal_bytes',        wal_bytes,
+             'wal_buffers_full', wal_buffers_full,
+             'stats_reset',      stats_reset)
+           FROM pg_stat_get_backend_wal($1::int))",
+        pqxx::params{std::to_string(pid)});
+      if (!w.empty() && !w[0][0].is_null())
+        out["wal"] = json::parse(w[0][0].as<std::string>());
     }
+    return out;
   }
 
   const json wraparound_status(const std::string& schema, int limit) {
@@ -3950,10 +4224,20 @@ private:
 	  result_content = server_settings();
 	}
 	else if (tool_name == "currentActivity") {
-	  result_content = activity();
+	  int pid = arguments.contains("pid") && arguments["pid"].is_number_integer()
+	    ? arguments["pid"].get<int>() : 0;
+	  std::string qid = arguments.contains("query_id") && arguments["query_id"].is_string()
+	    ? arguments["query_id"].get<std::string>() : "";
+	  double min_dur = arguments.contains("min_duration_s") && arguments["min_duration_s"].is_number()
+	    ? arguments["min_duration_s"].get<double>() : 0;
+	  std::string st = arguments.contains("state") && arguments["state"].is_string()
+	    ? arguments["state"].get<std::string>() : "";
+	  result_content = activity(pid, qid, min_dur, st);
 	}
 	else if (tool_name == "currentLocks") {
-	  result_content = locks();
+	  int pid = arguments.contains("pid") && arguments["pid"].is_number_integer()
+	    ? arguments["pid"].get<int>() : 0;
+	  result_content = locks(pid);
 	}
 	else if (tool_name == "replicationSlots") {
 	  result_content = replication_slots();
@@ -3963,7 +4247,17 @@ private:
 	}
 	else if (tool_name == "statementStats") {
 	  int limit = arguments.contains("limit") ? arguments["limit"].get<int>() : 20;
-	  result_content = statement_stats(limit);
+	  std::string qid;
+	  if (arguments.contains("query_id")) {
+	    if (arguments["query_id"].is_string()) qid = arguments["query_id"].get<std::string>();
+	    else if (arguments["query_id"].is_number_integer())
+	      qid = std::to_string(arguments["query_id"].get<long long>());
+	  }
+	  std::string ord = arguments.contains("order_by") && arguments["order_by"].is_string()
+	    ? arguments["order_by"].get<std::string>() : "";
+	  long long min_calls = arguments.contains("min_calls") && arguments["min_calls"].is_number_integer()
+	    ? arguments["min_calls"].get<long long>() : 0;
+	  result_content = statement_stats(limit, qid, ord, min_calls);
 	}
 	else if (tool_name == "wraparoundStatus") {
 	  // No schema default here: wraparound is a whole-database property, and
@@ -3976,10 +4270,22 @@ private:
 	  result_content = checkpoint_stats();
 	}
 	else if (tool_name == "progressStats") {
-	  result_content = progress_stats();
+	  int pid = arguments.contains("pid") && arguments["pid"].is_number_integer()
+	    ? arguments["pid"].get<int>() : 0;
+	  std::string rel = arguments.contains("relation") && arguments["relation"].is_string()
+	    ? arguments["relation"].get<std::string>() : "";
+	  result_content = progress_stats(pid, rel);
 	}
 	else if (tool_name == "ioStats") {
-	  result_content = io_stats();
+	  int pid = arguments.contains("pid") && arguments["pid"].is_number_integer()
+	    ? arguments["pid"].get<int>() : 0;
+	  std::string bt = arguments.contains("backend_type") && arguments["backend_type"].is_string()
+	    ? arguments["backend_type"].get<std::string>() : "";
+	  std::string ob = arguments.contains("object") && arguments["object"].is_string()
+	    ? arguments["object"].get<std::string>() : "";
+	  std::string cx = arguments.contains("context") && arguments["context"].is_string()
+	    ? arguments["context"].get<std::string>() : "";
+	  result_content = io_stats(pid, bt, ob, cx);
 	}
 	else if (tool_name == "tableIOStats") {
 	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";

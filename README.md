@@ -53,8 +53,18 @@ prefix-redundant indexes, compared by column expression, opclass, collation and 
 and `hostCapacity` (memory settings against the host's actual RAM and vCPU count — see
 below).
 
-`currentActivity` returns `query_id`, so a statement seen running can be looked up in
-`statementStats` and handed straight to `explainQuery`.
+The monitoring tools take optional `pid` and `query_id` filters, so a symptom can be
+followed to its cause rather than read out of a full dump:
+
+```
+statementStats → query_id → currentActivity(query_id) → pid → currentLocks(pid)
+                                                            → progressStats(pid)
+                                                            → ioStats(pid)
+                                                            → explainQuery(query_id)
+```
+
+`currentLocks(pid)` resolves the transitive blocking chain and tags each row with
+`chain_depth`, so the backend at the root of a pile-up is the one with the highest depth.
 
 Each one is documented, with its arguments, in `man pg_licht_mcp` under OPERATIONS. Every
 operation also accepts an optional `connection` argument to select one of several
