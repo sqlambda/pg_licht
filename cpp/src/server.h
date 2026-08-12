@@ -218,6 +218,79 @@ private:
 
   const pglicht::ConnConfig& active_cfg() const { return registry_.get(active_); }
 
+  // Where each extension actually lives, per connection.
+  //
+  // An extension does not have to be in public: CREATE EXTENSION ... SCHEMA
+  // ext is normal practice, and a hardened cluster usually keeps extensions
+  // out of public entirely. Nothing here sets a search_path -- it cannot,
+  // since PgBouncer discards session state and rejects `options` in the
+  // conninfo -- so an unqualified pgstattuple() or pg_stat_statements
+  // resolves only against the *default* search_path of the connecting role,
+  // and a tool that relied on that reported "not installed" for an extension
+  // that was plainly installed. Every extension object is therefore
+  // schema-qualified from pg_extension instead.
+  //
+  // Keyed by connection name because one name is one database for the life of
+  // the process, and the lookup is otherwise an extra round trip per call.
+  std::map<std::string, std::map<std::string, std::string>> ext_schemas_;
+
+  // The schema of an installed extension, already quoted for interpolation
+  // into SQL, or "" when the extension is not installed on this connection.
+  //
+  // Runs inside the caller's transaction, so the answer is consistent with the
+  // query it is about to qualify.
+  std::string extension_schema(pqxx::work& txn, const std::string& extname) {
+    auto& per_conn = ext_schemas_[active_cfg().name];
+    auto it = per_conn.find(extname);
+    if (it != per_conn.end()) return it->second;
+
+    pqxx::result r = pqxx_exec(
+      txn,
+      "SELECT QUOTE_IDENT(n.nspname)"
+      " FROM pg_extension AS e"
+      " JOIN pg_namespace AS n ON n.oid = e.extnamespace"
+      " WHERE e.extname = $1",
+      pqxx::params{extname});
+
+    std::string schema = r.empty() || r[0][0].is_null()
+      ? std::string{} : r[0][0].as<std::string>();
+
+    // Only a positive answer is remembered. Caching "not installed" would pin
+    // that verdict for the life of the process, so a CREATE EXTENSION during
+    // an incident would never be picked up -- exactly when it is most likely
+    // to happen, since the tool's own hint is what prompts it.
+    if (!schema.empty()) per_conn[extname] = schema;
+    return schema;
+  }
+
+  // Drop a remembered schema after a query that used it failed to find the
+  // object. ALTER EXTENSION ... SET SCHEMA is rare, but a cached location that
+  // has moved would otherwise keep failing until a restart; forgetting it here
+  // makes the next call re-resolve. The failed statement has already aborted
+  // this transaction, so the retry cannot happen before then.
+  void forget_extension_schema(const std::string& extname) {
+    auto conn = ext_schemas_.find(active_cfg().name);
+    if (conn != ext_schemas_.end()) conn->second.erase(extname);
+  }
+
+  // The two error shapes for a missing extension, kept next to each other so
+  // the hints stay consistent between the tools that raise them.
+  static json pgss_missing() {
+    return {
+      {"error", "pg_stat_statements is not installed"},
+      {"hint", "Add 'pg_stat_statements' to shared_preload_libraries in "
+               "postgresql.conf, restart PostgreSQL, then run: "
+               "CREATE EXTENSION pg_stat_statements;"}
+    };
+  }
+
+  static json pgstattuple_missing() {
+    return {
+      {"error", "pgstattuple is not installed"},
+      {"hint", "Run: CREATE EXTENSION pgstattuple;"}
+    };
+  }
+
   // Fail fast on an unusable default connection, matching the previous
   // behaviour where the constructor connected eagerly.
   void probe() {
@@ -1542,6 +1615,13 @@ private:
     Session sess{active_cfg()};
     pqxx::work& txn = sess.txn();
 
+    // Qualified with the schema the extension was installed into; see
+    // extension_schema. An empty answer is "not installed", which is the same
+    // outcome the 42P01 catch below reports -- it is checked up front so the
+    // caller gets that answer whatever their search_path looks like.
+    const std::string pgss = extension_schema(txn, "pg_stat_statements");
+    if (pgss.empty()) return pgss_missing();
+
     // pg_stat_statements_info.dealloc counts how many times the extension has
     // evicted its least-used entries because pg_stat_statements.max was
     // exceeded. A climbing dealloc means this list is not the slowest queries
@@ -1593,7 +1673,7 @@ private:
                        'database',         d.datname
                      )" + since + pg18 + R"(
                      ) AS row_json
-              FROM pg_stat_statements AS pss
+              FROM )" + pgss + R"(.pg_stat_statements AS pss
               LEFT JOIN pg_roles AS r ON r.oid = pss.userid
               LEFT JOIN pg_database AS d ON d.oid = pss.dbid
               WHERE ($2 = '' OR pss.queryid = $2::bigint)
@@ -1603,7 +1683,7 @@ private:
           ) sub), '[]'::jsonb),
         'info', (SELECT JSONB_BUILD_OBJECT(
                    'dealloc', i.dealloc, 'stats_reset', i.stats_reset)
-                 FROM pg_stat_statements_info AS i),
+                 FROM )" + pgss + R"(.pg_stat_statements_info AS i),
         -- missing_ok, so a server where the GUC is absent yields null rather
         -- than an error that would mask the real result.
         'max', current_setting('pg_stat_statements.max', true)
@@ -1625,12 +1705,10 @@ private:
       }
     } catch (const pqxx::sql_error& e) {
       if (e.sqlstate() == "42P01") { // undefined_table
-        return {
-          {"error", "pg_stat_statements is not installed"},
-          {"hint", "Add 'pg_stat_statements' to shared_preload_libraries in "
-                   "postgresql.conf, restart PostgreSQL, then run: "
-                   "CREATE EXTENSION pg_stat_statements;"}
-        };
+        // The view was there when its schema was resolved, so it has since
+        // moved or been dropped; forget the location and report it missing.
+        forget_extension_schema("pg_stat_statements");
+        return pgss_missing();
       }
       throw;
     }
@@ -2674,6 +2752,11 @@ private:
     json stats = nullptr;
 
     if (!queryid.empty()) {
+      // Schema-qualified from pg_extension rather than left to search_path;
+      // see extension_schema.
+      const std::string pgss = extension_schema(txn, "pg_stat_statements");
+      if (pgss.empty()) return pgss_missing();
+
       // Full, untruncated text: recovering it is the whole point of the
       // queryid path, so this deliberately omits statementStats' LEFT(query,500).
       std::string q = R"(
@@ -2696,7 +2779,7 @@ private:
                  'database_oid',     pss.dbid::text,
                  'is_current_db',    COALESCE(d.datname = current_database(), false)
                )
-        FROM pg_stat_statements AS pss
+        FROM )" + pgss + R"(.pg_stat_statements AS pss
         LEFT JOIN pg_roles AS r ON r.oid = pss.userid
         LEFT JOIN pg_database AS d ON d.oid = pss.dbid
         WHERE pss.queryid = $1::bigint
@@ -2718,12 +2801,8 @@ private:
         stats = json::parse(res[0][0].as<std::string>());
       } catch (const pqxx::sql_error& e) {
         if (e.sqlstate() == "42P01") { // undefined_table
-          return {
-            {"error", "pg_stat_statements is not installed"},
-            {"hint", "Add 'pg_stat_statements' to shared_preload_libraries in "
-                     "postgresql.conf, restart PostgreSQL, then run: "
-                     "CREATE EXTENSION pg_stat_statements;"}
-          };
+          forget_extension_schema("pg_stat_statements");
+          return pgss_missing();
         }
         throw;
       }
@@ -2932,6 +3011,13 @@ private:
     Session sess{active_cfg()};
     pqxx::work& txn = sess.txn();
 
+    // Schema-qualified from pg_extension rather than left to search_path; see
+    // extension_schema. pgstattuple is the extension most often installed
+    // somewhere other than public, since it is an operator's tool rather than
+    // part of any application's schema.
+    const std::string pgst = extension_schema(txn, "pgstattuple");
+    if (pgst.empty()) return pgstattuple_missing();
+
     // pgstattuple() does a full sequential scan (real I/O on large tables);
     // pgstattuple_approx() uses the visibility map for a cheap estimate.
     // Field names are normalized across both so callers don't need to branch
@@ -2952,7 +3038,7 @@ private:
                  'free_percent',       bt.free_percent
                )
              END
-      FROM pgstattuple(
+      FROM )" + pgst + R"(.pgstattuple(
              (SELECT oid FROM pg_class WHERE relnamespace = $1::regnamespace AND relname = $2)
            ) AS bt;
     )" : R"(
@@ -2971,7 +3057,7 @@ private:
                  'free_percent',       bt.approx_free_percent
                )
              END
-      FROM pgstattuple_approx(
+      FROM )" + pgst + R"(.pgstattuple_approx(
              (SELECT oid FROM pg_class WHERE relnamespace = $1::regnamespace AND relname = $2)
            ) AS bt;
     )";
@@ -2986,10 +3072,11 @@ private:
       }
     } catch (const pqxx::sql_error& e) {
       if (e.sqlstate() == "42883") { // undefined_function
-        return {
-          {"error", "pgstattuple is not installed"},
-          {"hint", "Run: CREATE EXTENSION pgstattuple;"}
-        };
+        // The extension was there when its schema was resolved, so it has
+        // since moved or been dropped; forget the location so the next call
+        // looks it up again.
+        forget_extension_schema("pgstattuple");
+        return pgstattuple_missing();
       }
       throw;
     }
