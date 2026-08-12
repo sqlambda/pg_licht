@@ -1,5 +1,17 @@
 # Changelog
 
+## 3.0.1 (2026-08-12)
+
+### Fixed
+
+- **Extensions installed outside `public` are now found.** `tableBloat`, `statementStats` and `explainQuery`'s `queryid` path referenced `pgstattuple`, `pgstattuple_approx`, `pg_stat_statements` and `pg_stat_statements_info` unqualified, and so depended on the extension's schema happening to be on the connecting role's `search_path`. It commonly is not: `CREATE EXTENSION ... SCHEMA extensions` is ordinary practice for keeping operator tooling out of an application's schemas, and a hardened cluster keeps extensions out of `public` entirely. The tools reported "pgstattuple is not installed" for an extension that was plainly installed, and the hint told the operator to run a `CREATE EXTENSION` that would then fail as already existing — a dead end.
+
+  Each extension's schema is now read from `pg_extension` and every object reference is qualified with it. A `search_path` could not have fixed this: the server sets no session state, because the target deployment is a transaction-mode pooler that discards it, and PgBouncer rejects a GUC passed through the `options` connection keyword outright.
+
+  The location is resolved once per configured connection and remembered, since one connection addresses one database for the life of the process. Only a positive answer is cached — caching "not installed" would pin that verdict until a restart, so a `CREATE EXTENSION` run in response to the tool's own hint would never be picked up — and a remembered location is discarded whenever the object turns out not to be there, so `ALTER EXTENSION ... SET SCHEMA` is picked up on the next call.
+
+  The test fixtures now install `pgstattuple` and `pg_stat_statements` into a schema that is on no `search_path`, which makes every existing `tableBloat`, `statementStats` and `explainQuery` test a regression test for this: eleven of them fail against the previous code.
+
 ## 3.0.0 (2026-08-06)
 
 ### Breaking

@@ -1,7 +1,7 @@
 .\" Copyright (c) 2026 Daniel Cristian.
 .\" Licensed under the Apache License, Version 2.0; see LICENSE.
 .\"
-.Dd August 4, 2026
+.Dd August 12, 2026
 .Dt PG_LICHT_MCP 1
 .Os pg-licht
 .Sh NAME
@@ -210,6 +210,42 @@ connection.
 Arguments shown as
 .Ar name
 are required.
+.Ss Extension schemas
+Operations backed by an extension
+.Pq Ic statementStats , Ic explainQuery No and Ic tableBloat
+locate its objects through
+.Li pg_extension
+and reference them schema-qualified.
+The extension therefore does not have to be installed in
+.Li public ,
+and does not have to be on any
+.Va search_path :
+.Ql "CREATE EXTENSION pgstattuple SCHEMA extensions"
+works exactly as an installation into
+.Li public
+does.
+.Pp
+This cannot be solved with a
+.Va search_path
+instead.
+.Nm
+sets no session state, because the target deployment is a transaction-mode
+pooler that discards it, and PgBouncer rejects a GUC passed through the
+.Va options
+connection keyword outright.
+.Pp
+The location of each extension is resolved once per configured connection and
+remembered for the life of the process, since one connection addresses one
+database.
+It is looked up again after any failure to find the object, so an extension
+installed
+.Pq or moved with Ql "ALTER EXTENSION ... SET SCHEMA"
+while
+.Nm
+is running is picked up on the next call.
+An extension that is absent is reported as not installed, with the hint naming
+the setup steps; see
+.Sx DIAGNOSTICS .
 .Ss Schema exploration
 .Bl -tag -width Ds
 .It Ic listSchemas

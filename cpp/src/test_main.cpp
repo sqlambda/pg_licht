@@ -204,7 +204,17 @@ protected:
       txn.exec("ALTER TABLE grocery.bare_notes ADD COLUMN price grocery.positive_amount");
 
       txn.exec("CREATE EXTENSION IF NOT EXISTS postgres_fdw");
-      txn.exec("CREATE EXTENSION IF NOT EXISTS pgstattuple");
+
+      // Deliberately NOT in public, and in a schema that is on nobody's
+      // search_path: "extensions" is the usual convention for keeping an
+      // operator's tooling out of the application's schemas, and an
+      // unqualified pgstattuple() cannot resolve here. Every tableBloat test
+      // below is therefore also a regression test for schema qualification --
+      // they all failed with "pgstattuple is not installed" when the tool
+      // relied on name resolution.
+      txn.exec("CREATE SCHEMA extensions");
+      txn.exec("COMMENT ON SCHEMA extensions IS 'operator tooling, off the default search_path'");
+      txn.exec("CREATE EXTENSION IF NOT EXISTS pgstattuple SCHEMA extensions");
       txn.exec(
         "CREATE SERVER grocery_remote FOREIGN DATA WRAPPER postgres_fdw"
         " OPTIONS (host 'localhost', dbname 'probe', port '5432')"
@@ -2632,8 +2642,13 @@ protected:
 
       pqxx::connection c(url);
       {
+        // In a schema of its own, off the default search_path, for the same
+        // reason as pgstattuple in the main fixture: statementStats and
+        // explainQuery's queryid path have to find the view by catalog
+        // lookup, not by hoping it is in public.
         pqxx::work t(c);
-        t.exec("CREATE EXTENSION pg_stat_statements");
+        t.exec("CREATE SCHEMA extensions");
+        t.exec("CREATE EXTENSION pg_stat_statements SCHEMA extensions");
         t.commit();
       }
       {
@@ -2643,7 +2658,7 @@ protected:
         // shared_preload_libraries". Probe the view itself so the suite skips
         // in that case instead of failing every test body.
         pqxx::work t(c);
-        t.exec("SELECT 1 FROM pg_stat_statements LIMIT 1");
+        t.exec("SELECT 1 FROM extensions.pg_stat_statements LIMIT 1");
         t.commit();
       }
       {
@@ -2682,7 +2697,7 @@ protected:
     pqxx::connection c(url);
     pqxx::work t(c);
     pqxx::result r = t.exec(
-      "SELECT queryid::text FROM pg_stat_statements "
+      "SELECT queryid::text FROM extensions.pg_stat_statements "
       "WHERE query ILIKE 'SELECT count(*) FROM pg_class%' "
       "AND dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) "
       "ORDER BY total_exec_time DESC LIMIT 1");
@@ -2855,7 +2870,7 @@ TEST_F(PgssMCPServerTest, QueryIdFromADroppedDatabaseIsReportedNotCrashed) {
     pqxx::connection c(url);
     pqxx::work t(c);
     pqxx::result r = t.exec(
-      "SELECT queryid::text FROM pg_stat_statements "
+      "SELECT queryid::text FROM extensions.pg_stat_statements "
       "WHERE query ILIKE '%zzz_victim_marker%' ORDER BY total_exec_time DESC LIMIT 1");
     if (!r.empty()) qid = r[0][0].as<std::string>();
   }
