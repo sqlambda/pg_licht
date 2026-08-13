@@ -292,6 +292,31 @@ protected:
       // report the storage parameter rather than the server-wide default.
       txn.exec("ALTER TABLE grocery.index_zoo SET (autovacuum_freeze_max_age = 100000000)");
 
+      // One index per access method indexBloat has to tell apart. They live on
+      // index_zoo rather than on users so the index counts asserted elsewhere
+      // stay put. The GIN index carries explicit fastupdate and
+      // gin_pending_list_limit settings, since those are what make its
+      // pending_pages readable and the tool reports them alongside.
+      txn.exec("CREATE TABLE grocery.index_ams (id INT, doc TEXT, tags TEXT[], box_col BOX)");
+      txn.exec("INSERT INTO grocery.index_ams(id, doc, tags, box_col)"
+               " SELECT g, 'doc ' || g, ARRAY['t' || (g % 7), 'all'],"
+               "        BOX(POINT(g, g), POINT(g + 1, g + 1))"
+               " FROM generate_series(1, 500) AS g");
+      txn.exec("CREATE INDEX ams_btree ON grocery.index_ams (id)");
+      txn.exec("CREATE INDEX ams_gin   ON grocery.index_ams USING gin (tags)"
+               " WITH (fastupdate = on, gin_pending_list_limit = 128)");
+      txn.exec("CREATE INDEX ams_hash  ON grocery.index_ams USING hash (id)");
+      // gist has no pgstattuple function at all; the tool must say so by name
+      // rather than fail with a bare error from the wrong function.
+      txn.exec("CREATE INDEX ams_gist  ON grocery.index_ams USING gist (box_col)");
+      txn.exec("ANALYZE grocery.index_ams");
+
+      // A partitioned index is a catalog entry with no storage of its own.
+      txn.exec("CREATE TABLE grocery.index_parted (id INT, val TEXT) PARTITION BY RANGE (id)");
+      txn.exec("CREATE TABLE grocery.index_parted_p1 PARTITION OF grocery.index_parted"
+               " FOR VALUES FROM (0) TO (100)");
+      txn.exec("CREATE INDEX parted_id_idx ON grocery.index_parted (id)");
+
       txn.exec("GRANT USAGE ON SCHEMA grocery TO PUBLIC");
       txn.exec("GRANT SELECT ON grocery.users TO PUBLIC");
       txn.exec("GRANT EXECUTE ON FUNCTION grocery.get_user_count() TO PUBLIC");
@@ -1694,6 +1719,106 @@ TEST_F(PostgresMCPServerTest, TableBloatExactReturnsExpectedFields) {
 TEST_F(PostgresMCPServerTest, TableBloatUnknownTableReturnsEmpty) {
   json result = srv->call_table_bloat("grocery", "does_not_exist", false);
   EXPECT_TRUE(result.empty());
+}
+
+// --- indexBloat ---
+//
+// pgstattuple lives in the "extensions" schema in this fixture (see
+// SetUpTestSuite), so every one of these also exercises schema qualification:
+// none of the three functions is reachable through the default search_path.
+
+TEST_F(PostgresMCPServerTest, IndexBloatBtreeReturnsPgstatindexFields) {
+  json r = srv->call_index_bloat("grocery", "ams_btree");
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  EXPECT_EQ(r["access_method"].get<std::string>(), "btree");
+  EXPECT_EQ(r["index"].get<std::string>(), "ams_btree");
+  EXPECT_EQ(r["table"].get<std::string>(), "index_ams");
+  EXPECT_EQ(r["schema"].get<std::string>(), "grocery");
+  for (const char* f : {"version", "tree_level", "root_block_no", "internal_pages",
+                        "leaf_pages", "empty_pages", "deleted_pages",
+                        "avg_leaf_density", "leaf_fragmentation"})
+    EXPECT_TRUE(r.contains(f)) << f << " missing from " << r.dump(2);
+  EXPECT_GT(r["index_size"].get<long long>(), 0);
+  EXPECT_GT(r["leaf_pages"].get<long long>(), 0);
+  // GIN-only fields must not leak onto a btree result.
+  EXPECT_FALSE(r.contains("pending_pages"));
+  EXPECT_FALSE(r.contains("fastupdate"));
+}
+
+TEST_F(PostgresMCPServerTest, IndexBloatGinReturnsPendingListWithItsBounds) {
+  json r = srv->call_index_bloat("grocery", "ams_gin");
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  EXPECT_EQ(r["access_method"].get<std::string>(), "gin");
+  ASSERT_TRUE(r.contains("pending_pages")) << r.dump(2);
+  ASSERT_TRUE(r.contains("pending_tuples"));
+  EXPECT_TRUE(r.contains("version"));
+  EXPECT_GE(r["pending_pages"].get<long long>(), 0);
+
+  // pending_pages is only interpretable against the settings that bound it,
+  // so the tool reports them alongside; both were set explicitly on this index.
+  EXPECT_EQ(r["fastupdate"].get<std::string>(), "on");
+  EXPECT_EQ(r["pending_list_limit_kb"].get<std::string>(), "128");
+
+  // btree-only fields must not leak onto a GIN result.
+  EXPECT_FALSE(r.contains("leaf_fragmentation"));
+  EXPECT_FALSE(r.contains("avg_leaf_density"));
+}
+
+TEST_F(PostgresMCPServerTest, IndexBloatHashReturnsBucketAndOverflowPages) {
+  json r = srv->call_index_bloat("grocery", "ams_hash");
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  EXPECT_EQ(r["access_method"].get<std::string>(), "hash");
+  for (const char* f : {"version", "bucket_pages", "overflow_pages", "bitmap_pages",
+                        "unused_pages", "live_items", "dead_items", "free_percent"})
+    EXPECT_TRUE(r.contains(f)) << f << " missing from " << r.dump(2);
+  EXPECT_GT(r["bucket_pages"].get<long long>(), 0);
+  EXPECT_FALSE(r.contains("leaf_pages"));
+}
+
+// The point of resolving the access method from the catalog: a gist index
+// must produce a stated answer naming what is supported, not the bare
+// "relation is not a btree index" that pgstatindex would raise.
+TEST_F(PostgresMCPServerTest, IndexBloatUnsupportedAccessMethodIsNamed) {
+  json r = srv->call_index_bloat("grocery", "ams_gist");
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  EXPECT_NE(r["error"].get<std::string>().find("gist"), std::string::npos);
+  EXPECT_EQ(r["access_method"].get<std::string>(), "gist");
+  ASSERT_TRUE(r.contains("hint"));
+  EXPECT_NE(r["hint"].get<std::string>().find("pageinspect"), std::string::npos);
+}
+
+TEST_F(PostgresMCPServerTest, IndexBloatPartitionedIndexHasNoStorageOfItsOwn) {
+  json r = srv->call_index_bloat("grocery", "parted_id_idx");
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  EXPECT_NE(r["error"].get<std::string>().find("partitioned index"), std::string::npos);
+  EXPECT_TRUE(r.contains("hint"));
+}
+
+TEST_F(PostgresMCPServerTest, IndexBloatOnATableSaysToUseTableBloat) {
+  json r = srv->call_index_bloat("grocery", "users");
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  EXPECT_NE(r["error"].get<std::string>().find("is not an index"), std::string::npos);
+  EXPECT_NE(r["hint"].get<std::string>().find("tableBloat"), std::string::npos);
+}
+
+// An unknown name is a stated result, not an exception -- and an unknown
+// schema must behave the same, which a ::regnamespace cast would not.
+TEST_F(PostgresMCPServerTest, IndexBloatUnknownIndexAndSchemaAreReportedNotThrown) {
+  json r = srv->call_index_bloat("grocery", "does_not_exist");
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  EXPECT_NE(r["error"].get<std::string>().find("no relation named"), std::string::npos);
+
+  json s = srv->call_index_bloat("no_such_schema", "does_not_exist");
+  ASSERT_TRUE(s.contains("error")) << s.dump(2);
+  EXPECT_NE(s["error"].get<std::string>().find("no relation named"), std::string::npos);
+}
+
+TEST_F(PostgresMCPServerTest, IndexBloatIsRegisteredAsATool) {
+  json tools = srv->call_tools_list();
+  bool found = false;
+  for (const auto& t : tools)
+    if (t.value("name", "") == "indexBloat") found = true;
+  EXPECT_TRUE(found) << "indexBloat missing from tools/list";
 }
 
 // --- currentActivity enrichment ---

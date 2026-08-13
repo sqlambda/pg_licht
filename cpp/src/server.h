@@ -170,6 +170,13 @@ public:
   const json call_table_bloat(const std::string& schema, const std::string& table_name, bool exact) {
     return table_bloat(schema, table_name, exact);
   }
+  const json call_index_bloat(const std::string& schema, const std::string& index_name) {
+    return index_bloat(schema, index_name);
+  }
+  // The tools array as tools/list advertises it, so a query method that exists
+  // but was never registered -- and is therefore unreachable by any client --
+  // fails the suite rather than passing it.
+  const json call_tools_list() { return get_tools_list()["tools"]; }
   const json call_check_key(const std::string& schema, const std::string& table_name, const json& values) {
     return check_key(schema, table_name, values);
   }
@@ -288,6 +295,21 @@ private:
     return {
       {"error", "pgstattuple is not installed"},
       {"hint", "Run: CREATE EXTENSION pgstattuple;"}
+    };
+  }
+
+  // Every pgstattuple function is installed with EXECUTE revoked from PUBLIC
+  // and granted to pg_stat_scan_tables, so a perfectly valid read-only role
+  // gets SQLSTATE 42501 rather than an answer. Left as a raw exception that
+  // reads as an internal failure, it sends the caller looking for a bug
+  // instead of asking for the one grant that fixes it.
+  static json pgstattuple_denied(const std::string& func, const std::string& detail) {
+    return {
+      {"error", "permission denied for " + func},
+      {"hint", "pgstattuple's functions have EXECUTE revoked from PUBLIC and "
+               "granted to pg_stat_scan_tables. Run: GRANT pg_stat_scan_tables "
+               "TO <role>; (or grant EXECUTE on the function directly)"},
+      {"detail", detail}
     };
   }
 
@@ -840,6 +862,19 @@ private:
 		    {"exact",  {{"type", "boolean"}}}
 		  }},
 		{"required", {"schema", "table"}}
+	      }}
+	  },
+	  {
+	    {"name", "indexBloat"},
+	    {"description", "return physical statistics for one index, from whichever pgstattuple function matches its access method: pgstatindex for btree (tree level, leaf/internal/empty/deleted pages, average leaf density, leaf fragmentation), pgstatginindex for GIN (pending list pages and tuples, alongside the fastupdate setting and pending list limit that bound them), pgstathashindex for hash (bucket/overflow/bitmap/unused pages, live and dead items, free percent). The access method is resolved from the catalog, so the caller does not need to know it; gist, spgist and brin are reported as unsupported by name, since pgstattuple has no function for them. Metrics are deliberately NOT normalized across access methods -- 'access_method' says which set came back. Index size and idx_scan travel with the metrics, because a fragmented index nothing has scanned is a candidate for dropping rather than REINDEX. btree and hash read the whole index; GIN reads only the metapage and is always cheap"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", {
+		    {"schema", {{"type", "string"}}},
+		    {"index",  {{"type", "string"},
+				{"description", "the index's own name, not the name of the table it is on"}}}
+		  }},
+		{"required", {"schema", "index"}}
 	      }}
 	  },
 	  {
@@ -3078,6 +3113,217 @@ private:
         forget_extension_schema("pgstattuple");
         return pgstattuple_missing();
       }
+      if (e.sqlstate() == "42501") // insufficient_privilege
+        return pgstattuple_denied("pgstattuple", e.what());
+      throw;
+    }
+  }
+
+  // Compare a pg_extension.extversion against a major.minor floor. Only the
+  // first two components are considered, which is all pgstattuple has ever
+  // used, and an unparsable version is treated as too old rather than assumed
+  // current -- guessing high turns a clear "upgrade the extension" answer into
+  // an undefined-function error.
+  static bool extversion_at_least(const std::string& v, int want_major, int want_minor) {
+    int major = 0, minor = 0;
+    size_t i = 0;
+    if (i >= v.size() || !std::isdigit(static_cast<unsigned char>(v[i]))) return false;
+    while (i < v.size() && std::isdigit(static_cast<unsigned char>(v[i])))
+      major = major * 10 + (v[i++] - '0');
+    if (i < v.size() && v[i] == '.') {
+      i++;
+      while (i < v.size() && std::isdigit(static_cast<unsigned char>(v[i])))
+        minor = minor * 10 + (v[i++] - '0');
+    }
+    return major > want_major || (major == want_major && minor >= want_minor);
+  }
+
+  // Physical statistics for one index, from whichever pgstattuple function
+  // fits its access method.
+  //
+  // The access method is resolved here rather than asked of the caller. The
+  // three functions have nothing in common -- different names, disjoint
+  // column sets, and one of them (pgstatindex) raises a bare "is not a btree
+  // index" when pointed at the wrong kind -- so a caller made to choose would
+  // have to look the index up first, which is the work this tool exists to do.
+  //
+  // The returned metrics are deliberately NOT normalized across access
+  // methods, unlike tableBloat's exact/approx pair: leaf_fragmentation and
+  // pending_tuples are not two spellings of one quantity, and flattening them
+  // into shared field names would invent a comparison that does not exist.
+  // 'access_method' names which set came back.
+  const json index_bloat(const std::string& schema, const std::string& index_name) {
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
+
+    const std::string pgst = extension_schema(txn, "pgstattuple");
+    if (pgst.empty()) return pgstattuple_missing();
+
+    // Matched through pg_namespace by name rather than by casting to
+    // regnamespace: the cast raises on a schema that does not exist, and
+    // "no such index" should come back from a diagnostic tool as a stated
+    // result, not as an exception.
+    //
+    // The size and scan count travel with the metrics because they are what
+    // the metrics get weighed against -- a fragmented index nobody has
+    // scanned since the last statistics reset is a candidate for dropping,
+    // not for REINDEX, and that call cannot be made from density alone.
+    const std::string meta_q = R"(
+      SELECT JSONB_BUILD_OBJECT(
+               'oid',           c.oid::text,
+               'relkind',       c.relkind::text,
+               'access_method', COALESCE(am.amname, ''),
+               'schema',        n.nspname,
+               'index',         c.relname,
+               'table',         COALESCE(t.relname, ''),
+               'index_size',    pg_relation_size(c.oid),
+               'idx_scan',      s.idx_scan,
+               -- GIN's pending list is only populated when fastupdate is on,
+               -- and its size is bounded by the reloption if set and by the
+               -- GUC otherwise. pending_pages without them is a number with
+               -- no threshold to read it against.
+               'fastupdate',    (SELECT o.option_value
+                                 FROM pg_options_to_table(c.reloptions) AS o
+                                 WHERE o.option_name = 'fastupdate'),
+               'pending_list_limit_kb',
+                                COALESCE((SELECT o.option_value
+                                          FROM pg_options_to_table(c.reloptions) AS o
+                                          WHERE o.option_name = 'gin_pending_list_limit'),
+                                         current_setting('gin_pending_list_limit', true)),
+               'extension_version',
+                                (SELECT e.extversion FROM pg_extension AS e
+                                 WHERE e.extname = 'pgstattuple')
+             )
+      FROM pg_class AS c
+      JOIN pg_namespace AS n ON n.oid = c.relnamespace
+      LEFT JOIN pg_am AS am ON am.oid = c.relam
+      LEFT JOIN pg_index AS i ON i.indexrelid = c.oid
+      LEFT JOIN pg_class AS t ON t.oid = i.indrelid
+      LEFT JOIN pg_stat_all_indexes AS s ON s.indexrelid = c.oid
+      WHERE n.nspname = $1 AND c.relname = $2;
+    )";
+
+    pqxx::result mres = pqxx_exec(txn, meta_q, pqxx::params{schema, index_name});
+    if (mres.empty() || mres[0][0].is_null()) {
+      return {
+        {"error", "no relation named \"" + schema + "\".\"" + index_name + "\""},
+        {"hint", "indexes are listed per table by tableDetails, and across a "
+                 "schema by duplicateIndexes"}
+      };
+    }
+
+    json meta = json::parse(mres[0][0].as<std::string>());
+    const std::string relkind = json_str(meta, "relkind");
+    const std::string am      = json_str(meta, "access_method");
+
+    // A partitioned index is a catalog entry with no storage of its own; the
+    // pages belong to the per-partition indexes underneath it.
+    if (relkind == "I") {
+      return {
+        {"error", "\"" + schema + "\".\"" + index_name +
+                  "\" is a partitioned index and has no storage of its own"},
+        {"hint", "inspect the index on an individual partition instead; "
+                 "tableDetails on a partition lists them"},
+        {"access_method", am}
+      };
+    }
+    if (relkind != "i") {
+      return {
+        {"error", "\"" + schema + "\".\"" + index_name + "\" is not an index"},
+        {"hint", relkind == "r" || relkind == "m" || relkind == "p"
+                   ? "it looks like a table or materialized view; use tableBloat"
+                   : "indexes are listed per table by tableDetails"}
+      };
+    }
+
+    // gist, spgist and brin have no pgstattuple support at all. Saying so,
+    // and naming what is supported, is the whole difference between a dead
+    // end and a caller who knows to reach for pageinspect.
+    static const std::map<std::string, std::string> FUNCS = {
+      {"btree", "pgstatindex"},
+      {"gin",   "pgstatginindex"},
+      {"hash",  "pgstathashindex"},
+    };
+    auto fn = FUNCS.find(am);
+    if (fn == FUNCS.end()) {
+      return {
+        {"error", "pgstattuple has no statistics function for a " +
+                  (am.empty() ? std::string("(unknown)") : am) + " index"},
+        {"hint", "supported access methods are btree, gin and hash; for gist, "
+                 "spgist and brin the page-level detail is in the pageinspect "
+                 "extension instead"},
+        {"access_method", am}
+      };
+    }
+
+    // pgstathashindex arrived in pgstattuple 1.5. An extension created before
+    // that and never ALTER EXTENSION ... UPDATE'd is a live catalog entry
+    // missing exactly this function, which would otherwise surface as the
+    // extension being absent -- it is not, it is out of date.
+    const std::string extver = json_str(meta, "extension_version");
+    if (fn->second == "pgstathashindex" && !extversion_at_least(extver, 1, 5)) {
+      return {
+        {"error", "pgstathashindex requires pgstattuple 1.5, but version " +
+                  (extver.empty() ? std::string("(unknown)") : extver) +
+                  " is installed"},
+        {"hint", "Run: ALTER EXTENSION pgstattuple UPDATE;"},
+        {"access_method", am}
+      };
+    }
+
+    // Column lists per access method, spelled out rather than SELECT *: the
+    // shape is part of this tool's contract, and a column added by a future
+    // extension version should not silently change it.
+    static const std::map<std::string, std::string> COLUMNS = {
+      {"btree",
+       "'version', s.version, 'tree_level', s.tree_level,"
+       " 'root_block_no', s.root_block_no, 'internal_pages', s.internal_pages,"
+       " 'leaf_pages', s.leaf_pages, 'empty_pages', s.empty_pages,"
+       " 'deleted_pages', s.deleted_pages, 'avg_leaf_density', s.avg_leaf_density,"
+       " 'leaf_fragmentation', s.leaf_fragmentation"},
+      {"gin",
+       "'version', s.version, 'pending_pages', s.pending_pages,"
+       " 'pending_tuples', s.pending_tuples"},
+      {"hash",
+       "'version', s.version, 'bucket_pages', s.bucket_pages,"
+       " 'overflow_pages', s.overflow_pages, 'bitmap_pages', s.bitmap_pages,"
+       " 'unused_pages', s.unused_pages, 'live_items', s.live_items,"
+       " 'dead_items', s.dead_items, 'free_percent', s.free_percent"},
+    };
+
+    // The oid is resolved above and passed back as text, so the function
+    // argument is a bind parameter and not the caller's identifier.
+    const std::string stat_q =
+      "SELECT JSONB_BUILD_OBJECT(" + COLUMNS.at(am) + ")"
+      " FROM " + pgst + "." + fn->second + "($1::oid::regclass) AS s;";
+
+    try {
+      pqxx::result res = pqxx_exec(txn, stat_q, pqxx::params{json_str(meta, "oid")});
+      if (res.empty() || res[0][0].is_null()) return {};
+
+      json out = json::parse(res[0][0].as<std::string>());
+      out["schema"]        = meta["schema"];
+      out["index"]         = meta["index"];
+      out["table"]         = meta["table"];
+      out["access_method"] = am;
+      out["index_size"]    = meta["index_size"];
+      out["idx_scan"]      = meta["idx_scan"];
+      // Only meaningful for GIN, and misleading anywhere else.
+      if (am == "gin") {
+        // fastupdate defaults to on, and the reloption is absent until it is
+        // set explicitly, so a null here is "on" rather than "unknown".
+        out["fastupdate"] = meta["fastupdate"].is_null()
+          ? json("on") : meta["fastupdate"];
+        out["pending_list_limit_kb"] = meta["pending_list_limit_kb"];
+      }
+      return out;
+    } catch (const pqxx::sql_error& e) {
+      if (e.sqlstate() == "42883") { // undefined_function
+        forget_extension_schema("pgstattuple");
+        return pgstattuple_missing();
+      }
+      if (e.sqlstate() == "42501") // insufficient_privilege
+        return pgstattuple_denied(fn->second, e.what());
       throw;
     }
   }
@@ -4399,6 +4645,11 @@ private:
 	  std::string target_table  = arguments.contains("table")  ? arguments["table"].get<std::string>()  : "";
 	  bool exact = arguments.contains("exact") ? arguments["exact"].get<bool>() : false;
 	  result_content = table_bloat(target_schema, target_table, exact);
+	}
+	else if (tool_name == "indexBloat") {
+	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+	  std::string target_index  = arguments.contains("index")  ? arguments["index"].get<std::string>()  : "";
+	  result_content = index_bloat(target_schema, target_index);
 	}
 	else if (tool_name == "checkKey") {
 	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
