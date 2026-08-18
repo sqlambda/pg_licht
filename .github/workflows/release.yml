@@ -188,6 +188,25 @@ jobs:
 
       - name: Create GitHub release
         run: |
+          # Idempotent, so re-running this job after a later step fails does not
+          # dead-end here. `gh release create` errors with "a release with the
+          # same tag name already exists", which aborts the job before the
+          # Homebrew step it was re-run to reach -- the release is made once,
+          # every step after it is not, and only the retry path notices.
+          if gh release view "${{ github.ref_name }}" --repo ${{ github.repository }} >/dev/null 2>&1; then
+            echo "Release ${{ github.ref_name }} exists; refreshing its assets."
+            gh release upload "${{ github.ref_name }}" \
+              --repo ${{ github.repository }} \
+              --clobber \
+              pg_licht_mcp-linux-x86_64.tar.gz \
+              pg_licht_mcp-linux-arm64.tar.gz \
+              pg_licht_mcp-linux-x86_64-debian13.deb \
+              pg_licht_mcp-linux-arm64-debian13.deb \
+              pg_licht_mcp-linux-x86_64-rocky9.rpm \
+              pg_licht_mcp-linux-arm64-rocky9.rpm \
+              pg_licht_mcp-macos-arm64.tar.gz
+            exit 0
+          fi
           gh release create ${{ github.ref_name }} \
             --repo ${{ github.repository }} \
             --title "pg_licht_mcp ${{ github.ref_name }}" \
@@ -211,13 +230,44 @@ jobs:
       - name: Update Homebrew formula
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_REPO: sqlambda/homebrew-pg-licht
         run: |
-          git clone "https://x-access-token:${TAP_TOKEN}@github.com/sqlambda/homebrew-pg-licht.git" tap
+          # A dead token reaches git as an empty or rejected credential, and git
+          # reports it as "Password authentication is not supported" -- which
+          # reads like the workflow tried to send a password, and sends whoever
+          # is debugging it after the wrong problem entirely. Diagnose it here
+          # instead, before anything is cloned or pushed.
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN is not set on this repository." \
+                 "Create a fine-grained PAT scoped to ${TAP_REPO} with" \
+                 "Contents: Read and write, then: gh secret set HOMEBREW_TAP_TOKEN"
+            exit 1
+          fi
+          if ! curl -sf -o /dev/null -H "Authorization: Bearer ${TAP_TOKEN}" \
+                 "https://api.github.com/repos/${TAP_REPO}"; then
+            echo "::error::HOMEBREW_TAP_TOKEN cannot read ${TAP_REPO} -- it is" \
+                 "expired, revoked, or not scoped to that repository." \
+                 "Fine-grained PATs default to a 30-day expiry; mint a new one" \
+                 "with Contents: Read and write and re-run this job."
+            exit 1
+          fi
+
+          # The tap is public, so the clone needs no credential. Keeping the
+          # token out of the clone URL also keeps it out of the checkout's
+          # .git/config, where any later `git remote -v` would print it.
+          git clone --depth 1 "https://github.com/${TAP_REPO}.git" tap
           cd tap
           sed -i "s|refs/tags/v[^/]*.tar.gz|refs/tags/${{ github.ref_name }}.tar.gz|" Formula/pg-licht.rb
           sed -i "s/sha256 \"[a-f0-9]\{64\}\"/sha256 \"${{ steps.sha.outputs.sha256 }}\"/" Formula/pg-licht.rb
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
           git add Formula/pg-licht.rb
-          git diff --cached --quiet || git commit -m "Update pg-licht to ${{ github.ref_name }}"
-          git push
+          if git diff --cached --quiet; then
+            echo "Formula already at ${{ github.ref_name }}; nothing to push."
+            exit 0
+          fi
+          git commit -m "Update pg-licht to ${{ github.ref_name }}"
+          # Credential supplied per-invocation rather than stored in the remote,
+          # so it lives only in this process and not on the runner's disk.
+          git push "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" \
+                   "HEAD:$(git rev-parse --abbrev-ref HEAD)"

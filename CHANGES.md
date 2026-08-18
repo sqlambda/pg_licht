@@ -1,6 +1,18 @@
 # Changelog
 
-## 3.1.0 (2026-08-12)
+## 3.1.1 (2026-08-18)
+
+### Fixed
+
+- **The release workflow no longer dead-ends when it is re-run.** `Create GitHub release` ran `gh release create` unconditionally, and that command fails with "a release with the same tag name already exists" once the release is there. The two steps that follow it — the source checksum and the Homebrew formula update — therefore became unreachable the moment anything after the release creation failed: the release is made once, everything after it is not, and re-running the job to reach those steps fails at the first one instead. Recovering meant deleting a published release, with its download links, to get back to a state the job could run from.
+
+  The step now checks whether the release exists and refreshes its assets with `gh release upload --clobber` instead, so the job is idempotent from the release onward and a re-run resumes at whatever actually failed. This is what stranded 3.1.0's tap update at 3.0.1.
+
+- **The Homebrew tap step says what is wrong with its token.** The step cloned the tap with the token embedded in the URL, so an expired or missing `HOMEBREW_TAP_TOKEN` surfaced as git's generic `remote: Invalid username or token. Password authentication is not supported for Git operations.` That message describes the credential git *fell back to*, not the one the workflow supplied, and it reads like the workflow transmitted a password — sending whoever is debugging it after a leak that never happened rather than after an expiry. Fine-grained tokens default to 30 days, so this is a failure the workflow should expect.
+
+  The token is now checked before anything is cloned: empty is reported as an unset secret, and a token the GitHub API rejects for the tap repository is reported as expired, revoked, or misscoped, each naming the permission to grant. The clone itself dropped the credential — the tap is public and never needed one — which also keeps the token out of the checkout's `.git/config`, and the push supplies it per-invocation rather than storing it in a remote.
+
+## 3.1.0 (2026-08-18)
 
 ### New tools
 
