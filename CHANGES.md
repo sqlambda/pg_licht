@@ -1,5 +1,23 @@
 # Changelog
 
+## 3.1.0 (2026-08-12)
+
+### New tools
+
+- **`indexBloat`** — physical statistics for one index, from whichever `pgstattuple` function fits its access method: `pgstatindex` for btree (tree level, internal/leaf/empty/deleted pages, average leaf density, leaf fragmentation), `pgstatginindex` for GIN (pending list pages and tuples), `pgstathashindex` for hash (bucket, overflow, bitmap and unused pages, live and dead items, free percent).
+
+  The access method is resolved from the catalog rather than asked of the caller. The three functions share no name and no columns, and `pgstatindex` raises a bare "is not a btree index" when pointed at the wrong kind — so a caller made to choose would first have to look the index up, which is the work this tool exists to do. `gist`, `spgist` and `brin` have no `pgstattuple` function at all and are reported as unsupported by name, pointing at `pageinspect`; a partitioned index is reported as having no storage of its own.
+
+  The metrics are deliberately **not** normalized across access methods, unlike `tableBloat`'s exact/approximate pair: `leaf_fragmentation` and `pending_tuples` are not two spellings of one quantity, and shared field names would invent a comparison that does not exist. `access_method` says which set came back.
+
+  GIN's `pending_pages` is returned alongside the `fastupdate` reloption and the effective `gin_pending_list_limit` — the pending list only exists when `fastupdate` is on, and its size is meaningless without the limit it is filling toward. It is also the one variant that is free: `pgstatginindex` reads the metapage only, where the btree and hash functions read the whole index.
+
+  `index_size` and `idx_scan` accompany every result, since a fragmented index that nothing has scanned since the last statistics reset is a candidate for dropping rather than for `REINDEX` — a call that cannot be made from density alone.
+
+### Fixed
+
+- **`tableBloat` now explains a permission failure instead of raising.** Every `pgstattuple` function is installed with `EXECUTE` revoked from `PUBLIC` and granted to `pg_stat_scan_tables`, so a role holding every read privilege on the data is still refused the statistics with SQLSTATE 42501. That surfaced as an unhandled exception reading like an internal fault, sending the caller after a bug rather than after the one grant that fixes it. Both `tableBloat` and `indexBloat` now return the error with the grant named.
+
 ## 3.0.1 (2026-08-12)
 
 ### Fixed

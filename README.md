@@ -35,7 +35,7 @@ Other install channels — deb, rpm, tarball, source — are in [INSTALL.md](INS
 
 ## Tools
 
-47 read-only operations, grouped as schema exploration, catalog search, cluster-wide
+48 read-only operations, grouped as schema exploration, catalog search, cluster-wide
 objects, extensibility and text search, foreign data and replication, monitoring and
 statistics, diagnostics and query planning, and connections. Highlights include
 `tableDetails` (columns, indexes, constraints, foreign keys in both directions, triggers,
@@ -50,8 +50,10 @@ checkpoints, backend-written buffers, WAL volume — normalized across the Postg
 with a completion percentage), `ioStats` (`pg_stat_io` per backend type and context, 16+),
 `tableIOStats` (cache hit ratio per table and per index), `duplicateIndexes` (identical and
 prefix-redundant indexes, compared by column expression, opclass, collation and sort order),
-and `hostCapacity` (memory settings against the host's actual RAM and vCPU count — see
-below).
+`indexBloat` (per-index physical statistics, dispatched on the access method — btree leaf
+density and fragmentation, GIN pending list against the `fastupdate` settings that bound it,
+hash bucket and overflow pages), and `hostCapacity` (memory settings against the host's
+actual RAM and vCPU count — see below).
 
 The monitoring tools take optional `pid` and `query_id` filters, so a symptom can be
 followed to its cause rather than read out of a full dump:
@@ -90,7 +92,7 @@ the tool, which takes precedence over both.
 
 | | |
 |---|---|
-| `man pg_licht_mcp` | configuration, connection strings, all 47 operations, MCP client setup |
+| `man pg_licht_mcp` | configuration, connection strings, all 48 operations, MCP client setup |
 | [INSTALL.md](INSTALL.md) | Homebrew, deb, rpm, tarball, verifying, uninstalling |
 | [BUILD.md](BUILD.md) | building from source, tests, sanitizers, CI, release process |
 | [CHANGES.md](CHANGES.md) | changelog |

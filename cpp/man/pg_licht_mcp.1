@@ -212,7 +212,7 @@ Arguments shown as
 are required.
 .Ss Extension schemas
 Operations backed by an extension
-.Pq Ic statementStats , Ic explainQuery No and Ic tableBloat
+.Pq Ic statementStats , Ic explainQuery , Ic tableBloat No and Ic indexBloat
 locate its objects through
 .Li pg_extension
 and reference them schema-qualified.
@@ -838,6 +838,69 @@ visibility-map-based approximation.
 Default
 .Dv false .
 .El
+.It Ic indexBloat Ar schema Ar index
+Physical statistics for one index, from whichever
+.Li pgstattuple
+function fits its access method.
+The access method is resolved from the catalog, so the caller does not need to
+know it in advance.
+.Pp
+.Bl -tag -width "spgist" -compact
+.It Li btree
+.Li pgstatindex :
+.Va version , tree_level , root_block_no , internal_pages , leaf_pages ,
+.Va empty_pages , deleted_pages , avg_leaf_density
+and
+.Va leaf_fragmentation .
+Reads the whole index.
+.It Li gin
+.Li pgstatginindex :
+.Va version , pending_pages
+and
+.Va pending_tuples ,
+reported together with the
+.Va fastupdate
+setting and the effective
+.Va pending_list_limit_kb
+that bound them.
+Reads only the metapage, so it is cheap on any size of index.
+.It Li hash
+.Li pgstathashindex :
+.Va version , bucket_pages , overflow_pages , bitmap_pages , unused_pages ,
+.Va live_items , dead_items
+and
+.Va free_percent .
+Reads the whole index.
+.El
+.Pp
+The metrics are deliberately not normalized across access methods, unlike
+.Ic tableBloat Ns 's
+exact and approximate pair:
+.Va leaf_fragmentation
+and
+.Va pending_tuples
+are not two spellings of one quantity.
+.Va access_method
+names which set was returned.
+.Pp
+.Va index_size
+and
+.Va idx_scan
+accompany every result, because they are what the metrics are weighed against:
+a fragmented index that nothing has scanned since the last statistics reset is
+a candidate for dropping rather than for
+.Ql REINDEX .
+.Pp
+.Li gist , spgist
+and
+.Li brin
+have no
+.Li pgstattuple
+function at all and are reported as unsupported by name; their page-level
+detail is in the
+.Li pageinspect
+extension instead.
+A partitioned index has no storage of its own and is reported as such.
 .It Ic checkKey Ar schema Ar table Ar values
 Check whether a row exists by primary key, single or composite.
 Value types are validated against the primary key column types before querying.
@@ -1117,7 +1180,35 @@ The returned hint gives the setup steps.
 An equivalent error is returned for
 .Li pgstattuple
 by
-.Ic tableBloat .
+.Ic tableBloat
+and
+.Ic indexBloat .
+.It Sy permission denied for ...
+Every
+.Li pgstattuple
+function is installed with EXECUTE revoked from
+.Li PUBLIC
+and granted to
+.Li pg_stat_scan_tables ,
+so a role with every read privilege on the data can still be refused the
+statistics.
+The hint names the grant.
+Affects
+.Ic tableBloat
+and
+.Ic indexBloat .
+.It Sy pgstattuple has no statistics function for a ... index
+The index uses
+.Li gist , spgist
+or
+.Li brin ,
+which the extension does not cover.
+The hint names the supported access methods and points at
+.Li pageinspect .
+.It Sy pgstathashindex requires pgstattuple 1.5
+The extension is installed but predates the hash index function.
+Run
+.Ql "ALTER EXTENSION pgstattuple UPDATE" .
 .It Sy SQLSTATE Er 25006
 A statement attempted to write inside the read-only transaction.
 This is the backstop described in
