@@ -7,6 +7,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A follow-up push supersedes the previous run of the same ref. Only
+# pull_request runs are cancelled: a tag run publishes the release and its
+# assets, so it must always be allowed to finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   # Pinned so every Linux target links the same libpqxx, built statically from
   # source, instead of whatever version each distro happens to package.
