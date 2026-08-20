@@ -215,6 +215,10 @@ protected:
       txn.exec("CREATE SCHEMA extensions");
       txn.exec("COMMENT ON SCHEMA extensions IS 'operator tooling, off the default search_path'");
       txn.exec("CREATE EXTENSION IF NOT EXISTS pgstattuple SCHEMA extensions");
+      // Same reasoning for pg_buffercache: out of public, so the buffer cache
+      // tools are exercised against a schema-qualified lookup rather than
+      // whatever happens to be on the role's search_path.
+      txn.exec("CREATE EXTENSION IF NOT EXISTS pg_buffercache SCHEMA extensions");
       txn.exec(
         "CREATE SERVER grocery_remote FOREIGN DATA WRAPPER postgres_fdw"
         " OPTIONS (host 'localhost', dbname 'probe', port '5432')"
@@ -3231,6 +3235,1210 @@ TEST(ConnectionConfigTest, FromUrlLeavesUriFormUntouched) {
   // libpq parses URI forms itself; appending keywords would corrupt them.
   auto reg = pglicht::ConnectionRegistry::from_url("postgresql://h/db", "app/1");
   EXPECT_EQ(reg.get("default").conninfo, "postgresql://h/db");
+}
+
+// --- connection topology ---
+
+TEST(ConnectionTopologyTest, TheShippedExampleFileParses) {
+  // The example is documentation that runs: if the parser gains a rule the
+  // example violates, this fails rather than shipping a file that would be
+  // rejected on the reader's first attempt.
+  //
+  // Parsed through a copy at mode 0600, not in place. Git records only the
+  // executable bit, so a checkout gets whatever the umask gives -- 0644 on a
+  // CI runner -- and from_ini refuses a group-readable config on the ~/.pgpass
+  // rule. That refusal is correct and has its own test; what this one is about
+  // is the content.
+  std::ifstream in(PGLICHT_EXAMPLE_INI);
+  ASSERT_TRUE(in) << "cannot read " << PGLICHT_EXAMPLE_INI;
+  std::stringstream body;
+  body << in.rdbuf();
+  ASSERT_FALSE(body.str().empty());
+
+  TempIni copy(body.str());
+  auto reg = pglicht::ConnectionRegistry::from_ini(copy.path(), "pg-licht-test");
+
+  EXPECT_EQ(reg.names().size(), 5u);
+  // Two declared instances plus one inferred from a shared host and port.
+  EXPECT_EQ(reg.instances().size(), 3u);
+  EXPECT_EQ(reg.replication_groups().size(), 2u);
+
+  EXPECT_EQ(reg.get("app_dev").instance_source, "inferred");
+  EXPECT_EQ(reg.get("app_prod").instance_source, "declared");
+  // Capacity declared once on the instance reaches its members.
+  EXPECT_EQ(reg.get("app_prod").capacity.ram_mb, 65536);
+  EXPECT_EQ(reg.get("app_prod").capacity.source, "instance section");
+  // A replica on a deliberately smaller box: proof that inheritance follows
+  // the instance and not the replication group.
+  EXPECT_EQ(reg.get("app_ro").capacity.ram_mb, 16384);
+
+  // A group spans instances, which is what groups are for.
+  EXPECT_EQ(reg.members("group", "app").size(), 3u);
+}
+
+
+
+TEST(ConnectionTopologyTest, ParsesTheThreeAxesAndKeepsThemOutOfTheConninfo) {
+  auto reg = load("[billing_prod]\ndbname = billing\ninstance = pg-prod-01\n"
+                  "replication_group = billing-ha\ngroup = prod, billing\n");
+  const auto& c = reg.get("billing_prod");
+  EXPECT_EQ(c.instance, "pg-prod-01");
+  EXPECT_EQ(c.instance_source, "declared");
+  EXPECT_EQ(c.replication_group, "billing-ha");
+  ASSERT_EQ(c.groups.size(), 2u);
+  EXPECT_EQ(c.groups[0], "prod");
+  EXPECT_EQ(c.groups[1], "billing");
+  // libpq rejects the whole conninfo over an unknown keyword, so all three
+  // must be consumed rather than passed through.
+  EXPECT_EQ(c.conninfo.find("instance"), std::string::npos);
+  EXPECT_EQ(c.conninfo.find("replication_group"), std::string::npos);
+  EXPECT_EQ(c.conninfo.find("group"), std::string::npos);
+}
+
+TEST(ConnectionTopologyTest, IndexesMembersInFileOrder) {
+  auto reg = load("[c]\ndbname = c\ninstance = i1\n"
+                  "[a]\ndbname = a\ninstance = i1\n"
+                  "[b]\ndbname = b\ninstance = i2\n");
+  const auto& m = reg.members("instance", "i1");
+  ASSERT_EQ(m.size(), 2u);
+  EXPECT_EQ(m[0], "c");   // file order, not alphabetical
+  EXPECT_EQ(m[1], "a");
+  EXPECT_EQ(reg.instances().size(), 2u);
+}
+
+TEST(ConnectionTopologyTest, UnknownTopologyNameListsConfiguredOnes) {
+  auto reg = load("[a]\ndbname = a\ngroup = prod\n");
+  try {
+    reg.members("group", "dev");
+    FAIL() << "expected unknown group to throw";
+  } catch (const std::exception& e) {
+    std::string msg = e.what();
+    EXPECT_NE(msg.find("dev"), std::string::npos);
+    EXPECT_NE(msg.find("prod"), std::string::npos);
+  }
+}
+
+TEST(ConnectionTopologyTest, TrailingCommaInAGroupListIsRejected) {
+  // Silently dropping it would leave a group the operator believes exists but
+  // that no connection is a member of.
+  EXPECT_THROW(load("[a]\ndbname = a\ngroup = prod,\n"), std::exception);
+  EXPECT_THROW(load("[a]\ndbname = a\ngroup = prod,,dev\n"), std::exception);
+}
+
+TEST(ConnectionTopologyTest, RepeatedGroupKeysAccumulateAndDeduplicate) {
+  auto reg = load("[a]\ndbname = a\ngroup = prod\ngroup = billing, prod\n");
+  const auto& g = reg.get("a").groups;
+  ASSERT_EQ(g.size(), 2u);
+  EXPECT_EQ(g[0], "prod");
+  EXPECT_EQ(g[1], "billing");
+}
+
+TEST(ConnectionTopologyTest, RepeatedInstanceKeyIsRejected) {
+  EXPECT_THROW(load("[a]\ndbname = a\ninstance = i1\ninstance = i2\n"), std::exception);
+  EXPECT_THROW(load("[a]\ndbname = a\nreplication_group = r\nreplication_group = s\n"),
+               std::exception);
+}
+
+TEST(ConnectionTopologyTest, EmptyTopologyValueIsRejected) {
+  EXPECT_THROW(load("[a]\ndbname = a\ninstance =\n"), std::exception);
+}
+
+TEST(ConnectionTopologyTest, OneNameMayNotLabelTwoAxes) {
+  // An agent passing the right name to the wrong argument would otherwise
+  // sweep a different set of databases with nothing in the payload to say so.
+  try {
+    load("[a]\ndbname = a\ninstance = shared\n"
+         "[b]\ndbname = b\ngroup = shared\n");
+    FAIL() << "expected a cross-axis rejection";
+  } catch (const std::exception& e) {
+    std::string msg = e.what();
+    EXPECT_NE(msg.find("shared"), std::string::npos);
+    EXPECT_NE(msg.find("instance"), std::string::npos);
+    EXPECT_NE(msg.find("group"), std::string::npos);
+  }
+}
+
+TEST(ConnectionTopologyTest, InstanceSectionIsNotAConnectionEvenWhenWrittenFirst) {
+  // order_ used to take every section, so a reserved section placed first
+  // would have become the default connection.
+  auto reg = load("[instance:pg-01]\nhost_ram_mb = 65536\n"
+                  "[app]\ndbname = app\ninstance = pg-01\n");
+  EXPECT_EQ(reg.default_name(), "app");
+  ASSERT_EQ(reg.names().size(), 1u);
+  EXPECT_EQ(reg.names()[0], "app");
+  EXPECT_THROW(reg.get("instance:pg-01"), std::exception);
+}
+
+TEST(ConnectionTopologyTest, InstanceCapacityIsInheritedByMembers) {
+  auto reg = load("[instance:pg-01]\nhost_ram_mb = 65536\nhost_vcpus = 16\n"
+                  "host_storage = local nvme\n"
+                  "[a]\ndbname = a\ninstance = pg-01\n"
+                  "[b]\ndbname = b\ninstance = pg-01\n");
+  for (const char* n : {"a", "b"}) {
+    const auto& c = reg.get(n);
+    EXPECT_EQ(c.capacity.ram_mb, 65536) << n;
+    EXPECT_EQ(c.capacity.vcpus, 16) << n;
+    EXPECT_EQ(c.capacity.storage, "local nvme") << n;
+    EXPECT_EQ(c.capacity.source, "instance section") << n;
+  }
+  EXPECT_EQ(reg.instance_capacity("pg-01").ram_mb, 65536);
+}
+
+TEST(ConnectionTopologyTest, ExplicitCapacityWinsOverTheInstanceSection) {
+  auto reg = load("[instance:pg-01]\nhost_ram_mb = 65536\nhost_vcpus = 16\n"
+                  "[a]\ndbname = a\ninstance = pg-01\nhost_ram_mb = 1024\n");
+  const auto& c = reg.get("a");
+  EXPECT_EQ(c.capacity.ram_mb, 1024);          // the connection's own value
+  EXPECT_EQ(c.capacity.vcpus, 16);             // still inherited
+  EXPECT_EQ(c.capacity.source, "config file + instance section");
+}
+
+TEST(ConnectionTopologyTest, InstanceSectionRejectsConnectionKeys) {
+  try {
+    load("[instance:pg-01]\ndbname = oops\n[a]\ndbname = a\ninstance = pg-01\n");
+    FAIL() << "expected a rejection";
+  } catch (const std::exception& e) {
+    std::string msg = e.what();
+    EXPECT_NE(msg.find("pg-01"), std::string::npos);
+    EXPECT_NE(msg.find("dbname"), std::string::npos);
+  }
+}
+
+TEST(ConnectionTopologyTest, UnclaimedInstanceSectionIsRejected) {
+  // The symptom otherwise is capacity silently missing from every ratio.
+  try {
+    load("[instance:typo]\nhost_ram_mb = 65536\n"
+         "[a]\ndbname = a\ninstance = pg-01\n");
+    FAIL() << "expected a rejection";
+  } catch (const std::exception& e) {
+    EXPECT_NE(std::string(e.what()).find("typo"), std::string::npos);
+  }
+}
+
+TEST(ConnectionTopologyTest, CapacityIsNotInheritedThroughAnInferredInstance) {
+  // Inheritance follows a declared instance only. Here the two connections
+  // share an endpoint and would be inferred into "h:5432", but the section
+  // naming that endpoint is claimed by nobody -- and is rejected as such.
+  EXPECT_THROW(load("[instance:h:5432]\nhost_ram_mb = 65536\n"
+                    "[a]\nhost = h\nport = 5432\ndbname = a\n"
+                    "[b]\nhost = h\nport = 5432\ndbname = b\n"),
+               std::exception);
+}
+
+TEST(ConnectionTopologyTest, InstanceIsInferredFromAnIdenticalHostAndPort) {
+  auto reg = load("[a]\nhost = h1\nport = 5432\ndbname = a\n"
+                  "[b]\nhost = h1\nport = 5432\ndbname = b\n");
+  EXPECT_EQ(reg.get("a").instance, "h1:5432");
+  EXPECT_EQ(reg.get("a").instance_source, "inferred");
+  EXPECT_EQ(reg.members("instance", "h1:5432").size(), 2u);
+}
+
+TEST(ConnectionTopologyTest, InferenceNeedsBothHostAndPortAndMoreThanOneMember) {
+  // A single connection on an endpoint is not evidence of anything.
+  auto lone = load("[a]\nhost = h1\nport = 5432\ndbname = a\n");
+  EXPECT_EQ(lone.get("a").instance, "");
+
+  // Many instances can run on one host as long as their ports differ, so the
+  // host alone must not group them.
+  auto ports = load("[a]\nhost = h1\nport = 5432\ndbname = a\n"
+                    "[b]\nhost = h1\nport = 5433\ndbname = b\n");
+  EXPECT_EQ(ports.get("a").instance, "");
+  EXPECT_EQ(ports.get("b").instance, "");
+
+  // No port at all is not an endpoint.
+  auto noport = load("[a]\nhost = h1\ndbname = a\n[b]\nhost = h1\ndbname = b\n");
+  EXPECT_EQ(noport.get("a").instance, "");
+}
+
+TEST(ConnectionTopologyTest, ServiceConnectionsAreNeverInferred) {
+  // The service file is deliberately not expanded, so host and port are
+  // unknown here and any grouping would be a guess.
+  auto reg = load("[a]\nservice = svc\nhost = h1\nport = 5432\n"
+                  "[b]\nservice = svc\nhost = h1\nport = 5432\n");
+  EXPECT_EQ(reg.get("a").instance, "");
+  EXPECT_EQ(reg.get("b").instance, "");
+}
+
+TEST(ConnectionTopologyTest, ADeclaredInstanceIsNeverOverwrittenByInference) {
+  auto reg = load("[a]\nhost = h1\nport = 5432\ndbname = a\ninstance = declared\n"
+                  "[b]\nhost = h1\nport = 5432\ndbname = b\n");
+  EXPECT_EQ(reg.get("a").instance, "declared");
+  EXPECT_EQ(reg.get("a").instance_source, "declared");
+  EXPECT_EQ(reg.get("b").instance, "");   // one remaining member is not evidence
+}
+
+TEST(ConnectionTopologyTest, ConnectionsWithoutTopologyKeepEmptyIndexes) {
+  auto reg = load("[a]\ndbname = a\n");
+  EXPECT_TRUE(reg.instances().empty());
+  EXPECT_TRUE(reg.replication_groups().empty());
+  EXPECT_TRUE(reg.groups().empty());
+  EXPECT_EQ(reg.get("a").instance_source, "");
+}
+
+// --- tool classification and annotations ---
+
+TEST_F(PostgresMCPServerTest, EveryToolIsClassified) {
+  // The fan-out rules read the scope table. A tool missing from it would be
+  // silently ineligible for every sweep, which is invisible from the outside.
+  json tools = srv->call_tools_list();
+  ASSERT_FALSE(tools.empty());
+  for (const auto& t : tools) {
+    const std::string name = t.value("name", "");
+    // scope_note() returns "" only for the registry tools; every other tool
+    // must have said something about where its answer varies.
+    const bool registry = (name == "listConnections" || name == "listTopology" ||
+                           name == "verifyTopology");
+    const std::string d = t.value("description", "");
+    if (!registry) {
+      const bool classified =
+          d.find("instance-wide") != std::string::npos ||
+          d.find("byte-identical here") != std::string::npos ||
+          d.find("each server's own") != std::string::npos ||
+          d.find("Never runs across more than one connection") != std::string::npos;
+      EXPECT_TRUE(classified) << name << " carries no scope note: " << d;
+    }
+  }
+}
+
+TEST_F(PostgresMCPServerTest, LegacyClientsSeeNoAnnotationsOrTitles) {
+  // annotations arrived in 2025-03-26 and title in 2025-06-18. Sending either
+  // to a 2024-11-05 client would change bytes 3.1.1 promised.
+  json tools = srv->call_tools_list("2024-11-05");
+  ASSERT_FALSE(tools.empty());
+  for (const auto& t : tools) {
+    EXPECT_FALSE(t.contains("annotations")) << t.value("name", "");
+    EXPECT_FALSE(t.contains("title")) << t.value("name", "");
+  }
+}
+
+TEST_F(PostgresMCPServerTest, AnnotationsAppearForClientsThatUnderstandThem) {
+  json tools = srv->call_tools_list("2025-03-26");
+  ASSERT_FALSE(tools.empty());
+  int explain_seen = 0;
+  for (const auto& t : tools) {
+    const std::string name = t.value("name", "");
+    ASSERT_TRUE(t.contains("annotations")) << name;
+    const json& a = t["annotations"];
+    // Honest because every statement runs in a read-only transaction.
+    EXPECT_TRUE(a["readOnlyHint"].get<bool>()) << name;
+    EXPECT_FALSE(a["destructiveHint"].get<bool>()) << name;
+    EXPECT_FALSE(a["openWorldHint"].get<bool>()) << name;
+    // title belongs to a later revision and must not appear yet.
+    EXPECT_FALSE(t.contains("title")) << name;
+
+    if (name == "explainQuery") {
+      explain_seen++;
+      // With analyze:true it really executes; the plan is proven free of any
+      // ModifyTable node first, so it cannot mutate, but it is not idempotent.
+      ASSERT_TRUE(a.contains("idempotentHint")) << t.dump(2);
+      EXPECT_FALSE(a["idempotentHint"].get<bool>());
+    } else {
+      EXPECT_FALSE(a.contains("idempotentHint")) << name;
+    }
+  }
+  EXPECT_EQ(explain_seen, 1);
+}
+
+TEST_F(PostgresMCPServerTest, TitlesAppearOnlyFromTheRevisionThatDefinedThem) {
+  json tools = srv->call_tools_list("2025-06-18");
+  bool checked = false;
+  for (const auto& t : tools) {
+    ASSERT_TRUE(t.contains("title")) << t.value("name", "");
+    if (t.value("name", "") == "bufferCacheSummary") {
+      EXPECT_EQ(t["title"], "Buffer cache summary");
+      checked = true;
+    }
+  }
+  EXPECT_TRUE(checked);
+}
+
+TEST_F(PostgresMCPServerTest, InstanceWideToolsSayThatTheyAre) {
+  json tools = srv->call_tools_list();
+  std::map<std::string, std::string> d;
+  for (const auto& t : tools) d[t.value("name", "")] = t.value("description", "");
+
+  // pg_stat_activity and pg_stat_statements report the whole instance from any
+  // one database, so a sweep across databases repeats one answer.
+  for (const char* n : {"currentActivity", "currentLocks", "statementStats",
+                        "bufferCacheSummary", "serverSettings"})
+    EXPECT_NE(d[n].find("instance-wide"), std::string::npos) << n;
+
+  // ...while the per-database catalogs must not claim to be.
+  for (const char* n : {"listTables", "tableBloat", "listFunctions"})
+    EXPECT_EQ(d[n].find("instance-wide"), std::string::npos) << n;
+}
+
+TEST_F(PostgresMCPServerTest, IndexToolsSayTheirScanCountsArePerServer) {
+  // The reason this matters: an index dead on the primary may be carrying a
+  // replica's whole reporting workload, and only idx_scan on that replica
+  // shows it. duplicateIndexes and indexBloat both report idx_scan.
+  json tools = srv->call_tools_list();
+  std::map<std::string, std::string> d;
+  for (const auto& t : tools) d[t.value("name", "")] = t.value("description", "");
+  for (const char* n : {"duplicateIndexes", "indexBloat", "tableIOStats"})
+    EXPECT_NE(d[n].find("each server's own"), std::string::npos) << n;
+  // Bloat of a table is physical and replicated verbatim.
+  EXPECT_NE(d["tableBloat"].find("byte-identical here"), std::string::npos);
+}
+
+TEST_F(PostgresMCPServerTest, InitializeHonoursTheRequestedProtocolVersion) {
+  // 3.1.1 ignored it and always replied 2024-11-05.
+  EXPECT_EQ(srv->call_initialize_version("2025-06-18"), "2025-06-18");
+  EXPECT_EQ(srv->call_initialize_version("2024-11-05"), "2024-11-05");
+  // An unknown or absent version falls back to the revision this server has
+  // always spoken rather than echoing something untested.
+  EXPECT_EQ(srv->call_initialize_version("2099-01-01"), "2024-11-05");
+  EXPECT_EQ(srv->call_initialize_version(""), "2024-11-05");
+}
+
+// --- buffer cache ---
+
+TEST_F(PostgresMCPServerTest, BufferCacheSummaryReportsTotalsAndTheUsageHistogram) {
+  json r = srv->call_buffer_cache_summary();
+
+  // pg_buffercache 1.4 shipped with PostgreSQL 16, so on 14 and 15 the summary
+  // functions genuinely do not exist. Assert the gate says so honestly rather
+  // than skipping: pointing the operator at ALTER EXTENSION on a server with no
+  // 1.4 to update to would send them in a circle.
+  if (r.contains("error")) {
+    const std::string e = r["error"].get<std::string>();
+    ASSERT_NE(e.find("pg_buffercache_summary()"), std::string::npos) << r.dump(2);
+    EXPECT_NE(e.find("PostgreSQL 16"), std::string::npos) << r.dump(2);
+    EXPECT_NE(r["hint"].get<std::string>().find("bufferCacheContents"),
+              std::string::npos) << r.dump(2);
+    GTEST_SKIP() << "pg_buffercache predates 1.4 on this server: " << e;
+  }
+
+  // shared_buffers is the denominator for everything else here, so the used,
+  // unused and total figures have to agree or none of the ratios mean anything.
+  ASSERT_TRUE(r.contains("shared_buffers_blocks")) << r.dump(2);
+  const long long total = r["shared_buffers_blocks"].get<long long>();
+  const long long used = r["buffers_used"].get<long long>();
+  const long long unused = r["buffers_unused"].get<long long>();
+  EXPECT_GT(total, 0);
+  EXPECT_EQ(used + unused, total);
+  EXPECT_EQ(r["shared_buffers_bytes"].get<long long>(),
+            total * r["block_size_bytes"].get<long long>());
+
+  // The histogram is the reason this tool exists: a hit ratio cannot tell a
+  // stable working set from clock-sweep churn, and the usage counts can.
+  ASSERT_TRUE(r["usage_counts"].is_array()) << r.dump(2);
+  ASSERT_FALSE(r["usage_counts"].empty());
+  long long histogram_total = 0;
+  int previous = -1;
+  for (const auto& b : r["usage_counts"]) {
+    EXPECT_GT(b["usage_count"].get<int>(), previous) << "not ordered";
+    previous = b["usage_count"].get<int>();
+    histogram_total += b["buffers"].get<long long>();
+  }
+  EXPECT_EQ(histogram_total, total) << "histogram must account for every buffer";
+}
+
+TEST_F(PostgresMCPServerTest, BufferCacheContentsRanksRelationsAndResolvesMappedCatalogs) {
+  // A mapped catalog has relfilenode = 0 in pg_class, so joining the view on
+  // oid instead of pg_relation_filenode(oid) silently drops every one of them
+  // -- and they are among the most heavily cached relations in any database.
+  // Ask the catalog which relations are mapped rather than hardcoding names.
+  std::set<std::string> mapped;
+  {
+    pqxx::connection c(test_url);
+    pqxx::work t(c);
+    for (const auto& row : t.exec("SELECT relname FROM pg_class WHERE relfilenode = 0"))
+      mapped.insert(row[0].as<std::string>());
+  }
+  ASSERT_FALSE(mapped.empty()) << "no mapped relations: the premise is wrong";
+
+  json r = srv->call_buffer_cache_contents(200);
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  ASSERT_TRUE(r["relations"].is_array()) << r.dump(2);
+  ASSERT_FALSE(r["relations"].empty());
+
+  long long previous = -1;
+  bool saw_mapped = false;
+  for (const auto& row : r["relations"]) {
+    // Ranked by buffers held, descending.
+    const long long buffers = row["buffers"].get<long long>();
+    if (previous >= 0) { EXPECT_LE(buffers, previous); }
+    previous = buffers;
+
+    // An unresolved row would mean the join dropped a relation rather than
+    // naming it, which is the failure this tool must never produce silently.
+    const std::string relation = row["relation"].get<std::string>();
+    EXPECT_FALSE(relation.empty()) << row.dump(2);
+    EXPECT_FALSE(row["schema"].get<std::string>().empty()) << row.dump(2);
+
+    const std::string fork = row["fork"].get<std::string>();
+    EXPECT_TRUE(fork == "main" || fork == "fsm" || fork == "vm" || fork == "init")
+      << "unexpected fork: " << fork;
+
+    if (mapped.count(relation)) saw_mapped = true;
+  }
+  EXPECT_TRUE(saw_mapped)
+    << "no mapped catalog resolved; the relfilenode join is wrong: " << r.dump(2);
+}
+
+TEST_F(PostgresMCPServerTest, BufferCacheContentsResolvesSharedCatalogs) {
+  // reldatabase 0 is the shared catalogs. Filtering them out along with other
+  // databases' buffers would drop pg_database and pg_authid entirely.
+  { pqxx::connection c(test_url); pqxx::work t(c);
+    t.exec("SELECT count(*) FROM pg_database"); }
+
+  json r = srv->call_buffer_cache_contents(200);
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  bool saw_shared = false;
+  for (const auto& row : r["relations"]) {
+    if (row["relation"] == "pg_database") saw_shared = true;
+  }
+  EXPECT_TRUE(saw_shared) << "shared catalogs must survive the reldatabase filter";
+}
+
+TEST_F(PostgresMCPServerTest, BufferCacheContentsCapsAndDefaultsTheLimit) {
+  EXPECT_EQ(srv->call_buffer_cache_contents(5)["limit"].get<int>(), 5);
+  EXPECT_EQ(srv->call_buffer_cache_contents(0)["limit"].get<int>(), 20);
+  EXPECT_EQ(srv->call_buffer_cache_contents(-1)["limit"].get<int>(), 20);
+  EXPECT_EQ(srv->call_buffer_cache_contents(100000)["limit"].get<int>(), 200);
+  EXPECT_LE(srv->call_buffer_cache_contents(3)["relations"].size(), 3u);
+}
+
+TEST_F(PostgresMCPServerTest, BufferCacheToolsNameTheExtensionWhenItIsAbsent) {
+  // A database without the extension must produce the CREATE EXTENSION hint,
+  // not an empty result. This is also the extension_schema() miss path: the
+  // lookup returns nothing rather than resolving to public.
+  const std::string other = test_dbname + "_nobc";
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("CREATE DATABASE \"" + other + "\"");
+  }
+  const std::string other_url = std::regex_replace(
+      test_url, std::regex(R"(\bdbname\s*=\s*\S+)"), "dbname=" + other);
+  {
+    PostgresMCPServer bare{other_url};
+    for (const json& r : {bare.call_buffer_cache_summary(),
+                          bare.call_buffer_cache_contents(10)}) {
+      ASSERT_TRUE(r.contains("error")) << r.dump(2);
+      EXPECT_NE(r["error"].get<std::string>().find("pg_buffercache is not installed"),
+                std::string::npos);
+      EXPECT_NE(r["hint"].get<std::string>().find("CREATE EXTENSION pg_buffercache"),
+                std::string::npos);
+    }
+  }
+  pqxx::nontransaction n(*admin_conn);
+  n.exec("DROP DATABASE \"" + other + "\" WITH (FORCE)");
+}
+
+TEST_F(PostgresMCPServerTest, BufferCacheDeniedNamesTheGrantRatherThanTheExtension) {
+  // A valid read-only role missing a monitoring grant is a different problem
+  // from an absent extension. Reporting it as "not installed" would send the
+  // operator to CREATE EXTENSION for something already installed.
+  const std::string role = "licht_unpriv_" + std::to_string(getpid());
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+    n.exec("CREATE ROLE \"" + role + "\" LOGIN");
+  }
+  const std::string url = std::regex_replace(
+      test_url, std::regex(R"(\buser\s*=\s*\S+)"), "") + " user=" + role;
+
+  // Two ways this cannot be exercised, both of which must skip rather than
+  // silently pass: peer/ident auth refuses the login outright, and a pooler
+  // configured with a forced user (as the local rig's PgBouncer is) hands back
+  // the superuser's session no matter which role was asked for.
+  bool usable = false;
+  std::string actual;
+  try {
+    pqxx::connection probe(url);
+    pqxx::work t(probe);
+    actual = t.exec("SELECT current_user")[0][0].as<std::string>();
+    usable = (actual == role);
+  } catch (const std::exception&) {
+    actual = "(could not connect)";
+  }
+
+  if (usable) {
+    PostgresMCPServer unpriv{url};
+    // bufferCacheContents reads the view, which every version of the extension
+    // has -- so this reaches the permission check on PostgreSQL 14 and 15 too,
+    // where the summary functions do not exist and the version gate would
+    // answer first.
+    json r = unpriv.call_buffer_cache_contents(5);
+    ASSERT_TRUE(r.contains("error")) << r.dump(2);
+    EXPECT_NE(r["error"].get<std::string>().find("permission denied"), std::string::npos);
+    EXPECT_NE(r["hint"].get<std::string>().find("GRANT pg_monitor"), std::string::npos);
+    EXPECT_EQ(r["error"].get<std::string>().find("not installed"), std::string::npos);
+  }
+
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+  }
+  if (!usable)
+    GTEST_SKIP() << "cannot run as an unprivileged role here (got " << actual
+                 << "); needs a direct connection with password or trust auth";
+}
+
+TEST_F(PostgresMCPServerTest, BufferCacheToolsAreRegistered) {
+  json tools = srv->call_tools_list();
+  int found = 0;
+  for (const auto& t : tools) {
+    const std::string n = t.value("name", "");
+    if (n == "bufferCacheSummary" || n == "bufferCacheContents") found++;
+  }
+  EXPECT_EQ(found, 2);
+}
+
+// --- observed role ---
+
+TEST_F(PostgresMCPServerTest, SessionObservesRoleOnTheSameRoundTripAsTheGuard) {
+  auto reg = pglicht::ConnectionRegistry::from_url(test_url, "pg-licht-test");
+  Session s{reg.get("default")};
+
+  // The development database is a primary. The standby side of this is covered
+  // by the pooled rig, which stands up a replica of its own.
+  EXPECT_STREQ(s.role(), "primary");
+  EXPECT_FALSE(s.in_recovery());
+
+  // The property batching the probe onto the guard's statement could have
+  // broken. If SET TRANSACTION READ ONLY ever stopped taking effect, every
+  // tool would silently lose its write backstop, so assert it here rather
+  // than trust that PQexec keeps running the first statement.
+  EXPECT_THROW(s.txn().exec("CREATE TEMP TABLE role_probe_guard(i int)"),
+               std::exception);
+}
+
+// A physical standby, when the pooled rig provided one. Plain ctest runs have
+// no standby and skip: the replica side is genuinely untestable without one,
+// and a silently-passing test would be worse than a skipped one.
+namespace {
+std::string standby_url() {
+  const char* u = std::getenv("STANDBY_URL");
+  return u ? std::string(u) : std::string();
+}
+}  // namespace
+
+TEST(SessionRoleTest, ObservesTheReplicaSideOnAStandby) {
+  if (standby_url().empty())
+    GTEST_SKIP() << "no STANDBY_URL; run cpp/test/run-pooled-tests.sh";
+  auto reg = pglicht::ConnectionRegistry::from_url(standby_url(), "pg-licht-test");
+  Session s{reg.get("default")};
+  EXPECT_STREQ(s.role(), "replica");
+  EXPECT_TRUE(s.in_recovery());
+}
+
+TEST_F(PostgresMCPServerTest, RoleIsObservedFreshlyForEverySession) {
+  // Nothing caches it: two sessions each ask. A cached role would go stale at
+  // a failover, which is exactly when it would be read.
+  auto reg = pglicht::ConnectionRegistry::from_url(test_url, "pg-licht-test");
+  Session a{reg.get("default")};
+  Session b{reg.get("default")};
+  EXPECT_STREQ(a.role(), b.role());
+  EXPECT_STREQ(a.role(), "primary");
+}
+
+// --- topology tools ---
+
+namespace {
+
+// A server built from an INI, so the topology tools run against a real
+// registry. probe() only touches the *default* connection, so the extra
+// sections may name anything: nothing ever connects to them.
+class TopologyFixture : public PostgresMCPServerTest {
+protected:
+  // One INI section addressing `url`, plus whatever topology keys are wanted.
+  static std::string section(const std::string& name, const std::string& url,
+                             const std::string& extra) {
+    std::string out = "[" + name + "]\n";
+    std::istringstream in(url);
+    std::string tok;
+    while (in >> tok) {
+      size_t eq = tok.find('=');
+      if (eq != std::string::npos)
+        out += tok.substr(0, eq) + " = " + tok.substr(eq + 1) + "\n";
+    }
+    return out + extra;
+  }
+  static std::string ini_with(const std::string& extra) {
+    return section("default", test_url, extra);
+  }
+  // A connection that cannot be reached: port 1 refuses immediately.
+  static std::string unreachable(const std::string& name) {
+    return "[" + name + "]\nhost = 127.0.0.1\nport = 1\ndbname = nowhere\n";
+  }
+  static std::string standby_url_or_empty() {
+    const char* u = std::getenv("STANDBY_URL");
+    return u ? std::string(u) : std::string();
+  }
+  static int count_severity(const json& findings, const char* sev) {
+    int n = 0;
+    for (const auto& f : findings) { if (f["severity"] == sev) n++; }
+    return n;
+  }
+  static bool has_topic(const json& findings, const char* topic) {
+    for (const auto& f : findings) { if (f["topic"] == topic) return true; }
+    return false;
+  }
+};
+
+std::unique_ptr<PostgresMCPServer> server_from(const std::string& body) {
+  TempIni ini(body);
+  return std::make_unique<PostgresMCPServer>(
+      pglicht::ConnectionRegistry::from_ini(ini.path(), "pg-licht-test"));
+}
+
+}  // namespace
+
+TEST_F(TopologyFixture, ListTopologyIndexesTheThreeAxes) {
+  auto s = server_from(ini_with(
+      "instance = pg-01\ngroup = prod\n"
+      "[ro]\nhost = h9\nport = 5432\ndbname = ro\n"
+      "instance = pg-02\nreplication_group = ha\ngroup = prod, reporting\n"));
+  json t = s->call_topology();
+
+  ASSERT_EQ(t["instances"].size(), 2u);
+  EXPECT_EQ(t["instances"][0]["name"], "pg-01");
+  EXPECT_EQ(t["instances"][0]["source"], "declared");
+  EXPECT_EQ(t["instances"][0]["connections"][0], "default");
+
+  ASSERT_EQ(t["replication_groups"].size(), 1u);
+  EXPECT_EQ(t["replication_groups"][0]["name"], "ha");
+  EXPECT_EQ(t["replication_groups"][0]["connections"].size(), 1u);
+
+  // A group spans instances; "prod" holds both, in file order.
+  ASSERT_EQ(t["groups"].size(), 2u);
+  json prod;
+  for (const auto& g : t["groups"]) if (g["name"] == "prod") prod = g;
+  ASSERT_FALSE(prod.is_null());
+  ASSERT_EQ(prod["connections"].size(), 2u);
+  EXPECT_EQ(prod["connections"][0], "default");
+  EXPECT_EQ(prod["connections"][1], "ro");
+
+  EXPECT_TRUE(t["unlabelled"].empty());
+}
+
+TEST_F(TopologyFixture, ListTopologyNamesConnectionsWithNoLabelsAtAll) {
+  auto s = server_from(ini_with("[lonely]\ndbname = lonely\n"));
+  json t = s->call_topology();
+  ASSERT_EQ(t["unlabelled"].size(), 2u);
+  EXPECT_EQ(t["unlabelled"][0], "default");
+  EXPECT_EQ(t["unlabelled"][1], "lonely");
+  EXPECT_TRUE(t["instances"].empty());
+}
+
+TEST_F(TopologyFixture, ListTopologyReportsInferredInstancesAsSuch) {
+  auto s = server_from(ini_with(
+      "[a]\nhost = h1\nport = 5432\ndbname = a\n"
+      "[b]\nhost = h1\nport = 5432\ndbname = b\n"));
+  json t = s->call_topology();
+  ASSERT_EQ(t["instances"].size(), 1u);
+  EXPECT_EQ(t["instances"][0]["name"], "h1:5432");
+  // Inferred is a hint for grouping output, not evidence of shared memory, so
+  // the caller has to be able to tell the two apart.
+  EXPECT_EQ(t["instances"][0]["source"], "inferred");
+}
+
+TEST_F(TopologyFixture, ListTopologyCarriesInstanceCapacity) {
+  auto s = server_from(ini_with(
+      "instance = pg-01\n"
+      "[instance:pg-01]\nhost_ram_mb = 65536\nhost_vcpus = 16\n"));
+  json t = s->call_topology();
+  ASSERT_EQ(t["instances"].size(), 1u);
+  EXPECT_EQ(t["instances"][0]["host_ram_mb"], 65536);
+  EXPECT_EQ(t["instances"][0]["host_vcpus"], 16);
+}
+
+TEST_F(TopologyFixture, ListConnectionsCarriesTopologyLabels) {
+  auto s = server_from(ini_with(
+      "instance = pg-01\nreplication_group = ha\ngroup = prod, billing\n"));
+  json c = s->call_connections();
+  ASSERT_EQ(c.size(), 1u);
+  EXPECT_EQ(c[0]["instance"], "pg-01");
+  EXPECT_EQ(c[0]["instance_source"], "declared");
+  EXPECT_EQ(c[0]["replication_group"], "ha");
+  ASSERT_EQ(c[0]["groups"].size(), 2u);
+  EXPECT_EQ(c[0]["groups"][0], "prod");
+  // Role is observed, never configured, so it must not appear here.
+  EXPECT_FALSE(c[0].contains("role"));
+}
+
+TEST_F(TopologyFixture, VerifyTopologyReportsWhatEachServerActuallyIs) {
+  auto s = server_from(ini_with(""));
+  json v = s->call_verify_topology();
+
+  ASSERT_EQ(v["connections"].size(), 1u);
+  const json& c = v["connections"][0];
+  EXPECT_EQ(c["connection"], "default");
+  EXPECT_EQ(c["role"], "primary");
+  EXPECT_EQ(c["database"], test_dbname);
+  // 64-bit: a system identifier does not survive JSON number precision, so it
+  // must arrive as a string, like query_id.
+  ASSERT_TRUE(c.contains("system_identifier")) << v.dump(2);
+  EXPECT_TRUE(c["system_identifier"].is_string()) << v.dump(2);
+  EXPECT_FALSE(c["system_identifier"].get<std::string>().empty());
+
+  // Nothing is declared, so there is nothing to contradict.
+  EXPECT_EQ(count_severity(v["findings"], "error"), 0) << v.dump(2);
+}
+
+TEST_F(TopologyFixture, VerifyTopologyAcceptsATrueInstanceDeclaration) {
+  // Two names for the same server, declared as one instance: true by
+  // construction, so no error may be raised.
+  auto s = server_from(ini_with("instance = pg-01\n") +
+                       section("twin", test_url, "instance = pg-01\n"));
+  json v = s->call_verify_topology();
+  EXPECT_EQ(count_severity(v["findings"], "error"), 0) << v.dump(2);
+  EXPECT_EQ(v["connections"][0]["instance"], "pg-01");
+}
+
+TEST_F(TopologyFixture, VerifyTopologyFlagsALineageTheConfigDoesNotDeclare) {
+  // Same server under two names, declared as two separate instances. They hold
+  // the same data and neither declaration ties them together -- the case where
+  // a sweep silently misses a server that carries real workload.
+  auto s = server_from(ini_with("instance = pg-01\n") +
+                       section("twin", test_url, "instance = pg-02\n"));
+  json v = s->call_verify_topology();
+  ASSERT_TRUE(has_topic(v["findings"], "system_identifier")) << v.dump(2);
+}
+
+TEST_F(TopologyFixture, VerifyTopologyCallsTwoPrimariesSplitBrain) {
+  // Two names for the same primary, declared as a replication group. Exactly
+  // the shape of split brain, and the tool must report both rather than pick.
+  auto s = server_from(ini_with("replication_group = ha\n") +
+                       section("twin", test_url, "replication_group = ha\n"));
+  json v = s->call_verify_topology();
+
+  bool split = false;
+  for (const auto& f : v["findings"]) {
+    if (f["topic"] == "replication_group" &&
+        f["detail"].get<std::string>().find("split") != std::string::npos) {
+      split = true;
+      EXPECT_NE(f["detail"].get<std::string>().find("default"), std::string::npos);
+      EXPECT_NE(f["detail"].get<std::string>().find("twin"), std::string::npos);
+    }
+  }
+  EXPECT_TRUE(split) << v.dump(2);
+}
+
+TEST_F(TopologyFixture, VerifyTopologySurvivesAnUnreachableMember) {
+  // A partial answer during an incident beats an exception, so the sweep must
+  // finish and say plainly what it could not reach.
+  auto s = server_from(ini_with("") + unreachable("dead"));
+  json v = s->call_verify_topology();
+
+  ASSERT_EQ(v["connections"].size(), 2u);
+  const json& dead = v["connections"][1];
+  EXPECT_EQ(dead["connection"], "dead");
+  ASSERT_TRUE(dead.contains("error")) << v.dump(2);
+  EXPECT_FALSE(dead.contains("role"));
+  // The reachable one is still fully reported.
+  EXPECT_EQ(v["connections"][0]["role"], "primary");
+  EXPECT_TRUE(has_topic(v["findings"], "reachability")) << v.dump(2);
+}
+
+TEST_F(TopologyFixture, VerifyTopologyReadsARealStandbyAsAReplica) {
+  const std::string sb = standby_url_or_empty();
+  if (sb.empty()) GTEST_SKIP() << "no STANDBY_URL; run cpp/test/run-pooled-tests.sh";
+
+  auto s = server_from(ini_with("replication_group = ha\n") +
+                       section("replica", sb, "replication_group = ha\n"));
+  json v = s->call_verify_topology();
+
+  ASSERT_EQ(v["connections"].size(), 2u);
+  EXPECT_EQ(v["connections"][0]["role"], "primary");
+  EXPECT_EQ(v["connections"][1]["role"], "replica");
+  // A physical replica carries its primary's identifier: that is what makes
+  // the identifier a lineage rather than a postmaster.
+  EXPECT_EQ(v["connections"][0]["system_identifier"],
+            v["connections"][1]["system_identifier"]);
+  // One primary, one lineage, correctly declared: nothing to report.
+  EXPECT_EQ(count_severity(v["findings"], "error"), 0) << v.dump(2);
+}
+
+TEST_F(TopologyFixture, VerifyTopologyRejectsAStandbyDeclaredAsTheSameInstance) {
+  const std::string sb = standby_url_or_empty();
+  if (sb.empty()) GTEST_SKIP() << "no STANDBY_URL; run cpp/test/run-pooled-tests.sh";
+
+  // Same identifier, different servers. They share WAL lineage, not memory, so
+  // calling them one instance would license a contention claim that is false.
+  auto s = server_from(ini_with("instance = wrong\n") +
+                       section("replica", sb, "instance = wrong\n"));
+  json v = s->call_verify_topology();
+
+  bool flagged = false;
+  for (const auto& f : v["findings"]) {
+    if (f["topic"] == "instance" && f["severity"] == "error" &&
+        f["detail"].get<std::string>().find("replication_group") != std::string::npos)
+      flagged = true;
+  }
+  EXPECT_TRUE(flagged) << v.dump(2);
+}
+
+// --- dual-era protocol ---
+
+namespace {
+
+const char* kProtoVersion  = "io.modelcontextprotocol/protocolVersion";
+const char* kProtoCaps     = "io.modelcontextprotocol/clientCapabilities";
+const char* kProtoSrvInfo  = "io.modelcontextprotocol/serverInfo";
+
+json modern_meta(const std::string& version = "2026-07-28") {
+  return {{kProtoVersion, version}, {kProtoCaps, json::object()}};
+}
+
+}  // namespace
+
+TEST_F(PostgresMCPServerTest, TheSameCallDrivenBothWaysReturnsIdenticalContent) {
+  // The compatibility claim of the whole release, made checkable: the payload
+  // a client reads must not depend on which era it spoke.
+  json legacy = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                               {"params", {{"name", "listSchemas"},
+                                           {"arguments", json::object()}}}});
+  json modern = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 2}, {"method", "tools/call"},
+                               {"params", {{"name", "listSchemas"},
+                                           {"arguments", json::object()},
+                                           {"_meta", modern_meta()}}}});
+  EXPECT_EQ(legacy["result"]["content"], modern["result"]["content"]);
+}
+
+TEST_F(PostgresMCPServerTest, ALegacyResponseIsUnchangedFrom311) {
+  json r = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                          {"params", {{"name", "listSchemas"},
+                                      {"arguments", json::object()}}}});
+  // Nothing new may appear in a legacy result, or the compatibility claim is
+  // assumed rather than proven.
+  EXPECT_FALSE(r["result"].contains("resultType"));
+  EXPECT_FALSE(r["result"].contains("_meta"));
+}
+
+TEST_F(PostgresMCPServerTest, AModernResponseCarriesResultTypeAndServerInfo) {
+  json r = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                          {"params", {{"name", "listSchemas"},
+                                      {"arguments", json::object()},
+                                      {"_meta", modern_meta()}}}});
+  EXPECT_EQ(r["result"]["resultType"], "complete");
+  ASSERT_TRUE(r["result"]["_meta"].contains(kProtoSrvInfo)) << r.dump(2);
+  EXPECT_EQ(r["result"]["_meta"][kProtoSrvInfo]["name"], "pg-licht-cpp");
+}
+
+TEST_F(PostgresMCPServerTest, ALegacyProgressTokenIsNotMistakenForAModernRequest) {
+  // _meta is not new: progressToken has lived there since the legacy
+  // revisions. Discriminating on _meta itself rather than on the specific
+  // version key would reject a 3.1.1 client for using a legacy feature
+  // correctly.
+  json r = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                          {"params", {{"name", "listSchemas"},
+                                      {"arguments", json::object()},
+                                      {"_meta", {{"progressToken", 7}}}}}});
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  EXPECT_FALSE(r["result"]["isError"].get<bool>());
+  EXPECT_FALSE(r["result"].contains("resultType"));   // still legacy
+}
+
+TEST_F(PostgresMCPServerTest, AModernRequestMissingClientCapabilitiesIsMalformed) {
+  json r = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                          {"params", {{"name", "listSchemas"},
+                                      {"arguments", json::object()},
+                                      {"_meta", {{kProtoVersion, "2026-07-28"}}}}}});
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  EXPECT_EQ(r["error"]["code"], -32602);
+  EXPECT_NE(r["error"]["message"].get<std::string>().find("clientCapabilities"),
+            std::string::npos);
+}
+
+TEST_F(PostgresMCPServerTest, AnUnsupportedProtocolVersionIsRejectedWithWhatIsSupported) {
+  json r = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                          {"params", {{"name", "listSchemas"},
+                                      {"arguments", json::object()},
+                                      {"_meta", modern_meta("1999-01-01")}}}});
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  EXPECT_EQ(r["error"]["code"], -32022);
+  ASSERT_TRUE(r["error"]["data"].contains("supported")) << r.dump(2);
+  EXPECT_EQ(r["error"]["data"]["requested"], "1999-01-01");
+  bool has_modern = false;
+  for (const auto& v : r["error"]["data"]["supported"]) {
+    if (v == "2026-07-28") has_modern = true;
+  }
+  EXPECT_TRUE(has_modern) << r.dump(2);
+}
+
+TEST_F(PostgresMCPServerTest, ServerDiscoverDescribesTheServerWithoutAHandshake) {
+  json r = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "server/discover"},
+                          {"params", {{"_meta", modern_meta()}}}});
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  const json& res = r["result"];
+  EXPECT_EQ(res["resultType"], "complete");
+  EXPECT_TRUE(res["capabilities"].contains("tools"));
+  ASSERT_TRUE(res["supportedVersions"].is_array());
+  EXPECT_GE(res["supportedVersions"].size(), 2u);
+
+  // The instructions exist to say the things that otherwise live only inside
+  // individual tool descriptions.
+  const std::string ins = res["instructions"].get<std::string>();
+  EXPECT_NE(ins.find("READ ONLY"), std::string::npos);
+  EXPECT_NE(ins.find("explainQuery"), std::string::npos);
+  EXPECT_NE(ins.find("connection"), std::string::npos);
+  EXPECT_NE(ins.find("replication_group"), std::string::npos);
+}
+
+TEST_F(PostgresMCPServerTest, ModernClientsGetAnnotationsWithoutAHandshake) {
+  // The stateless revision has no initialize, so annotations must be driven by
+  // the per-request version rather than by anything negotiated.
+  json r = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/list"},
+                          {"params", {{"_meta", modern_meta()}}}});
+  ASSERT_FALSE(r["result"]["tools"].empty()) << r.dump(2);
+  EXPECT_TRUE(r["result"]["tools"][0].contains("annotations")) << r.dump(2);
+  EXPECT_TRUE(r["result"]["tools"][0].contains("title"));
+}
+
+TEST_F(PostgresMCPServerTest, NotificationsInitializedRemainsALegacyNoOp) {
+  json r = srv->call_rpc({{"jsonrpc", "2.0"}, {"method", "notifications/initialized"},
+                          {"params", json::object()}});
+  EXPECT_TRUE(r.empty()) << r.dump(2);
+}
+
+TEST_F(PostgresMCPServerTest, InitializeEchoesTheNegotiatedVersionOverTheWire) {
+  json r = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"},
+                          {"params", {{"protocolVersion", "2025-06-18"}}}});
+  EXPECT_EQ(r["result"]["protocolVersion"], "2025-06-18");
+  // ...and from then on tools/list carries what that revision defines.
+  json tools = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 2}, {"method", "tools/list"},
+                              {"params", json::object()}});
+  EXPECT_TRUE(tools["result"]["tools"][0].contains("title")) << tools.dump(2);
+}
+
+// --- fan-out dispatch ---
+
+namespace {
+
+json rpc_call(PostgresMCPServer& srv, const std::string& tool, json args) {
+  return srv.call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                       {"params", {{"name", tool}, {"arguments", args}}}});
+}
+
+// The tool payload, unwrapped from the MCP text content block.
+json rpc_payload(const json& response) {
+  return json::parse(response["result"]["content"][0]["text"].get<std::string>());
+}
+
+}  // namespace
+
+TEST_F(TopologyFixture, ASingleConnectionCallCarriesNoSweepEnvelope) {
+  // The whole release rests on this: naming one connection must behave exactly
+  // as it did in 3.1.1, envelope and all.
+  auto s = server_from(ini_with("instance = pg-01\n"));
+  json r = rpc_call(*s, "listSchemas", {{"connection", "default"}});
+  ASSERT_FALSE(r["result"]["isError"].get<bool>()) << r.dump(2);
+  json p = rpc_payload(r);
+  EXPECT_FALSE(p.contains("members"));
+  EXPECT_FALSE(p.contains("axis"));
+}
+
+TEST_F(TopologyFixture, InstanceSweepReturnsOneResultPerMember) {
+  auto s = server_from(ini_with("instance = pg-01\n") +
+                       section("twin", test_url, "instance = pg-01\n"));
+  json p = rpc_payload(rpc_call(*s, "listSchemas", {{"instance", "pg-01"}}));
+
+  EXPECT_EQ(p["axis"], "instance");
+  EXPECT_EQ(p["name"], "pg-01");
+  ASSERT_EQ(p["members"].size(), 2u);
+  // File order, so a sweep is reproducible.
+  EXPECT_EQ(p["members"][0]["connection"], "default");
+  EXPECT_EQ(p["members"][1]["connection"], "twin");
+  for (const auto& m : p["members"]) {
+    EXPECT_EQ(m["role"], "primary") << m.dump(2);
+    EXPECT_EQ(m["instance"], "pg-01");
+    ASSERT_TRUE(m.contains("result")) << m.dump(2);
+    EXPECT_FALSE(m.contains("error"));
+  }
+}
+
+TEST_F(TopologyFixture, SweepingAnInstanceWideReadingAcrossDatabasesIsRefused) {
+  // Eight databases on one postmaster would return the same rows eight times
+  // with nothing in the payload to say so.
+  auto s = server_from(ini_with("instance = pg-01\n") +
+                       section("twin", test_url, "instance = pg-01\n"));
+  json r = rpc_call(*s, "currentActivity", {{"instance", "pg-01"}});
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  EXPECT_EQ(r["error"]["code"], -32602);
+  EXPECT_NE(r["error"]["message"].get<std::string>().find("instance-wide"),
+            std::string::npos);
+}
+
+TEST_F(TopologyFixture, SweepingAByteIdenticalReadingAcrossReplicasIsRefused) {
+  auto s = server_from(ini_with("replication_group = ha\n") +
+                       section("twin", test_url, "replication_group = ha\n"));
+  json r = rpc_call(*s, "tableBloat", {{"replication_group", "ha"}, {"schema", "grocery"}});
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  EXPECT_EQ(r["error"]["code"], -32602);
+  EXPECT_NE(r["error"]["message"].get<std::string>().find("byte-identical"),
+            std::string::npos);
+}
+
+TEST_F(TopologyFixture, IndexToolsMaySweepAReplicationGroup) {
+  // duplicateIndexes reports idx_scan, which is each server's own. This is the
+  // case the release exists for, so it must not be refused.
+  auto s = server_from(ini_with("replication_group = ha\n") +
+                       section("twin", test_url, "replication_group = ha\n"));
+  json r = rpc_call(*s, "duplicateIndexes", {{"replication_group", "ha"}, {"schema", "grocery"}});
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  EXPECT_EQ(rpc_payload(r)["members"].size(), 2u);
+}
+
+TEST_F(TopologyFixture, AGroupSweepCollapsesMembersThatWouldAnswerIdentically) {
+  // A group may span instances, so it cannot be refused outright -- but two
+  // databases on one postmaster answering an instance-wide question would
+  // duplicate, and a caller reading two identical answers concludes agreement.
+  auto s = server_from(ini_with("instance = pg-01\ngroup = prod\n") +
+                       section("twin", test_url, "instance = pg-01\ngroup = prod\n"));
+  json p = rpc_payload(rpc_call(*s, "currentActivity", {{"group", "prod"}}));
+
+  EXPECT_EQ(p["members"].size(), 1u);
+  ASSERT_TRUE(p.contains("skipped")) << p.dump(2);
+  ASSERT_EQ(p["skipped"].size(), 1u);
+  EXPECT_EQ(p["skipped"][0]["connection"], "twin");
+  EXPECT_NE(p["skipped"][0]["reason"].get<std::string>().find("instance-wide"),
+            std::string::npos);
+}
+
+TEST_F(TopologyFixture, AnUnreachableMemberDoesNotFailTheSweep) {
+  auto s = server_from(ini_with("group = prod\n") +
+                       "[dead]\nhost = 127.0.0.1\nport = 1\ndbname = nowhere\ngroup = prod\n");
+  json p = rpc_payload(rpc_call(*s, "listSchemas", {{"group", "prod"}}));
+
+  ASSERT_EQ(p["members"].size(), 2u);
+  EXPECT_TRUE(p["members"][0].contains("result"));
+  ASSERT_TRUE(p["members"][1].contains("error")) << p.dump(2);
+  // A member that never connected must not inherit the previous member's role.
+  EXPECT_EQ(p["members"][1]["role"], "unknown");
+}
+
+TEST_F(TopologyFixture, MoreThanOneTargetIsRejected) {
+  auto s = server_from(ini_with("group = prod\n"));
+  json r = rpc_call(*s, "listSchemas", {{"connection", "default"}, {"group", "prod"}});
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  EXPECT_EQ(r["error"]["code"], -32602);
+  EXPECT_NE(r["error"]["message"].get<std::string>().find("connection"), std::string::npos);
+  EXPECT_NE(r["error"]["message"].get<std::string>().find("group"), std::string::npos);
+}
+
+TEST_F(TopologyFixture, RoleAppliesOnlyAcrossServers) {
+  auto s = server_from(ini_with("instance = pg-01\n") +
+                       section("twin", test_url, "instance = pg-01\n"));
+  json r = rpc_call(*s, "listSchemas", {{"instance", "pg-01"}, {"role", "primary"}});
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  EXPECT_EQ(r["error"]["code"], -32602);
+
+  json bad = rpc_call(*s, "listSchemas", {{"group", "nope"}, {"role", "leader"}});
+  ASSERT_TRUE(bad.contains("error")) << bad.dump(2);
+  EXPECT_EQ(bad["error"]["code"], -32602);
+}
+
+TEST_F(TopologyFixture, TwoPrimariesAreSweptAndNamedRatherThanChosen) {
+  auto s = server_from(ini_with("replication_group = ha\n") +
+                       section("twin", test_url, "replication_group = ha\n"));
+  json p = rpc_payload(rpc_call(*s, "duplicateIndexes",
+                                {{"replication_group", "ha"}, {"role", "primary"}}));
+  EXPECT_EQ(p["members"].size(), 2u);
+  ASSERT_TRUE(p.contains("notes")) << p.dump(2);
+  bool split = false;
+  for (const auto& n : p["notes"]) {
+    if (n.get<std::string>().find("split brain") != std::string::npos) split = true;
+  }
+  EXPECT_TRUE(split) << p.dump(2);
+}
+
+TEST_F(TopologyFixture, NoReplicaIsAFindingNotAnEmptyResult) {
+  auto s = server_from(ini_with("replication_group = ha\n"));
+  json p = rpc_payload(rpc_call(*s, "duplicateIndexes",
+                                {{"replication_group", "ha"}, {"role", "replica"}}));
+  EXPECT_TRUE(p["members"].empty());
+  ASSERT_TRUE(p.contains("notes")) << p.dump(2);
+  EXPECT_NE(p["notes"][0].get<std::string>().find("no member"), std::string::npos);
+}
+
+TEST_F(TopologyFixture, ExplainQueryAndRegistryToolsNeverSweep) {
+  auto s = server_from(ini_with("group = prod\n"));
+  for (const char* tool : {"explainQuery", "listTopology", "listConnections"}) {
+    json r = rpc_call(*s, tool, {{"group", "prod"}});
+    ASSERT_TRUE(r.contains("error")) << tool << ": " << r.dump(2);
+    EXPECT_EQ(r["error"]["code"], -32602) << tool;
+  }
+}
+
+TEST_F(TopologyFixture, AWideSweepNamesWhatItDropped) {
+  // Silent truncation would read as "nothing else is affected".
+  std::string ini = ini_with("group = wide\n");
+  for (int i = 0; i < 40; i++)
+    ini += section("c" + std::to_string(i), test_url, "group = wide\n");
+  auto s = server_from(ini);
+
+  json p = rpc_payload(rpc_call(*s, "listSchemas", {{"group", "wide"}}));
+  EXPECT_EQ(p["members"].size(), 32u);
+  ASSERT_TRUE(p.contains("skipped")) << p.dump(2);
+  EXPECT_EQ(p["skipped"].size(), 41u - 32u);
+  EXPECT_NE(p["skipped"][0]["reason"].get<std::string>().find("cap"), std::string::npos);
+}
+
+TEST_F(TopologyFixture, UnknownTopologyNameFailsAtTheCallRatherThanSweepingNothing) {
+  auto s = server_from(ini_with("group = prod\n"));
+  json r = rpc_call(*s, "listSchemas", {{"group", "typo"}});
+  ASSERT_FALSE(r["result"].is_null());
+  EXPECT_TRUE(r["result"]["isError"].get<bool>()) << r.dump(2);
+  EXPECT_NE(r["result"]["content"][0]["text"].get<std::string>().find("typo"),
+            std::string::npos);
+}
+
+TEST_F(TopologyFixture, SweepArgumentsAreAdvertisedOnlyWhereTheyApply) {
+  auto s = server_from(ini_with(""));
+  json tools = s->call_tools_list();
+  std::map<std::string, json> props;
+  for (const auto& t : tools) props[t.value("name", "")] = t["inputSchema"]["properties"];
+
+  // Instance-wide: no instance sweep offered, but a group may still span hosts.
+  EXPECT_FALSE(props["currentActivity"].contains("instance"));
+  EXPECT_TRUE(props["currentActivity"].contains("group"));
+  // Byte-identical across replicas: no replication_group sweep, no role filter.
+  EXPECT_FALSE(props["tableBloat"].contains("replication_group"));
+  EXPECT_FALSE(props["tableBloat"].contains("role"));
+  EXPECT_TRUE(props["tableBloat"].contains("instance"));
+  // Per-server counters: both offered.
+  EXPECT_TRUE(props["duplicateIndexes"].contains("replication_group"));
+  EXPECT_TRUE(props["duplicateIndexes"].contains("role"));
+  // Never sweeps.
+  EXPECT_FALSE(props["explainQuery"].contains("group"));
+  EXPECT_FALSE(props.count("listTopology") && props["listTopology"].contains("group"));
+}
+
+TEST_F(PostgresMCPServerTest, ListConnectionsOmitsTopologyWhenNoneIsConfigured) {
+  // A DATABASE_URL deployment has one connection and no topology; the fields
+  // must be absent rather than empty, so 3.1.1 output is unchanged.
+  json c = srv->call_connections();
+  ASSERT_EQ(c.size(), 1u);
+  EXPECT_FALSE(c[0].contains("instance"));
+  EXPECT_FALSE(c[0].contains("replication_group"));
+  EXPECT_FALSE(c[0].contains("groups"));
+}
+
+TEST_F(PostgresMCPServerTest, RegistryToolsTakeNoConnectionArgument) {
+  // Neither reads a database, so neither has a target to be pointed at.
+  json tools = srv->call_tools_list();
+  int seen = 0;
+  for (const auto& t : tools) {
+    const std::string name = t.value("name", "");
+    if (name != "listConnections" && name != "listTopology" &&
+        name != "verifyTopology") continue;
+    seen++;
+    EXPECT_FALSE(t["inputSchema"]["properties"].contains("connection")) << name;
+  }
+  EXPECT_EQ(seen, 3);
+}
+
+TEST_F(PostgresMCPServerTest, EveryOtherToolTakesAConnectionArgument) {
+  json tools = srv->call_tools_list();
+  for (const auto& t : tools) {
+    const std::string name = t.value("name", "");
+    if (name == "listConnections" || name == "listTopology" ||
+        name == "verifyTopology") continue;
+    EXPECT_TRUE(t["inputSchema"]["properties"].contains("connection")) << name;
+  }
 }
 
 TEST_F(PostgresMCPServerTest, ListConnectionsReportsDefaultWithoutSecrets) {

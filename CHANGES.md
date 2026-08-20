@@ -1,5 +1,130 @@
 # Changelog
 
+## 3.2.0 (2026-08-20)
+
+No existing tool's payload shape changed, and a legacy protocol response is
+byte-identical to 3.1.1. An existing configuration file and an existing client
+config keep working with no edit.
+
+### Added
+
+- **Connection topology: `instance`, `replication_group` and `group`.** Three
+  optional keys per section in the connections file say how the configured
+  databases relate. An `instance` is one postmaster, whose databases share
+  `shared_buffers`, WAL, autovacuum workers and disk. A `replication_group` is a
+  primary and its replicas: the same data on different servers, each keeping its
+  own statistics counters. A `group` is an arbitrary operator label and implies
+  nothing, which is what makes it the way to ask about "dev" without knowing any
+  connection name.
+
+  There is no `cluster` key, deliberately. PostgreSQL's glossary uses that word
+  for the first sense — the databases one instance manages — and RDS and Aurora
+  use it for the second, so it means opposite things to the two people most
+  likely to read the file.
+
+  An `instance` is inferred when two sections share a host *and* port, and
+  reported as `inferred` rather than `declared`: behind a pooler one endpoint can
+  front several instances, so it groups output without licensing a claim about
+  shared memory.
+
+- **Fan-out.** Passing `instance`, `replication_group` or `group` in place of
+  `connection` runs the tool once per member and returns one result per member,
+  in configuration file order. A member that cannot be reached is reported in
+  place rather than failing the sweep — a partial answer during an incident beats
+  an exception.
+
+  Which of the three a tool accepts depends on where its answer actually varies,
+  and its input schema now says which. `currentActivity`, `currentLocks`,
+  `statementStats` and the buffer cache tools report the whole instance from any
+  one of its databases, so sweeping them across an instance would repeat one
+  answer and is refused with `-32602`. Catalogs and `tableBloat` are
+  byte-identical across a replication group for the mirror-image reason.
+
+  `duplicateIndexes`, `indexBloat` and `tableIOStats` are the case the feature
+  exists for: they carry `idx_scan`, which is each server's own. An index that
+  reads as unused on the primary may be carrying a replica's entire reporting
+  workload, and only that replica's scan counts show it.
+
+- **Role is observed, never configured.** Every connection reports `primary` or
+  `replica` from `pg_is_in_recovery()`, read on connect and never cached —
+  failover swaps it, and failover is exactly when this server gets used. The
+  probe rides along on the round trip the read-only guard already spends, so it
+  costs nothing. `role: "primary"` or `role: "replica"` narrows a sweep; two
+  primaries are reported as split brain with none chosen, and no primary at all
+  is stated as a finding rather than returned as an empty result.
+
+- **`listTopology`** — every instance, replication group and group with its
+  members, plus the connections carrying no label. Reads the configuration file
+  and opens no connection.
+
+- **`verifyTopology`** — connects to each configured connection and checks the
+  declared topology against what the servers report. A system identifier names a
+  replication *lineage*, not a postmaster: a physical replica carries its
+  primary's value forever, so the identifier is read alongside the endpoint. Same
+  identifier and endpoint is one instance; same identifier on different hosts is
+  a replication group. Reports contradicted declarations, connections that share
+  an identifier without being declared together, and split brain. Logical
+  replication is reported as "cannot verify" rather than as a mismatch.
+
+- **`bufferCacheSummary`** and **`bufferCacheContents`** — `pg_buffercache`.
+  `tableIOStats` counts only what `shared_buffers` served, so a miss there may
+  still have come from the OS page cache at RAM speed; these are the only
+  in-core view of that split. `bufferCacheContents` aggregates per relation and
+  fork, never raw per-buffer rows. Requires `pg_monitor`; the summary needs
+  extension version 1.4, gated on the *extension* version rather than the server
+  version. 1.4 ships with PostgreSQL 16, so on 14 and 15 the summary says there
+  is no 1.4 to update to and points at `bufferCacheContents`, which reads the
+  view and works on every supported version.
+
+- **Host capacity may be declared once per instance.** A reserved
+  `[instance:<name>]` section carries the four host capacity keys and its members
+  inherit them; an explicit per-connection value still wins. Inheritance follows
+  `instance` only, never `replication_group`: replicas routinely run on smaller
+  machines, and inheriting the primary's RAM would give every replica a
+  confidently wrong `shared_buffers` ratio.
+
+- **Dual-era MCP.** The stateless `2026-07-28` revision is served alongside the
+  handshake-based ones. The era is discriminated on the presence of
+  `params._meta["io.modelcontextprotocol/protocolVersion"]` specifically, never on
+  `_meta` itself — `progressToken` has lived in `_meta` since the legacy
+  revisions, and keying on `_meta` would reject a working 3.1.1 client for using
+  a legacy feature correctly. Adds `server/discover`, `resultType` and
+  `io.modelcontextprotocol/serverInfo` on modern results, `-32022` for an
+  unsupported version and `-32602` for a modern request missing a required
+  `_meta` key. Legacy responses are unchanged.
+
+- **Tool annotations.** `readOnlyHint`, `destructiveHint` and `openWorldHint` on
+  every tool, honest because every statement runs inside `SET TRANSACTION READ
+  ONLY`; `explainQuery` additionally carries `idempotentHint: false`, since with
+  `analyze: true` it really executes. `annotations` and `title` are emitted only
+  to a client that negotiated the revision defining them (`2025-03-26` and
+  `2025-06-18`), so a `2024-11-05` client's `tools/list` is unchanged.
+
+- **`initialize` honours `params.protocolVersion`.** 3.1.1 ignored it and always
+  replied `2024-11-05`. The requested version is now echoed when it is one CI
+  exercises, and otherwise falls back rather than claiming support for something
+  untested.
+
+### Fixed
+
+- **Permission errors reported the raw exception instead of the missing grant.**
+  `tableBloat` and `indexBloat` tested `e.sqlstate() == "42501"` to turn a denied
+  `pgstattuple` call into the `GRANT pg_stat_scan_tables` hint, but libpqxx
+  constructs `pqxx::insufficient_privilege` with an *empty* `sqlstate()` — verified
+  against libpqxx 7.10, where `undefined_table` and `undefined_function` both
+  carry their codes and `insufficient_privilege` does not. The comparison
+  therefore never matched, the branch never ran, and a read-only role missing the
+  grant got a raw exception. All four privilege branches now catch the exception
+  by type, where the string is unreliable.
+
+### Changed
+
+- `listConnections` entries carry their `instance`, `replication_group` and
+  `group` labels where configured. Additive; no existing field changed.
+- Tool descriptions state where each tool's answer varies, since the payload
+  cannot say it and a sweep that silently repeated one answer would read as
+  agreement between databases.
+
 ## 3.1.1 (2026-08-18)
 
 ### Fixed

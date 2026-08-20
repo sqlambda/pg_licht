@@ -3,8 +3,11 @@
 #include <cctype>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <set>
+#include <sstream>
 #include <string>
+#include <vector>
 #include <unistd.h>
 #include <nlohmann/json.hpp>
 #include "config.h"
@@ -56,7 +59,22 @@ public:
     // Must be the first statement in the transaction. This is the real write
     // backstop: it catches writes a query plan cannot reveal, such as a
     // VOLATILE function that modifies data, aborting with SQLSTATE 25006.
-    txn_.exec("SET TRANSACTION READ ONLY");
+    //
+    // pg_is_in_recovery() rides along on the same round trip. PQexec takes
+    // several statements separated by semicolons and returns the last result,
+    // so the role costs nothing beyond what the guard already spends -- which
+    // is why every session observes it rather than only the calls that think
+    // they need it.
+    //
+    // The property this could have broken is the guard itself, and it does
+    // not: a write attempted later in the same transaction is still rejected
+    // with 25006. A test asserts exactly that, because the failure mode of
+    // getting it wrong is silent.
+    pqxx::result role = txn_.exec(
+      "SET TRANSACTION READ ONLY; SELECT pg_is_in_recovery()");
+    if (!role.empty() && !role[0][0].is_null())
+      in_recovery_ = role[0][0].as<bool>();
+    last_observed_role() = this->role();
     if (timeout_ms > 0) {
       // set_config(..., is_local => true) is SET LOCAL: transaction-scoped,
       // and binds the value as a parameter instead of concatenating it.
@@ -66,6 +84,36 @@ public:
   }
 
   pqxx::work& txn() { return txn_; }
+
+  // Whether this server is a standby, observed on connect rather than declared.
+  //
+  // Role is not configuration: failover swaps it, and failover is exactly when
+  // this server gets used. Nothing caches it -- a stale "this one is the
+  // primary" is the worst answer available, and it would be given at the
+  // moment it costs the most.
+  //
+  // "unknown" is reachable only if the probe returned nothing, which should
+  // not happen; it is spelled out rather than defaulted to "primary" because
+  // defaulting would be a claim.
+  const char* role() const {
+    return !in_recovery_.has_value() ? "unknown"
+         : *in_recovery_             ? "replica"
+                                     : "primary";
+  }
+  bool in_recovery() const { return in_recovery_.value_or(false); }
+
+  // The role the most recently constructed Session observed.
+  //
+  // This exists so a fan-out sweep can label a member's result without opening
+  // a second connection purely to ask. It is safe for the same reason active_
+  // is: the server reads stdin line by line, so exactly one tool call is ever
+  // in flight, and each call opens one Session. The sweep resets it before
+  // every member so a member that never connects cannot inherit the previous
+  // one's role.
+  static const char*& last_observed_role() {
+    static const char* r = "unknown";
+    return r;
+  }
 
   // Server version as an integer (e.g. 160004 for 16.4), from the startup
   // handshake -- no round trip. Used to gate catalog columns and SQL features
@@ -82,6 +130,7 @@ public:
 private:
   pqxx::connection conn_;
   pqxx::work txn_;
+  std::optional<bool> in_recovery_;
 };
 
 class PostgresMCPServer {
@@ -176,7 +225,16 @@ public:
   // The tools array as tools/list advertises it, so a query method that exists
   // but was never registered -- and is therefore unreachable by any client --
   // fails the suite rather than passing it.
-  const json call_tools_list() { return get_tools_list()["tools"]; }
+  const json call_tools_list() { return get_tools_list(client_protocol_)["tools"]; }
+  const json call_tools_list(const std::string& protocol) {
+    return get_tools_list(protocol)["tools"];
+  }
+  // Which protocol version initialize would settle on, without the transport.
+  std::string call_initialize_version(const std::string& requested) {
+    for (const auto& v : supported_protocols())
+      if (v == requested) return v;
+    return "2024-11-05";
+  }
   const json call_check_key(const std::string& schema, const std::string& table_name, const json& values) {
     return check_key(schema, table_name, values);
   }
@@ -204,7 +262,28 @@ public:
     return host_capacity(ram_mb, vcpus, storage);
   }
 
+  // Drive one JSON-RPC request and return the response, for tests that need the
+  // transport layer rather than a query method -- argument validation, error
+  // codes and the fan-out envelope all live there.
+  json call_rpc(const json& request) {
+    std::ostringstream buf;
+    std::streambuf* saved = std::cout.rdbuf(buf.rdbuf());
+    try {
+      handle_request(request);
+    } catch (...) {
+      std::cout.rdbuf(saved);
+      throw;
+    }
+    std::cout.rdbuf(saved);
+    const std::string line = buf.str();
+    return line.empty() ? json::object() : json::parse(line);
+  }
+
   const json call_connections() { return connections(); }
+  const json call_topology() { return topology(); }
+  const json call_verify_topology() { return verify_topology(); }
+  const json call_buffer_cache_summary() { return buffer_cache_summary(); }
+  const json call_buffer_cache_contents(int limit) { return buffer_cache_contents(limit); }
   const json call_explain_query(const std::string& queryid, const std::string& sql,
                                 const json& params, bool analyze, int timeout_ms) {
     return explain_query(queryid, sql, params, analyze, timeout_ms);
@@ -218,6 +297,18 @@ private:
   // in flight and a member is safe.
   std::string active_;
   unsigned long long explain_seq_ = 0;
+  // What the client negotiated. Defaults to the revision 3.1.1 spoke, so a
+  // client that never sends initialize sees exactly 3.1.1's tools/list.
+  std::string client_protocol_ = "2024-11-05";
+  // Per-request: whether this one came from a stateless (modern) client, and
+  // which revision it speaks. Members rather than parameters for the same
+  // reason as active_ -- the server reads stdin line by line, so exactly one
+  // request is ever in flight.
+  bool modern_ = false;
+  std::string request_protocol_ = "2024-11-05";
+
+  // Bounded connect for the tools that sweep every configured connection.
+  static constexpr int kSweepConnectTimeoutSeconds = 5;
 
   static std::string app_name() {
     return std::string("pg-licht-cpp/") + PGLICHT_VERSION;
@@ -303,6 +394,42 @@ private:
   // gets SQLSTATE 42501 rather than an answer. Left as a raw exception that
   // reads as an internal failure, it sends the caller looking for a bug
   // instead of asking for the one grant that fixes it.
+  // Why every privilege branch below catches pqxx::insufficient_privilege by
+  // type rather than testing e.sqlstate() == "42501":
+  //
+  // libpqxx maps the SQLSTATE to the right exception class but leaves
+  // sqlstate() *empty* on that class -- verified against libpqxx 7.10, where
+  // undefined_table and undefined_function both carry their codes and
+  // insufficient_privilege does not. A code comparison therefore never matches,
+  // the branch never runs, and the operator gets a raw exception instead of the
+  // grant they are missing. The type is reliable where the string is not.
+  //
+  // Note that libpqxx also raises insufficient_privilege for SQLSTATE 25006
+  // (write attempted in a read-only transaction). None of these queries write,
+  // so the two cannot be confused here -- but a future caller that does write
+  // must not reuse this pattern to report a grant.
+
+  // pg_buffercache's two failure shapes. The grant is the interesting one: a
+  // valid read-only role missing a monitoring grant is a different problem
+  // from an absent extension, and conflating them sends the operator to
+  // CREATE EXTENSION for something that is plainly already installed.
+  static json pg_buffercache_missing() {
+    return {
+      {"error", "pg_buffercache is not installed"},
+      {"hint", "Run: CREATE EXTENSION pg_buffercache;"}
+    };
+  }
+
+  static json pg_buffercache_denied(const std::string& what,
+                                    const std::string& detail) {
+    return {
+      {"error", "permission denied for " + what},
+      {"hint", "pg_buffercache is restricted to superusers and roles with "
+               "pg_monitor. Run: GRANT pg_monitor TO <role>;"},
+      {"detail", detail}
+    };
+  }
+
   static json pgstattuple_denied(const std::string& func, const std::string& detail) {
     return {
       {"error", "permission denied for " + func},
@@ -333,6 +460,15 @@ private:
       if (!c.port.empty())    entry["port"]    = c.port;
       if (!c.dbname.empty())  entry["dbname"]  = c.dbname;
       if (!c.user.empty())    entry["user"]    = c.user;
+      // Topology, so a caller can see which connections share a postmaster and
+      // which hold the same data, without a second call. Role is deliberately
+      // absent: it is observed, not configured (see verifyTopology).
+      if (!c.instance.empty()) {
+        entry["instance"] = c.instance;
+        entry["instance_source"] = c.instance_source;
+      }
+      if (!c.replication_group.empty()) entry["replication_group"] = c.replication_group;
+      if (!c.groups.empty())            entry["groups"] = c.groups;
       // Host capacity, so a caller can see at a glance which connections still
       // need it injected before hostCapacity can compute anything.
       if (c.capacity.ram_mb > 0)        entry["host_ram_mb"]  = c.capacity.ram_mb;
@@ -344,7 +480,401 @@ private:
     return out;
   }
 
-  const json get_tools_list() {
+  // The configured topology, as three indexes plus whatever belongs to none of
+  // them. Pure registry data: this opens no connection, which is what makes it
+  // cheap enough to call before deciding how wide a sweep to run.
+  const json topology() {
+    auto axis = [&](const pglicht::ConnectionRegistry::Members& idx) {
+      json out = json::array();
+      for (const auto& [name, members] : idx)
+        out.push_back({{"name", name}, {"connections", members}});
+      return out;
+    };
+
+    json instances = json::array();
+    for (const auto& [name, members] : registry_.instances()) {
+      json entry = {{"name", name}, {"connections", members}};
+      // Members of one instance share a source by construction: inference only
+      // ever fills in connections that declared nothing.
+      entry["source"] = registry_.get(members.front()).instance_source;
+      const auto cap = registry_.instance_capacity(name);
+      if (cap.ram_mb > 0)       entry["host_ram_mb"]  = cap.ram_mb;
+      if (cap.vcpus > 0)        entry["host_vcpus"]   = cap.vcpus;
+      if (!cap.storage.empty()) entry["host_storage"] = cap.storage;
+      if (!cap.note.empty())    entry["host_note"]    = cap.note;
+      instances.push_back(entry);
+    }
+
+    json unlabelled = json::array();
+    for (const auto& name : registry_.names()) {
+      const auto& c = registry_.get(name);
+      if (c.instance.empty() && c.replication_group.empty() && c.groups.empty())
+        unlabelled.push_back(name);
+    }
+
+    return {
+      {"instances", instances},
+      {"replication_groups", axis(registry_.replication_groups())},
+      {"groups", axis(registry_.groups())},
+      {"unlabelled", unlabelled}
+    };
+  }
+
+  // A copy of a connection's config with a bounded connect, for the tools that
+  // sweep every configured connection. One unreachable host must cost seconds,
+  // not whatever the kernel's TCP timeout happens to be.
+  static pglicht::ConnConfig with_connect_timeout(pglicht::ConnConfig cfg,
+                                                  int seconds) {
+    if (cfg.conninfo.find("connect_timeout") != std::string::npos) return cfg;
+    const bool uri = cfg.conninfo.rfind("postgres://", 0) == 0 ||
+                     cfg.conninfo.rfind("postgresql://", 0) == 0;
+    if (uri)
+      cfg.conninfo += (cfg.conninfo.find('?') == std::string::npos ? "?" : "&") +
+                      ("connect_timeout=" + std::to_string(seconds));
+    else
+      cfg.conninfo += " connect_timeout=" + std::to_string(seconds);
+    return cfg;
+  }
+
+  // Whether the declared topology is true.
+  //
+  // The whole tool turns on one fact: system_identifier names a replication
+  // *lineage*, not a postmaster. A physical replica began life as a copy of its
+  // primary and carries the same value forever. So the identifier alone cannot
+  // tell the two axes apart, and the endpoint has to be read alongside it:
+  //
+  //   same identifier, same host and port  -> one instance. Shared buffers,
+  //                                           shared autovacuum workers.
+  //   same identifier, different host      -> one replication group. Shared
+  //                                           data and WAL lineage, not memory.
+  //   different identifiers where the config claims either -> the config is
+  //                                           wrong, and says so.
+  //
+  // Logical replication is outside this entirely: a logical replica has its own
+  // identifier and its own schema, so disagreement there is "cannot verify",
+  // not "mismatch". Saying "mismatch" would send an operator to fix a config
+  // that is correct.
+  const json verify_topology() {
+    struct Observed {
+      std::string name, role, sysid, database, addr, version, error;
+      long long port = 0;
+      bool ok = false, endpoint_known = false;
+    };
+    std::vector<Observed> seen;
+
+    const std::string q = R"(
+      SELECT JSONB_BUILD_OBJECT(
+               'system_identifier', (SELECT c.system_identifier::text
+                                     FROM pg_control_system() AS c),
+               'database',          current_database(),
+               'server_addr',       HOST(inet_server_addr()),
+               'server_port',       inet_server_port(),
+               'server_version',    current_setting('server_version')
+             );
+    )";
+
+    for (const auto& name : registry_.names()) {
+      Observed o;
+      o.name = name;
+      const auto& cfg = registry_.get(name);
+      try {
+        Session sess{with_connect_timeout(cfg, kSweepConnectTimeoutSeconds)};
+        o.role = sess.role();
+        pqxx::result r = pqxx_exec(sess.txn(), q, pqxx::params{});
+        json row = json::parse(r[0][0].as<std::string>());
+        // As text: a system identifier is a 64-bit value and does not survive
+        // JSON number precision, the same reason query_id is a string.
+        if (!row["system_identifier"].is_null())
+          o.sysid = row["system_identifier"].get<std::string>();
+        o.database = row.value("database", "");
+        o.version  = row.value("server_version", "");
+        if (!row["server_addr"].is_null() && !row["server_port"].is_null()) {
+          o.addr = row["server_addr"].get<std::string>();
+          o.port = row["server_port"].get<long long>();
+          o.endpoint_known = true;
+        }
+        o.ok = true;
+      } catch (const std::exception& e) {
+        o.error = e.what();
+      }
+      seen.push_back(o);
+    }
+
+    json findings = json::array();
+    auto finding = [&](const char* topic, const std::string& name,
+                       const char* severity, const std::string& detail) {
+      findings.push_back({{"topic", topic}, {"name", name},
+                          {"severity", severity}, {"detail", detail}});
+    };
+    auto by_name = [&](const std::string& n) -> const Observed* {
+      for (const auto& o : seen) if (o.name == n) return &o;
+      return nullptr;
+    };
+    auto join = [](const std::vector<std::string>& v) {
+      std::string out;
+      for (const auto& x : v) out += (out.empty() ? "" : ", ") + x;
+      return out;
+    };
+
+    // --- declared instances ---
+    for (const auto& [iname, members] : registry_.instances()) {
+      if (registry_.get(members.front()).instance_source != "declared") continue;
+      std::vector<std::string> reachable;
+      std::set<std::string> ids, endpoints;
+      bool endpoints_known = true;
+      for (const auto& m : members) {
+        const Observed* o = by_name(m);
+        if (!o || !o->ok) continue;
+        reachable.push_back(m);
+        if (!o->sysid.empty()) ids.insert(o->sysid);
+        if (o->endpoint_known) endpoints.insert(o->addr + ":" + std::to_string(o->port));
+        else endpoints_known = false;
+      }
+      if (reachable.size() < 2) continue;
+      if (ids.size() > 1) {
+        finding("instance", iname, "error",
+                "members report different system identifiers, so they are not one "
+                "postmaster and share no buffers: " + join(reachable));
+      } else if (!endpoints_known) {
+        finding("instance", iname, "info",
+                "members agree on the system identifier, but at least one is "
+                "connected over a Unix socket, where inet_server_addr() is null "
+                "-- an instance and a replication group cannot be told apart "
+                "without an endpoint");
+      } else if (endpoints.size() > 1) {
+        finding("instance", iname, "error",
+                "members share a system identifier but sit on different servers. "
+                "That is a replication lineage, not one postmaster: declare them "
+                "as a replication_group instead");
+      }
+    }
+
+    // --- declared replication groups ---
+    for (const auto& [rname, members] : registry_.replication_groups()) {
+      std::vector<std::string> reachable, primaries;
+      std::set<std::string> ids;
+      for (const auto& m : members) {
+        const Observed* o = by_name(m);
+        if (!o || !o->ok) continue;
+        reachable.push_back(m);
+        if (!o->sysid.empty()) ids.insert(o->sysid);
+        if (o->role == std::string("primary")) primaries.push_back(m);
+      }
+      if (reachable.empty()) {
+        finding("replication_group", rname, "error",
+                "no member could be reached, so nothing about this group was "
+                "verified");
+        continue;
+      }
+      if (ids.size() > 1) {
+        finding("replication_group", rname, "warning",
+                "cannot verify: physical replication shares one system "
+                "identifier and these members do not. If this is logical "
+                "replication that is expected -- membership can then only be "
+                "declared, and listPublications and listSubscriptions are where "
+                "it is visible");
+      }
+      if (primaries.empty()) {
+        finding("replication_group", rname, "error",
+                "every reachable member is in recovery: there is no primary. "
+                "During a failover this is the finding, not an empty result");
+      } else if (primaries.size() > 1) {
+        finding("replication_group", rname, "error",
+                "more than one member reports itself a primary, which is split "
+                "brain: " + join(primaries) + ". Both are reported; neither is "
+                "chosen");
+      }
+    }
+
+    // --- lineages the config never mentions ---
+    // An undeclared replica is the case where "is this index used?" quietly
+    // gets the wrong answer: the workload is on a server nothing sweeps.
+    std::map<std::string, std::vector<std::string>> by_sysid;
+    for (const auto& o : seen)
+      if (o.ok && !o.sysid.empty()) by_sysid[o.sysid].push_back(o.name);
+
+    for (const auto& [sysid, members] : by_sysid) {
+      if (members.size() < 2) continue;
+      const auto& first = registry_.get(members.front());
+      bool one_instance = !first.instance.empty();
+      bool one_group = !first.replication_group.empty();
+      for (const auto& m : members) {
+        const auto& c = registry_.get(m);
+        if (c.instance != first.instance) one_instance = false;
+        if (c.replication_group != first.replication_group) one_group = false;
+      }
+      if (one_instance || one_group) continue;
+      finding("system_identifier", sysid, "warning",
+              "these connections share a system identifier but the config does "
+              "not tie them together: " + join(members) +
+              ". They hold the same data; statistics counters on each are that "
+              "server's own, so a sweep that misses one misses that workload");
+    }
+
+    // --- what could not be answered ---
+    std::vector<std::string> failed;
+    for (const auto& o : seen) if (!o.ok) failed.push_back(o.name);
+    if (!failed.empty())
+      finding("reachability", "", "warning",
+              "not reached, so every finding above covers only what answered: " +
+              join(failed));
+
+    json conns = json::array();
+    for (const auto& o : seen) {
+      json e = {{"connection", o.name}};
+      const auto& cfg = registry_.get(o.name);
+      if (!cfg.instance.empty()) {
+        e["instance"] = cfg.instance;
+        e["instance_source"] = cfg.instance_source;
+      }
+      if (!cfg.replication_group.empty()) e["replication_group"] = cfg.replication_group;
+      if (!o.ok) { e["error"] = o.error; conns.push_back(e); continue; }
+      e["role"] = o.role;
+      e["database"] = o.database;
+      e["server_version"] = o.version;
+      if (!o.sysid.empty()) e["system_identifier"] = o.sysid;
+      if (o.endpoint_known) {
+        e["server_addr"] = o.addr;
+        e["server_port"] = o.port;
+      }
+      conns.push_back(e);
+    }
+
+    return {{"connections", conns}, {"findings", findings}};
+  }
+
+  // Where a tool's answer actually varies.
+  //
+  // The two fan-out axes are close to inverses of each other, and getting this
+  // wrong produces sweeps that are either duplicated or misleading:
+  //
+  //   per_database  differs between the databases of one instance. False for
+  //                 the instance-wide views -- pg_stat_activity, pg_locks,
+  //                 pg_stat_statements, pg_buffercache and the shared catalogs
+  //                 all report the whole instance from any one database, so a
+  //                 sweep would return the same rows once per database with
+  //                 nothing in the payload to say so.
+  //   per_server    differs between members of a replication group. A physical
+  //                 replica is byte-identical in its catalogs and its physical
+  //                 layout, so DDL and bloat do not vary -- but every statistics
+  //                 counter does, because each server accumulates its own.
+  //   primary_authoritative
+  //                 carries vacuum-side counters. Vacuum never runs on a
+  //                 replica, so its values there are noise rather than a second
+  //                 opinion.
+  //   registry      touches no database at all.
+  //
+  // Note which tools are per_server for a reason that is easy to miss:
+  // duplicateIndexes and indexBloat report idx_scan alongside their physical
+  // measurements. The bloat figures are identical across a replication group;
+  // the scan counts are not, and they are the whole answer to "is this index
+  // safe to drop?" -- an index dead on the primary may be carrying a replica's
+  // entire reporting workload.
+  struct ToolScope {
+    bool per_database = false;
+    bool per_server = false;
+    bool primary_authoritative = false;
+    bool registry = false;
+  };
+
+  static const std::map<std::string, ToolScope>& tool_scopes() {
+    // {per_database, per_server, primary_authoritative, registry}
+    static const std::map<std::string, ToolScope> m = {
+      // Registry only: no connection is opened.
+      {"listConnections",       {false, false, false, true}},
+      {"listTopology",          {false, false, false, true}},
+      {"verifyTopology",        {false, false, false, true}},
+
+      // Instance-wide readings: one answer per postmaster.
+      {"bufferCacheContents",   {false, true,  false, false}},
+      {"bufferCacheSummary",    {false, true,  false, false}},
+      {"checkpointStats",       {false, true,  false, false}},
+      {"currentActivity",       {false, true,  false, false}},
+      {"currentLocks",          {false, true,  false, false}},
+      {"databaseStats",         {false, true,  false, false}},
+      {"hostCapacity",          {false, true,  false, false}},
+      {"ioStats",               {false, true,  false, false}},
+      {"progressStats",         {false, true,  false, false}},
+      {"replicationSlots",      {false, true,  false, false}},
+      {"serverSettings",        {false, true,  false, false}},
+      {"statementStats",        {false, true,  false, false}},
+      // Shared catalogs, and replicated verbatim.
+      {"listRoles",             {false, false, false, false}},
+      {"listTablespaces",       {false, false, false, false}},
+
+      // Per-database catalogs, identical on a physical replica.
+      {"checkKey",              {true,  false, false, false}},
+      {"databaseSize",          {true,  false, false, false}},
+      {"enumDetails",           {true,  false, false, false}},
+      {"explainQuery",          {true,  false, false, false}},
+      {"functionDetails",       {true,  false, false, false}},
+      {"listAccessMethods",     {true,  false, false, false}},
+      {"listCasts",             {true,  false, false, false}},
+      {"listCollations",        {true,  false, false, false}},
+      {"listEnums",             {true,  false, false, false}},
+      {"listEventTriggers",     {true,  false, false, false}},
+      {"listExtendedStatistics",{true,  false, false, false}},
+      {"listExtensions",        {true,  false, false, false}},
+      {"listForeignServers",    {true,  false, false, false}},
+      {"listForeignTables",     {true,  false, false, false}},
+      {"listFunctions",         {true,  false, false, false}},
+      {"listLanguages",         {true,  false, false, false}},
+      {"listOperatorClasses",   {true,  false, false, false}},
+      {"listOperators",         {true,  false, false, false}},
+      {"listPublications",      {true,  false, false, false}},
+      {"listSchemas",           {true,  false, false, false}},
+      {"listSequences",         {true,  false, false, false}},
+      {"listSubscriptions",     {true,  false, false, false}},
+      {"listTextSearchConfigs", {true,  false, false, false}},
+      {"listTypes",             {true,  false, false, false}},
+      {"searchEnums",           {true,  false, false, false}},
+      {"searchFunctions",       {true,  false, false, false}},
+      {"tableBloat",            {true,  false, false, false}},
+      {"typeDetails",           {true,  false, false, false}},
+
+      // Per-database *and* per-server: they carry statistics counters.
+      {"duplicateIndexes",      {true,  true,  false, false}},
+      {"indexBloat",            {true,  true,  false, false}},
+      {"tableIOStats",          {true,  true,  false, false}},
+      {"listTables",            {true,  true,  true,  false}},
+      {"searchTables",          {true,  true,  true,  false}},
+      {"tableDetails",          {true,  true,  true,  false}},
+      // Frozen xids are replicated, but the vacuum counters beside them are not
+      // meaningful on a server where vacuum never runs.
+      {"wraparoundStatus",      {true,  false, true,  false}},
+    };
+    return m;
+  }
+
+  // What to add to a tool's description so the model can tell which of the
+  // three classes it is in. The payload cannot say it, and a sweep that
+  // silently repeated one answer would read as agreement between databases.
+  static std::string scope_note(const std::string& name, const ToolScope& sc) {
+    if (sc.registry) return "";
+    if (name == "explainQuery")
+      return " Never runs across more than one connection: the same statement is"
+             " rarely valid in another database, and with analyze it would"
+             " execute once per member.";
+    std::string note;
+    if (!sc.per_database)
+      note += " This reading is instance-wide -- every database on the same"
+              " postmaster returns it identically, so asking each of them in turn"
+              " repeats one answer.";
+    if (!sc.per_server)
+      note += " A physical replica is byte-identical here, so asking each member"
+              " of a replication group adds nothing.";
+    else if (!sc.registry)
+      note += " The counters here are each server's own, so members of a"
+              " replication group legitimately disagree and the answer is their"
+              " sum, not the primary's copy.";
+    if (sc.primary_authoritative)
+      note += " Dead tuples and the last vacuum and analyze times describe work"
+              " that only happens on a primary; on a replica they are noise, not"
+              " a second opinion.";
+    return note;
+  }
+
+  const json get_tools_list(const std::string& protocol) {
     json list = {
       {"tools", {
 	  {
@@ -920,8 +1450,42 @@ private:
 	      }}
 	  },
 	  {
+	    {"name", "verifyTopology"},
+	    {"description", "connect to every configured connection and report what each server actually is: its role (primary or replica, from pg_is_in_recovery(), observed now rather than configured), its system identifier, database, address, port and version -- then check the declared topology against them. A physical replica carries the same system identifier as its primary forever, so the identifier alone cannot separate the two axes: same identifier with the same host and port is one instance, same identifier on different hosts is a replication group. Reports declarations the servers contradict, connections that share an identifier but are not declared together (an undeclared replica is where 'is this index used?' quietly gets the wrong answer), a replication group with no primary, and split brain. Logical replication cannot be verified this way and is reported as such rather than as a mismatch. Connects once per configured connection, sequentially, with a short connect timeout; a connection that fails is reported and does not abort the rest"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", json::object()}
+	      }}
+	  },
+	  {
+	    {"name", "bufferCacheSummary"},
+	    {"description", "return how much of shared_buffers is used, dirty and pinned, with the usage-count histogram from pg_buffercache. Cheap enough for a routine health sweep beside checkpointStats. tableIOStats counts only what shared_buffers served, so a miss there may still have come from the OS page cache at RAM speed; this is the only in-core view of that split. Read the histogram rather than a hit ratio: mass at usage_count 2-5 is a stable working set, everything at 0-1 with no unused buffers is clock-sweep churn, and those are the same ratio with opposite diagnoses. One sample is weak evidence -- two samples minutes apart are the method. The readings cover the whole instance, not this database alone. Requires the pg_buffercache extension at version 1.4 or later, and a role with pg_monitor"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", json::object()}
+	      }}
+	  },
+	  {
+	    {"name", "bufferCacheContents"},
+	    {"description", "return which relations own shared_buffers, aggregated per relation and fork and ranked by buffers held: cached bytes, percent of that fork resident, percent of shared_buffers consumed, dirty buffers, average usagecount and pins. Never raw per-buffer rows. Answers which relation is driving checkpoint writeback (pair with checkpointStats), whether the visibility-map fork is resident enough for index-only scans to pay off, and -- on a multi-tenant instance -- which database's working set is displacing the others. Only buffers belonging to this database and the shared catalogs can be resolved to names; buffers held by other databases on the same instance are visible to PostgreSQL but deliberately not reported here. Requires the pg_buffercache extension and a role with pg_monitor"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", {
+		    {"limit", {{"type", "integer"}, {"description", "how many relation/fork rows to return, ranked by buffers held. Defaults to 20, capped at 200"}}}
+		  }}
+	      }}
+	  },
+	  {
+	    {"name", "listTopology"},
+	    {"description", "return the configured topology: which connections share an instance (one postmaster, so they share shared_buffers, WAL, autovacuum workers and disk), which belong to the same replication_group (a primary and its replicas, holding the same data on different servers), and which carry each operator group label. Reads the config file only and opens no database connection, so it is cheap to call before deciding how wide a sweep to run. An instance whose source is \"inferred\" was derived from an identical host and port rather than declared, and is a hint for grouping output, not evidence of shared memory. Roles are not here: primary or replica is observed per call, never configured -- use verifyTopology"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", json::object()}
+	      }}
+	  },
+	  {
 	    {"name", "listConnections"},
-	    {"description", "return the configured database connections by name, with the libpq service name or host/port/dbname/user for each, and which is the default; passwords are never returned and a service file is never expanded. Pass a name as the 'connection' argument of any other tool to run that tool against that database"},
+	    {"description", "return the configured database connections by name, with the libpq service name or host/port/dbname/user for each, its instance, replication_group and group labels where configured, and which is the default; passwords are never returned and a service file is never expanded. Pass a name as the 'connection' argument of any other tool to run that tool against that database. See listTopology for the same labels indexed the other way round, by topology name rather than by connection"},
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", json::object()}
@@ -938,11 +1502,105 @@ private:
       {"description", "name of a configured connection (see listConnections); "
                       "defaults to \"" + registry_.default_name() + "\""}
     };
+    // `annotations` arrived in MCP revision 2025-03-26 and tool `title` in
+    // 2025-06-18. Emitting them to a client that negotiated 2024-11-05 would
+    // change bytes that release 3.1.1 promised, so both are gated on the
+    // version the client actually asked for rather than sent unconditionally.
+    // Revision strings are ISO dates, so comparing them as strings is ordering
+    // them by date.
+    const bool wants_annotations = protocol >= "2025-03-26";
+    const bool wants_title       = protocol >= "2025-06-18";
+
     for (auto& tool : list["tools"]) {
-      if (tool["name"] == "listConnections") continue;
-      tool["inputSchema"]["properties"]["connection"] = conn_prop;
+      const std::string name = tool["name"].get<std::string>();
+      auto it = tool_scopes().find(name);
+      // A tool with no entry is a bug, not a default: the fan-out rules read
+      // this table, and a missing row would quietly make a tool ineligible.
+      // A test asserts the table covers every tool.
+      const ToolScope sc = it == tool_scopes().end() ? ToolScope{} : it->second;
+
+      if (!sc.registry) {
+        tool["inputSchema"]["properties"]["connection"] = conn_prop;
+
+        // The sweep arguments are advertised only where they are eligible, so
+        // the schema itself teaches the rule and the -32602 is only a backstop.
+        //
+        // These are this server's own surface rather than a protocol-revision
+        // feature, so unlike annotations they are not gated on the negotiated
+        // version: a new optional input property cannot break a caller, and
+        // gating it would hide the feature from exactly the clients that exist.
+        if (tool_name_is_sweepable(name)) {
+          if (sc.per_database)
+            tool["inputSchema"]["properties"]["instance"] = json{
+              {"type", "string"},
+              {"description", "run against every database of this instance (see "
+                              "listTopology) and return one result per member"}};
+          if (sc.per_server)
+            tool["inputSchema"]["properties"]["replication_group"] = json{
+              {"type", "string"},
+              {"description", "run against every member of this replication group "
+                              "and return one result per member. The counters here "
+                              "are each server's own, so the answer is their sum"}};
+          tool["inputSchema"]["properties"]["group"] = json{
+            {"type", "string"},
+            {"description", "run against every connection carrying this group "
+                            "label. Members that would answer identically for "
+                            "this tool are collapsed and reported under "
+                            "'skipped'"}};
+          if (sc.per_server)
+            tool["inputSchema"]["properties"]["role"] = json{
+              {"type", "string"},
+              {"description", "with replication_group or group, sweep only "
+                              "members whose observed role is \"primary\" or "
+                              "\"replica\". Observed per call, never configured"}};
+        }
+      }
+
+      const std::string note = scope_note(name, sc);
+      if (!note.empty())
+        tool["description"] = tool["description"].get<std::string>() + note;
+
+      if (wants_annotations) {
+        // Every tool runs inside SET TRANSACTION READ ONLY, which is what makes
+        // the claim honest rather than aspirational.
+        json ann = {
+          {"readOnlyHint", true},
+          {"destructiveHint", false},
+          {"openWorldHint", false}
+        };
+        // explainQuery is the carve-out. With analyze:true it really executes
+        // the statement -- the plan is proven free of any ModifyTable node
+        // first, so it still cannot mutate, but running it twice is not the
+        // same as running it once.
+        if (name == "explainQuery") ann["idempotentHint"] = false;
+        tool["annotations"] = ann;
+      }
+      if (wants_title) tool["title"] = tool_title(name);
     }
     return list;
+  }
+
+  // explainQuery aside, any tool that touches a database can be swept.
+  static bool tool_name_is_sweepable(const std::string& name) {
+    return name != "explainQuery";
+  }
+
+  // A human-readable label, derived from the tool name rather than stored
+  // twice: "bufferCacheSummary" -> "Buffer cache summary". Keeping it derived
+  // means a renamed tool cannot end up with a stale title.
+  static std::string tool_title(const std::string& name) {
+    std::string out;
+    for (size_t i = 0; i < name.size(); i++) {
+      const unsigned char c = static_cast<unsigned char>(name[i]);
+      if (i == 0) { out += static_cast<char>(std::toupper(c)); continue; }
+      if (std::isupper(c) && !std::isupper(static_cast<unsigned char>(name[i - 1]))) {
+        out += ' ';
+        out += static_cast<char>(std::tolower(c));
+      } else {
+        out += name[i];
+      }
+    }
+    return out;
   }
 
   const json schemas() {
@@ -3105,6 +3763,8 @@ private:
       } else {
         return {};
       }
+    } catch (const pqxx::insufficient_privilege& e) {
+      return pgstattuple_denied("pgstattuple", e.what());
     } catch (const pqxx::sql_error& e) {
       if (e.sqlstate() == "42883") { // undefined_function
         // The extension was there when its schema was resolved, so it has
@@ -3113,8 +3773,6 @@ private:
         forget_extension_schema("pgstattuple");
         return pgstattuple_missing();
       }
-      if (e.sqlstate() == "42501") // insufficient_privilege
-        return pgstattuple_denied("pgstattuple", e.what());
       throw;
     }
   }
@@ -3317,13 +3975,195 @@ private:
         out["pending_list_limit_kb"] = meta["pending_list_limit_kb"];
       }
       return out;
+    } catch (const pqxx::insufficient_privilege& e) {
+      return pgstattuple_denied(fn->second, e.what());
     } catch (const pqxx::sql_error& e) {
       if (e.sqlstate() == "42883") { // undefined_function
         forget_extension_schema("pgstattuple");
         return pgstattuple_missing();
       }
-      if (e.sqlstate() == "42501") // insufficient_privilege
-        return pgstattuple_denied(fn->second, e.what());
+      throw;
+    }
+  }
+
+  // How much of shared_buffers is in use, and the usage-count histogram.
+  //
+  // Why this is not answerable from tableIOStats: that counts only what
+  // shared_buffers served, so a "miss" there may still have been served from
+  // the OS page cache at RAM speed. pg_buffercache is the only in-core view of
+  // the split.
+  //
+  // The histogram is the part worth reading. A hit ratio says almost nothing
+  // on its own; mass at usage_count 2-5 is a stable working set, while
+  // everything sitting at 0-1 with no unused buffers is clock-sweep churn --
+  // the same ratio, the opposite diagnosis.
+  const json buffer_cache_summary() {
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
+
+    const std::string ext = extension_schema(txn, "pg_buffercache");
+    if (ext.empty()) return pg_buffercache_missing();
+
+    // Gate on the *extension* version, not the server version. An extension
+    // created before 1.4 and never ALTER EXTENSION ... UPDATE'd is a live
+    // catalog entry missing exactly these two functions, which would otherwise
+    // surface as the extension being absent -- it is not, it is out of date.
+    pqxx::result ver = pqxx_exec(
+      txn, "SELECT extversion FROM pg_extension WHERE extname = 'pg_buffercache'",
+      pqxx::params{});
+    const std::string extver = ver.empty() || ver[0][0].is_null()
+      ? std::string() : ver[0][0].as<std::string>();
+    if (!extversion_at_least(extver, 1, 4)) {
+      const std::string have = extver.empty() ? std::string("(unknown)") : extver;
+      // Two different problems that look alike. pg_buffercache 1.4 shipped with
+      // PostgreSQL 16, so on 14 and 15 there is no 1.4 to update to and
+      // "ALTER EXTENSION ... UPDATE" would send the operator in a circle.
+      if (sess.server_version() < 160000) {
+        return {
+          {"error", "pg_buffercache_summary() was added in pg_buffercache 1.4, "
+                    "which ships with PostgreSQL 16. This server has "
+                    "pg_buffercache " + have + ", the newest available here"},
+          {"hint", "Use bufferCacheContents instead: it reads the pg_buffercache "
+                   "view, which exists in every version of the extension"}
+        };
+      }
+      return {
+        {"error", "pg_buffercache_summary() requires pg_buffercache 1.4, but "
+                  "version " + have + " is installed"},
+        {"hint", "Run: ALTER EXTENSION pg_buffercache UPDATE;"}
+      };
+    }
+
+    const std::string query = R"(
+      SELECT JSONB_BUILD_OBJECT(
+               'buffers_used',        s.buffers_used,
+               'buffers_unused',      s.buffers_unused,
+               'buffers_dirty',       s.buffers_dirty,
+               'buffers_pinned',      s.buffers_pinned,
+               'usagecount_avg',      ROUND(s.usagecount_avg::numeric, 2),
+               'shared_buffers_blocks',
+                 (SELECT setting::bigint FROM pg_settings WHERE name = 'shared_buffers'),
+               'block_size_bytes',    current_setting('block_size')::bigint,
+               'shared_buffers_bytes',
+                 (SELECT setting::bigint FROM pg_settings WHERE name = 'shared_buffers')
+                 * current_setting('block_size')::bigint,
+               'usage_counts',
+                 (SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                           'usage_count', u.usage_count,
+                           'buffers',     u.buffers,
+                           'dirty',       u.dirty,
+                           'pinned',      u.pinned)
+                         ORDER BY u.usage_count)
+                  FROM )" + ext + R"(.pg_buffercache_usage_counts() AS u),
+               'extension_version',   $1::text
+             )
+      FROM )" + ext + R"(.pg_buffercache_summary() AS s;
+    )";
+
+    try {
+      pqxx::result res = pqxx_exec(txn, query, pqxx::params{extver});
+      if (res.empty() || res[0][0].is_null()) return {};
+      return json::parse(res[0][0].as<std::string>());
+    } catch (const pqxx::insufficient_privilege& e) {
+      return pg_buffercache_denied("pg_buffercache_summary()", e.what());
+    } catch (const pqxx::sql_error& e) {
+      if (e.sqlstate() == "42883") {   // undefined_function
+        forget_extension_schema("pg_buffercache");
+        return pg_buffercache_missing();
+      }
+      throw;
+    }
+  }
+
+  // Which relations own the cache, aggregated per relation and fork.
+  //
+  // Never raw per-buffer rows: the view has one row per buffer, so a machine
+  // with 16GB of shared_buffers has two million of them.
+  //
+  // The aggregation happens before the join for the same reason -- it collapses
+  // millions of buffer rows to a few thousand groups, instead of hash-joining
+  // pg_class against the whole pool.
+  //
+  // Two joins that most published examples get wrong:
+  //
+  //   * Join on relfilenode, not oid. A mapped catalog has relfilenode = 0 in
+  //     pg_class, so pg_relation_filenode(oid) is what matches the view.
+  //   * Filter reldatabase to this database's oid *or* 0. Zero is the shared
+  //     catalogs; buffers belonging to other databases in the instance are
+  //     visible here but cannot be resolved to names locally, and reporting
+  //     them as unknown rows would invite them to be read as this database's.
+  const json buffer_cache_contents(int limit) {
+    if (limit <= 0) limit = 20;
+    if (limit > 200) limit = 200;
+
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
+
+    const std::string ext = extension_schema(txn, "pg_buffercache");
+    if (ext.empty()) return pg_buffercache_missing();
+
+    const std::string query = R"(
+      WITH buf AS (
+        SELECT relfilenode,
+               relforknumber,
+               COUNT(*)                                  AS buffers,
+               COUNT(*) FILTER (WHERE isdirty)           AS dirty,
+               ROUND(AVG(usagecount)::numeric, 2)        AS avg_usagecount,
+               SUM(pinning_backends)                     AS pins
+          FROM )" + ext + R"(.pg_buffercache
+         WHERE reldatabase IN (0, (SELECT oid FROM pg_database
+                                    WHERE datname = current_database()))
+           AND relfilenode IS NOT NULL
+         GROUP BY relfilenode, relforknumber
+      ), named AS (
+        SELECT n.nspname                                 AS schema,
+               c.relname                                 AS relation,
+               c.relkind                                 AS relkind,
+               CASE buf.relforknumber WHEN 0 THEN 'main' WHEN 1 THEN 'fsm'
+                                      WHEN 2 THEN 'vm'   WHEN 3 THEN 'init' END AS fork,
+               buf.buffers, buf.dirty, buf.avg_usagecount, buf.pins,
+               buf.buffers * current_setting('block_size')::bigint AS cached_bytes,
+               CASE buf.relforknumber
+                 WHEN 0 THEN pg_relation_size(c.oid, 'main')
+                 WHEN 1 THEN pg_relation_size(c.oid, 'fsm')
+                 WHEN 2 THEN pg_relation_size(c.oid, 'vm')
+                 WHEN 3 THEN pg_relation_size(c.oid, 'init')
+               END                                       AS fork_bytes
+          FROM buf
+          JOIN pg_class     AS c ON pg_relation_filenode(c.oid) = buf.relfilenode
+          JOIN pg_namespace AS n ON n.oid = c.relnamespace
+      )
+      SELECT JSONB_AGG(x ORDER BY x.buffers DESC) FROM (
+        SELECT schema, relation, relkind, fork, buffers, dirty, pins,
+               avg_usagecount, cached_bytes, fork_bytes,
+               CASE WHEN fork_bytes > 0
+                    THEN ROUND(cached_bytes * 100.0 / fork_bytes, 2) END
+                 AS percent_of_fork_cached,
+               ROUND(buffers * 100.0 /
+                     NULLIF((SELECT setting::bigint FROM pg_settings
+                              WHERE name = 'shared_buffers'), 0), 2)
+                 AS percent_of_shared_buffers
+          FROM named
+         ORDER BY buffers DESC
+         LIMIT $1
+      ) AS x;
+    )";
+
+    try {
+      pqxx::result res = pqxx_exec(txn, query, pqxx::params{limit});
+      json rows = (res.empty() || res[0][0].is_null())
+        ? json::array() : json::parse(res[0][0].as<std::string>());
+      return {
+        {"limit", limit},
+        {"relations", rows}
+      };
+    } catch (const pqxx::insufficient_privilege& e) {
+      return pg_buffercache_denied("the pg_buffercache view", e.what());
+    } catch (const pqxx::sql_error& e) {
+      if (e.sqlstate() == "42P01") {   // undefined_table
+        forget_extension_schema("pg_buffercache");
+        return pg_buffercache_missing();
+      }
       throw;
     }
   }
@@ -4401,9 +5241,73 @@ private:
     }
   }
 
-  void initialize(const json& id) {
+  // The three _meta keys the stateless revision defines, and the revision
+  // itself. Spelled out once: a typo in one of these strings would silently
+  // route every modern request down the legacy path.
+  static constexpr const char* kMetaProtocolVersion =
+    "io.modelcontextprotocol/protocolVersion";
+  static constexpr const char* kMetaClientCapabilities =
+    "io.modelcontextprotocol/clientCapabilities";
+  static constexpr const char* kMetaServerInfo =
+    "io.modelcontextprotocol/serverInfo";
+  static constexpr const char* kModernProtocol = "2026-07-28";
+
+  // Legacy revisions this server's surface is genuinely the same across: tools
+  // only, text content, no resources or prompts. Listed rather than
+  // open-ended, because echoing a version nobody exercises asserts support for
+  // features that may not exist.
+  static const std::vector<std::string>& supported_protocols() {
+    static const std::vector<std::string> v = {
+      "2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"
+    };
+    return v;
+  }
+
+  // Everything the server answers to, legacy and modern.
+  static const std::vector<std::string>& all_protocols() {
+    static const std::vector<std::string> v = [] {
+      std::vector<std::string> a = supported_protocols();
+      a.push_back(kModernProtocol);
+      return a;
+    }();
+    return v;
+  }
+
+  // What a client should know before its first call, and what currently lives
+  // only inside individual tool descriptions where a client browsing the server
+  // never sees it.
+  static std::string instructions() {
+    return
+      "Every statement runs inside a transaction opened with SET TRANSACTION "
+      "READ ONLY. Nothing here writes: the one tool that executes anything is "
+      "explainQuery with analyze:true, and it does so only after the plan is "
+      "proven free of any ModifyTable node.\n\n"
+      "explainQuery returns the plan verbatim. There are no heuristics and no "
+      "generated DDL -- reading the plan is yours to do.\n\n"
+      "Every tool that reads a database takes an optional 'connection' naming "
+      "one configured target; listConnections and listTopology enumerate them "
+      "without connecting. Tools may instead take 'instance' (the databases of "
+      "one postmaster), 'replication_group' (a primary and its replicas) or "
+      "'group' (an operator label), and then return one result per member. "
+      "Which of those a tool accepts depends on where its answer actually "
+      "varies, and its input schema says which.\n\n"
+      "Role -- primary or replica -- is observed on every connection rather "
+      "than configured, because failover swaps it. verifyTopology checks the "
+      "declared topology against what the servers report.";
+  }
+
+  void initialize(const json& id, const json& params) {
+    // 3.1.1 ignored params.protocolVersion and always replied 2024-11-05.
+    // Honouring it is what lets tool annotations reach a client that
+    // understands them while a 2024-11-05 client keeps byte-identical output.
+    std::string want = params.value("protocolVersion", std::string());
+    std::string reply = "2024-11-05";
+    for (const auto& v : supported_protocols())
+      if (v == want) { reply = v; break; }
+    client_protocol_ = reply;
+
     send_response(id, {
-        {"protocolVersion", "2024-11-05"},
+        {"protocolVersion", reply},
         {"capabilities", {
             {"tools", json::object()}
 	  }},
@@ -4411,270 +5315,572 @@ private:
       });
   }
 
+  // How many members one sweep will visit. Fan-out is sequential -- the server
+  // is a single-threaded getline loop with no stdout write mutex -- so width is
+  // wall-clock, and a sweep that quietly covered 10 of 40 databases would read
+  // as "nothing else is affected".
+  static constexpr size_t kMaxSweepMembers = 32;
+
+  // Why a sweep on this axis is refused, or "" when it is allowed.
+  //
+  // These are -32602 rather than a shrug because the failure they prevent is
+  // invisible in the payload: sweeping an instance-wide reading across eight
+  // databases returns the same rows eight times, and nothing in the result says
+  // so. A caller reading eight identical answers concludes the databases agree.
+  std::string sweep_rejection(const std::string& axis,
+                              const std::string& tool_name,
+                              const std::vector<std::string>& members) const {
+    auto it = tool_scopes().find(tool_name);
+    if (it == tool_scopes().end()) return "";
+    const ToolScope& sc = it->second;
+    const std::string first = members.empty() ? std::string("<connection>") : members.front();
+
+    if (sc.registry)
+      return tool_name + " reads no database, so it has no target to sweep";
+    if (tool_name == "explainQuery")
+      return "explainQuery never sweeps: the same statement is rarely valid in "
+             "another database, and with analyze:true it would execute once per "
+             "member";
+    if (axis == "instance" && !sc.per_database)
+      return tool_name + " is instance-wide -- every database on one postmaster "
+             "returns it identically, so sweeping them would repeat one answer. "
+             "Call it once with connection=" + first;
+    if (axis == "replication_group" && !sc.per_server)
+      return tool_name + " is byte-identical across a replication group, because "
+             "physical replication copies it verbatim. Call it once with "
+             "connection=" + first;
+    return "";
+  }
+
+  // Run one tool across a set of connections.
+  //
+  // The loop lives here, above dispatch, which is what lets every query method
+  // go on reading active_cfg() without learning that a sweep exists -- and what
+  // keeps a call that names a single connection byte-identical to 3.1.1.
+  json fan_out(const std::string& axis, const std::string& name,
+               const std::string& role_filter, const std::string& tool_name,
+               const json& arguments) {
+    std::vector<std::string> members = registry_.members(axis, name);
+    auto scope_it = tool_scopes().find(tool_name);
+    const ToolScope sc = scope_it == tool_scopes().end() ? ToolScope{} : scope_it->second;
+
+    json skipped = json::array();
+    auto skip = [&](const std::string& conn, const std::string& why) {
+      skipped.push_back({{"connection", conn}, {"reason", why}});
+    };
+
+    // A group may span instances and replication groups, so it cannot be
+    // refused the way the two topology axes are -- sweeping listTables across
+    // two databases on different hosts is exactly what a group is for. Instead
+    // collapse the members that would answer identically, and say which and why.
+    if (axis == "group") {
+      std::set<std::string> seen_instance, seen_group;
+      std::vector<std::string> kept;
+      for (const auto& m : members) {
+        const auto& c = registry_.get(m);
+        if (!sc.per_database && !c.instance.empty() && !seen_instance.insert(c.instance).second) {
+          skip(m, "another member of instance " + c.instance + " already answered, "
+                  "and this reading is instance-wide");
+          continue;
+        }
+        if (!sc.per_server && !c.replication_group.empty() &&
+            !seen_group.insert(c.replication_group).second) {
+          skip(m, "another member of replication_group " + c.replication_group +
+                  " already answered, and this reading is byte-identical across it");
+          continue;
+        }
+        kept.push_back(m);
+      }
+      members = kept;
+    }
+
+    // Role filtering has to observe, never assume -- so it costs one connect
+    // per member before the tool's own. Every member is probed even when only
+    // the primary is wanted: stopping at the first would hide split brain, and
+    // "never pick one of two primaries" outranks saving a connect.
+    json notes = json::array();
+    if (!role_filter.empty()) {
+      std::vector<std::string> matched, primaries;
+      for (const auto& m : members) {
+        std::string observed;
+        try {
+          Session probe{with_connect_timeout(registry_.get(m), kSweepConnectTimeoutSeconds)};
+          observed = probe.role();
+        } catch (const std::exception&) {
+          observed = "unknown";
+        }
+        if (observed == "primary") primaries.push_back(m);
+        if (observed == role_filter) matched.push_back(m);
+        else skip(m, "role is " + observed + ", not " + role_filter);
+      }
+      if (role_filter == "primary" && primaries.size() > 1)
+        notes.push_back("more than one member reports itself a primary (" +
+                        std::to_string(primaries.size()) + "): this is split "
+                        "brain. Every one of them was swept; none was chosen");
+      if (matched.empty())
+        notes.push_back("no member is currently a " + role_filter +
+                        ". During a failover that is the finding, not an empty "
+                        "result");
+      members = matched;
+    }
+
+    if (members.size() > kMaxSweepMembers) {
+      for (size_t i = kMaxSweepMembers; i < members.size(); i++)
+        skip(members[i], "beyond the " + std::to_string(kMaxSweepMembers) +
+                         "-member cap for one sweep");
+      members.resize(kMaxSweepMembers);
+    }
+
+    json out = json::array();
+    for (const auto& m : members) {
+      // Reset first: a member that never connects must not inherit the
+      // previous member's role.
+      Session::last_observed_role() = "unknown";
+      active_ = m;
+      const auto& cfg = registry_.get(m);
+
+      json entry = {{"connection", m}};
+      if (!cfg.instance.empty())          entry["instance"] = cfg.instance;
+      if (!cfg.replication_group.empty()) entry["replication_group"] = cfg.replication_group;
+
+      json result;
+      try {
+        if (!dispatch_tool(tool_name, arguments, result)) {
+          entry["error"] = "Tool not found: " + tool_name;
+        } else {
+          entry["result"] = result;
+        }
+      } catch (const std::exception& e) {
+        // One unreachable host must not fail the sweep: a partial answer
+        // during an incident beats an exception.
+        entry["error"] = e.what();
+      }
+      entry["role"] = Session::last_observed_role();
+      out.push_back(entry);
+    }
+    active_.clear();
+
+    json payload = {
+      {"axis", axis},
+      {"name", name},
+      {"members", out}
+    };
+    if (!role_filter.empty()) payload["role"] = role_filter;
+    if (!skipped.empty())     payload["skipped"] = skipped;
+    if (!notes.empty())       payload["notes"] = notes;
+    return payload;
+  }
+
+  // The tool dispatch chain, lifted out of handle_request so a fan-out sweep
+  // can run it once per member. Returns false when the name is unknown.
+  //
+  // Every branch reads active_, set by the caller. That indirection is the
+  // whole reason the ~50 query methods needed no changes to gain fan-out.
+  bool dispatch_tool(const std::string& tool_name, const json& arguments,
+                     json& result_content) {
+    if (tool_name == "listConnections") {
+      result_content = connections();
+    }
+    else if (tool_name == "listTopology") {
+      result_content = topology();
+    }
+    else if (tool_name == "verifyTopology") {
+      result_content = verify_topology();
+    }
+    else if (tool_name == "bufferCacheSummary") {
+      result_content = buffer_cache_summary();
+    }
+    else if (tool_name == "bufferCacheContents") {
+      int limit = arguments.contains("limit") && arguments["limit"].is_number_integer()
+        ? arguments["limit"].get<int>() : 20;
+      result_content = buffer_cache_contents(limit);
+    }
+    else if (tool_name == "listSchemas") {
+      result_content = schemas();
+    }
+    else if (tool_name == "listTables") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      result_content = tables(target_schema);
+    }
+    else if (tool_name == "tableDetails") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      std::string target_table = arguments.contains("table") ? arguments["table"].get<std::string>() : "";
+      result_content = table(target_schema, target_table);
+    }
+    else if (tool_name == "searchTables") {
+      std::string web_search = arguments.contains("web_search") ? arguments["web_search"].get<std::string>() : "";
+      result_content = search(web_search);
+    }
+    else if (tool_name == "listFunctions") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      result_content = functions(target_schema);
+    }
+    else if (tool_name == "functionDetails") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      std::string func_name = arguments.contains("function") ? arguments["function"].get<std::string>() : "";
+      result_content = function_detail(target_schema, func_name);
+    }
+    else if (tool_name == "searchFunctions") {
+      std::string web_search = arguments.contains("web_search") ? arguments["web_search"].get<std::string>() : "";
+      result_content = search_functions(web_search);
+    }
+    else if (tool_name == "listEnums") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      result_content = enums(target_schema);
+    }
+    else if (tool_name == "enumDetails") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      std::string enum_name = arguments.contains("enum") ? arguments["enum"].get<std::string>() : "";
+      result_content = enum_detail(target_schema, enum_name);
+    }
+    else if (tool_name == "searchEnums") {
+      std::string web_search = arguments.contains("web_search") ? arguments["web_search"].get<std::string>() : "";
+      result_content = search_enums(web_search);
+    }
+    else if (tool_name == "listTypes") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      result_content = types(target_schema);
+    }
+    else if (tool_name == "typeDetails") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      std::string type_name = arguments.contains("type") ? arguments["type"].get<std::string>() : "";
+      result_content = type_detail(target_schema, type_name);
+    }
+    else if (tool_name == "listRoles") {
+      result_content = roles();
+    }
+    else if (tool_name == "listForeignTables") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      result_content = foreign_tables(target_schema);
+    }
+    else if (tool_name == "listForeignServers") {
+      result_content = foreign_servers();
+    }
+    else if (tool_name == "listTablespaces") {
+      result_content = tablespaces();
+    }
+    else if (tool_name == "listCollations") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      result_content = collations(target_schema);
+    }
+    else if (tool_name == "listEventTriggers") {
+      result_content = event_triggers();
+    }
+    else if (tool_name == "listPublications") {
+      result_content = publications();
+    }
+    else if (tool_name == "listSubscriptions") {
+      result_content = subscriptions();
+    }
+    else if (tool_name == "listLanguages") {
+      result_content = languages();
+    }
+    else if (tool_name == "listExtendedStatistics") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      result_content = extended_statistics(target_schema);
+    }
+    else if (tool_name == "listOperators") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      result_content = operators(target_schema);
+    }
+    else if (tool_name == "listOperatorClasses") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      result_content = operator_classes(target_schema);
+    }
+    else if (tool_name == "listAccessMethods") {
+      result_content = access_methods();
+    }
+    else if (tool_name == "listCasts") {
+      result_content = casts();
+    }
+    else if (tool_name == "listTextSearchConfigs") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      result_content = text_search_configs(target_schema);
+    }
+    else if (tool_name == "listSequences") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      result_content = sequences(target_schema);
+    }
+    else if (tool_name == "listExtensions") {
+      result_content = extensions();
+    }
+    else if (tool_name == "databaseSize") {
+      result_content = database_size();
+    }
+    else if (tool_name == "serverSettings") {
+      result_content = server_settings();
+    }
+    else if (tool_name == "currentActivity") {
+      int pid = arguments.contains("pid") && arguments["pid"].is_number_integer()
+        ? arguments["pid"].get<int>() : 0;
+      std::string qid = arguments.contains("query_id") && arguments["query_id"].is_string()
+        ? arguments["query_id"].get<std::string>() : "";
+      double min_dur = arguments.contains("min_duration_s") && arguments["min_duration_s"].is_number()
+        ? arguments["min_duration_s"].get<double>() : 0;
+      std::string st = arguments.contains("state") && arguments["state"].is_string()
+        ? arguments["state"].get<std::string>() : "";
+      result_content = activity(pid, qid, min_dur, st);
+    }
+    else if (tool_name == "currentLocks") {
+      int pid = arguments.contains("pid") && arguments["pid"].is_number_integer()
+        ? arguments["pid"].get<int>() : 0;
+      result_content = locks(pid);
+    }
+    else if (tool_name == "replicationSlots") {
+      result_content = replication_slots();
+    }
+    else if (tool_name == "databaseStats") {
+      result_content = database_stats();
+    }
+    else if (tool_name == "statementStats") {
+      int limit = arguments.contains("limit") ? arguments["limit"].get<int>() : 20;
+      std::string qid;
+      if (arguments.contains("query_id")) {
+        if (arguments["query_id"].is_string()) qid = arguments["query_id"].get<std::string>();
+        else if (arguments["query_id"].is_number_integer())
+          qid = std::to_string(arguments["query_id"].get<long long>());
+      }
+      std::string ord = arguments.contains("order_by") && arguments["order_by"].is_string()
+        ? arguments["order_by"].get<std::string>() : "";
+      long long min_calls = arguments.contains("min_calls") && arguments["min_calls"].is_number_integer()
+        ? arguments["min_calls"].get<long long>() : 0;
+      result_content = statement_stats(limit, qid, ord, min_calls);
+    }
+    else if (tool_name == "wraparoundStatus") {
+      // No schema default here: wraparound is a whole-database property, and
+      // silently scoping it to "public" would understate the risk.
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "";
+      int limit = arguments.contains("limit") ? arguments["limit"].get<int>() : 20;
+      result_content = wraparound_status(target_schema, limit);
+    }
+    else if (tool_name == "checkpointStats") {
+      result_content = checkpoint_stats();
+    }
+    else if (tool_name == "progressStats") {
+      int pid = arguments.contains("pid") && arguments["pid"].is_number_integer()
+        ? arguments["pid"].get<int>() : 0;
+      std::string rel = arguments.contains("relation") && arguments["relation"].is_string()
+        ? arguments["relation"].get<std::string>() : "";
+      result_content = progress_stats(pid, rel);
+    }
+    else if (tool_name == "ioStats") {
+      int pid = arguments.contains("pid") && arguments["pid"].is_number_integer()
+        ? arguments["pid"].get<int>() : 0;
+      std::string bt = arguments.contains("backend_type") && arguments["backend_type"].is_string()
+        ? arguments["backend_type"].get<std::string>() : "";
+      std::string ob = arguments.contains("object") && arguments["object"].is_string()
+        ? arguments["object"].get<std::string>() : "";
+      std::string cx = arguments.contains("context") && arguments["context"].is_string()
+        ? arguments["context"].get<std::string>() : "";
+      result_content = io_stats(pid, bt, ob, cx);
+    }
+    else if (tool_name == "tableIOStats") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      std::string target_table  = arguments.contains("table")  ? arguments["table"].get<std::string>()  : "";
+      int limit = arguments.contains("limit") ? arguments["limit"].get<int>() : 20;
+      result_content = table_io_stats(target_schema, target_table, limit);
+    }
+    else if (tool_name == "hostCapacity") {
+      long long ram_mb = arguments.contains("ram_mb") && arguments["ram_mb"].is_number_integer()
+        ? arguments["ram_mb"].get<long long>() : 0;
+      int vcpus = arguments.contains("vcpus") && arguments["vcpus"].is_number_integer()
+        ? arguments["vcpus"].get<int>() : 0;
+      std::string storage = arguments.contains("storage") && arguments["storage"].is_string()
+        ? arguments["storage"].get<std::string>() : "";
+      result_content = host_capacity(ram_mb, vcpus, storage);
+    }
+    else if (tool_name == "duplicateIndexes") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      std::string target_table  = arguments.contains("table")  ? arguments["table"].get<std::string>()  : "";
+      result_content = duplicate_indexes(target_schema, target_table);
+    }
+    else if (tool_name == "tableBloat") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      std::string target_table  = arguments.contains("table")  ? arguments["table"].get<std::string>()  : "";
+      bool exact = arguments.contains("exact") ? arguments["exact"].get<bool>() : false;
+      result_content = table_bloat(target_schema, target_table, exact);
+    }
+    else if (tool_name == "indexBloat") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      std::string target_index  = arguments.contains("index")  ? arguments["index"].get<std::string>()  : "";
+      result_content = index_bloat(target_schema, target_index);
+    }
+    else if (tool_name == "checkKey") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      std::string target_table  = arguments.contains("table")  ? arguments["table"].get<std::string>()  : "";
+      json vals = arguments.contains("values") ? arguments["values"] : json::array();
+      result_content = check_key(target_schema, target_table, vals);
+    }
+    else if (tool_name == "explainQuery") {
+      // queryid is documented as a string because a 64-bit value does not
+      // survive JSON number precision, but accept a number too rather than
+      // fail with a raw nlohmann type error.
+      std::string qid;
+      if (arguments.contains("queryid")) {
+        if (arguments["queryid"].is_string())
+          qid = arguments["queryid"].get<std::string>();
+        else if (arguments["queryid"].is_number_integer())
+          qid = std::to_string(arguments["queryid"].get<long long>());
+      }
+      std::string sql = arguments.contains("sql") ? arguments["sql"].get<std::string>() : "";
+      json prms = arguments.contains("params") ? arguments["params"] : json::array();
+      bool do_analyze = arguments.contains("analyze") ? arguments["analyze"].get<bool>() : false;
+      int tmo = arguments.contains("timeout_ms") ? arguments["timeout_ms"].get<int>() : 0;
+      result_content = explain_query(qid, sql, prms, do_analyze, tmo);
+    }
+    else {
+      return false;
+    }
+    return true;
+  }
+
   void handle_request(const json& req) {
     std::string method = req.value("method", "");
+    const json params = req.contains("params") && req["params"].is_object()
+      ? req["params"] : json::object();
+
+    // Era discrimination.
+    //
+    // The discriminator is the presence of that one _meta key, never the
+    // presence of _meta itself. progressToken has lived in _meta since the
+    // legacy revisions, so keying on _meta would route any legacy client using
+    // progress tokens into the modern path and reject it with -32602 -- a
+    // client that worked in 3.1.1 breaking on upgrade for using a legacy
+    // feature correctly.
+    const json meta = params.contains("_meta") && params["_meta"].is_object()
+      ? params["_meta"] : json::object();
+    modern_ = meta.contains(kMetaProtocolVersion);
+
+    if (modern_) {
+      // Both keys are required on every modern request; a request missing one
+      // is malformed rather than defaulted.
+      if (!meta[kMetaProtocolVersion].is_string()) {
+        send_error(req.value("id", json()), -32602,
+                   std::string(kMetaProtocolVersion) + " must be a string");
+        return;
+      }
+      if (!meta.contains(kMetaClientCapabilities)) {
+        send_error(req.value("id", json()), -32602,
+                   std::string("modern requests must carry ") +
+                   kMetaClientCapabilities + " in params._meta");
+        return;
+      }
+      request_protocol_ = meta[kMetaProtocolVersion].get<std::string>();
+      bool known = false;
+      for (const auto& v : all_protocols()) if (v == request_protocol_) known = true;
+      if (!known) {
+        send_error_with_data(
+          req.value("id", json()), -32022,
+          "unsupported protocol version: " + request_protocol_,
+          {{"supported", all_protocols()}, {"requested", request_protocol_}});
+        return;
+      }
+    } else {
+      // Legacy: whatever the handshake settled on, defaulting to the revision
+      // 3.1.1 spoke.
+      request_protocol_ = client_protocol_;
+    }
+
+    if (method == "server/discover") {
+      send_response(req.value("id", json()), {
+          {"resultType", "complete"},
+          {"supportedVersions", all_protocols()},
+          {"capabilities", {{"tools", json::object()}}},
+          {"instructions", instructions()}
+        });
+      return;
+    }
 
     if (method == "initialize") {
-      initialize(req["id"]);
+      initialize(req["id"], params);
     }
     else if (method == "notifications/initialized") {
       return;
     }
     else if (method == "tools/list") {
-      send_response(req["id"], get_tools_list());
+      send_response(req["id"], get_tools_list(request_protocol_));
     }
     else if (method == "tools/call") {
-      auto params = req.value("params", json::object());
       std::string tool_name = params.value("name", "");
       auto arguments = params.value("arguments", json::object());
 
       try {
 	json result_content;
 
+	// At most one target selector. More than one is a caller error worth
+	// naming: silently preferring one would run the sweep the caller did
+	// not ask for.
+	auto str_arg = [&](const char* k) {
+	  return arguments.contains(k) && arguments[k].is_string()
+	    ? arguments[k].get<std::string>() : std::string{};
+	};
+	const std::string want_conn     = str_arg("connection");
+	const std::string want_instance = str_arg("instance");
+	const std::string want_repl     = str_arg("replication_group");
+	const std::string want_group    = str_arg("group");
+	const std::string want_role     = str_arg("role");
+
+	std::vector<std::string> given;
+	if (!want_conn.empty())     given.push_back("connection");
+	if (!want_instance.empty()) given.push_back("instance");
+	if (!want_repl.empty())     given.push_back("replication_group");
+	if (!want_group.empty())    given.push_back("group");
+	if (given.size() > 1) {
+	  std::string names;
+	  for (const auto& g : given) names += (names.empty() ? "" : ", ") + g;
+	  send_error(req["id"], -32602,
+		     "at most one target may be given, but got: " + names);
+	  return;
+	}
+
+	const std::string axis = !want_instance.empty() ? "instance"
+			       : !want_repl.empty()     ? "replication_group"
+			       : !want_group.empty()    ? "group"
+						        : std::string{};
+
+	if (!want_role.empty()) {
+	  if (want_role != "primary" && want_role != "replica") {
+	    send_error(req["id"], -32602,
+		       "role must be \"primary\" or \"replica\", got \"" + want_role + "\"");
+	    return;
+	  }
+	  // Filtering by role only means something across servers. Within one
+	  // instance every database has the same role by definition.
+	  if (axis != "replication_group" && axis != "group") {
+	    send_error(req["id"], -32602,
+		       "role applies only to a replication_group or group sweep; "
+		       "every database of one instance has the same role");
+	    return;
+	  }
+	}
+
+	if (!axis.empty()) {
+	  // members() throws a message listing the configured names, so a typo
+	  // fails here rather than as a silently empty sweep.
+	  const auto& members = registry_.members(axis, axis == "instance" ? want_instance
+					       : axis == "replication_group" ? want_repl
+									     : want_group);
+	  const std::string why = sweep_rejection(axis, tool_name, members);
+	  if (!why.empty()) { send_error(req["id"], -32602, why); return; }
+
+	  result_content = fan_out(axis,
+				   axis == "instance" ? want_instance
+				 : axis == "replication_group" ? want_repl : want_group,
+				   want_role, tool_name, arguments);
+	  send_response(req["id"], {
+	      {"content", {{{"type", "text"}, {"text", result_content.dump(2)}}}},
+	      {"isError", false}
+	    });
+	  return;
+	}
+
 	// Resolve the target connection once, before dispatch. get() throws a
 	// message listing the configured names if this one is unknown, so a
 	// typo fails here rather than as a confusing connect error later.
-	active_ = arguments.contains("connection") && arguments["connection"].is_string()
-	  ? arguments["connection"].get<std::string>() : std::string{};
+	active_ = want_conn;
 	(void)registry_.get(active_);
 
-	if (tool_name == "listConnections") {
-	  result_content = connections();
-	}
-	else if (tool_name == "listSchemas") {
-	  result_content = schemas();
-	}
-	else if (tool_name == "listTables") {
-	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-	  result_content = tables(target_schema);
-	}
-	else if (tool_name == "tableDetails") {
-	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-	  std::string target_table = arguments.contains("table") ? arguments["table"].get<std::string>() : "";
-	  result_content = table(target_schema, target_table);
-	}
-	else if (tool_name == "searchTables") {
-	  std::string web_search = arguments.contains("web_search") ? arguments["web_search"].get<std::string>() : "";
-	  result_content = search(web_search);
-	}
-	else if (tool_name == "listFunctions") {
-	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-	  result_content = functions(target_schema);
-	}
-	else if (tool_name == "functionDetails") {
-	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-	  std::string func_name = arguments.contains("function") ? arguments["function"].get<std::string>() : "";
-	  result_content = function_detail(target_schema, func_name);
-	}
-	else if (tool_name == "searchFunctions") {
-	  std::string web_search = arguments.contains("web_search") ? arguments["web_search"].get<std::string>() : "";
-	  result_content = search_functions(web_search);
-	}
-	else if (tool_name == "listEnums") {
-	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-	  result_content = enums(target_schema);
-	}
-	else if (tool_name == "enumDetails") {
-	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-	  std::string enum_name = arguments.contains("enum") ? arguments["enum"].get<std::string>() : "";
-	  result_content = enum_detail(target_schema, enum_name);
-	}
-	else if (tool_name == "searchEnums") {
-	  std::string web_search = arguments.contains("web_search") ? arguments["web_search"].get<std::string>() : "";
-	  result_content = search_enums(web_search);
-	}
-	else if (tool_name == "listTypes") {
-	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-	  result_content = types(target_schema);
-	}
-	else if (tool_name == "typeDetails") {
-	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-	  std::string type_name = arguments.contains("type") ? arguments["type"].get<std::string>() : "";
-	  result_content = type_detail(target_schema, type_name);
-	}
-	else if (tool_name == "listRoles") {
-	  result_content = roles();
-	}
-	else if (tool_name == "listForeignTables") {
-	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-	  result_content = foreign_tables(target_schema);
-	}
-	else if (tool_name == "listForeignServers") {
-	  result_content = foreign_servers();
-	}
-	else if (tool_name == "listTablespaces") {
-	  result_content = tablespaces();
-	}
-	else if (tool_name == "listCollations") {
-	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-	  result_content = collations(target_schema);
-	}
-	else if (tool_name == "listEventTriggers") {
-	  result_content = event_triggers();
-	}
-	else if (tool_name == "listPublications") {
-	  result_content = publications();
-	}
-	else if (tool_name == "listSubscriptions") {
-	  result_content = subscriptions();
-	}
-	else if (tool_name == "listLanguages") {
-	  result_content = languages();
-	}
-	else if (tool_name == "listExtendedStatistics") {
-	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-	  result_content = extended_statistics(target_schema);
-	}
-	else if (tool_name == "listOperators") {
-	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-	  result_content = operators(target_schema);
-	}
-	else if (tool_name == "listOperatorClasses") {
-	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-	  result_content = operator_classes(target_schema);
-	}
-	else if (tool_name == "listAccessMethods") {
-	  result_content = access_methods();
-	}
-	else if (tool_name == "listCasts") {
-	  result_content = casts();
-	}
-	else if (tool_name == "listTextSearchConfigs") {
-	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-	  result_content = text_search_configs(target_schema);
-	}
-	else if (tool_name == "listSequences") {
-	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-	  result_content = sequences(target_schema);
-	}
-	else if (tool_name == "listExtensions") {
-	  result_content = extensions();
-	}
-	else if (tool_name == "databaseSize") {
-	  result_content = database_size();
-	}
-	else if (tool_name == "serverSettings") {
-	  result_content = server_settings();
-	}
-	else if (tool_name == "currentActivity") {
-	  int pid = arguments.contains("pid") && arguments["pid"].is_number_integer()
-	    ? arguments["pid"].get<int>() : 0;
-	  std::string qid = arguments.contains("query_id") && arguments["query_id"].is_string()
-	    ? arguments["query_id"].get<std::string>() : "";
-	  double min_dur = arguments.contains("min_duration_s") && arguments["min_duration_s"].is_number()
-	    ? arguments["min_duration_s"].get<double>() : 0;
-	  std::string st = arguments.contains("state") && arguments["state"].is_string()
-	    ? arguments["state"].get<std::string>() : "";
-	  result_content = activity(pid, qid, min_dur, st);
-	}
-	else if (tool_name == "currentLocks") {
-	  int pid = arguments.contains("pid") && arguments["pid"].is_number_integer()
-	    ? arguments["pid"].get<int>() : 0;
-	  result_content = locks(pid);
-	}
-	else if (tool_name == "replicationSlots") {
-	  result_content = replication_slots();
-	}
-	else if (tool_name == "databaseStats") {
-	  result_content = database_stats();
-	}
-	else if (tool_name == "statementStats") {
-	  int limit = arguments.contains("limit") ? arguments["limit"].get<int>() : 20;
-	  std::string qid;
-	  if (arguments.contains("query_id")) {
-	    if (arguments["query_id"].is_string()) qid = arguments["query_id"].get<std::string>();
-	    else if (arguments["query_id"].is_number_integer())
-	      qid = std::to_string(arguments["query_id"].get<long long>());
-	  }
-	  std::string ord = arguments.contains("order_by") && arguments["order_by"].is_string()
-	    ? arguments["order_by"].get<std::string>() : "";
-	  long long min_calls = arguments.contains("min_calls") && arguments["min_calls"].is_number_integer()
-	    ? arguments["min_calls"].get<long long>() : 0;
-	  result_content = statement_stats(limit, qid, ord, min_calls);
-	}
-	else if (tool_name == "wraparoundStatus") {
-	  // No schema default here: wraparound is a whole-database property, and
-	  // silently scoping it to "public" would understate the risk.
-	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "";
-	  int limit = arguments.contains("limit") ? arguments["limit"].get<int>() : 20;
-	  result_content = wraparound_status(target_schema, limit);
-	}
-	else if (tool_name == "checkpointStats") {
-	  result_content = checkpoint_stats();
-	}
-	else if (tool_name == "progressStats") {
-	  int pid = arguments.contains("pid") && arguments["pid"].is_number_integer()
-	    ? arguments["pid"].get<int>() : 0;
-	  std::string rel = arguments.contains("relation") && arguments["relation"].is_string()
-	    ? arguments["relation"].get<std::string>() : "";
-	  result_content = progress_stats(pid, rel);
-	}
-	else if (tool_name == "ioStats") {
-	  int pid = arguments.contains("pid") && arguments["pid"].is_number_integer()
-	    ? arguments["pid"].get<int>() : 0;
-	  std::string bt = arguments.contains("backend_type") && arguments["backend_type"].is_string()
-	    ? arguments["backend_type"].get<std::string>() : "";
-	  std::string ob = arguments.contains("object") && arguments["object"].is_string()
-	    ? arguments["object"].get<std::string>() : "";
-	  std::string cx = arguments.contains("context") && arguments["context"].is_string()
-	    ? arguments["context"].get<std::string>() : "";
-	  result_content = io_stats(pid, bt, ob, cx);
-	}
-	else if (tool_name == "tableIOStats") {
-	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-	  std::string target_table  = arguments.contains("table")  ? arguments["table"].get<std::string>()  : "";
-	  int limit = arguments.contains("limit") ? arguments["limit"].get<int>() : 20;
-	  result_content = table_io_stats(target_schema, target_table, limit);
-	}
-	else if (tool_name == "hostCapacity") {
-	  long long ram_mb = arguments.contains("ram_mb") && arguments["ram_mb"].is_number_integer()
-	    ? arguments["ram_mb"].get<long long>() : 0;
-	  int vcpus = arguments.contains("vcpus") && arguments["vcpus"].is_number_integer()
-	    ? arguments["vcpus"].get<int>() : 0;
-	  std::string storage = arguments.contains("storage") && arguments["storage"].is_string()
-	    ? arguments["storage"].get<std::string>() : "";
-	  result_content = host_capacity(ram_mb, vcpus, storage);
-	}
-	else if (tool_name == "duplicateIndexes") {
-	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-	  std::string target_table  = arguments.contains("table")  ? arguments["table"].get<std::string>()  : "";
-	  result_content = duplicate_indexes(target_schema, target_table);
-	}
-	else if (tool_name == "tableBloat") {
-	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-	  std::string target_table  = arguments.contains("table")  ? arguments["table"].get<std::string>()  : "";
-	  bool exact = arguments.contains("exact") ? arguments["exact"].get<bool>() : false;
-	  result_content = table_bloat(target_schema, target_table, exact);
-	}
-	else if (tool_name == "indexBloat") {
-	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-	  std::string target_index  = arguments.contains("index")  ? arguments["index"].get<std::string>()  : "";
-	  result_content = index_bloat(target_schema, target_index);
-	}
-	else if (tool_name == "checkKey") {
-	  std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-	  std::string target_table  = arguments.contains("table")  ? arguments["table"].get<std::string>()  : "";
-	  json vals = arguments.contains("values") ? arguments["values"] : json::array();
-	  result_content = check_key(target_schema, target_table, vals);
-	}
-	else if (tool_name == "explainQuery") {
-	  // queryid is documented as a string because a 64-bit value does not
-	  // survive JSON number precision, but accept a number too rather than
-	  // fail with a raw nlohmann type error.
-	  std::string qid;
-	  if (arguments.contains("queryid")) {
-	    if (arguments["queryid"].is_string())
-	      qid = arguments["queryid"].get<std::string>();
-	    else if (arguments["queryid"].is_number_integer())
-	      qid = std::to_string(arguments["queryid"].get<long long>());
-	  }
-	  std::string sql = arguments.contains("sql") ? arguments["sql"].get<std::string>() : "";
-	  json prms = arguments.contains("params") ? arguments["params"] : json::array();
-	  bool do_analyze = arguments.contains("analyze") ? arguments["analyze"].get<bool>() : false;
-	  int tmo = arguments.contains("timeout_ms") ? arguments["timeout_ms"].get<int>() : 0;
-	  result_content = explain_query(qid, sql, prms, do_analyze, tmo);
-	}
-	else {
+	if (!dispatch_tool(tool_name, arguments, result_content)) {
 	  send_error(req["id"], -32601, "Tool not found: " + tool_name);
 	  return;
 	}
@@ -4702,7 +5908,25 @@ private:
   }
 
   void send_response(const json& id, const json& result) {
-    json res = {{"jsonrpc", "2.0"}, {"id", id}, {"result", result}};
+    json body = result;
+    // Modern results must carry resultType, and should carry serverInfo in
+    // _meta. Both are gated: a legacy response has to stay byte-identical to
+    // 3.1.1, which is what makes that compatibility provable rather than
+    // assumed.
+    if (modern_) {
+      if (!body.contains("resultType")) body["resultType"] = "complete";
+      body["_meta"][kMetaServerInfo] = {
+        {"name", "pg-licht-cpp"}, {"version", PGLICHT_VERSION}
+      };
+    }
+    json res = {{"jsonrpc", "2.0"}, {"id", id}, {"result", body}};
+    std::cout << res.dump() << std::endl;
+  }
+
+  void send_error_with_data(const json& id, int code, const std::string& msg,
+                            const json& data) {
+    json res = {{"jsonrpc", "2.0"}, {"id", id},
+                {"error", {{"code", code}, {"message", msg}, {"data", data}}}};
     std::cout << res.dump() << std::endl;
   }
 
