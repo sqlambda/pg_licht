@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pg_licht_mcp VERSION 3.1.1 LANGUAGES CXX)
+project(pg_licht_mcp VERSION 3.2.0 LANGUAGES CXX)
 
 # Standard bin/ and share/man/ layout, so `cmake --install` produces a tree that
 # can be dropped onto a prefix as-is: the release tarballs are staged this way,
@@ -48,7 +48,11 @@ if(BUILD_TESTING)
     enable_testing()
     find_package(GTest REQUIRED)
     add_executable(pg_licht_mcp_test src/test_main.cpp)
-    target_compile_definitions(pg_licht_mcp_test PRIVATE PGLICHT_VERSION="${PROJECT_VERSION}")
+    target_compile_definitions(pg_licht_mcp_test PRIVATE
+        PGLICHT_VERSION="${PROJECT_VERSION}"
+        # The shipped example connections file, so a test can prove it still
+        # parses rather than leaving it to rot alongside the parser.
+        PGLICHT_EXAMPLE_INI="${CMAKE_CURRENT_SOURCE_DIR}/test/connections.example.ini")
     target_link_libraries(pg_licht_mcp_test
         PRIVATE
             GTest::gtest

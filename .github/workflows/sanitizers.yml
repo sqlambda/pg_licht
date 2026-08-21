@@ -6,10 +6,108 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A second push supersedes the first, so a force-push or a quick follow-up
+# commit does not leave a full 20-job matrix running against a commit nobody
+# will look at. Only pull_request runs are cancelled: a push to main or a tag
+# must finish, because its result is what the branch protection and the release
+# read.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Pinned so every job links the same libpqxx, built statically from source,
+  # instead of whatever each distro happens to package. Named once here because
+  # it is also part of the build cache key.
+  PQXX_VERSION: 8.0.2
+
 jobs:
-  sanitize:
-    name: ${{ matrix.sanitizer.name }}-pg${{ matrix.pg }}
+  # Compile each distinct configuration once and hand the binary to the jobs
+  # that run it.
+  #
+  # There are three configurations and twenty test jobs: valgrind and pooled
+  # both want the plain RelWithDebInfo build, and the five PostgreSQL majors of
+  # each differ only in the server they talk to, not in the binary. Compiling
+  # per test job spent roughly 40 minutes of runner time re-deriving three
+  # binaries. libpqxx is linked statically (BUILD_SHARED_LIBS=OFF), so the
+  # artifact needs nothing at run time beyond libpq.
+  build:
+    name: build-${{ matrix.config }}
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - config: plain
+            sanitizer: NONE
+          - config: address-undefined
+            sanitizer: ADDRESS_UNDEFINED
+          - config: thread
+            sanitizer: THREAD
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          # mandoc is only needed for the manpage_lint ctest; the build itself
+          # has no doc-toolchain dependency, since the man page is checked in.
+          .github/scripts/apt-pgdg.sh cmake libpq-dev nlohmann-json3-dev \
+                                      libgtest-dev pkg-config mandoc
+          # Part of the libpqxx cache key: libpqxx compiles against these
+          # headers, so a libpq upgrade must not reuse an object built before it.
+          echo "LIBPQ_VERSION=$(dpkg-query -W -f='${Version}' libpq-dev)" >> "$GITHUB_ENV"
+
+      # Installed to a prefix under $HOME rather than /usr/local so it can be
+      # cached: the generated libpqxx.pc bakes in its prefix, so the restore
+      # path has to match the install path exactly.
+      - name: Cache libpqxx
+        id: pqxx
+        uses: actions/cache@v4
+        with:
+          path: ~/pqxx
+          key: pqxx-${{ env.PQXX_VERSION }}-${{ runner.os }}-${{ runner.arch }}-libpq-${{ env.LIBPQ_VERSION }}
+
+      - name: Build libpqxx
+        if: steps.pqxx.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
+          cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON \
+            -DCMAKE_INSTALL_PREFIX="$HOME/pqxx"
+          cmake --build /tmp/libpqxx-build
+          cmake --install /tmp/libpqxx-build
+
+      - name: Configure and build
+        run: |
+          # lib64 as well as lib: CMake picks the directory, not this workflow.
+          echo "PKG_CONFIG_PATH=$HOME/pqxx/lib/pkgconfig:$HOME/pqxx/lib64/pkgconfig" >> "$GITHUB_ENV"
+          export PKG_CONFIG_PATH="$HOME/pqxx/lib/pkgconfig:$HOME/pqxx/lib64/pkgconfig"
+          cmake -S cpp -B cpp/build \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DPGLICHT_SANITIZER=${{ matrix.sanitizer }}
+          cmake --build cpp/build --target pg_licht_mcp_test
+
+      # Needs no database and does not vary by PostgreSQL version, so it runs
+      # once here rather than twenty times downstream.
+      - name: Lint the man page
+        if: matrix.config == 'plain'
+        working-directory: cpp/build
+        run: ctest -R manpage_lint --output-on-failure
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-binary-${{ matrix.config }}
+          path: cpp/build/pg_licht_mcp_test
+          retention-days: 1
+          if-no-files-found: error
+
+  sanitize:
+    name: ${{ matrix.sanitizer }}-pg${{ matrix.pg }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
     services:
       postgres:
         image: postgres:${{ matrix.pg }}
@@ -26,50 +124,36 @@ jobs:
       fail-fast: false
       matrix:
         pg: [14, 15, 16, 17, 18]
-        sanitizer:
-          - name: address-undefined
-            flag: ADDRESS_UNDEFINED
-          - name: thread
-            flag: THREAD
+        sanitizer: [address-undefined, thread]
 
     steps:
+      # The suite reads cpp/test/connections.example.ini through a path baked
+      # in at compile time, so the source tree has to be present even though
+      # nothing here is compiled.
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get install -y curl ca-certificates lsb-release
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-            | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
-          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
-            | sudo tee /etc/apt/sources.list.d/pgdg.list
-          sudo apt-get update -q
-          # mandoc is only needed for the manpage_lint ctest; the build itself
-          # has no doc-toolchain dependency, since the man page is checked in.
-          sudo apt-get install -y cmake libpq-dev nlohmann-json3-dev libgtest-dev pkg-config mandoc
-          curl -fsSL https://github.com/jtv/libpqxx/archive/refs/tags/8.0.2.tar.gz | tar -xz -C /tmp
-          cmake -S /tmp/libpqxx-8.0.2 -B /tmp/libpqxx-build \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
-          cmake --build /tmp/libpqxx-build
-          sudo cmake --install /tmp/libpqxx-build
-          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
+      - name: Install runtime dependencies
+        run: .github/scripts/apt-pgdg.sh libpq5
 
-      - name: Configure and build
-        run: |
-          cmake -S cpp -B cpp/build \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DPGLICHT_SANITIZER=${{ matrix.sanitizer.flag }}
-          cmake --build cpp/build --target pg_licht_mcp_test
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-binary-${{ matrix.sanitizer }}
+          path: cpp/build
 
       - name: Run tests
         working-directory: cpp/build
         env:
           DATABASE_URL: "host=localhost port=5432 user=postgres password=postgres dbname=postgres"
           ASAN_OPTIONS: detect_leaks=1
-        run: ctest --output-on-failure
+        run: |
+          chmod +x pg_licht_mcp_test   # artifacts do not preserve the mode bit
+          ./pg_licht_mcp_test
 
   valgrind:
     name: valgrind-pg${{ matrix.pg }}
+    needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -90,42 +174,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get install -y curl ca-certificates lsb-release
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-            | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
-          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
-            | sudo tee /etc/apt/sources.list.d/pgdg.list
-          sudo apt-get update -q
-          sudo apt-get install -y cmake libpq-dev nlohmann-json3-dev libgtest-dev pkg-config valgrind
-          curl -fsSL https://github.com/jtv/libpqxx/archive/refs/tags/8.0.2.tar.gz | tar -xz -C /tmp
-          cmake -S /tmp/libpqxx-8.0.2 -B /tmp/libpqxx-build \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
-          cmake --build /tmp/libpqxx-build
-          sudo cmake --install /tmp/libpqxx-build
-          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
+      - name: Install runtime dependencies
+        run: .github/scripts/apt-pgdg.sh libpq5 valgrind
 
-      - name: Configure and build
-        run: |
-          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=RelWithDebInfo
-          cmake --build cpp/build --target pg_licht_mcp_test
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-binary-plain
+          path: cpp/build
 
+      # The same invocation pglicht_add_valgrind_test() registers in
+      # cpp/cmake/SafetyFlags.cmake. Spelled out here because the build tree
+      # ctest needs is not carried across jobs; keep the two in step.
       - name: Run tests under Valgrind
         working-directory: cpp/build
         env:
           DATABASE_URL: "host=localhost port=5432 user=postgres password=postgres dbname=postgres"
-        run: ctest -R valgrind --output-on-failure
+        run: |
+          chmod +x pg_licht_mcp_test
+          valgrind --error-exitcode=99 --leak-check=full --track-origins=yes \
+            ./pg_licht_mcp_test
 
   # Runs the full suite directly and then through a companion PgBouncer in
   # transaction mode (server_reset_query=DISCARD ALL) -- the deployment a
   # session-scoped read-only guard silently fails on. The script provisions its
-  # own throwaway cluster + pooler, so no service container is used here; it
-  # also preloads pg_stat_statements, exercising the queryid path that the
-  # service-container jobs above skip.
+  # own throwaway cluster, a streaming standby and a pooler, so no service
+  # container is used here; it also preloads pg_stat_statements, exercising the
+  # queryid path that the service-container jobs above skip.
   pooled:
     name: pooled-pg${{ matrix.pg }}
+    needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -134,34 +213,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get install -y curl ca-certificates lsb-release
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-            | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
-          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
-            | sudo tee /etc/apt/sources.list.d/pgdg.list
-          sudo apt-get update -q
-          # postgresql-${{ matrix.pg }} brings initdb/pg_ctl and the bundled
-          # contrib extensions (pg_stat_statements, postgres_fdw, pgstattuple)
-          # the fixtures install; pgbouncer is the companion pooler.
-          sudo apt-get install -y cmake libpq-dev nlohmann-json3-dev libgtest-dev pkg-config \
-            postgresql-${{ matrix.pg }} pgbouncer
-          curl -fsSL https://github.com/jtv/libpqxx/archive/refs/tags/8.0.2.tar.gz | tar -xz -C /tmp
-          cmake -S /tmp/libpqxx-8.0.2 -B /tmp/libpqxx-build \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
-          cmake --build /tmp/libpqxx-build
-          sudo cmake --install /tmp/libpqxx-build
-          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
+      - name: Install runtime dependencies
+        # postgresql-${{ matrix.pg }} brings initdb/pg_ctl/pg_basebackup and the
+        # bundled contrib extensions (pg_stat_statements, postgres_fdw,
+        # pgstattuple, pg_buffercache) the fixtures install; pgbouncer is the
+        # companion pooler.
+        run: .github/scripts/apt-pgdg.sh libpq5 postgresql-${{ matrix.pg }} pgbouncer
 
-      - name: Build test binary
-        run: |
-          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=RelWithDebInfo
-          cmake --build cpp/build --target pg_licht_mcp_test
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-binary-plain
+          path: cpp/build
 
       - name: Run suite directly and through the pooler
         env:
           # Pin the cluster to the matrix version rather than letting the script
           # autodetect the newest one the runner happens to have installed.
           PG_BINDIR: /usr/lib/postgresql/${{ matrix.pg }}/bin
-        run: cpp/test/run-pooled-tests.sh
+        run: |
+          chmod +x cpp/build/pg_licht_mcp_test
+          cpp/test/run-pooled-tests.sh

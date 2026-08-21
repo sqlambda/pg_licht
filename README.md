@@ -35,9 +35,9 @@ Other install channels — deb, rpm, tarball, source — are in [INSTALL.md](INS
 
 ## Tools
 
-48 read-only operations, grouped as schema exploration, catalog search, cluster-wide
+52 read-only operations, grouped as schema exploration, catalog search, cluster-wide
 objects, extensibility and text search, foreign data and replication, monitoring and
-statistics, diagnostics and query planning, and connections. Highlights include
+statistics, diagnostics and query planning, topology, and connections. Highlights include
 `tableDetails` (columns, indexes, constraints, foreign keys in both directions, triggers,
 policies), `searchTables` (full-text search across names, descriptions, and enum values),
 and `explainQuery` (recover a slow statement from `pg_stat_statements` by `queryid` and get
@@ -55,6 +55,18 @@ density and fragmentation, GIN pending list against the `fastupdate` settings th
 hash bucket and overflow pages), and `hostCapacity` (memory settings against the host's
 actual RAM and vCPU count — see below).
 
+`bufferCacheSummary` and `bufferCacheContents` read `pg_buffercache`. The summary needs
+extension version 1.4, which ships with PostgreSQL 16; on 14 and 15 it says so and points
+at `bufferCacheContents`, which reads the view and works everywhere. `tableIOStats` counts
+only what `shared_buffers` served, so a miss there may still have come from the OS page
+cache at RAM speed; these are the only in-core view of that split. Read the usage-count
+histogram rather than a hit ratio: mass at 2–5 is a stable working set, everything at 0–1
+with no unused buffers is clock-sweep churn, and those are the same ratio with opposite
+diagnoses. `bufferCacheContents` aggregates per relation and fork, never raw per-buffer
+rows.
+
+`listTopology` and `verifyTopology` cover the connection topology — see below.
+
 The monitoring tools take optional `pid` and `query_id` filters, so a symptom can be
 followed to its cause rather than read out of a full dump:
 
@@ -70,7 +82,69 @@ statementStats → query_id → currentActivity(query_id) → pid → currentLoc
 
 Each one is documented, with its arguments, in `man pg_licht_mcp` under OPERATIONS. Every
 operation also accepts an optional `connection` argument to select one of several
-configured databases.
+configured databases, and most accept `instance`, `replication_group` or `group` to run
+across several at once — see below.
+
+## Topology
+
+With more than one database configured, three labels say how they relate. They are
+deliberately separate, because only the first two license a conclusion:
+
+```ini
+[billing_prod]
+service           = billing-prod
+instance          = pg-prod-01      # one postmaster
+replication_group = billing-ha      # a primary and its replicas
+group             = prod, billing   # an operator label
+
+[billing_ro]
+service           = billing-replica
+instance          = pg-prod-02
+replication_group = billing-ha
+group             = prod, billing, reporting
+```
+
+- **`instance`** — one postmaster. Its databases share `shared_buffers`, WAL, autovacuum
+  workers, `max_connections` and disk, so one database's checkpoint storm really is
+  another's latency. PostgreSQL's own glossary calls this a *database cluster*.
+- **`replication_group`** — a primary and its replicas: the same data on different
+  servers, each keeping its own statistics counters.
+- **`group`** — an arbitrary label. Implies nothing, which is the point: it is how an
+  agent asks about "dev" without knowing any connection name.
+
+There is no `cluster` key. PostgreSQL uses that word for the first sense and RDS/Aurora
+for the second, so it means opposite things to the two people most likely to read the
+file. There is no `role` key either: primary or replica is observed on every connection
+via `pg_is_in_recovery()` and never cached, because failover swaps it and failover is
+exactly when this server gets used.
+
+An `instance` is inferred when two connections share a host **and** port, and reported as
+`inferred` rather than `declared` — behind a pooler one endpoint can front several
+instances, so it groups output without licensing a contention claim. `verifyTopology`
+settles it, by connecting to each server and reading its system identifier: same
+identifier on the same endpoint is one instance, the same identifier on different hosts is
+a replication lineage, and a disagreement means the config is wrong.
+
+Passing `instance`, `replication_group` or `group` instead of `connection` runs the tool
+once per member and returns one result per member, in config file order. A member that
+cannot be reached is reported in place rather than failing the sweep. Which of the three a
+tool accepts depends on where its answer actually varies, and its input schema says which:
+
+| | varies across the databases of one instance | varies across members of a replication group |
+|---|---|---|
+| catalogs, `tableBloat` | yes | no — a physical replica is byte-identical |
+| `duplicateIndexes`, `indexBloat`, `tableIOStats` | yes | **yes** — they carry `idx_scan` |
+| `currentActivity`, `currentLocks`, `statementStats`, buffer cache | no — instance-wide | yes |
+
+That middle row is the one worth knowing: an index that reads as unused on the primary may
+be carrying a replica's entire reporting workload, and only that replica's `idx_scan`
+shows it. `role: "primary"` or `role: "replica"` narrows a sweep to one side.
+
+Sweeps are sequential — the server is a single-threaded loop — so width costs wall clock.
+Call `listTopology` first; it reads the config file and opens no connection.
+
+A worked example covering all of this is in
+[cpp/test/connections.example.ini](cpp/test/connections.example.ini).
 
 ## Host capacity
 
@@ -84,7 +158,20 @@ host_ram_mb  = 65536
 host_vcpus   = 16
 ```
 
-or, with a single `DATABASE_URL`, via `PG_LICHT_HOST_RAM_MB` and `PG_LICHT_HOST_VCPUS`. An
+With several databases on one postmaster, declare it once for the instance instead and the
+members inherit it; an explicit per-connection value still wins:
+
+```ini
+[instance:pg-prod-01]
+host_ram_mb  = 65536
+host_vcpus   = 16
+```
+
+Inheritance follows `instance` only, never `replication_group`: replicas routinely run on
+smaller machines, and inheriting the primary's RAM would give every replica a confidently
+wrong `shared_buffers` ratio.
+
+Or, with a single `DATABASE_URL`, via `PG_LICHT_HOST_RAM_MB` and `PG_LICHT_HOST_VCPUS`. An
 agent that inspects the host at run time can instead pass `ram_mb` and `vcpus` straight to
 the tool, which takes precedence over both.
 
@@ -92,7 +179,7 @@ the tool, which takes precedence over both.
 
 | | |
 |---|---|
-| `man pg_licht_mcp` | configuration, connection strings, all 48 operations, MCP client setup |
+| `man pg_licht_mcp` | configuration, connection strings, all 52 operations, MCP client setup |
 | [INSTALL.md](INSTALL.md) | Homebrew, deb, rpm, tarball, verifying, uninstalling |
 | [BUILD.md](BUILD.md) | building from source, tests, sanitizers, CI, release process |
 | [CHANGES.md](CHANGES.md) | changelog |

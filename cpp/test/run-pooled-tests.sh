@@ -20,6 +20,13 @@
 #   TEST_BIN    the gtest binary                          (default: cpp/build/pg_licht_mcp_test)
 #   PG_PORT     port for the temp cluster                 (default: 55432)
 #   BOUNCER_PORT port for the companion pooler            (default: 56432)
+#   STANDBY_PORT port for the streaming standby           (default: 57432)
+#
+# A physical standby is streamed off the primary with pg_basebackup and its
+# conninfo is exported as STANDBY_URL. The role and topology tests use it to
+# check the replica side of pg_is_in_recovery() and the shared system
+# identifier; they skip when STANDBY_URL is unset, so a plain `ctest` run is
+# unaffected.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -49,8 +56,10 @@ PGBOUNCER="${PGBOUNCER:-$(command -v pgbouncer || echo /usr/sbin/pgbouncer)}"
 TEST_BIN="${TEST_BIN:-$cpp_dir/build/pg_licht_mcp_test}"
 PG_PORT="${PG_PORT:-55432}"
 BOUNCER_PORT="${BOUNCER_PORT:-56432}"
+STANDBY_PORT="${STANDBY_PORT:-57432}"
 
-for req in "$PG_BINDIR/initdb" "$PG_BINDIR/pg_ctl" "$PG_BINDIR/createdb" "$PGBOUNCER" "$TEST_BIN"; do
+for req in "$PG_BINDIR/initdb" "$PG_BINDIR/pg_ctl" "$PG_BINDIR/createdb" \
+           "$PG_BINDIR/pg_basebackup" "$PGBOUNCER" "$TEST_BIN"; do
   [ -x "$req" ] || { echo "ERROR: missing or not executable: $req" >&2
                      [ "$req" = "$TEST_BIN" ] && echo "  build it: cmake --build $cpp_dir/build" >&2
                      exit 1; }
@@ -60,11 +69,13 @@ done
 # A short socket directory: PostgreSQL rejects a Unix socket path over 107 bytes.
 work="$(mktemp -d "${TMPDIR:-/tmp}/pglicht-rig.XXXXXX")"
 PGDATA="$work/pg"
+SBDATA="$work/standby"
 BDIR="$work/bouncer"
 mkdir -p "$PGDATA" "$BDIR"
 
 cleanup() {
   [ -f "$BDIR/pgbouncer.pid" ] && kill "$(cat "$BDIR/pgbouncer.pid")" 2>/dev/null || true
+  "$PG_BINDIR/pg_ctl" -D "$SBDATA" -m immediate stop >/dev/null 2>&1 || true
   "$PG_BINDIR/pg_ctl" -D "$PGDATA" -m immediate stop >/dev/null 2>&1 || true
   rm -rf "$work"
 }
@@ -86,6 +97,28 @@ CONF
 echo "--- start postgres on $PG_PORT (pg_stat_statements preloaded)"
 "$PG_BINDIR/pg_ctl" -D "$PGDATA" -l "$PGDATA/pg.log" -w start >/dev/null
 "$PG_BINDIR/createdb" -h 127.0.0.1 -p "$PG_PORT" -U pglicht pglicht
+
+# --- streaming standby -----------------------------------------------------
+# Taken after createdb so the test database is already in the base backup. The
+# standby inherits postgresql.conf from the primary, so the port and socket
+# directory are overridden by appending: the last assignment wins.
+#
+# This exists for the role and topology tests. A standby shares its primary's
+# system identifier -- that is what makes the identifier a replication lineage
+# rather than a postmaster -- so it is the only way to check that the two are
+# told apart by host and port rather than by identity.
+echo "--- pg_basebackup a standby on $STANDBY_PORT"
+"$PG_BINDIR/pg_basebackup" -h 127.0.0.1 -p "$PG_PORT" -U pglicht \
+    -D "$SBDATA" -R -X stream >/dev/null
+
+cat >> "$SBDATA/postgresql.conf" <<CONF
+port = $STANDBY_PORT
+unix_socket_directories = '$work'
+CONF
+
+"$PG_BINDIR/pg_ctl" -D "$SBDATA" -l "$SBDATA/pg.log" -w start >/dev/null
+STANDBY_URL="host=127.0.0.1 port=$STANDBY_PORT dbname=pglicht user=pglicht"
+export STANDBY_URL
 
 # --- companion pooler (transaction mode) -----------------------------------
 # auth_type=any + a forced user: this is a local throwaway, so the point is not
@@ -125,4 +158,5 @@ echo; echo "================ POOLED (port $BOUNCER_PORT) ================"; tail
 [ "$rc" -eq 0 ] || { echo "POOLED run failed"; exit 1; }
 
 echo
-echo "OK: suite passed both directly and through the transaction-mode pooler."
+echo "OK: suite passed both directly and through the transaction-mode pooler"
+echo "    (standby on $STANDBY_PORT covered the replica-side role tests)."

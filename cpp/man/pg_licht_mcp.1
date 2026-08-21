@@ -54,6 +54,12 @@ accepts an optional
 argument naming one of its sections; omitting it uses the default section.
 .Ic listConnections
 reports what is configured.
+An operation may instead take
+.Va instance , Va replication_group
+or
+.Va group
+and run once per member; see
+.Sx Topology: instances, replication groups, and groups .
 .Sh CONFIGURATION
 .Ss Connection strings
 A connection string is handed to libpq unchanged, so both accepted forms work:
@@ -91,6 +97,119 @@ argument of any operation to run it against that database; omit it to use
 or, if there is no
 .Sy [default] ,
 the first section in the file.
+.Ss Topology: instances, replication groups, and groups
+Three optional keys per section say how the configured databases relate.
+They are deliberately separate, because only the first two license a
+conclusion:
+.Bd -literal -offset indent
+[billing_prod]
+service           = billing-prod
+instance          = pg-prod-01      ; one postmaster
+replication_group = billing-ha      ; a primary and its replicas
+group             = prod, billing   ; an operator label
+
+[billing_ro]
+service           = billing-replica
+instance          = pg-prod-02
+replication_group = billing-ha
+group             = prod, billing, reporting
+.Ed
+.Bl -tag -width Ds
+.It Va instance
+One postmaster.
+Its databases share
+.Va shared_buffers ,
+WAL, autovacuum workers,
+.Va max_connections
+and disk, so one database's checkpoint storm really is another's latency.
+PostgreSQL's glossary calls this a
+.Em database cluster .
+.It Va replication_group
+A primary and its replicas: the same data on different servers, each keeping
+its own statistics counters.
+.It Va group
+An arbitrary label, repeatable as a comma-separated list.
+It implies nothing, which is the point \(em it is how an agent asks about
+"dev" without knowing any connection name.
+.El
+.Pp
+There is no
+.Va cluster
+key.
+PostgreSQL uses that word for the first sense and RDS and Aurora for the
+second, so it means opposite things to the two people most likely to read the
+file.
+There is no
+.Va role
+key either: primary or replica is observed on every connection through
+.Fn pg_is_in_recovery
+and never cached, because failover swaps it and failover is exactly when this
+server gets used.
+.Pp
+An
+.Va instance
+is inferred when two sections share a host
+.Em and
+port, and reported as
+.Ql inferred
+rather than
+.Ql declared .
+Behind a pooler one endpoint can front several instances and one instance can
+be reached through several pooler ports, so an inferred instance groups output
+without licensing a contention claim;
+.Ic verifyTopology
+settles it.
+A section using
+.Va service
+is never inferred, since the service file is deliberately not expanded and its
+host and port are therefore unknown.
+.Ss Sweeping several connections
+Passing
+.Va instance , Va replication_group
+or
+.Va group
+in place of
+.Va connection
+runs the operation once per member and returns one result per member, in file
+order.
+A member that cannot be reached is reported in place rather than failing the
+sweep.
+.Pp
+Which of the three an operation accepts depends on where its answer actually
+varies, and its input schema says which.
+Catalog and bloat readings vary between the databases of one instance but not
+between members of a replication group, because a physical replica is
+byte-identical.
+.Ic currentActivity , Ic currentLocks , Ic statementStats
+and the buffer cache operations are the other way round: they report the whole
+instance from any one of its databases, so sweeping them across it would repeat
+one answer, and that is refused with
+.Er -32602 .
+.Pp
+.Ic duplicateIndexes , Ic indexBloat
+and
+.Ic tableIOStats
+are the case worth knowing: they carry
+.Va idx_scan ,
+which is each server's own.
+An index that reads as unused on the primary may be carrying a replica's entire
+reporting workload, and only that replica's scan counts show it.
+.Va role
+set to
+.Ql primary
+or
+.Ql replica
+narrows a sweep to one side.
+.Pp
+A sweep is sequential \(em the server is a single-threaded loop \(em so its
+width is wall-clock time.
+.Ic listTopology
+reads the configuration file and opens no connection, so it is cheap to call
+first.
+.Pp
+A worked example covering all of this is shipped as
+.Pa cpp/test/connections.example.ini
+in the source tree.
 .Ss libpq passthrough and services
 Keys are passed through to libpq, so anything libpq accepts works, including
 .Va service ,
@@ -168,6 +287,36 @@ and
 straight to
 .Ic hostCapacity ,
 which takes precedence over both.
+.Pp
+With several databases on one postmaster, a reserved
+.Sy [instance:name]
+section carries the same keys once and its members inherit them; an explicit
+per-connection value still wins:
+.Bd -literal -offset indent
+[instance:pg-prod-01]
+host_ram_mb  = 65536
+host_vcpus   = 16
+
+[app]
+service  = app_ro
+instance = pg-prod-01
+.Ed
+.Pp
+An
+.Sy [instance:name]
+section is not a connection: it never appears in
+.Ic listConnections
+and never becomes the default.
+It accepts the four host capacity keys and nothing else, and is rejected at
+startup if no section declares that instance.
+Inheritance follows
+.Va instance
+only, never
+.Va replication_group :
+replicas routinely run on smaller machines, and inheriting the primary's RAM
+would give every replica a confidently wrong
+.Va shared_buffers
+ratio.
 .Ss Resolution order
 The connection source is resolved in this order:
 .Bl -enum -width 2n
@@ -750,6 +899,59 @@ making the table-level ratios any easier to read.
 Maximum number of tables to return, most physical reads first.
 Defaults to 20.
 .El
+.It Ic bufferCacheSummary
+How much of
+.Va shared_buffers
+is used, dirty and pinned, with the usage-count histogram, from
+.Li pg_buffercache .
+.Pp
+.Ic tableIOStats
+counts only what
+.Va shared_buffers
+served, so a miss there may still have come from the operating system page
+cache at RAM speed; this is the only in-core view of that split.
+Read the histogram rather than a hit ratio: mass at usage count 2 to 5 is a
+stable working set, everything at 0 to 1 with no unused buffers is clock-sweep
+churn, and those are the same ratio with opposite diagnoses.
+A single sample is weak evidence; two samples minutes apart are the method.
+.Pp
+Requires the
+.Li pg_buffercache
+extension at version 1.4 or later \(em the summary functions arrived there \(em
+and a role with
+.Li pg_monitor .
+Version 1.4 ships with PostgreSQL 16; on 14 and 15 there is no 1.4 to update
+to, and the operation says so and points at
+.Ic bufferCacheContents ,
+which reads the view and works on every version.
+On 16 and newer an out-of-date extension is reported as such rather than as
+absent, and a missing grant names the grant.
+.It Ic bufferCacheContents Op Va limit
+Which relations own
+.Va shared_buffers ,
+aggregated per relation and fork and ranked by buffers held: cached bytes,
+percent of that fork resident, percent of
+.Va shared_buffers
+consumed, dirty buffers, average usage count and pins.
+Never raw per-buffer rows \(em a machine with 16GB of
+.Va shared_buffers
+has two million of them.
+.Pp
+Answers which relation drives checkpoint writeback (pair with
+.Ic checkpointStats ) ,
+whether the visibility map fork is resident enough for index-only scans to pay
+off, and which database's working set is displacing the others.
+.Pp
+Only buffers belonging to this database and to the shared catalogs are resolved
+to names.
+Buffers held by other databases on the same instance are visible to PostgreSQL
+but not reported, because they cannot be resolved locally and unnamed rows
+would invite being read as this database's.
+.Bl -tag -width Ds
+.It Va limit
+Maximum number of relation and fork rows to return.
+Defaults to 20, capped at 200.
+.El
 .It Ic hostCapacity Op Va ram_mb , Va vcpus , Va storage
 Memory and parallelism settings correlated with the capacity of the machine
 PostgreSQL runs on.
@@ -977,6 +1179,46 @@ Statement timeout in milliseconds, clamped to 100 through 30000.
 Defaults to 5000 for plan-only calls.
 .El
 .El
+.Ss Topology
+.Bl -tag -width Ds
+.It Ic listTopology
+Every instance, replication group and group with its members, plus the
+connections carrying no label at all.
+Reads the configuration file and opens no database connection.
+An instance whose
+.Va source
+is
+.Ql inferred
+was derived from a shared host and port rather than declared.
+Takes no
+.Va connection
+argument.
+.It Ic verifyTopology
+Connects to every configured connection and reports what each server actually
+is: its role, system identifier, database, address, port and version.
+Then checks the declared topology against them.
+.Pp
+The whole operation turns on one fact: a system identifier names a replication
+.Em lineage ,
+not a postmaster.
+A physical replica began as a copy of its primary and carries the same value
+forever, so the identifier alone cannot separate the two axes and the endpoint
+has to be read alongside it.
+The same identifier on the same host and port is one instance; the same
+identifier on different hosts is a replication group.
+.Pp
+Reports declarations the servers contradict, connections that share an
+identifier without being declared together, a replication group with no
+reachable primary, and split brain \(em where it names every primary it found
+and chooses none.
+Logical replication cannot be verified this way, because a logical replica has
+its own identifier, and is reported as
+.Ql cannot verify
+rather than as a mismatch.
+Takes no
+.Va connection
+argument.
+.El
 .Ss Connections
 .Bl -tag -width Ds
 .It Ic listConnections
@@ -984,7 +1226,15 @@ The configured database connections by name, with the libpq
 .Va service
 name or host, port, dbname, and user for each, and which is the default.
 Passwords are never returned and a service file is never expanded.
-This is the only operation that does not take a
+Each entry also carries its
+.Va instance , Va replication_group
+and
+.Va group
+labels where they are configured.
+.Ic listConnections , Ic listTopology
+and
+.Ic verifyTopology
+are the only operations that do not take a
 .Va connection
 argument.
 .El
@@ -1240,6 +1490,26 @@ supported version.
 requires PostgreSQL 16, where
 .Li pg_stat_io
 was introduced, and returns an error naming the alternatives on older servers.
+.Pp
+.Ic bufferCacheSummary
+requires the
+.Li pg_buffercache
+extension at version 1.4 or later, where
+.Fn pg_buffercache_summary
+and
+.Fn pg_buffercache_usage_counts
+were added.
+The gate is on the extension version rather than the server version: an
+extension created before 1.4 and never updated is a live catalog entry missing
+exactly those two functions, and is reported as out of date rather than absent.
+Version 1.4 first shipped with PostgreSQL 16, so on 14 and 15 the operation
+reports that instead \(em there is no 1.4 to update to there \(em and points at
+.Ic bufferCacheContents ,
+which reads the view and is available in every version of the extension.
+.Ic bufferCacheContents
+reads the view, which exists in every version the extension has had.
+Both need a role with
+.Li pg_monitor .
 .Pp
 Elsewhere, a field is simply omitted where the underlying column does not
 exist, and normalized where it was renamed.
