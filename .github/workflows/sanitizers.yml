@@ -34,6 +34,7 @@ jobs:
   build:
     name: build-${{ matrix.config }}
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -50,15 +51,10 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          sudo apt-get install -y curl ca-certificates lsb-release
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-            | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
-          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
-            | sudo tee /etc/apt/sources.list.d/pgdg.list
-          sudo apt-get update -q
           # mandoc is only needed for the manpage_lint ctest; the build itself
           # has no doc-toolchain dependency, since the man page is checked in.
-          sudo apt-get install -y cmake libpq-dev nlohmann-json3-dev libgtest-dev pkg-config mandoc
+          .github/scripts/apt-pgdg.sh cmake libpq-dev nlohmann-json3-dev \
+                                      libgtest-dev pkg-config mandoc
           # Part of the libpqxx cache key: libpqxx compiles against these
           # headers, so a libpq upgrade must not reuse an object built before it.
           echo "LIBPQ_VERSION=$(dpkg-query -W -f='${Version}' libpq-dev)" >> "$GITHUB_ENV"
@@ -111,6 +107,7 @@ jobs:
     name: ${{ matrix.sanitizer }}-pg${{ matrix.pg }}
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     services:
       postgres:
         image: postgres:${{ matrix.pg }}
@@ -136,7 +133,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install runtime dependencies
-        run: ${{ github.workspace }}/.github/scripts/install-libpq.sh
+        run: .github/scripts/apt-pgdg.sh libpq5
 
       - uses: actions/download-artifact@v4
         with:
@@ -156,6 +153,7 @@ jobs:
     name: valgrind-pg${{ matrix.pg }}
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -177,9 +175,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install runtime dependencies
-        run: |
-          ${{ github.workspace }}/.github/scripts/install-libpq.sh
-          sudo apt-get install -y valgrind
+        run: .github/scripts/apt-pgdg.sh libpq5 valgrind
 
       - uses: actions/download-artifact@v4
         with:
@@ -208,6 +204,7 @@ jobs:
     name: pooled-pg${{ matrix.pg }}
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -217,13 +214,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install runtime dependencies
-        run: |
-          ${{ github.workspace }}/.github/scripts/install-libpq.sh
-          # postgresql-${{ matrix.pg }} brings initdb/pg_ctl/pg_basebackup and
-          # the bundled contrib extensions (pg_stat_statements, postgres_fdw,
-          # pgstattuple, pg_buffercache) the fixtures install; pgbouncer is the
-          # companion pooler.
-          sudo apt-get install -y postgresql-${{ matrix.pg }} pgbouncer
+        # postgresql-${{ matrix.pg }} brings initdb/pg_ctl/pg_basebackup and the
+        # bundled contrib extensions (pg_stat_statements, postgres_fdw,
+        # pgstattuple, pg_buffercache) the fixtures install; pgbouncer is the
+        # companion pooler.
+        run: .github/scripts/apt-pgdg.sh libpq5 postgresql-${{ matrix.pg }} pgbouncer
 
       - uses: actions/download-artifact@v4
         with:

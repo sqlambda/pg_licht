@@ -25,6 +25,8 @@ jobs:
   build:
     name: Build (${{ matrix.artifact }})
     runs-on: ${{ matrix.os }}
+    # A hung apt or network step would otherwise sit until the six-hour default.
+    timeout-minutes: 40
     container: ${{ matrix.container || '' }}
     strategy:
       fail-fast: false
@@ -185,6 +187,7 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
 
