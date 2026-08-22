@@ -54,7 +54,11 @@ inline pqxx::result pqxx_exec(pqxx::work& txn, const std::string& sql, P&& param
 //   FATAL: unsupported startup parameter in options: default_transaction_read_only
 class Session {
 public:
-  explicit Session(const pglicht::ConnConfig& cfg, int timeout_ms = 0)
+  // timeout_ms overrides the connection's configured statement ceiling; omit it
+  // and the connection's own value applies. Only explainQuery passes one, since
+  // it is the one tool whose caller states how long it is willing to wait.
+  explicit Session(const pglicht::ConnConfig& cfg,
+                   std::optional<int> timeout_ms = std::nullopt)
     : conn_(cfg.conninfo), txn_(conn_) {
     // Must be the first statement in the transaction. This is the real write
     // backstop: it catches writes a query plan cannot reveal, such as a
@@ -75,13 +79,28 @@ public:
     if (!role.empty() && !role[0][0].is_null())
       in_recovery_ = role[0][0].as<bool>();
     last_observed_role() = this->role();
-    if (timeout_ms > 0) {
-      // set_config(..., is_local => true) is SET LOCAL: transaction-scoped,
-      // and binds the value as a parameter instead of concatenating it.
+
+    // The statement ceiling. Costs one round trip, which is why it is worth
+    // saying what it buys: without it every tool but explainQuery ran with no
+    // upper bound at all, and the three that scale with the server rather than
+    // the query (tableBloat, indexBloat, bufferCacheContents) could run for as
+    // long as the relation or shared_buffers took to read.
+    //
+    // It cannot ride along in the batch above: set_config(..., is_local => true)
+    // is SET LOCAL, transaction-scoped like the read-only guard, and binds the
+    // value as a parameter rather than concatenating it -- and a parameterised
+    // statement cannot be batched with others in one PQexec.
+    statement_timeout_ms_ = timeout_ms.value_or(cfg.statement_timeout_ms);
+    last_statement_timeout_ms() = statement_timeout_ms_;
+    if (statement_timeout_ms_ > 0) {
       pqxx_exec(txn_, "SELECT set_config('statement_timeout', $1, true)",
-                pqxx::params{std::to_string(timeout_ms)});
+                pqxx::params{std::to_string(statement_timeout_ms_)});
     }
   }
+
+  // The ceiling this session applied, so a cancellation can be reported as the
+  // limit being reached rather than as an unexplained error. 0 means none.
+  int statement_timeout_ms() const { return statement_timeout_ms_; }
 
   pqxx::work& txn() { return txn_; }
 
@@ -115,6 +134,17 @@ public:
     return r;
   }
 
+  // The ceiling the most recently constructed Session applied.
+  //
+  // Exists for the same reason and on the same terms as last_observed_role():
+  // exactly one tool call is ever in flight, and each opens one Session. The
+  // reader is the handler that turns a cancellation into a message, which runs
+  // after the Session has been destroyed and so cannot ask it directly.
+  static int& last_statement_timeout_ms() {
+    static int ms = 0;
+    return ms;
+  }
+
   // Server version as an integer (e.g. 160004 for 16.4), from the startup
   // handshake -- no round trip. Used to gate catalog columns and SQL features
   // that don't exist on older majors; correct per connection, which matters
@@ -131,6 +161,7 @@ private:
   pqxx::connection conn_;
   pqxx::work txn_;
   std::optional<bool> in_recovery_;
+  int statement_timeout_ms_ = 0;
 };
 
 class PostgresMCPServer {
@@ -310,11 +341,24 @@ private:
   // Bounded connect for the tools that sweep every configured connection.
   static constexpr int kSweepConnectTimeoutSeconds = 5;
 
+  // The current sweep member's config, carrying the bounded connect.
+  //
+  // Set only while fan_out is running a member, so every query method goes on
+  // reading active_cfg() without learning that a sweep exists -- the same
+  // reason the sweep loop itself lives above dispatch. Without this the bound
+  // reached only the optional role probe, and the connection that did the
+  // actual work waited out the kernel's TCP timeout instead: sweeps are
+  // sequential, so each unreachable member cost the whole sweep about two
+  // minutes on a Linux default of six SYN retries.
+  std::optional<pglicht::ConnConfig> sweep_cfg_;
+
   static std::string app_name() {
     return std::string("pg-licht-cpp/") + PGLICHT_VERSION;
   }
 
-  const pglicht::ConnConfig& active_cfg() const { return registry_.get(active_); }
+  const pglicht::ConnConfig& active_cfg() const {
+    return sweep_cfg_ ? *sweep_cfg_ : registry_.get(active_);
+  }
 
   // Where each extension actually lives, per connection.
   //
@@ -408,6 +452,41 @@ private:
   // (write attempted in a read-only transaction). None of these queries write,
   // so the two cannot be confused here -- but a future caller that does write
   // must not reuse this pattern to report a grant.
+
+  // A statement the server cancelled because it hit statement_timeout.
+  //
+  // Reported as the ceiling being reached rather than as a raw error, because
+  // the two call for opposite responses: an error means something is wrong,
+  // while this means the answer needs longer than the caller allowed -- and the
+  // caller cannot tell which from the message PostgreSQL sends.
+  //
+  // Unlike insufficient_privilege (see above), a cancellation really does carry
+  // its SQLSTATE. libpqxx has no dedicated class for 57014, so it arrives as a
+  // plain pqxx::sql_error with sqlstate() == "57014" -- verified against
+  // libpqxx 7.10, the same version whose empty sqlstate() on
+  // insufficient_privilege made the code comparison there unusable. Testing the
+  // code is right here for exactly the reason it was wrong there, so the two
+  // must not be made to look alike.
+  static bool is_statement_timeout(const pqxx::sql_error& e) {
+    return e.sqlstate() == "57014";
+  }
+
+  static json statement_timeout_error(int timeout_ms, const std::string& detail) {
+    return {
+      {"error", "statement cancelled after " + std::to_string(timeout_ms) +
+                "ms (statement_timeout)"},
+      {"hint", "This is a ceiling, not a failure: the statement was still "
+               "running when it was reached. Raise it for this connection with "
+               "'statement_timeout_ms' in the connections file (or "
+               "PG_LICHT_STATEMENT_TIMEOUT_MS with a single DATABASE_URL), or "
+               "set 0 to remove it. tableBloat with exact=true, indexBloat on a "
+               "btree or hash index, and bufferCacheContents all scale with the "
+               "relation or with shared_buffers rather than with the query, so "
+               "they are the calls that reach it"},
+      {"timeout_ms", timeout_ms},
+      {"detail", detail}
+    };
+  }
 
   // pg_buffercache's two failure shapes. The grant is the interesting one: a
   // valid read-only role missing a monitoring grant is a different problem
@@ -1467,7 +1546,7 @@ private:
 	  },
 	  {
 	    {"name", "bufferCacheContents"},
-	    {"description", "return which relations own shared_buffers, aggregated per relation and fork and ranked by buffers held: cached bytes, percent of that fork resident, percent of shared_buffers consumed, dirty buffers, average usagecount and pins. Never raw per-buffer rows. Answers which relation is driving checkpoint writeback (pair with checkpointStats), whether the visibility-map fork is resident enough for index-only scans to pay off, and -- on a multi-tenant instance -- which database's working set is displacing the others. Only buffers belonging to this database and the shared catalogs can be resolved to names; buffers held by other databases on the same instance are visible to PostgreSQL but deliberately not reported here. Requires the pg_buffercache extension and a role with pg_monitor"},
+	    {"description", "return which relations own shared_buffers, aggregated per relation and fork and ranked by buffers held: cached bytes, percent of that fork resident, percent of shared_buffers consumed, dirty buffers, average usagecount and pins. Never raw per-buffer rows. Answers which relation is driving checkpoint writeback (pair with checkpointStats), whether the visibility-map fork is resident enough for index-only scans to pay off, and -- on a multi-tenant instance -- which database's working set is displacing the others. Only buffers belonging to this database and the shared catalogs can be resolved to names; buffers held by other databases on the same instance are visible to PostgreSQL but deliberately not reported here. Cost is O(shared_buffers) and does not vary with the limit or with anything else asked: pg_buffercache materialises one row per buffer before any filter applies, so narrowing the question does not narrow the scan. Around 0.5s per 16GB of shared_buffers, and it is subject to the connection's statement_timeout like every other call. bufferCacheSummary reads the same memory through a function that returns one row and is roughly a hundred times cheaper, so prefer it for anything routine. Requires the pg_buffercache extension and a role with pg_monitor"},
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", {
@@ -4119,19 +4198,25 @@ private:
         SELECT n.nspname                                 AS schema,
                c.relname                                 AS relation,
                c.relkind                                 AS relkind,
+               c.oid                                     AS reloid,
+               buf.relforknumber,
                CASE buf.relforknumber WHEN 0 THEN 'main' WHEN 1 THEN 'fsm'
                                       WHEN 2 THEN 'vm'   WHEN 3 THEN 'init' END AS fork,
                buf.buffers, buf.dirty, buf.avg_usagecount, buf.pins,
-               buf.buffers * current_setting('block_size')::bigint AS cached_bytes,
-               CASE buf.relforknumber
-                 WHEN 0 THEN pg_relation_size(c.oid, 'main')
-                 WHEN 1 THEN pg_relation_size(c.oid, 'fsm')
-                 WHEN 2 THEN pg_relation_size(c.oid, 'vm')
-                 WHEN 3 THEN pg_relation_size(c.oid, 'init')
-               END                                       AS fork_bytes
+               buf.buffers * current_setting('block_size')::bigint AS cached_bytes
           FROM buf
           JOIN pg_class     AS c ON pg_relation_filenode(c.oid) = buf.relfilenode
           JOIN pg_namespace AS n ON n.oid = c.relnamespace
+      -- Ranking needs only the buffer counts, so the limit is applied before
+      -- any fork is measured. pg_relation_size() is a stat() per call, and
+      -- computing it inside `named` meant one syscall per *cached relation* to
+      -- return `limit` rows -- on a large instance thousands of them, and on
+      -- network storage with a cold dentry cache that is the dominant cost of
+      -- the whole tool. The join stays above the limit so the ranking is still
+      -- over relations that actually resolve, which keeps the result identical
+      -- to what a caller got before.
+      ), top AS (
+        SELECT * FROM named ORDER BY buffers DESC LIMIT $1
       )
       SELECT JSONB_AGG(x ORDER BY x.buffers DESC) FROM (
         SELECT schema, relation, relkind, fork, buffers, dirty, pins,
@@ -4143,9 +4228,15 @@ private:
                      NULLIF((SELECT setting::bigint FROM pg_settings
                               WHERE name = 'shared_buffers'), 0), 2)
                  AS percent_of_shared_buffers
-          FROM named
-         ORDER BY buffers DESC
-         LIMIT $1
+          FROM top
+          CROSS JOIN LATERAL (
+            SELECT CASE top.relforknumber
+                     WHEN 0 THEN pg_relation_size(top.reloid, 'main')
+                     WHEN 1 THEN pg_relation_size(top.reloid, 'fsm')
+                     WHEN 2 THEN pg_relation_size(top.reloid, 'vm')
+                     WHEN 3 THEN pg_relation_size(top.reloid, 'init')
+                   END AS fork_bytes
+          ) AS sz
       ) AS x;
     )";
 
@@ -5432,12 +5523,24 @@ private:
     }
 
     json out = json::array();
+
+    // Clearing on the way out has to survive an exception escaping the loop:
+    // a sweep config left behind would silently redirect the next
+    // single-connection call, which is the kind of bug that only shows up
+    // after the call that caused it has been forgotten.
+    struct SweepScope {
+      std::optional<pglicht::ConnConfig>& slot;
+      ~SweepScope() { slot.reset(); }
+    } sweep_scope{sweep_cfg_};
+
     for (const auto& m : members) {
       // Reset first: a member that never connects must not inherit the
       // previous member's role.
       Session::last_observed_role() = "unknown";
       active_ = m;
       const auto& cfg = registry_.get(m);
+      // Every connect this member makes is bounded, not just the role probe.
+      sweep_cfg_ = with_connect_timeout(cfg, kSweepConnectTimeoutSeconds);
 
       json entry = {{"connection", m}};
       if (!cfg.instance.empty())          entry["instance"] = cfg.instance;
@@ -5450,6 +5553,16 @@ private:
         } else {
           entry["result"] = result;
         }
+      } catch (const pqxx::sql_error& e) {
+        // A member that ran out of time is a finding about that member, not a
+        // failure of the sweep -- and it is the member most worth looking at,
+        // so it must not be flattened into the same string as a refused
+        // connection.
+        if (is_statement_timeout(e))
+          entry["error"] = statement_timeout_error(
+            Session::last_statement_timeout_ms(), e.what());
+        else
+          entry["error"] = e.what();
       } catch (const std::exception& e) {
         // One unreachable host must not fail the sweep: a partial answer
         // during an incident beats an exception.
@@ -5893,6 +6006,23 @@ private:
 	    {"isError", false}
           });
 
+      } catch (const pqxx::sql_error& e) {
+	// Hitting the ceiling is reported as a result rather than an execution
+	// error: nothing went wrong, the answer just needs longer than this
+	// connection allows, and the caller can act on that.
+	if (is_statement_timeout(e)) {
+	  send_response(req["id"], {
+	      {"content", {{{"type", "text"},
+			    {"text", statement_timeout_error(
+			       Session::last_statement_timeout_ms(), e.what()).dump(2)}}}},
+	      {"isError", true}
+	    });
+	} else {
+	  send_response(req["id"], {
+	      {"content", {{{"type", "text"}, {"text", std::string("Execution error: ") + e.what()}}}},
+	      {"isError", true}
+	    });
+	}
       } catch (const std::exception& e) {
 	send_response(req["id"], {
 	    {"content", {{{"type", "text"}, {"text", std::string("Execution error: ") + e.what()}}}},

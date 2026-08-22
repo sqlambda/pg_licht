@@ -16,6 +16,22 @@ so even a bug that let a query attempt a write would fail rather than succeed si
 That guard is transaction-scoped rather than session-scoped, which is what makes it hold
 behind a connection pooler in transaction mode.
 
+The same transaction sets `statement_timeout`, so no call can occupy a backend
+indefinitely. It defaults to two minutes and is per connection:
+
+```ini
+[billing_prod]
+service              = billing-prod
+statement_timeout_ms = 600000      ; 0 removes the ceiling
+```
+
+Most operations are catalog reads that never approach it. The ones that can are
+those whose cost scales with the server rather than with the query —
+`tableBloat` with `exact: true`, `indexBloat` on a btree or hash index, and
+`bufferCacheContents` — so raise it for a connection where such a scan is the
+point of the call. Reaching it is reported as the ceiling being reached, naming
+the value and the key to change, rather than as an error.
+
 Full rationale, including the guarded exception for `explainQuery`, is in the
 SECURITY CONSIDERATIONS section of `man pg_licht_mcp`.
 
