@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <chrono>
 #include <cstdlib>
 #include <unistd.h>
 #include <sstream>
@@ -3109,7 +3110,13 @@ TEST(ConnectionConfigTest, OptionsKeyIsRejectedWithPgBouncerExplanation) {
     load("[default]\ndbname = one\noptions = -c statement_timeout=1000\n");
     FAIL() << "expected 'options' to be rejected";
   } catch (const std::exception& e) {
-    EXPECT_NE(std::string(e.what()).find("PgBouncer"), std::string::npos);
+    std::string msg = e.what();
+    EXPECT_NE(msg.find("PgBouncer"), std::string::npos);
+    // Rejecting the only obvious workaround obliges the message to name the
+    // supported one. Until 3.2.1 it claimed a SET LOCAL statement_timeout that
+    // only explainQuery ever issued, which sent the reader looking for a
+    // setting that was not being applied.
+    EXPECT_NE(msg.find("statement_timeout_ms"), std::string::npos) << msg;
   }
 }
 
@@ -3235,6 +3242,75 @@ TEST(ConnectionConfigTest, FromUrlLeavesUriFormUntouched) {
   // libpq parses URI forms itself; appending keywords would corrupt them.
   auto reg = pglicht::ConnectionRegistry::from_url("postgresql://h/db", "app/1");
   EXPECT_EQ(reg.get("default").conninfo, "postgresql://h/db");
+}
+
+// --- the statement ceiling ---
+
+TEST(ConnectionConfigTest, StatementTimeoutDefaultsWhenNotDeclared) {
+  auto reg = load("[default]\ndbname = one\n");
+  EXPECT_EQ(reg.get("default").statement_timeout_ms,
+            pglicht::kDefaultStatementTimeoutMs);
+}
+
+TEST(ConnectionConfigTest, StatementTimeoutIsPerConnectionAndKeptOutOfTheConninfo) {
+  // The ceiling that suits a catalog browsed over a WAN link is not the one
+  // that suits a deliberate pgstattuple scan, so it is declared per section.
+  auto reg = load("[fast]\ndbname = one\nstatement_timeout_ms = 5000\n"
+                  "[slow]\ndbname = two\nstatement_timeout_ms = 900000\n");
+  EXPECT_EQ(reg.get("fast").statement_timeout_ms, 5000);
+  EXPECT_EQ(reg.get("slow").statement_timeout_ms, 900000);
+  // statement_timeout is a GUC, not a libpq keyword: passed through, it would
+  // make libpq reject the entire conninfo.
+  EXPECT_EQ(reg.get("fast").conninfo.find("statement_timeout"), std::string::npos);
+  EXPECT_EQ(reg.get("slow").conninfo.find("900000"), std::string::npos);
+}
+
+TEST(ConnectionConfigTest, ZeroStatementTimeoutDisablesTheCeiling) {
+  // Unlike the capacity keys, 0 is a value here rather than a typo: it is how
+  // an operator restores the unbounded behaviour of 3.2.0 and earlier.
+  auto reg = load("[default]\ndbname = one\nstatement_timeout_ms = 0\n");
+  EXPECT_EQ(reg.get("default").statement_timeout_ms, 0);
+}
+
+TEST(ConnectionConfigTest, NonNumericStatementTimeoutIsRejectedNamingTheSection) {
+  try {
+    load("[prod]\ndbname = one\nstatement_timeout_ms = 30s\n");
+    FAIL() << "expected a rejection";
+  } catch (const std::exception& e) {
+    std::string msg = e.what();
+    EXPECT_NE(msg.find("prod"), std::string::npos);
+    EXPECT_NE(msg.find("statement_timeout_ms"), std::string::npos);
+    EXPECT_NE(msg.find("30s"), std::string::npos);
+  }
+}
+
+TEST(ConnectionConfigTest, AnOversizedStatementTimeoutIsRejectedRatherThanNarrowed) {
+  // statement_timeout is an int GUC. Narrowing past INT_MAX would turn "wait
+  // essentially forever" into a few seconds, which is the one direction an
+  // operator must never be surprised in.
+  try {
+    load("[prod]\ndbname = one\nstatement_timeout_ms = 99999999999\n");
+    FAIL() << "expected a rejection";
+  } catch (const std::exception& e) {
+    std::string msg = e.what();
+    EXPECT_NE(msg.find("2147483647"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("prod"), std::string::npos) << msg;
+  }
+}
+
+TEST(ConnectionConfigTest, StatementTimeoutComesFromTheEnvironmentForASingleConnection) {
+  ::setenv("PG_LICHT_STATEMENT_TIMEOUT_MS", "7500", 1);
+  auto reg = pglicht::ConnectionRegistry::from_url("dbname=x", "app/1");
+  ::unsetenv("PG_LICHT_STATEMENT_TIMEOUT_MS");
+  EXPECT_EQ(reg.get("default").statement_timeout_ms, 7500);
+  EXPECT_EQ(reg.get("default").conninfo.find("7500"), std::string::npos);
+}
+
+TEST(ConnectionConfigTest, StatementTimeoutFallsBackToTheDefaultWithoutTheEnvironment) {
+  ::unsetenv("PG_LICHT_STATEMENT_TIMEOUT_MS");
+  auto reg = pglicht::ConnectionRegistry::from_url("dbname=x", "app/1");
+  EXPECT_EQ(reg.get("default").statement_timeout_ms,
+            pglicht::kDefaultStatementTimeoutMs);
 }
 
 // --- connection topology ---
@@ -3677,6 +3753,28 @@ TEST_F(PostgresMCPServerTest, BufferCacheContentsRanksRelationsAndResolvesMapped
     << "no mapped catalog resolved; the relfilenode join is wrong: " << r.dump(2);
 }
 
+TEST_F(PostgresMCPServerTest, BufferCacheContentsStillMeasuresTheForksItReturns) {
+  // 3.2.1 moved pg_relation_size() below the limit, so it is called for the
+  // rows returned instead of once per cached relation. The measurement must
+  // still be there: dropping it would turn a cost fix into a payload change.
+  json r = srv->call_buffer_cache_contents(5);
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  ASSERT_FALSE(r["relations"].empty()) << r.dump(2);
+
+  bool measured = false;
+  for (const auto& row : r["relations"]) {
+    ASSERT_TRUE(row.contains("fork_bytes")) << row.dump(2);
+    ASSERT_TRUE(row.contains("cached_bytes")) << row.dump(2);
+    ASSERT_TRUE(row.contains("percent_of_shared_buffers")) << row.dump(2);
+    if (!row["fork_bytes"].is_null() && row["fork_bytes"].get<long long>() > 0) {
+      measured = true;
+      // A fork that holds buffers has a size, and the ratio derived from it.
+      EXPECT_FALSE(row["percent_of_fork_cached"].is_null()) << row.dump(2);
+    }
+  }
+  EXPECT_TRUE(measured) << "no fork was measured at all: " << r.dump(2);
+}
+
 TEST_F(PostgresMCPServerTest, BufferCacheContentsResolvesSharedCatalogs) {
   // reldatabase 0 is the shared catalogs. Filtering them out along with other
   // databases' buffers would drop pg_database and pg_authid entirely.
@@ -3824,6 +3922,61 @@ TEST(SessionRoleTest, ObservesTheReplicaSideOnAStandby) {
   EXPECT_TRUE(s.in_recovery());
 }
 
+// --- the statement ceiling ---
+
+TEST_F(PostgresMCPServerTest, SessionAppliesTheConfiguredStatementTimeout) {
+  // Transaction-scoped, like the read-only guard and for the same reason: a
+  // transaction pooler discards session state but preserves this.
+  auto reg = pglicht::ConnectionRegistry::from_url(test_url, "pg-licht-test");
+  ASSERT_EQ(reg.get("default").statement_timeout_ms,
+            pglicht::kDefaultStatementTimeoutMs);
+
+  Session s{reg.get("default")};
+  EXPECT_EQ(s.statement_timeout_ms(), pglicht::kDefaultStatementTimeoutMs);
+  pqxx::result r = s.txn().exec("SHOW statement_timeout");
+  EXPECT_EQ(r[0][0].as<std::string>(), "2min");
+}
+
+TEST_F(PostgresMCPServerTest, AZeroStatementTimeoutLeavesTheServerDefaultAlone) {
+  // 0 must not be spelled as "0ms": setting it explicitly would override a
+  // server that deliberately configures its own ceiling.
+  auto reg = pglicht::ConnectionRegistry::from_url(test_url, "pg-licht-test");
+  pglicht::ConnConfig cfg = reg.get("default");
+  cfg.statement_timeout_ms = 0;
+
+  Session s{cfg};
+  EXPECT_EQ(s.statement_timeout_ms(), 0);
+  pqxx::result r = s.txn().exec(
+    "SELECT current_setting('statement_timeout') = boot_val "
+    "  FROM pg_settings WHERE name = 'statement_timeout'");
+  EXPECT_TRUE(r[0][0].as<bool>()) << "the session set a timeout it should not have";
+}
+
+TEST_F(PostgresMCPServerTest, AnExceededCeilingArrivesAsSqlstate57014) {
+  // The whole reporting path turns on this code being readable. It is the
+  // mirror image of the insufficient_privilege case fixed in 3.2.0, where
+  // libpqxx leaves sqlstate() empty: here there is no dedicated exception
+  // class, so it arrives as a plain sql_error that does carry its code.
+  auto reg = pglicht::ConnectionRegistry::from_url(test_url, "pg-licht-test");
+  Session s{reg.get("default"), 100};
+  ASSERT_EQ(s.statement_timeout_ms(), 100);
+  try {
+    s.txn().exec("SELECT pg_sleep(3)");
+    FAIL() << "expected the statement to be cancelled";
+  } catch (const pqxx::sql_error& e) {
+    EXPECT_EQ(e.sqlstate(), "57014") << e.what();
+  }
+}
+
+TEST_F(PostgresMCPServerTest, AnExplicitTimeoutOverridesTheConnectionCeiling) {
+  // explainQuery is the one caller that states how long it will wait.
+  auto reg = pglicht::ConnectionRegistry::from_url(test_url, "pg-licht-test");
+  Session s{reg.get("default"), 250};
+  EXPECT_EQ(s.statement_timeout_ms(), 250);
+  pqxx::result r = s.txn().exec("SHOW statement_timeout");
+  EXPECT_EQ(r[0][0].as<std::string>(), "250ms");
+}
+
 TEST_F(PostgresMCPServerTest, RoleIsObservedFreshlyForEverySession) {
   // Nothing caches it: two sessions each ask. A cached role would go stale at
   // a failover, which is exactly when it would be read.
@@ -3860,8 +4013,19 @@ protected:
     return section("default", test_url, extra);
   }
   // A connection that cannot be reached: port 1 refuses immediately.
+  //
+  // Immediately is the point -- this exercises the error path, not the timeout
+  // path. For a host that never answers at all, use blackholed() below; the two
+  // fail in different ways and only the second is bounded by connect_timeout.
   static std::string unreachable(const std::string& name) {
     return "[" + name + "]\nhost = 127.0.0.1\nport = 1\ndbname = nowhere\n";
+  }
+  // A connection whose packets go nowhere. 192.0.2.0/24 is TEST-NET-1
+  // (RFC 5737): reserved for documentation, routed nowhere, so a SYN to it is
+  // dropped rather than refused. That is the case a connect timeout exists
+  // for, and the one a decommissioned or firewalled database presents.
+  static std::string blackholed(const std::string& name, const std::string& extra) {
+    return "[" + name + "]\nhost = 192.0.2.1\nport = 5432\ndbname = nowhere\n" + extra;
   }
   static std::string standby_url_or_empty() {
     const char* u = std::getenv("STANDBY_URL");
@@ -4308,6 +4472,66 @@ TEST_F(TopologyFixture, AnUnreachableMemberDoesNotFailTheSweep) {
   ASSERT_TRUE(p["members"][1].contains("error")) << p.dump(2);
   // A member that never connected must not inherit the previous member's role.
   EXPECT_EQ(p["members"][1]["role"], "unknown");
+}
+
+TEST_F(TopologyFixture, ASweepBoundsTheConnectThatDoesTheWork) {
+  // Until 3.2.1 the bounded connect reached only verifyTopology and the
+  // optional role probe. The connection each member's tool actually opened
+  // went through active_cfg() unbounded, so a blackholed member cost the
+  // kernel's SYN-retry budget -- six retries, about 127 seconds, on a Linux
+  // default -- and sweeps are sequential, so every such member added that to
+  // the whole call.
+  //
+  // The bound is 5 seconds. The assertion is deliberately loose: what it has
+  // to separate is "bounded" from "waiting on the kernel", and any figure
+  // between the two settles that without turning a slow CI runner into a
+  // failure.
+  auto s = server_from(ini_with("group = prod\n") + blackholed("gone", "group = prod\n"));
+
+  const auto start = std::chrono::steady_clock::now();
+  json p = rpc_payload(rpc_call(*s, "listSchemas", {{"group", "prod"}}));
+  const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+      std::chrono::steady_clock::now() - start).count();
+
+  ASSERT_EQ(p["members"].size(), 2u) << p.dump(2);
+  EXPECT_TRUE(p["members"][0].contains("result")) << p.dump(2);
+  ASSERT_TRUE(p["members"][1].contains("error")) << p.dump(2);
+  EXPECT_LT(elapsed, 60) << "the sweep waited on the kernel rather than on "
+                            "connect_timeout: " << elapsed << "s";
+}
+
+TEST_F(TopologyFixture, AnExceededCeilingIsReportedAsTheCeilingNotAnExecutionError) {
+  // A ceiling reached and a query that failed call for opposite responses, and
+  // PostgreSQL's own message does not distinguish them for the caller. 1ms is
+  // below what any catalog read takes, so the tool's own query trips it -- the
+  // read-only guard and set_config both run before it takes effect.
+  auto s = server_from(ini_with("statement_timeout_ms = 1\n"));
+  json r = rpc_call(*s, "listTables", {{"schema", "grocery"}});
+
+  const std::string text = r["result"]["content"][0]["text"].get<std::string>();
+  if (!r["result"]["isError"].get<bool>())
+    GTEST_SKIP() << "the catalog read finished inside 1ms: " << text;
+
+  json p = json::parse(text);
+  ASSERT_TRUE(p.is_object()) << text;
+  EXPECT_NE(p.value("error", "").find("statement_timeout"), std::string::npos) << text;
+  EXPECT_EQ(p.value("timeout_ms", 0), 1) << text;
+  // The hint has to name the knob, or the caller has no way to act on it.
+  EXPECT_NE(p.value("hint", "").find("statement_timeout_ms"), std::string::npos) << text;
+}
+
+TEST_F(TopologyFixture, ASweepLeavesNoBoundedConfigBehindIt) {
+  // The sweep swaps in a connection config carrying the bounded connect. If it
+  // survived the call, the next single-connection call would silently inherit
+  // it -- a bug that only shows up long after the call that caused it.
+  auto s = server_from(ini_with("group = prod\n") +
+                       section("twin", test_url, "group = prod\n"));
+  rpc_payload(rpc_call(*s, "listSchemas", {{"group", "prod"}}));
+
+  json r = rpc_call(*s, "listConnections", json::object());
+  ASSERT_FALSE(r["result"]["isError"].get<bool>()) << r.dump(2);
+  json p = rpc_payload(r);
+  EXPECT_FALSE(p.contains("members")) << p.dump(2);
 }
 
 TEST_F(TopologyFixture, MoreThanOneTargetIsRejected) {

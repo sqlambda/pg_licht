@@ -24,6 +24,23 @@
 
 namespace pglicht {
 
+// How long any one statement may run before the server cancels it.
+//
+// Every tool but explainQuery ran unbounded until 3.2.1. Most of them are
+// catalog reads that finish in milliseconds, but tableBloat and indexBloat
+// call pgstattuple functions that read the whole relation, and bufferCacheContents
+// scans every buffer in shared_buffers -- all three grow with the server rather
+// than with the query, so the same call that is instant on a laptop runs for
+// minutes on the machine it was written for. Unbounded is the wrong default
+// there: a diagnostic tool that hangs is worse than one that says it gave up.
+//
+// Two minutes is chosen to be longer than any catalog read can plausibly take
+// and shorter than an operator's patience during an incident. It is a ceiling,
+// not a budget: nothing waits for it in the normal case. Raise it per
+// connection with statement_timeout_ms when a deliberate pgstattuple scan of a
+// large table is the point of the call, or set 0 to restore 3.2.0 behaviour.
+inline constexpr int kDefaultStatementTimeoutMs = 120000;
+
 // Capacity of the machine the server runs on.
 //
 // Total RAM and vCPU count are properties of the host, not of the cluster:
@@ -94,6 +111,17 @@ struct ConnConfig {
   std::vector<std::string> groups;
 
   HostCapacity capacity;
+
+  // statement_timeout for every transaction opened on this connection, in
+  // milliseconds; 0 disables it. Per connection rather than global because the
+  // ceiling that suits a catalog browsed over a WAN link is not the one that
+  // suits a deliberate pgstattuple scan of a 500GB table.
+  //
+  // It is deliberately not part of conninfo: statement_timeout is a GUC, not a
+  // libpq keyword, so libpq would reject the whole string, and the `options`
+  // keyword that could carry it is rejected by PgBouncer. It is applied per
+  // transaction instead, which is the scope a transaction pooler preserves.
+  int statement_timeout_ms = kDefaultStatementTimeoutMs;
 };
 
 namespace detail {
@@ -168,6 +196,40 @@ inline long long positive_int(const std::string& v, const std::string& where) {
   }
 }
 
+// Like positive_int, but 0 is a meaningful value rather than a mistake.
+//
+// Kept separate rather than adding a flag to positive_int: every existing
+// caller describes a quantity where zero means "unset", and letting one of
+// them accept 0 silently would turn a typo into a disabled feature.
+inline long long non_negative_int(const std::string& v, const std::string& where) {
+  if (v.empty())
+    throw std::runtime_error(where + ": expected a non-negative integer, got an empty value");
+  for (char c : v) {
+    if (!std::isdigit(static_cast<unsigned char>(c)))
+      throw std::runtime_error(where + ": expected a non-negative integer, got \"" + v + "\"");
+  }
+  try {
+    return std::stoll(v);
+  } catch (const std::out_of_range&) {
+    throw std::runtime_error(where + ": value out of range: \"" + v + "\"");
+  }
+}
+
+// A statement_timeout in milliseconds, bounded by what PostgreSQL will take.
+//
+// The GUC is an int, so anything past INT_MAX is not a longer timeout but a
+// different number: narrowing it silently would turn "wait essentially forever"
+// into a few seconds, which is the one direction an operator must never be
+// surprised in. 0 is passed through and means no ceiling.
+inline int statement_timeout_ms(const std::string& v, const std::string& where) {
+  const long long ms = non_negative_int(v, where);
+  if (ms > 2147483647LL)
+    throw std::runtime_error(
+      where + ": " + v + "ms exceeds PostgreSQL's maximum statement_timeout "
+      "(2147483647). Use 0 for no ceiling");
+  return static_cast<int>(ms);
+}
+
 }  // namespace detail
 
 // A set of named connections, plus which one is the default.
@@ -193,6 +255,7 @@ public:
     // the variables describe. With a connections file each section declares
     // its own, since the sections may well live on different machines.
     cfg.capacity = capacity_from_env();
+    cfg.statement_timeout_ms = statement_timeout_from_env();
 
     reg.order_.push_back("default");
     reg.conns_["default"] = cfg;
@@ -369,6 +432,17 @@ public:
     return cap;
   }
 
+  // The statement ceiling for the single-connection path, where there is no
+  // file to carry statement_timeout_ms. Same reasoning as capacity_from_env:
+  // one connection, so there is no question which one the variable describes.
+  static int statement_timeout_from_env() {
+    const char* v = std::getenv("PG_LICHT_STATEMENT_TIMEOUT_MS");
+    if (v == nullptr) return kDefaultStatementTimeoutMs;
+    const std::string s = detail::trim(v);
+    if (s.empty()) return kDefaultStatementTimeoutMs;
+    return detail::statement_timeout_ms(s, "PG_LICHT_STATEMENT_TIMEOUT_MS");
+  }
+
 private:
   std::map<std::string, ConnConfig> conns_;
   std::vector<std::string> order_;
@@ -531,7 +605,19 @@ private:
         throw std::runtime_error(
           path + ": [" + name + "] sets 'options', which PgBouncer rejects as an "
           "unsupported startup parameter. pg-licht sets what it needs per "
-          "transaction (BEGIN READ ONLY, SET LOCAL statement_timeout) instead");
+          "transaction instead: the read-only guard always, and "
+          "statement_timeout from the 'statement_timeout_ms' key in this "
+          "section (default " + std::to_string(kDefaultStatementTimeoutMs) +
+          "ms, 0 to disable)");
+
+      // The statement ceiling. Consumed here rather than passed through:
+      // statement_timeout is a GUC, so libpq would reject the conninfo, and it
+      // is applied per transaction by Session instead.
+      if (key == "statement_timeout_ms") {
+        cfg.statement_timeout_ms = detail::statement_timeout_ms(
+          val, path + ": [" + name + "] statement_timeout_ms");
+        continue;
+      }
 
       // Host capacity keys describe the machine, not the connection. They are
       // consumed here and never reach the conninfo -- libpq would reject the

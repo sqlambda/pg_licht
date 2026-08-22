@@ -1,5 +1,107 @@
 # Changelog
 
+## 3.2.1 (2026-08-21)
+
+Three fixes to behaviour shipped in 3.2.0 and earlier. No payload shape
+changed and no configuration file needs an edit, but one default did change:
+every call now runs under a `statement_timeout`.
+
+### Fixed
+
+- **A fan-out sweep did not bound the connection that did its work.** 3.2.0
+  added `with_connect_timeout()` so that "one unreachable host must cost
+  seconds, not whatever the kernel's TCP timeout happens to be", and applied it
+  in `verifyTopology` and in the optional role probe. The connection each
+  member's tool actually opened went through `active_cfg()` instead, which
+  returns the configured conninfo unchanged — and nothing supplies a default
+  `connect_timeout`.
+
+  A member that refuses a connection fails immediately, so this was invisible
+  in testing; a member that *drops* the packets — a decommissioned database, a
+  security group that changed, a host that went away — cost the kernel's
+  SYN-retry budget instead. On a Linux default of six retries that is about
+  two minutes, and sweeps are sequential, so each such member added two minutes
+  to the whole call. A handful of stale sections in a connections file was the
+  difference between a sweep that took seconds and one that took a quarter of
+  an hour.
+
+  There was an inversion in it worth naming: a sweep narrowed with
+  `role: "primary"` was fast, because the role probe *was* bounded and skipped
+  the member before its tool ever ran, while the same sweep without a role
+  filter was slow. Fast when narrowed and slow when not is the opposite of what
+  anyone would predict, which is part of why this took a while to see.
+
+  The sweep now swaps in a bounded copy of the member's config for the whole of
+  that member's turn, so every connection it opens carries the 5-second limit,
+  not just the probe. The regression test uses a TEST-NET-1 address
+  (192.0.2.1, RFC 5737) rather than a refused port, because a refused port
+  never exercises a timeout at all: against the previous code that test takes
+  134 seconds and fails, against this one it takes 5 and passes.
+
+- **Only `explainQuery` bounded how long a statement could run.** `Session`
+  took a `timeout_ms` defaulting to 0 and issued `SET LOCAL statement_timeout`
+  only when it was positive, and `explainQuery` was the sole caller that passed
+  one. Every other operation — all fifty-odd — ran with no upper bound.
+
+  For a catalog read that is academic. It is not academic for the three whose
+  cost scales with the server rather than with the query: `tableBloat` calls
+  `pgstattuple()`, a full sequential scan of the table (and `pgstattuple_approx()`,
+  the default, still reads every page the visibility map does not mark
+  all-visible, which on a write-heavy table is most of them); `indexBloat` reads
+  the whole index for btree and hash; and `bufferCacheContents` scans every
+  buffer in `shared_buffers`. On the machines this server is written for, those
+  are the calls that run for ten minutes, and nothing stopped them.
+
+  Nor could an operator stop them. `statement_timeout` is a GUC rather than a
+  libpq keyword, so it cannot go in a conninfo, and the `options` keyword that
+  could carry it is rejected at parse time — with a message that said pg-licht
+  "sets what it needs per transaction (BEGIN READ ONLY, SET LOCAL
+  statement_timeout) instead". The first half was true and the second was not,
+  so the message blocked the only available workaround by pointing at a setting
+  that was not being applied.
+
+  Every transaction now sets `statement_timeout`, defaulting to 120000ms and
+  configurable per connection with `statement_timeout_ms` (0 restores the old
+  unbounded behaviour), or with `PG_LICHT_STATEMENT_TIMEOUT_MS` on the single
+  `DATABASE_URL` path. It is transaction-scoped for the same reason the
+  read-only guard is: that is the scope a transaction-mode pooler preserves.
+  The `options` message now names the key that actually works.
+
+  A statement that reaches the ceiling is reported as the ceiling being
+  reached, with the value and the key to raise it, rather than as an execution
+  error — the two call for opposite responses and PostgreSQL's own message does
+  not distinguish them for the caller. Testing `sqlstate() == "57014"` is
+  reliable here, unlike the `42501` comparison fixed in 3.2.0: libpqxx has no
+  dedicated class for a cancelled statement, so it arrives as a plain
+  `pqxx::sql_error` that does carry its code. Verified against libpqxx 7.10,
+  the same version that leaves it empty on `insufficient_privilege`.
+
+- **`bufferCacheContents` measured every cached relation to return twenty.**
+  `pg_relation_size()` was called inside the CTE that resolved relation names,
+  so it ran once per relation holding a buffer and the `LIMIT` applied after.
+  Each call is a `stat()`. On a 16GB `shared_buffers` instance with 12,417
+  relations, that was 9,762 syscalls to produce 20 rows; on network storage
+  with a cold dentry cache it is the dominant cost of the tool. The limit is
+  now applied before any fork is measured. Measured at 513ms → 464ms locally,
+  where `stat()` is nearly free; the gap widens with the storage.
+
+  The join to `pg_class` was left alone deliberately. It reads
+  `pg_relation_filenode(c.oid)`, which cannot use
+  `pg_class_tblspc_relfilenode_index`, but a mapped catalog carries
+  `relfilenode = 0` in `pg_class` and can only be resolved through that
+  function — so an index-friendly predicate would drop exactly the relations
+  that are most heavily cached. Measured at ~25ms of 513ms, it is not where the
+  time goes.
+
+### Known limitations
+
+- The cost of `bufferCacheContents` and `bufferCacheSummary` is O(`shared_buffers`)
+  and independent of any argument: `pg_buffercache` materialises one row per
+  buffer before any `WHERE` clause is evaluated, so narrowing the question does
+  not narrow the scan. Measured at 2.1M buffers: 465ms for the contents,
+  5ms for the summary, which uses `pg_buffercache_summary()` and never
+  materialises rows. Prefer the summary for routine checks.
+
 ## 3.2.0 (2026-08-20)
 
 No existing tool's payload shape changed, and a legacy protocol response is

@@ -237,8 +237,63 @@ The key
 is rejected.
 PgBouncer refuses GUCs in the startup packet, so
 .Nm
-sets what it needs per transaction instead; see
+sets what it needs per transaction instead \(em the read-only guard always, and
+.Va statement_timeout
+from
+.Va statement_timeout_ms
+below; see
 .Sx SECURITY CONSIDERATIONS .
+.Ss The statement ceiling
+Every transaction sets
+.Va statement_timeout ,
+so no single call can run without an upper bound.
+The default is 120000 milliseconds.
+Set it per section:
+.Bd -literal -offset indent
+[prod]
+service              = billing-prod
+statement_timeout_ms = 300000
+
+[wan]
+service              = analytics-eu
+statement_timeout_ms = 15000
+.Ed
+.Pp
+A value of 0 removes the ceiling and leaves the server's own
+.Va statement_timeout
+untouched, which is the behaviour of 3.2.0 and earlier.
+With a single
+.Ev DATABASE_URL ,
+use
+.Ev PG_LICHT_STATEMENT_TIMEOUT_MS
+instead.
+.Pp
+Most operations are catalog reads that finish in milliseconds and never
+approach it.
+The ones that can are those whose cost scales with the server rather than with
+the query:
+.Ic tableBloat
+with
+.Va exact
+true,
+.Ic indexBloat
+on a btree or hash index, and
+.Ic bufferCacheContents ,
+which scans every buffer in
+.Va shared_buffers .
+Raise it for the connection when such a scan is the point of the call.
+.Pp
+A statement that reaches the ceiling is reported as the ceiling being reached,
+with the value and the key to change, rather than as an execution error:
+nothing went wrong, the answer simply needs longer than the connection allows.
+.Pp
+Like the read-only guard, the ceiling is transaction-scoped rather than
+session-scoped, which is what makes it survive a transaction-mode pooler.
+It cannot be carried in the conninfo:
+.Va statement_timeout
+is a GUC rather than a libpq keyword, and the
+.Va options
+keyword that could carry it is the one PgBouncer rejects.
 .Ss Host capacity
 Total RAM and vCPU count belong to the machine, not to the cluster.
 PostgreSQL has no catalog for them, and a backend could not read them portably
@@ -1264,6 +1319,16 @@ Number of vCPUs or cores on the host, under the same rule.
 Free-text storage description, under the same rule.
 .It Ev PG_LICHT_HOST_NOTE
 Free-text note about the host, under the same rule.
+.It Ev PG_LICHT_STATEMENT_TIMEOUT_MS
+Upper bound in milliseconds on any one statement; 0 removes it.
+Defaults to 120000.
+Honoured only with the single-connection
+.Ev DATABASE_URL
+form; with a connections file, use
+.Va statement_timeout_ms
+in the section instead.
+See
+.Sx The statement ceiling .
 .It Ev PGSERVICEFILE
 Path to a libpq service file, used to resolve a
 .Va service
@@ -1636,3 +1701,10 @@ The setting cannot be pushed into the connection string either: PgBouncer
 rejects GUCs in the startup packet outright, which is why the
 .Va options
 configuration key is refused.
+.Pp
+.Va statement_timeout
+is set on the same transaction and for the same reason, so no call can occupy a
+backend indefinitely.
+See
+.Sx The statement ceiling
+for the value and how to change it.
