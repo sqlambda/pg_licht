@@ -232,8 +232,10 @@ jobs:
         # PgBouncer issues as server_reset_query -- so without the reset one
         # caller's hypothetical index reshapes the next caller's plans. The
         # test for that passes vacuously on a direct connection.
-        run: .github/scripts/apt-pgdg.sh libpq5 postgresql-${{ matrix.pg }} \
-                                         postgresql-${{ matrix.pg }}-hypopg pgbouncer
+        # One line on purpose: this is a plain scalar, where a trailing
+        # backslash is not a continuation -- YAML folds the lines with a space
+        # and the backslash reaches the shell as an argument.
+        run: .github/scripts/apt-pgdg.sh libpq5 postgresql-${{ matrix.pg }} postgresql-${{ matrix.pg }}-hypopg pgbouncer
 
       - uses: actions/download-artifact@v4
         with:

@@ -220,11 +220,19 @@ protected:
       // tools are exercised against a schema-qualified lookup rather than
       // whatever happens to be on the role's search_path.
       txn.exec("CREATE EXTENSION IF NOT EXISTS pg_buffercache SCHEMA extensions");
-      // hypopg, also out of public. Optional: it is a third-party extension
-      // that may not be packaged everywhere, so the tests that need it skip
+      // hypopg, also out of public. Optional: it is third-party rather than
+      // contrib and is not packaged everywhere, so the tests that need it skip
       // rather than fail when it is absent.
+      //
+      // The savepoint is what makes that true, and catching the exception is
+      // not enough on its own: a failed statement poisons the whole
+      // transaction, so every command after it errors with 25P02 until a
+      // rollback -- which took the rest of this fixture down with it. Same
+      // reason explain_query and evaluate_index wrap their EXPLAINs.
       try {
-        txn.exec("CREATE EXTENSION IF NOT EXISTS hypopg SCHEMA extensions");
+        pqxx::subtransaction sub{txn};
+        sub.exec("CREATE EXTENSION IF NOT EXISTS hypopg SCHEMA extensions");
+        sub.commit();
       } catch (const std::exception&) {
       }
       txn.exec(
