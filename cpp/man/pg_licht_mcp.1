@@ -1,7 +1,7 @@
 .\" Copyright (c) 2026 Daniel Cristian.
 .\" Licensed under the Apache License, Version 2.0; see LICENSE.
 .\"
-.Dd August 12, 2026
+.Dd September 2, 2026
 .Dt PG_LICHT_MCP 1
 .Os pg-licht
 .Sh NAME
@@ -450,34 +450,166 @@ is running is picked up on the next call.
 An extension that is absent is reported as not installed, with the hint naming
 the setup steps; see
 .Sx DIAGNOSTICS .
+.Ss Privileges
+.Bl -tag -width Ds
+.It Ic checkPrivileges
+Which operations the current role can actually use on this connection, and how
+the rest fall short.
+.Pp
+Most of this server works for any role that can connect, because the catalog is
+world-readable.
+Measured on PostgreSQL 18: a bare
+.Ic LOGIN
+role with no grants runs 47 of the 58 operations at full fidelity, the
+monitoring role takes that to 54, and the three that remain are exactly the
+three that read row data \(em the
+.Ic tableStats
+column histograms,
+.Ic checkKey
+and
+.Ic explainQuery .
+.Pp
+Worth calling first against an unfamiliar connection or a restricted role.
+The alternative is discovering the limits one operation at a time, and the
+discovery misleads:
+.Ic tableStats
+under a role without
+.Ic SELECT
+returns every column present with null statistics, which is what a table that
+was never analyzed looks like, and
+.Ic statementStats
+returns rows whose query text is
+.Li <insufficient privilege>
+with no count of what was hidden.
+.Pp
+Operations named in neither list are fully available;
+.Va available
+is a count rather than a list, because the exceptions are the answer.
+.Va denied
+means the operation cannot answer at all,
+.Va degraded
+that it answers less than a privileged role would see.
+The three that read row data are always
+.Va degraded
+and never
+.Va denied ,
+because privilege there is per object: a role without blanket read access may
+still hold
+.Ic SELECT
+on some tables and not others.
+.Pp
+An absent extension is distinguished from a missing privilege, because the two
+send an operator to different fixes.
+.Pp
+No role memberships and no
+.Ic GRANT
+statements appear in the output.
+Which predefined role gates an operation is PostgreSQL's business; the caller
+needs to know what works.
+Naming a grant in the hint of an operation that failed is diagnosis; listing
+grants beside every unavailable operation would be a standing recommendation to
+escalate privilege, which is not this server's to make.
+.El
 .Ss Schema exploration
 .Bl -tag -width Ds
 .It Ic listSchemas
 All schemas with their table and view names and role grants.
 .It Ic listTables Ar schema
-Tables and views in
-.Ar schema
-with kind, row counts, sizes, scan stats, autovacuum stats (dead and live
-tuples, mods-since-analyze, inserts-since-vacuum, last vacuum and analyze,
-per-table reloptions), columns (name, description, per-column index count), and
-index and constraint counts.
+Structure of the tables and views in
+.Ar schema :
+kind, description, per-table reloptions, columns (name, description, per-column
+index count), and index and constraint counts.
 Full index and constraint definitions live in
 .Ic tableDetails ,
 not here; this operation is deliberately light for browsing a schema.
+Carries no statistics and no sizes: see
+.Ic listTableStats
+and
+.Ic listTableSizes .
 .It Ic tableDetails Ar schema Ar table
-Columns (types, nullability, defaults,
-.Li pg_stats
-histograms, per-column TOAST storage strategy and compression method), TOAST
-table (name, size, index size;
-.Dv null
-if the table has no toastable columns), primary key as an ordered column list,
-indexes (size, usage counts), constraints, foreign keys, inbound foreign keys
+Structure of one table: columns (types, nullability, defaults, per-column TOAST
+storage strategy and compression method), TOAST table name
+.Pq Dv null No if the table has no toastable columns ,
+primary key as an ordered column list, index definitions, constraints, foreign
+keys, inbound foreign keys
 .Pq Va referenced_by ,
 triggers (timing, events, when condition, language), rules (excluding the
 implicit view
 .Li _RETURN
-rule), row-level security status and policies, view definition, scan stats, and
-role grants.
+rule), row-level security status and policies, view definition, and role grants.
+.Pp
+Everything here changes only when someone issues DDL, and none of it is sampled
+row data.
+For row counts, scan counters, autovacuum state and the
+.Li pg_stats
+histograms see
+.Ic tableStats ;
+for measured sizes see
+.Ic tableSize .
+.It Ic tableStats Ar schema Ar table
+Statistics PostgreSQL already keeps for one table: estimated row count,
+.Va size_estimate
+.Pq Li relpages No * 8192 No with the Va estimated_from No timestamp that produced it ,
+.Va seq_scan
+and
+.Va idx_scan ,
+live and dead tuples, mods-since-analyze, inserts-since-vacuum, last vacuum and
+analyze, per-index scan counts, and the per-column
+.Li pg_stats
+histograms
+.Pq Va null_frac , Va avg_width , Va n_distinct , physical order correlation , Va most_common_vals No and their frequencies .
+Reads the catalog and the statistics collector only: no relation is opened and
+no file is measured.
+.Pp
+.Va most_common_vals
+is literal values sampled from the column, up to
+.Va default_statistics_target
+of them.
+This is the only operation that returns them.
+.It Ic listTableStats Ar schema
+The same statistics for every table in
+.Ar schema ,
+without the per-column histograms.
+Name one table to
+.Ic tableStats
+for those.
+.It Ic tableSize Ar schema Ar table
+Measured size of one table: main fork, table size including TOAST and the free
+space and visibility maps, index size, grand total, the TOAST relation, and each
+index individually.
+.Pp
+Costs more than it looks.
+.Li pg_table_size()
+and its relatives are not physical reads \(em they
+.Xr stat 2
+one file per 1 GB segment and read no blocks \(em but each opens the relation
+with
+.Sy AccessShareLock ,
+so a table being rewritten by an
+.Ic ALTER TABLE
+holds the call behind
+.Sy AccessExclusiveLock
+until
+.Va statement_timeout_ms
+fires.
+Prefer
+.Va size_estimate
+from
+.Ic tableStats ,
+which is free, and call this when the estimate is too stale to act on.
+A partitioned table reports its own storage, which is zero; measure the
+partitions.
+.It Ic listTableSizes Ar schema
+Measured table, index, and total size for every relation in
+.Ar schema .
+The lock caveat above applies with more force here: one relation is opened per
+table, so a single table under
+.Sy AccessExclusiveLock
+blocks the whole call rather than one row of it, and a wide schema means
+thousands of file-metadata calls.
+This is one of the operations worth raising
+.Va statement_timeout_ms
+for.
 .It Ic listFunctions Ar schema
 Functions and procedures in
 .Ar schema
@@ -531,6 +663,13 @@ Returns the same fields as
 .Ic listTables
 plus
 .Va roles .
+Structure only, and there is no statistics counterpart: a text search is how a
+table is found, not how a counter is read.
+Name a match to
+.Ic tableStats
+or
+.Ic tableSize
+for those.
 .It Ic searchFunctions Ar web_search
 Full-text search across function names, source code, language, trigger names,
 and descriptions.
@@ -1077,15 +1216,59 @@ flags, since those decide whether the index can be dropped at all.
 Restrict the check to one table.
 Omit it to check every table in the schema.
 .El
+.It Ic evaluateIndex Ar sql Op Va create , hide
+Plan a statement as if the indexes were different, using
+.Li hypopg .
+.Va create
+takes
+.Ic CREATE INDEX
+statements to plan against without building them;
+.Va hide
+takes the names of existing indexes to plan without, which is how to ask
+whether an index is safe to drop \(em the question
+.Ic duplicateIndexes
+raises and cannot settle, since neither redundancy nor an unused
+.Va idx_scan
+proves the planner would not miss it.
+.Pp
+Nothing is built, no lock is taken, no catalog row is written, and the
+statement is never executed:
+.Li hypopg
+cannot serve
+.Ic EXPLAIN ANALYZE ,
+so this is plan-only and safer than
+.Ic explainQuery
+with
+.Va analyze .
+Reports the plan and total cost before and after, and for each index whether
+the planner actually used it \(em a proposed index the planner ignores is the
+common case, and a cost figure alone hides it.
+The cost is the planner's estimate, not a measurement.
+.Pp
+A hypothetical index lives in backend-local memory for the whole session and is
+cleared by neither
+.Ic ROLLBACK ,
+a new transaction, nor
+.Ic DISCARD ALL ,
+which is what PgBouncer issues as
+.Va server_reset_query .
+This operation therefore resets explicitly on the way in and on the way out, so
+that behind a transaction pooler one caller's hypothetical index cannot reshape
+the next caller's plans.
+.Pp
+.Va hide
+requires
+.Li hypopg
+1.4.0 or later, gated on the extension version.
 .It Ic tableBloat Ar schema Ar table Op Va exact
 Physical storage bloat for a table
 .Pq Li pgstattuple No or Li pgstattuple_approx :
 table size, live and dead tuple counts and percentages, free space and
 percentage.
 More accurate than the ANALYZE-time estimates in
-.Ic listTables
+.Ic listTableStats
 and
-.Ic tableDetails .
+.Ic tableStats .
 Returns a clear error with setup instructions if the extension is not installed.
 .Pp
 .Bl -tag -width "timeout_ms" -compact
@@ -1293,6 +1476,256 @@ are the only operations that do not take a
 .Va connection
 argument.
 .El
+.Sh OUTPUT FORMAT
+A client that negotiated MCP revision
+.Li 2025-06-18
+or later receives its answer as
+.Va structuredContent
+and no text block.
+A client on an earlier revision receives the text block and no
+.Va structuredContent .
+Never both.
+.Pp
+The specification suggests serving both for backwards compatibility, and this
+implementation deliberately does not.
+Sending both serialises the same payload twice in one response, and a client
+that feeds tool results into a model's context may inject both, doubling the
+tokens on every call.
+The compatibility that suggestion protects is already covered by the negotiated
+revision: a client that cannot read
+.Va structuredContent
+does not ask for a revision that has it.
+If a client advertises
+.Li 2025-06-18
+but reads only
+.Va content ,
+pin it to
+.Li 2025-03-26
+and it behaves as before.
+.Pp
+The text block is serialised compactly.
+Indentation measured 18-39% of the payload across real catalog reads and no
+consumer reads it; every one parses the text as JSON.
+.Pp
+Errors remain a text block in both eras:
+.Va structuredContent
+is the format for a tool's answer, and an error is a message about why there is
+no answer.
+.Pp
+Every operation declares an
+.Va outputSchema
+to clients that negotiated the revision defining it.
+The schemas type the keys that are unconditional, mark nothing required, and
+permit additional properties.
+This is deliberate: payloads are version-conditional, and any operation may
+answer
+.Li {error, hint}
+when an extension is absent or a grant is missing, so a schema that enumerated
+leaf fields would reject correct answers.
+.Ss Caching and pagination
+Results that revision
+.Li 2026-07-28
+marks cacheable \(em
+.Ic server/discover ,
+.Ic tools/list ,
+.Ic prompts/list ,
+.Ic resources/list ,
+.Ic resources/templates/list
+and
+.Ic resources/read
+\(em carry
+.Va ttlMs
+and
+.Va cacheScope .
+Both are emitted only alongside
+.Va resultType ,
+so a legacy result is unchanged.
+.Pp
+Anything compiled in or read from the configuration file at startup is hinted
+at one hour: none of it can change while the process lives, and no
+.Va listChanged
+capability is declared, so there is no mechanism by which it could.
+Anything read from a live catalog is hinted at one minute.
+This matters most for
+.Ic tools/list ,
+which is roughly 93 kB once 58 operations carry descriptions, annotations,
+titles and output schemas, and which a client would otherwise re-fetch whenever
+it needed the list.
+.Pp
+.Ic tools/list
+is scoped
+.Li private
+rather than
+.Li public .
+Its content varies by negotiated revision, while the cache key is the method and
+its parameters and the revision travels in
+.Va _meta ;
+and its
+.Va connection
+property names the configured default connection.
+Neither belongs in a cache a shared gateway may serve to another caller.
+A private cache still serves the calling client, which is where the saving
+lands.
+.Pp
+The list operations accept an opaque
+.Va cursor
+and return
+.Va nextCursor
+when more results remain; an unusable cursor is refused with
+.Er -32602 .
+The page size is larger than any list this server currently produces, so a
+client that ignores cursors still receives every operation.
+.Ic resources/list
+is the one that grows, being connections multiplied by schemas.
+.Ss Transactions
+Every session runs inside a transaction opened with
+.Ic SET TRANSACTION READ ONLY
+and ends in
+.Ic ROLLBACK .
+Nothing is ever committed: there is nothing a commit could preserve, and
+rolling back leaves the server provably as it was found.
+.Pp
+Rollback does not undo backend-local state set by an extension.
+A
+.Li hypopg
+hypothetical index survives
+.Ic ROLLBACK ,
+the next transaction, and
+.Ic DISCARD ALL ,
+which is why
+.Ic evaluateIndex
+resets it explicitly rather than relying on the transaction ending.
+.Sh RESOURCES
+Structure is served as resources as well as operations \(em documents a client
+may browse and pin into context without a call.
+The division is volatility: a resource changes only when someone issues DDL,
+while a reading changes continuously and the model must decide when to take it.
+.Pp
+.Bl -tag -width Ds -compact
+.It Li pglicht:// Ns Ar conn Ns Li /schemas
+Every schema, with its tables and role grants.
+.It Li pglicht:// Ns Ar conn Ns Li /schema/ Ns Ar schema
+Structure of every table and view in one schema.
+.It Li pglicht:// Ns Ar conn Ns Li /schema/ Ns Ar schema Ns Li /table/ Ns Ar table
+One table's full structure.
+.It Li pglicht:// Ns Ar conn Ns Li /schema/ Ns Ar schema Ns Li /functions
+.It Li pglicht:// Ns Ar conn Ns Li /schema/ Ns Ar schema Ns Li /enums
+.It Li pglicht:// Ns Ar conn Ns Li /schema/ Ns Ar schema Ns Li /types
+.It Li pglicht:// Ns Ar conn Ns Li /server/roles
+.It Li pglicht:// Ns Ar conn Ns Li /server/extensions
+.It Li pglicht:// Ns Ar conn Ns Li /server/settings
+.El
+.Pp
+.Ic resources/list
+is bounded.
+It enumerates connections and their schemas and reaches tables, functions,
+enums and types through
+.Ic resources/templates/list
+instead: a database with 10 000 tables would otherwise produce a 10 000-entry
+response on a call clients make eagerly.
+Enumerating schemas costs one connection per configured connection; one that
+cannot be reached is skipped rather than failing the list.
+.Pp
+The topology axes are absent from the URI space by design.
+A resource names exactly one object in exactly one database, and partial
+failure across members can only be reported per member, which belongs to
+operations.
+.Sh PROMPTS
+Eight templates, each encoding an order of investigation that is easy to get
+wrong.
+Every one whose tools are privilege-gated opens by calling
+.Ic checkPrivileges :
+a restricted role receives null statistics rather than an error, so a plan
+built on operations that will not answer looks like it worked.
+They are static text with argument substitution and touch no database until the
+model acts on them.
+.Bl -tag -width Ds
+.It Ic diagnose-slow-query Op Va query_id , min_duration_s
+From
+.Ic statementStats
+to a plan to a fix, reading
+.Va info.dealloc
+first so a truncated list is not mistaken for the whole picture.
+.It Ic triage-lock-contention Op Va connection
+Follow the wait chain to its root before proposing to terminate anything.
+.It Ic bloat-and-vacuum-review Op Va schema
+Check
+.Ic replicationSlots
+before concluding anything about bloat: an inactive slot holds back the xmin
+horizon cluster-wide, and no autovacuum tuning fixes it.
+.It Ic buffer-cache-review Op Va connection
+Summary before contents, and hit ratios read against table size.
+.It Ic capacity-check Op Va connection
+Worst-case committed memory against host RAM; stops with a partial answer
+rather than guessing an undeclared host.
+.It Ic replication-slot-review Op Va connection
+The runbook for the failure mode that presents as something else.
+An unconsumed slot holds back the xmin horizon, so vacuum cannot remove dead
+tuples anywhere in the cluster, and pins WAL until the disk fills; both get
+diagnosed as bloat or as a disk problem.
+Reads
+.Va wal_status ,
+establishes whose slot it is before proposing anything, weighs
+.Va max_slot_wal_keep_size
+against the disk, and treats dropping a slot as irreversible for its consumer.
+.It Ic plan-schema-change Ar change Op Va schema , table
+Chooses how to apply a DDL change by measuring the table it targets.
+Carries no DDL recipes, deliberately: the safe method is a property of the
+table, not of the statement.
+The same statement that is instant on an empty table is an outage at a billion
+rows, and partitioning is the extreme case \(em trivial before there is data, a
+migration with a cutover after it.
+.Pp
+It sends the model to measure instead, and to measure every object the change
+touches rather than only the one named: a foreign key locks the table it
+references as well as the table it is added to, a partitioned table means the
+parent and every partition, and the object not named is often the busier one.
+The readings are rows and
+.Va most_common_vals
+from
+.Ic tableStats ,
+what a rewrite would move from
+.Ic tableSize ,
+the indexes and constraints that multiply it from
+.Ic tableDetails ,
+the oldest running transaction from
+.Ic currentActivity
+\(em then asks for the change to be classified as metadata only, a scan, or a
+full rewrite, and for the size at which the answer would flip.
+Lock level alone settles nothing: a strong lock held for a millisecond is safe
+and a weak one held for an hour may not be, and duration comes from the
+measurements.
+.It Ic explain-and-fix Ar sql Op Va params
+Plan without
+.Va analyze
+first, then with it if needed, and check existing indexes before proposing one.
+.Pp
+Both this and
+.Ic diagnose-slow-query
+close by choosing the kind of fix rather than defaulting to DDL: a query
+rewrite, a statistics fix, a configuration change, or DDL, preferred in that
+order because that is the order of what they cost \(em an
+.Ic ANALYZE
+is free, a rewrite costs a deploy and nothing in the database, configuration
+changes every other query too, and an index is a write cost paid by every
+.Ic INSERT
+and
+.Ic UPDATE
+for as long as it exists.
+A rewrite can then be verified on the spot by explaining it; an index cannot,
+so its benefit is presented as the prediction it is, and its creation handed to
+.Ic plan-schema-change .
+.El
+.Pp
+.Ic completion/complete
+offers values for the
+.Va conn ,
+.Va schema
+and
+.Va table
+variables that appear in prompt arguments and resource templates.
+A completion is a convenience: an argument it does not recognise, or a catalog
+it cannot read, yields an empty list rather than an error.
 .Sh ENVIRONMENT
 .Bl -tag -width ".Ev PG_LICHT_CONFIG"
 .It Ev DATABASE_URL

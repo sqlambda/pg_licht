@@ -27,9 +27,9 @@ statement_timeout_ms = 600000      ; 0 removes the ceiling
 
 Most operations are catalog reads that never approach it. The ones that can are
 those whose cost scales with the server rather than with the query —
-`tableBloat` with `exact: true`, `indexBloat` on a btree or hash index, and
-`bufferCacheContents` — so raise it for a connection where such a scan is the
-point of the call. Reaching it is reported as the ceiling being reached, naming
+`tableBloat` with `exact: true`, `indexBloat` on a btree or hash index,
+`bufferCacheContents`, and `listTableSizes` on a wide schema — so raise it for a
+connection where such a scan is the point of the call. Reaching it is reported as the ceiling being reached, naming
 the value and the key to change, rather than as an error.
 
 Full rationale, including the guarded exception for `explainQuery`, is in the
@@ -49,15 +49,108 @@ man pg_licht_mcp
 
 Other install channels — deb, rpm, tarball, source — are in [INSTALL.md](INSTALL.md).
 
+## Output format
+
+A client that negotiates MCP revision `2025-06-18` or later receives
+`structuredContent` and no text block; one on an earlier revision receives the
+text block and no `structuredContent`. Never both — sending both would
+serialise the same payload twice, and a client that feeds tool results into a
+model's context may inject both, doubling the tokens on every call. Combined
+with dropping the pretty-printing, a modern client's wire bytes fall by 27–46%.
+
+If you have a client that advertises `2025-06-18` but only reads `content`, pin
+it to `2025-03-26` and it keeps working unchanged.
+
+Every tool declares an `outputSchema` to clients that can use it. The schemas
+describe but never reject: payloads here are version-conditional, and any tool
+may answer `{error, hint}` when an extension is absent.
+
+Results that the protocol marks cacheable carry `ttlMs` and `cacheScope`.
+`tools/list` is about 93 kB and entirely static, so it is hinted at one hour
+and scoped `private` — it varies by negotiated revision and names the
+configured default connection, so it must not be served to another caller from
+a shared cache. Catalog-derived results are hinted at one minute.
+
+List operations accept an opaque `cursor` and return `nextCursor`. The page
+size is larger than anything this server lists today, so a client that ignores
+cursors still sees every tool; `resources/list` is the one that grows, being
+connections × schemas.
+
+## Resources and prompts
+
+Structure is also served as **resources** — documents a client can browse and
+pin into context without a tool call:
+
+```
+pglicht://{conn}/schemas
+pglicht://{conn}/schema/{schema}
+pglicht://{conn}/schema/{schema}/table/{table}
+pglicht://{conn}/schema/{schema}/{functions,enums,types}
+pglicht://{conn}/server/{roles,extensions,settings}
+```
+
+Readings stay tools, because the model has to decide *when* to take them.
+`resources/list` enumerates connections and schemas and reaches tables through
+a template, so a 10 000-table database does not produce a 10 000-entry
+response.
+
+Eight **prompts** encode an order of investigation that is easy to get wrong:
+`diagnose-slow-query`, `triage-lock-contention`, `bloat-and-vacuum-review`,
+`buffer-cache-review`, `capacity-check`, `replication-slot-review`,
+`plan-schema-change` and `explain-and-fix`. They are static text and touch no
+database until the model acts on them, and each one whose tools are
+privilege-gated opens by calling `checkPrivileges`.
+
+`diagnose-slow-query` is the hub — a slow statement can end in a plan fix, a
+vacuum change, an index, or a schema change, and it routes to the others
+accordingly. `plan-schema-change` answers "how should I apply this DDL
+here?" by measuring the table rather than prescribing a method — it carries no
+DDL recipes, because the same statement that is instant on an empty table is an
+outage at a billion rows, and only the row count, measured size, existing
+indexes and current lock waits can tell the two apart. **Completions** are offered for the `conn`,
+`schema` and `table` variables.
+
 ## Tools
 
-52 read-only operations, grouped as schema exploration, catalog search, cluster-wide
+58 read-only operations, grouped as schema exploration, catalog search, cluster-wide
 objects, extensibility and text search, foreign data and replication, monitoring and
 statistics, diagnostics and query planning, topology, and connections. Highlights include
 `tableDetails` (columns, indexes, constraints, foreign keys in both directions, triggers,
 policies), `searchTables` (full-text search across names, descriptions, and enum values),
 and `explainQuery` (recover a slow statement from `pg_stat_statements` by `queryid` and get
 its `EXPLAIN` plan).
+
+`checkPrivileges` reports which of them the current role can actually use on a given
+connection. Most work for any role that can connect, since the catalog is world-readable:
+measured on PostgreSQL 18, a bare login role runs 47 of 58 at full fidelity, the monitoring
+role 54, and the ones that remain are those that read row data. Worth calling first
+against an unfamiliar connection — a privilege-filtered answer is easy to mistake for an
+empty one, since `tableStats` on a role without `SELECT` returns columns with null
+statistics, exactly like a table that was never analyzed.
+
+`evaluateIndex` plans a statement as if the indexes were different, using
+[hypopg](https://github.com/HypoPG/hypopg): `create` tests a candidate index without
+building it, `hide` plans without an existing one — which is how to ask whether an index is
+safe to drop. Nothing is built, nothing is locked, and the statement is never executed. It
+reports whether the planner actually *used* each index, which is the answer a cost figure
+hides.
+
+Tables are covered by three tools rather than one, split by what the answer costs and how
+fast it goes stale:
+
+| | tools | reads |
+|---|---|---|
+| **structure** — changes only on DDL | `tableDetails`, `listTables`, `searchTables` | catalog |
+| **statistics** — changes continuously, free to ask | `tableStats`, `listTableStats` | catalog and the statistics collector |
+| **measured size** — changes continuously, costs a lock | `tableSize`, `listTableSizes` | `stat()` per segment, under `AccessShareLock` |
+
+The structure tools return no sample column values and no counters, so the payload an agent
+reads most often to understand a schema carries neither row data nor anything that moves
+under it. `tableStats` carries the `pg_stats` histograms — including `most_common_vals`,
+which is literal values sampled from the column — and a free `size_estimate` from
+`relpages`, dated by `estimated_from` so its staleness is visible. Reach for `tableSize`
+only when that estimate is too stale to act on: it opens each relation with
+`AccessShareLock`, so during a rewrite it waits behind the `ALTER TABLE`.
 
 For operational triage there are `wraparoundStatus` (XID and multixact headroom, per
 database and per table, TOAST tables included), `checkpointStats` (timed against requested
@@ -148,8 +241,8 @@ tool accepts depends on where its answer actually varies, and its input schema s
 
 | | varies across the databases of one instance | varies across members of a replication group |
 |---|---|---|
-| catalogs, `tableBloat` | yes | no — a physical replica is byte-identical |
-| `duplicateIndexes`, `indexBloat`, `tableIOStats` | yes | **yes** — they carry `idx_scan` |
+| catalogs, `tableBloat`, the structure and size tools | yes | no — a physical replica is byte-identical |
+| `duplicateIndexes`, `indexBloat`, `tableIOStats`, `tableStats`, `listTableStats` | yes | **yes** — they carry `idx_scan` |
 | `currentActivity`, `currentLocks`, `statementStats`, buffer cache | no — instance-wide | yes |
 
 That middle row is the one worth knowing: an index that reads as unused on the primary may

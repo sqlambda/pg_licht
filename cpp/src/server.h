@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <cctype>
 #include <iostream>
 #include <map>
@@ -152,7 +153,24 @@ public:
   int server_version() const { return conn_.server_version(); }
 
   // txn_ is destroyed before conn_, rolling back; conn_ then disconnects.
-  ~Session() = default;
+  // Every session ends in ROLLBACK, explicitly. pqxx::work already aborts an
+  // uncommitted transaction on destruction, so this changes no behaviour -- it
+  // states the intent, and makes it something a test can assert rather than
+  // something that holds by accident. Nothing here ever commits: every
+  // statement runs under SET TRANSACTION READ ONLY, so there is nothing a
+  // commit could preserve, and rolling back leaves the server provably as it
+  // was found.
+  //
+  // One thing rollback does NOT undo, and it is worth naming because the
+  // assumption is natural: backend-local state set by an extension. A hypopg
+  // hypothetical index survives ROLLBACK, survives into the next transaction,
+  // and survives DISCARD ALL. evaluate_index resets it explicitly for exactly
+  // that reason; see the bracket there.
+  ~Session() {
+    // A destructor must not throw, and a connection already gone is not an
+    // error worth reporting: the transaction dies with it either way.
+    try { txn_.abort(); } catch (...) {}
+  }
 
   Session(const Session&) = delete;
   Session& operator=(const Session&) = delete;
@@ -198,6 +216,14 @@ public:
   const json call_table(const std::string& schema, const std::string& table_name) {
     return table(schema, table_name);
   }
+  const json call_table_stats(const std::string& schema, const std::string& table_name) {
+    return table_stats(schema, table_name);
+  }
+  const json call_list_table_stats(const std::string& schema) { return list_table_stats(schema); }
+  const json call_table_size(const std::string& schema, const std::string& table_name) {
+    return table_size(schema, table_name);
+  }
+  const json call_list_table_sizes(const std::string& schema) { return list_table_sizes(schema); }
   const json call_functions(const std::string& schema) { return functions(schema); }
   const json call_function_detail(const std::string& schema, const std::string& func_name) {
     return function_detail(schema, func_name);
@@ -257,6 +283,13 @@ public:
   // but was never registered -- and is therefore unreachable by any client --
   // fails the suite rather than passing it.
   const json call_tools_list() { return get_tools_list(client_protocol_)["tools"]; }
+  // Test hook. Nothing this server lists today exceeds one page, which is
+  // deliberate -- see kListPageSize -- so the multi-page path would otherwise
+  // ship untested until the first operator with a hundred schemas found it.
+  static bool call_paginate(const json& items, const json& params,
+                            const char* key, json& out) {
+    return paginate(items, params, key, out);
+  }
   const json call_tools_list(const std::string& protocol) {
     return get_tools_list(protocol)["tools"];
   }
@@ -313,6 +346,11 @@ public:
   const json call_connections() { return connections(); }
   const json call_topology() { return topology(); }
   const json call_verify_topology() { return verify_topology(); }
+  const json call_check_privileges() { return check_privileges(); }
+  const json call_evaluate_index(const std::string& sql, const json& create_defs,
+                                 const json& hide_names) {
+    return evaluate_index(sql, create_defs, hide_names);
+  }
   const json call_buffer_cache_summary() { return buffer_cache_summary(); }
   const json call_buffer_cache_contents(int limit) { return buffer_cache_contents(limit); }
   const json call_explain_query(const std::string& queryid, const std::string& sql,
@@ -556,7 +594,9 @@ private:
       if (!c.capacity.note.empty())     entry["host_note"]    = c.capacity.note;
       out.push_back(entry);
     }
-    return out;
+    // Wrapped for the same reason as currentLocks: a top-level array cannot be
+    // a `structuredContent` payload.
+    return json{{"connections", out}};
   }
 
   // The configured topology, as three indexes plus whatever belongs to none of
@@ -908,16 +948,41 @@ private:
       {"listTypes",             {true,  false, false, false}},
       {"searchEnums",           {true,  false, false, false}},
       {"searchFunctions",       {true,  false, false, false}},
+      // Predefined-role membership is cluster-wide, but which extensions are
+      // installed is per database, and so are object grants -- so the answer
+      // legitimately differs between two databases of one instance. A physical
+      // replica returns it verbatim.
+      {"checkPrivileges",       {true,  false, false, false}},
+      // Planning is per database, and a physical replica plans identically off
+      // the same statistics. Like explainQuery it is never swept: the same
+      // statement is rarely valid in another database.
+      {"evaluateIndex",         {true,  false, false, false}},
       {"tableBloat",            {true,  false, false, false}},
       {"typeDetails",           {true,  false, false, false}},
+      // 4.0.0 moved these three off the per_server row below. They were only
+      // ever there because they carried statistics counters; structure is
+      // byte-identical on a physical replica by definition, so a
+      // replication_group sweep used to re-run the whole structural payload --
+      // columns, constraints, triggers, policies, view definitions -- once per
+      // replica to get identical bytes back. Correcting this row is the point
+      // of the split, not a side effect of it.
+      {"listTables",            {true,  false, false, false}},
+      {"searchTables",          {true,  false, false, false}},
+      {"tableDetails",          {true,  false, false, false}},
+      // Measured sizes read the same files on every member of a replication
+      // group, so they belong here too rather than beside the counters.
+      {"listTableSizes",        {true,  false, false, false}},
+      {"tableSize",             {true,  false, false, false}},
 
       // Per-database *and* per-server: they carry statistics counters.
       {"duplicateIndexes",      {true,  true,  false, false}},
       {"indexBloat",            {true,  true,  false, false}},
       {"tableIOStats",          {true,  true,  false, false}},
-      {"listTables",            {true,  true,  true,  false}},
-      {"searchTables",          {true,  true,  true,  false}},
-      {"tableDetails",          {true,  true,  true,  false}},
+      // The other half of the split, and the half that is worth sweeping:
+      // scan counts and dead tuples are each server's own, and vacuum only
+      // runs on the primary.
+      {"listTableStats",        {true,  true,  true,  false}},
+      {"tableStats",            {true,  true,  true,  false}},
       // Frozen xids are replicated, but the vacuum counters beside them are not
       // meaningful on a server where vacuum never runs.
       {"wraparoundStatus",      {true,  false, true,  false}},
@@ -953,6 +1018,832 @@ private:
     return note;
   }
 
+  // ======================= Resources ======================================
+  //
+  // The organising principle is the spec's control model read through
+  // volatility: a resource is a document a client may pin into context and
+  // re-read later, so only structure belongs here. Everything that changes
+  // without a DDL statement -- counters, sizes, activity, locks, plans --
+  // stays a tool, because the model has to decide *when* to take a reading.
+  //
+  // This is what the 4.0.0 statistics split bought. Before it, listTables and
+  // tableDetails carried n_dead_tup, last_vacuum and idx_scan, and serving
+  // them as documents would have invited a client to cache a number that moves
+  // under it. Now the structure half is genuinely stable and the readings have
+  // their own tools.
+  //
+  // URI scheme, namespaced per connection so multi-database stays coherent. A
+  // resource names exactly one object in exactly one database; the topology
+  // axes are deliberately absent, because partial failure across members can
+  // only be reported per member, and that belongs to tools.
+  //
+  //   pglicht://{conn}/schemas
+  //   pglicht://{conn}/schema/{schema}
+  //   pglicht://{conn}/schema/{schema}/table/{table}
+  //   pglicht://{conn}/schema/{schema}/functions
+  //   pglicht://{conn}/schema/{schema}/enums
+  //   pglicht://{conn}/schema/{schema}/types
+  //   pglicht://{conn}/server/roles
+  //   pglicht://{conn}/server/extensions
+  //   pglicht://{conn}/server/settings
+
+  static std::string uri_encode(const std::string& s) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string out;
+    for (char raw : s) {
+      const unsigned char c = static_cast<unsigned char>(raw);
+      if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') out += raw;
+      else { out += '%'; out += hex[c >> 4]; out += hex[c & 0x0F]; }
+    }
+    return out;
+  }
+
+  static std::string uri_decode(const std::string& s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); i++) {
+      if (s[i] == '%' && i + 2 < s.size()) {
+        out += static_cast<char>(std::stoi(s.substr(i + 1, 2), nullptr, 16));
+        i += 2;
+      } else out += s[i];
+    }
+    return out;
+  }
+
+  static json resource_entry(const std::string& uri, const std::string& name,
+                             const std::string& desc) {
+    return {{"uri", uri}, {"name", name}, {"description", desc},
+            {"mimeType", "application/json"}};
+  }
+
+  // Bounded on purpose. Per connection this lists the handful of documents
+  // that exist without knowing the catalog, plus one entry per schema. Tables,
+  // functions, enums and types are reached through a template instead: a
+  // database with 10 000 tables would otherwise produce a 10 000-entry
+  // response on every resources/list, which clients call eagerly.
+  //
+  // Enumerating schemas does cost one connection per configured connection. A
+  // connection that cannot be reached is skipped rather than failing the list,
+  // so one unreachable database does not hide every other one's schemas.
+  json get_resources_list() {
+    json out = json::array();
+    for (const auto& conn : registry_.names()) {
+      const std::string c = uri_encode(conn);
+      const std::string base = "pglicht://" + c;
+      out.push_back(resource_entry(base + "/schemas", conn + " schemas",
+                                   "Every schema in " + conn + ", with its tables and role grants."));
+      out.push_back(resource_entry(base + "/server/roles", conn + " roles",
+                                   "Cluster-wide roles, attributes and memberships."));
+      out.push_back(resource_entry(base + "/server/extensions", conn + " extensions",
+                                   "Installed extensions, their versions and schemas."));
+      out.push_back(resource_entry(base + "/server/settings", conn + " settings",
+                                   "Server configuration, grouped by category."));
+      const std::string prev = active_;
+      try {
+        active_ = conn;
+        const json schema_list = schemas();   // bound: .items() on a temporary dangles
+        if (schema_list.is_object()) {
+          for (const auto& item : schema_list.items()) {
+            const std::string schema = item.key();
+            out.push_back(resource_entry(
+                base + "/schema/" + uri_encode(schema),
+                conn + "." + schema,
+                "Structure of every table and view in schema " + schema + "."));
+          }
+        }
+      } catch (const std::exception&) {
+        // Unreachable, or the caller cannot read the catalog. Its static
+        // entries above still stand.
+      }
+      active_ = prev;
+    }
+    return {{"resources", out}};
+  }
+
+  json get_resource_templates_list() {
+    json t = json::array();
+    auto tpl = [&](const char* uri, const char* name, const char* desc) {
+      t.push_back({{"uriTemplate", uri}, {"name", name}, {"description", desc},
+                   {"mimeType", "application/json"}});
+    };
+    tpl("pglicht://{conn}/schema/{schema}/table/{table}", "table structure",
+        "Columns, indexes, constraints, foreign keys in both directions, triggers, "
+        "policies and grants for one table. Structure only -- for counters call "
+        "the tableStats tool, for measured size the tableSize tool.");
+    tpl("pglicht://{conn}/schema/{schema}/functions", "schema functions",
+        "Functions and procedures in one schema.");
+    tpl("pglicht://{conn}/schema/{schema}/enums", "schema enums",
+        "Enum types in one schema, with their ordered values.");
+    tpl("pglicht://{conn}/schema/{schema}/types", "schema types",
+        "Composite types, domains and range types in one schema.");
+    tpl("pglicht://{conn}/schema/{schema}", "schema tables",
+        "Structure of every table and view in one schema.");
+    return {{"resourceTemplates", t}};
+  }
+
+  // Splits a pglicht:// URI and answers it with the query method that already
+  // exists. Throws std::invalid_argument for anything unrecognised, which the
+  // caller turns into -32602 rather than a connect error.
+  json read_resource(const std::string& uri) {
+    const std::string prefix = "pglicht://";
+    if (uri.rfind(prefix, 0) != 0)
+      throw std::invalid_argument("unknown resource scheme: " + uri);
+
+    std::vector<std::string> seg;
+    {
+      std::string rest = uri.substr(prefix.size()), cur;
+      for (char ch : rest) {
+        if (ch == '/') { seg.push_back(uri_decode(cur)); cur.clear(); }
+        else cur += ch;
+      }
+      seg.push_back(uri_decode(cur));
+    }
+    if (seg.size() < 2) throw std::invalid_argument("incomplete resource URI: " + uri);
+
+    const std::string conn = seg[0];
+    // Fails here, naming the configured connections, rather than as a
+    // confusing connect error later.
+    (void)registry_.get(conn);
+
+    struct Restore {
+      std::string& slot; std::string prev;
+      ~Restore() { slot = prev; }
+    } restore{active_, active_};
+    active_ = conn;
+
+    if (seg.size() == 2 && seg[1] == "schemas")               return schemas();
+    if (seg.size() == 3 && seg[1] == "server") {
+      if (seg[2] == "roles")      return roles();
+      if (seg[2] == "extensions") return extensions();
+      if (seg[2] == "settings")   return server_settings();
+    }
+    if (seg[1] == "schema" && seg.size() >= 3) {
+      const std::string& sch = seg[2];
+      if (seg.size() == 3)                              return tables(sch);
+      if (seg.size() == 4 && seg[3] == "functions")     return functions(sch);
+      if (seg.size() == 4 && seg[3] == "enums")         return enums(sch);
+      if (seg.size() == 4 && seg[3] == "types")         return types(sch);
+      if (seg.size() == 5 && seg[3] == "table")         return table(sch, seg[4]);
+    }
+    throw std::invalid_argument("unknown resource: " + uri);
+  }
+
+  // ======================= Prompts ========================================
+  //
+  // Static templates with argument substitution: no database is touched until
+  // the model acts on the message and calls a tool. Each one encodes an order
+  // of investigation that is easy to get wrong -- read before you write, check
+  // the replication slot before blaming bloat, observe the role before
+  // trusting a reading -- and names the tools that answer each step.
+
+  struct PromptArg { const char* name; const char* desc; bool required; };
+  struct PromptDef {
+    const char* name;
+    const char* description;
+    std::vector<PromptArg> args;
+    std::string (*render)(const json&);
+  };
+
+  static std::string arg_or(const json& a, const char* key, const std::string& fallback) {
+    if (!a.contains(key) || a[key].is_null()) return fallback;
+    if (a[key].is_string()) return a[key].get<std::string>();
+    return a[key].dump();
+  }
+
+  static const std::vector<PromptDef>& prompt_defs() {
+    static const std::vector<PromptDef> v = {
+      {"diagnose-slow-query",
+       "Trace a slow statement from pg_stat_statements to a plan and a fix.",
+       {{"query_id", "queryid from statementStats; omit to start from the worst offender", false},
+        {"min_duration_s", "ignore statements faster than this mean duration", false}},
+       [](const json& a) -> std::string {
+         const std::string qid = arg_or(a, "query_id", "");
+         const std::string mind = arg_or(a, "min_duration_s", "");
+         std::string s =
+           "Diagnose a slow statement on this PostgreSQL server.\n\n"
+           "0. Call checkPrivileges first. statementStats hides the query text "
+           "of other roles without stats access, explainQuery needs SELECT on "
+           "the tables referenced, and tableBloat needs a grant of its own -- "
+           "a plan built on tools that will not answer wastes the incident.\n"
+           "1. Call statementStats to rank statements by total execution time. "
+           "Read info.dealloc first: if it is non-zero the extension has been "
+           "evicting entries, so the list is the slowest of what survived, not "
+           "the slowest overall -- say so before drawing conclusions.\n";
+         if (!qid.empty())
+           s += "2. The statement of interest is query_id " + qid +
+                ". Call explainQuery with that queryid.\n";
+         else
+           s += "2. Pick the statement with the largest total_exec_time"
+                + (mind.empty() ? std::string()
+                                : " whose mean duration is at least " + mind + "s")
+                + " and call explainQuery with its query_id.\n";
+         s +=
+           "3. Read the plan for the usual causes in this order: a sequential "
+           "scan on a large table, an estimate that is orders of magnitude off "
+           "the actual row count, a sort or hash that spilled to disk, and a "
+           "nested loop driven by a bad estimate.\n"
+           "4. If the estimates are wrong, call tableStats on the tables "
+           "involved and compare n_mod_since_analyze and last_analyze -- stale "
+           "statistics explain more bad plans than missing indexes do.\n"
+           "5. If the plan shows a sequential scan where a usable index exists, "
+           "or an index scan fetching far more heap pages than it returns rows, "
+           "suspect bloat rather than the plan. tableBloat measures dead space "
+           "in the table, indexBloat in one index; both cost a scan, so name "
+           "the object rather than sweeping the schema.\n"
+           "6. If bloat is confirmed, the fix is usually vacuum reaching the "
+           "table more often rather than a REINDEX. Read n_dead_tup and the "
+           "last vacuum times from tableStats and the per-table autovacuum "
+           "settings from tableDetails.reloptions, and follow "
+           "bloat-and-vacuum-review before changing anything cluster-wide -- "
+           "an unconsumed replication slot makes every autovacuum setting "
+           "irrelevant, and that prompt checks for one.\n"
+           "7. Before proposing an index, call duplicateIndexes to check that "
+           "one does not already exist, and tableDetails to see what is there. "
+           "If the change is DDL, follow plan-schema-change: an index that is "
+           "correct and an index that is safe to create on a live server are "
+           "different questions.\n"
+           "8. Decide what kind of fix this is before writing one, and say "
+           "which. Either the statement asks for something the planner cannot "
+           "use -- a predicate that is not sargable, a function or a cast over "
+           "an indexed column, NOT IN against a nullable subquery, OFFSET deep "
+           "into a large result -- and the fix is a rewrite. Or the planner was "
+           "misinformed, and the fix is statistics: an ANALYZE, a higher "
+           "statistics target, or extended statistics for correlated columns. "
+           "Or the plan is right but under-resourced, and the fix is "
+           "configuration, such as work_mem for a node that spilled. Or the "
+           "statement is already well formed and nothing supports the access "
+           "path it needs -- and only then is the fix DDL.\n"
+           "   Prefer them in that order, because that is the order of what "
+           "they cost. An ANALYZE is free and instant. A rewrite costs a deploy "
+           "and nothing in the database. Configuration changes the behaviour of "
+           "every other query too. An index is a write cost paid by every "
+           "INSERT and UPDATE for as long as it exists, to buy speed for one "
+           "read pattern. Say why the cheaper options were rejected rather than "
+           "passing over them.\n"           "9. Verify what can be verified. A rewrite can be checked here and "
+           "now: call explainQuery on the rewritten statement and show that the "
+           "plan actually changed, and how. An index is checkable too "
+           "wherever hypopg is installed: call evaluateIndex with the CREATE "
+           "INDEX statement and report whether the planner actually took it, "
+           "because a proposed index the planner ignores is the common case "
+           "and a cost figure alone hides it. checkPrivileges says whether "
+           "hypopg is there; where it is not, an index is a prediction and has "
+           "to be presented as one rather than as a result. Either way hand "
+           "the creation to plan-schema-change: whether an index is correct "
+           "and whether it is safe to build on this server are different "
+           "questions, and evaluateIndex answers only the first.";
+         return s;
+       }},
+
+      {"triage-lock-contention",
+       "Find what is blocking what, and who to look at first.",
+       {{"connection", "connection to investigate; defaults to the configured default", false}},
+       [](const json& a) -> std::string {
+         const std::string c = arg_or(a, "connection", "");
+         const std::string on = c.empty() ? std::string() : " on connection " + c;
+         return
+           "Triage lock contention" + on + ".\n\n"
+           "0. Call checkPrivileges. Without stats access, currentActivity hides "
+           "the query text of backends belonging to other roles, which is most "
+           "of what this investigation reads.\n\n"
+           "Read before you write. Do not kill anything, and do not recommend "
+           "killing anything until the last step.\n\n"
+           "1. Call currentLocks. The rows carry a chain_depth: 0 is the "
+           "backend asked about, and the largest depth is the backend at the "
+           "root of the wait chain. That is the one to look at first.\n"
+           "2. Call currentActivity for the pids in the chain. For each, read "
+           "state, wait_event_type, query and how long the transaction has "
+           "been open.\n"
+           "3. An idle in transaction backend at the root is the usual answer, "
+           "and the fix is in the application that left it open, not in the "
+           "database.\n"
+           "4. Report the chain root, what it is doing, how long it has held "
+           "the lock, and what is queued behind it. Only then discuss whether "
+           "terminating it is safe, and say what would be lost.";
+       }},
+
+      {"bloat-and-vacuum-review",
+       "Decide whether bloat is real, and whether autovacuum is keeping up.",
+       {{"schema", "schema to review; defaults to public", false}},
+       [](const json& a) -> std::string {
+         const std::string sch = arg_or(a, "schema", "public");
+         return
+           "Review bloat and autovacuum health for schema " + sch + ".\n\n"
+           "0. Call checkPrivileges. tableBloat and indexBloat are denied outright "
+           "to a role without the scanning grant, and tableStats returns null "
+           "statistics rather than an error when it cannot read a column -- "
+           "which looks exactly like a table nobody has analyzed.\n"
+           "1. Call listTableStats for " + sch + ". Rank by n_dead_tup, and "
+           "read last_vacuum and last_autovacuum beside it: a large dead-tuple "
+           "count on a table vacuumed minutes ago is a busy table, not a "
+           "neglected one.\n"
+           "2. Call replicationSlots before concluding anything. An inactive "
+           "or lagging slot holds back the xmin horizon, which stops vacuum "
+           "from removing dead tuples cluster-wide -- and no amount of "
+           "autovacuum tuning fixes it. This is the single most common wrong "
+           "diagnosis in this area.\n"
+           "3. Call wraparoundStatus. If any database or table is approaching "
+           "autovacuum_freeze_max_age, that outranks ordinary bloat.\n"
+           "4. For the worst few tables, call tableBloat to measure rather than "
+           "estimate. Leave exact at its default first; the approximation is "
+           "usually enough to rank them.\n"
+           "5. For an index that looks redundant, duplicateIndexes says it is "
+           "covered and idx_scan says nobody used it on this server -- but "
+           "neither proves the planner would not miss it. Where hypopg is "
+           "installed, evaluateIndex with 'hide' plans the query without the "
+           "index and settles it. Dropping an index is easy; rebuilding one on "
+           "a large table is not.\n"
+           "6. Only where bloat is confirmed, look at per-table autovacuum "
+           "storage parameters via tableDetails.reloptions and propose "
+           "changes. Say which reading justifies each one.";
+       }},
+
+      {"buffer-cache-review",
+       "See what is occupying shared buffers and whether it is the right thing.",
+       {{"connection", "connection to review; defaults to the configured default", false}},
+       [](const json& a) -> std::string {
+         const std::string c = arg_or(a, "connection", "");
+         const std::string on = c.empty() ? std::string() : " on connection " + c;
+         return
+           "Review shared buffer usage" + on + ".\n\n"
+           "0. Call checkPrivileges. Both buffer-cache tools need the monitoring "
+           "role, and they are the whole of this review.\n"
+           "1. Call bufferCacheSummary first. It is cheap; bufferCacheContents "
+           "aggregates every buffer and is not.\n"
+           "2. Call hostCapacity and compare shared_buffers against the host's "
+           "RAM, and effective_cache_size against what the OS can plausibly "
+           "cache.\n"
+           "3. Call tableIOStats. A low hit ratio on a small, frequently read "
+           "table is the actionable case; a low ratio on a large table scanned "
+           "once a day is not a problem.\n"
+           "4. Only if the summary suggests something is wrong, call "
+           "bufferCacheContents to see which relations hold the buffers.\n"
+           "5. Report whether the cache is undersized, mis-sized relative to "
+           "the host, or being churned by one workload, and say which reading "
+           "supports the conclusion.";
+       }},
+
+      {"capacity-check",
+       "Check memory and parallelism settings against the machine.",
+       {{"connection", "connection to check; defaults to the configured default", false}},
+       [](const json& a) -> std::string {
+         const std::string c = arg_or(a, "connection", "");
+         const std::string on = c.empty() ? std::string() : " for connection " + c;
+         return
+           "Check server capacity settings" + on + ".\n\n"
+           "1. Call hostCapacity. If it reports that host RAM and vCPU count "
+           "are unknown, say so and stop with a partial answer: PostgreSQL "
+           "cannot see the machine it runs on, and those values have to be "
+           "declared per connection in the config file. Do not guess them.\n"
+           "2. Read derived.committed_worst_case_percent_of_ram. This is "
+           "work_mem times max_connections plus maintenance_work_mem times "
+           "autovacuum_max_workers, and it is the number that decides whether "
+           "the OOM killer is a risk.\n"
+           "3. Compare shared_buffers and effective_cache_size against RAM.\n"
+           "4. Check parallelism: max_parallel_workers_per_vcpu above 1 means "
+           "a single query can oversubscribe the machine.\n"
+           "5. Call databaseStats and read numbackends against max_connections "
+           "to see how much of the worst case is actually reached.\n"
+           "6. Report each finding with the reading behind it, and name the "
+           "setting to change.";
+       }},
+
+      {"replication-slot-review",
+       "Find what a replication slot is holding back, and what it costs to release it.",
+       {{"connection", "connection to review; defaults to the configured default", false}},
+       [](const json& a) -> std::string {
+         const std::string c = arg_or(a, "connection", "");
+         const std::string on = c.empty() ? std::string() : " on connection " + c;
+         return
+           "Review replication slots" + on + " and what they are holding back.\n\n"
+           "An unconsumed slot is the failure mode that presents as something "
+           "else. It holds back the xmin horizon, so vacuum cannot remove dead "
+           "tuples anywhere in the cluster; and it pins WAL until the disk "
+           "fills. Both symptoms get diagnosed as bloat, or as a disk problem, "
+           "and neither diagnosis leads anywhere.\n\n"
+           "0. Call checkPrivileges: a role without stats access sees less of "
+           "replicationSlots and of currentActivity than this review needs.\n"
+           "1. Call replicationSlots. For each slot read three things: whether "
+           "it is active, how far its restart_lsn trails the current WAL "
+           "position, and its wal_status. reserved is healthy. extended means "
+           "it has gone past max_wal_size. unreserved means the slot is now the "
+           "only thing keeping that WAL on disk. lost means the WAL it needs is "
+           "already gone and the consumer cannot resume -- that slot is dead, "
+           "and only rebuilding its consumer fixes it.\n"
+           "2. An inactive slot with growing lag is the finding. Before "
+           "anything else, establish whose it is: listTopology and "
+           "verifyTopology for physical replicas, listSubscriptions and "
+           "listPublications for logical ones. A slot with no owner anybody "
+           "recognises is the common case and the easy one.\n"
+           "3. Measure how fast it grows before deciding how urgent it is. "
+           "checkpointStats reports WAL volume, and serverSettings carries "
+           "max_slot_wal_keep_size -- if that is set, PostgreSQL will "
+           "invalidate the slot rather than fill the disk, which trades a "
+           "broken replica for a live primary. If it is unset, nothing bounds "
+           "the growth.\n"
+           "4. Call wraparoundStatus. The same held xmin horizon also stops "
+           "freezing, and if wraparound headroom is shrinking that outranks the "
+           "disk: one ends in a slow server, the other in a cluster that stops "
+           "accepting writes.\n"
+           "5. Report the slot, its owner, what it is holding, and how long the "
+           "disk has at the current rate. Dropping a slot is irreversible for "
+           "its consumer: say exactly what would have to be rebuilt, and prefer "
+           "fixing or decommissioning the consumer over dropping the slot "
+           "underneath it.";
+       }},
+
+      {"plan-schema-change",
+       "Choose how to apply a DDL change by measuring the table it targets.",
+       {{"change", "the change you intend to make, in your own words", true},
+        {"schema", "schema of the table being changed", false},
+        {"table", "table being changed", false}},
+       [](const json& a) -> std::string {
+         const std::string change = arg_or(a, "change", "");
+         const std::string sch = arg_or(a, "schema", "");
+         const std::string tbl = arg_or(a, "table", "");
+         std::string target;
+         if (!tbl.empty()) target = "Target: " + (sch.empty() ? "" : sch + ".") + tbl + "\n";
+         return
+           "Plan this schema change against what this database actually is.\n\n"
+           "The change: " + change + "\n" + target + "\n"
+           "This server is read-only and will run none of it. What you produce "
+           "is a plan for an operator to apply.\n\n"
+           "Do not answer from a recipe. The safe method for a change is a "
+           "property of the table in front of you, not of the statement: the "
+           "same DDL that is instant on one table is an outage on another. A "
+           "table with no rows can be rewritten in place and nobody notices; "
+           "the same rewrite at a billion rows is hours under an exclusive "
+           "lock. Partitioning is the extreme case -- trivial before there is "
+           "data, a migration project with a cutover after it. Reaching for the "
+           "safest-at-scale approach on a small table is complexity nobody "
+           "needs, and reaching for the simple one on a large table is the "
+           "outage. Measure first, then choose, and say which reading decided "
+           "it.\n\n"
+           "1. Call checkPrivileges. tableStats and tableSize are what this "
+           "whole plan rests on; if either is degraded here, say so rather than "
+           "estimating, because they are what separates a metadata change from "
+           "a full rewrite.\n"
+           "2. Identify every object the change touches, then measure each of "
+           "them -- not only the one named as the target. A statement that "
+           "names one table routinely locks more than one: a foreign key locks "
+           "the table it references as well as the table it is added to, a "
+           "partitioned table means the parent and every partition, and a "
+           "column that other tables reference cannot be considered alone. The "
+           "object you did not name is often the busier one, and its lock is "
+           "the one that surprises people. Read the change itself for the "
+           "objects it names, and tableDetails for the ones the catalog knows "
+           "about -- foreign keys in both directions, and inheritance or "
+           "partition parents.\n"
+           "   For each of them:\n"
+           "   - tableStats: the row count, and n_distinct and most_common_vals "
+           "when the change involves a default, an index or a partition key -- "
+           "most_common_vals is the empirical answer to what value the rows "
+           "already hold\n"
+           "   - tableSize: what a rewrite would actually move. Use the "
+           "measured size, not the estimate; this is the number that turns "
+           "\"instant\" into \"an hour\"\n"
+           "   - tableDetails: the indexes, constraints, inbound foreign keys "
+           "and triggers already there, and whether it is already partitioned. "
+           "Each one multiplies the cost of a rewrite, and some rule out "
+           "approaches outright\n"
+           "   - the scan and tuple counters in tableStats: how busy it is. A "
+           "lock window costs nothing on a table nothing is touching\n"
+           "   - currentActivity and currentLocks: the oldest running "
+           "transaction, and whether anything already holds or waits for a lock "
+           "on any of these objects. A brief exclusive lock request waits "
+           "behind a long transaction, and everything arriving after it waits "
+           "behind that -- which is how a millisecond operation becomes an "
+           "outage. Check this for every object the change touches, since one "
+           "busy parent is enough to stall the whole statement\n"
+           "   - serverSettings for the server version, since what is possible "
+           "and what it costs both moved across majors\n"
+           "   - listTopology and replicationSlots if the change rewrites: the "
+           "WAL a rewrite generates has to reach every replica and pass through "
+           "every slot\n"
+           "3. From those numbers, classify the change before writing any DDL. "
+           "Say which of the three it is -- metadata only, a scan without a "
+           "rewrite, or a full rewrite of the table and its indexes -- and "
+           "separately what lock it needs and for how long. The lock level "
+           "alone settles nothing: a strong lock held for a millisecond is "
+           "safe, and a weak one held for an hour may not be. Duration is the "
+           "number that matters, and duration comes from the measurements.\n"
+           "4. Choose the method by matching that cost against what this table "
+           "can tolerate. Above some size the incremental approach is the only "
+           "one available; below it, it is machinery for nothing. State the "
+           "size or rate at which your answer would flip, so the reasoning can "
+           "be checked against a different table later.\n"
+           "5. Give the plan as ordered DDL. Against each statement say the "
+           "lock it takes, whether it rewrites, what must not be running "
+           "alongside it, and roughly how long at this table's measured size.\n"
+           "6. Say what the revert looks like, and flag anything irreversible "
+           "as irreversible whatever the size.";
+       }},
+
+      {"explain-and-fix",
+       "Explain one statement and propose a concrete fix.",
+       {{"sql", "the statement to explain", true},
+        {"params", "JSON array of parameter values, if the statement is parameterised", false}},
+       [](const json& a) -> std::string {
+         const std::string sql = arg_or(a, "sql", "");
+         const std::string prm = arg_or(a, "params", "");
+         return
+           "Explain this statement and propose a fix.\n\n"
+           "SQL:\n" + sql + "\n\n" +
+           (prm.empty() ? std::string()
+                        : "Parameters: " + prm + "\n\n") +
+           "0. Call checkPrivileges: EXPLAIN needs SELECT on every table the "
+           "statement touches, so a restricted role fails here rather than "
+           "returning a worse plan.\n"
+           "1. Call explainQuery with this sql" +
+           (prm.empty() ? std::string() : " and these params") +
+           ". Leave analyze false on the first call: the plan alone usually "
+           "shows the problem, and analyze executes the statement.\n"
+           "2. If the plan is not conclusive and the statement is a SELECT, "
+           "call again with analyze true to get actual row counts and timing. "
+           "The server proves the plan has no ModifyTable node before running "
+           "it, so this cannot mutate -- but say that you are about to run it.\n"
+           "3. Compare estimated against actual rows at each node. A ratio "
+           "worse than about 100x is a statistics problem, not an index "
+           "problem.\n"
+           "4. Call tableDetails and tableStats on the tables involved before "
+           "proposing an index: check what indexes exist, and whether "
+           "last_analyze is recent.\n"
+           "5. Decide what kind of fix this is before writing one, and say "
+           "which. Either the statement asks for something the planner cannot "
+           "use -- a predicate that is not sargable, a function or a cast over "
+           "an indexed column, NOT IN against a nullable subquery, OFFSET deep "
+           "into a large result -- and the fix is a rewrite. Or the planner was "
+           "misinformed, and the fix is statistics: an ANALYZE, a higher "
+           "statistics target, or extended statistics for correlated columns. "
+           "Or the plan is right but under-resourced, and the fix is "
+           "configuration, such as work_mem for a node that spilled. Or the "
+           "statement is already well formed and nothing supports the access "
+           "path it needs -- and only then is the fix DDL.\n"
+           "   Prefer them in that order, because that is the order of what "
+           "they cost. An ANALYZE is free and instant. A rewrite costs a deploy "
+           "and nothing in the database. Configuration changes the behaviour of "
+           "every other query too. An index is a write cost paid by every "
+           "INSERT and UPDATE for as long as it exists, to buy speed for one "
+           "read pattern. Say why the cheaper options were rejected rather than "
+           "passing over them.\n"           "6. Verify what can be verified. A rewrite can be checked here and "
+           "now: call explainQuery on the rewritten statement and show that the "
+           "plan actually changed, and how. An index is checkable too "
+           "wherever hypopg is installed: call evaluateIndex with the CREATE "
+           "INDEX statement and report whether the planner actually took it, "
+           "because a proposed index the planner ignores is the common case "
+           "and a cost figure alone hides it. checkPrivileges says whether "
+           "hypopg is there; where it is not, an index is a prediction and has "
+           "to be presented as one rather than as a result. Either way hand "
+           "the creation to plan-schema-change: whether an index is correct "
+           "and whether it is safe to build on this server are different "
+           "questions, and evaluateIndex answers only the first.";
+       }},
+    };
+    return v;
+  }
+
+  json get_prompts_list() {
+    json out = json::array();
+    for (const auto& p : prompt_defs()) {
+      json args = json::array();
+      for (const auto& a : p.args)
+        args.push_back({{"name", a.name}, {"description", a.desc}, {"required", a.required}});
+      out.push_back({{"name", p.name}, {"description", p.description}, {"arguments", args}});
+    }
+    return {{"prompts", out}};
+  }
+
+  json get_prompt(const std::string& name, const json& arguments) {
+    for (const auto& p : prompt_defs()) {
+      if (name != p.name) continue;
+      for (const auto& a : p.args)
+        if (a.required && (!arguments.contains(a.name) || arguments[a.name].is_null()))
+          throw std::invalid_argument(std::string("prompt ") + p.name +
+                                      " requires argument '" + a.name + "'");
+      return {{"description", p.description},
+              {"messages", {{{"role", "user"},
+                             {"content", {{"type", "text"}, {"text", p.render(arguments)}}}}}}};
+    }
+    throw std::invalid_argument("unknown prompt: " + name);
+  }
+
+  // ======================= Completions ====================================
+  //
+  // completion/complete is defined for prompt arguments and resource template
+  // variables -- there is no ref/tool in the spec -- so this covers the schema,
+  // table and connection variables that appear in both. The backing queries
+  // already exist; nothing new touches the database.
+  //
+  // A completion is a convenience, so it must never be the thing that fails a
+  // session: an unreachable database or an unreadable catalog returns an empty
+  // list rather than an error.
+  json complete(const json& ref, const json& argument) {
+    const std::string arg_name = argument.value("name", "");
+    const std::string typed    = argument.value("value", "");
+    std::vector<std::string> values;
+
+    auto starts_with = [&](const std::string& s) {
+      return typed.empty() || s.rfind(typed, 0) == 0;
+    };
+
+    try {
+      if (arg_name == "conn" || arg_name == "connection") {
+        for (const auto& n : registry_.names()) if (starts_with(n)) values.push_back(n);
+      } else if (arg_name == "schema") {
+        const std::string prev = active_;
+        struct R { std::string& s; std::string p; ~R(){ s = p; } } r{active_, prev};
+        // A resource template carries the connection in the same URI, but the
+        // completion request does not pass sibling variables, so this can only
+        // complete against the default connection. Better than nothing, and it
+        // never guesses at a connection the caller did not name.
+        const json all = schemas();
+        if (all.is_object())
+          for (const auto& it : all.items())
+            if (starts_with(it.key())) values.push_back(it.key());
+      } else if (arg_name == "table") {
+        const std::string prev = active_;
+        struct R { std::string& s; std::string p; ~R(){ s = p; } } r{active_, prev};
+        const json all = tables("public");
+        if (all.is_object())
+          for (const auto& it : all.items())
+            if (starts_with(it.key())) values.push_back(it.key());
+      }
+    } catch (const std::exception&) {
+      values.clear();
+    }
+    (void)ref;
+
+    // The spec caps a completion response at 100 values and asks the server to
+    // say whether more exist.
+    const bool has_more = values.size() > 100;
+    if (has_more) values.resize(100);
+    return {{"completion", {{"values", values},
+                            {"total", values.size()},
+                            {"hasMore", has_more}}}};
+  }
+
+  // --- outputSchema -------------------------------------------------------
+  //
+  // Emitted only to a client that negotiated 2025-06-18: that revision defined
+  // both `outputSchema` and `structuredContent`, and declaring a schema for a
+  // payload the client will never receive in structured form is noise.
+  //
+  // These are deliberately permissive, and that is the design rather than a
+  // shortcut. The roadmap's own warning is the real risk: a client that
+  // validates results against a declared schema turns any drift between the
+  // schema and the payload into a failed call, on a call that worked before.
+  // Three things make leaf-level schemas unsafe here:
+  //
+  //   1. Payloads are version-conditional. tableStats gains
+  //      n_tup_newpage_upd and last_seq_scan on PostgreSQL 16, checkpointStats
+  //      is normalised across three different sets of underlying views, and a
+  //      schema would have to be re-proved on five majors for 58 tools.
+  //   2. Every tool carries the same escape hatch: when an extension is absent
+  //      or a grant is missing, the payload is {error, hint} instead of the
+  //      documented shape. A schema that enumerated the documented shape would
+  //      reject exactly the answer an operator most needs to read.
+  //   3. A catalog is open-ended. New PostgreSQL releases add columns.
+  //
+  // So each schema names the shape it can actually promise, types the keys
+  // that are unconditional, marks nothing `required`, and allows additional
+  // properties. It can describe a payload; it can never reject one this server
+  // produces. A test walks real payloads against these to keep that true.
+
+  static json schema_map(const std::string& keyed_by, const std::string& entry) {
+    return {{"type", "object"},
+            {"description", "Keyed by " + keyed_by + "; each value is " + entry +
+                            ". An absent extension or a missing grant is reported "
+                            "as {error, hint} in place of the map."},
+            {"additionalProperties", true}};
+  }
+
+  static json schema_fixed(const std::string& desc,
+                           std::initializer_list<std::pair<const char*, const char*>> props) {
+    json p = json::object();
+    // Every declared type admits null. Almost all of these come out of a LEFT
+    // JOIN or a nullable catalog column -- tableDetails.definition is null for
+    // an ordinary table, reloptions is null unless storage parameters were set,
+    // last_vacuum is null on a table never vacuumed -- and a schema that said
+    // "integer" where the server can legitimately answer null would reject a
+    // correct payload. That is the one failure this whole table exists to
+    // avoid, so it is spelled out rather than left to chance.
+    for (const auto& kv : props)
+      p[kv.first] = json{{"type", json::array({kv.second, "null"})}};
+    return {{"type", "object"},
+            {"description", desc + " An absent extension or a missing grant is "
+                            "reported as {error, hint} instead."},
+            {"properties", p},
+            {"additionalProperties", true}};
+  }
+
+  static const std::map<std::string, json>& tool_output_schemas() {
+    static const std::map<std::string, json> m = {
+      // --- schema exploration: name -> object ---
+      {"listSchemas",            schema_map("schema name", "that schema's tables, views and role grants")},
+      {"listTables",             schema_map("table name", "that table's structure")},
+      {"searchTables",           schema_map("schema-qualified table name", "that table's structure")},
+      {"listFunctions",          schema_map("function signature", "that routine's signature and properties")},
+      {"searchFunctions",        schema_map("schema-qualified function signature", "that routine's signature and properties")},
+      {"functionDetails",        schema_map("function signature", "that routine's source, definition and grants")},
+      {"listEnums",              schema_map("enum type name", "that enum's ordered values")},
+      {"searchEnums",            schema_map("enum type name", "that enum's ordered values")},
+      {"enumDetails",            schema_map("enum type name", "its values and the columns that reference it")},
+      {"listTypes",              schema_map("type name", "that composite, domain or range type")},
+      {"typeDetails",            schema_map("type name", "its attributes or subtype and the columns using it")},
+      {"listSequences",          schema_map("sequence name", "that sequence's range, increment and owning column")},
+      {"listExtendedStatistics", schema_map("statistics object name", "its target table, columns and kinds")},
+      {"listCollations",         schema_map("collation name", "its provider, ctype and determinism")},
+      {"listCasts",              schema_map("source->target type pair", "that cast's function and context")},
+      {"listOperators",          schema_map("operator signature", "its operand and result types")},
+      {"listOperatorClasses",    schema_map("opclass name and access method", "its input type and default flag")},
+      {"listAccessMethods",      schema_map("access method name", "its kind and handler")},
+      {"listLanguages",          schema_map("language name", "its handler, trust and ownership")},
+      {"listTextSearchConfigs",  schema_map("configuration name", "its parser and token mappings")},
+      {"listEventTriggers",      schema_map("event trigger name", "its event, function and enabled state")},
+      {"listExtensions",         schema_map("extension name", "its version and installation schema")},
+      {"listRoles",              schema_map("role name", "its attributes and group memberships")},
+      {"listTablespaces",        schema_map("tablespace name", "its location, owner and options")},
+      {"listForeignServers",     schema_map("server name", "its wrapper, options and user mappings")},
+      {"listForeignTables",      schema_map("foreign table name", "its server and column list")},
+      {"listPublications",       schema_map("publication name", "its tables and replicated operations")},
+      {"listSubscriptions",      schema_map("subscription name", "its publication, slot and state")},
+      {"replicationSlots",       schema_map("slot name", "its type, activity and retained WAL")},
+
+      // --- statistics keyed by object ---
+      {"listTableStats",         schema_map("table name", "that table's statistics counters and size estimate")},
+      {"listTableSizes",         schema_map("table name", "that table's measured size, index size and total")},
+      {"tableIOStats",           schema_map("schema-qualified table name", "its buffer cache hit ratios and scan counts")},
+      {"databaseStats",          schema_map("database name", "that database's pg_stat_database counters")},
+      {"currentActivity",        schema_map("backend pid", "that backend's state, query and wait event")},
+      {"serverSettings",         schema_map("settings category", "a map of setting name to its value and metadata")},
+      {"bufferCacheContents",    schema_map("schema-qualified relation name", "its buffered pages and usage counts")},
+
+      // --- fixed shapes ---
+      {"tableDetails",           schema_fixed("One table's structure.",
+                                   {{"table", "string"}, {"kind", "string"}, {"description", "string"},
+                                    {"columns", "object"}, {"primary_key", "array"}, {"indexes", "object"},
+                                    {"constraints", "object"}, {"foreign_keys", "object"},
+                                    {"referenced_by", "object"}, {"triggers", "object"}, {"rules", "object"},
+                                    {"row_level_security", "object"}, {"policies", "object"},
+                                    {"roles", "object"}})},
+      {"tableStats",             schema_fixed("One table's statistics.",
+                                   {{"table", "string"}, {"rows", "number"}, {"size_estimate", "integer"},
+                                    {"seq_scan", "integer"}, {"idx_scan", "integer"},
+                                    {"n_live_tup", "integer"}, {"n_dead_tup", "integer"},
+                                    {"n_mod_since_analyze", "integer"}, {"n_ins_since_vacuum", "integer"},
+                                    {"columns", "object"}, {"indexes", "object"}})},
+      {"tableSize",              schema_fixed("One table's measured size.",
+                                   {{"table", "string"}, {"kind", "string"}, {"main_size", "integer"},
+                                    {"size", "integer"}, {"indexes_size", "integer"},
+                                    {"total_size", "integer"}, {"indexes", "object"}})},
+      {"databaseSize",           schema_fixed("Size of the connected database.",
+                                   {{"database", "string"}, {"size", "integer"}})},
+      {"checkKey",               schema_fixed("Whether a row with the given key exists.",
+                                   {{"exists", "boolean"}})},
+      {"evaluateIndex",          schema_fixed("How a statement would plan with different indexes.",
+                                   {{"statement", "string"}, {"hypopg_version", "string"},
+                                    {"baseline", "object"}, {"hypothetical", "object"},
+                                    {"cost_ratio", "number"}, {"indexes", "array"},
+                                    {"hidden", "array"}, {"note", "string"}})},
+      {"checkPrivileges",        schema_fixed("Which tools this role can use on this connection.",
+                                   {{"connection", "string"}, {"role", "string"},
+                                    {"tools", "integer"}, {"available", "integer"},
+                                    {"degraded", "array"}, {"denied", "array"}})},
+      {"currentLocks",           schema_fixed("Lock rows, newest blocking chain first.",
+                                   {{"locks", "array"}})},
+      {"listConnections",        schema_fixed("The configured connection registry.",
+                                   {{"connections", "array"}})},
+      {"listTopology",           schema_fixed("The three configured topology axes.",
+                                   {{"instances", "array"}, {"replication_groups", "array"},
+                                    {"groups", "array"}, {"unlabelled", "array"}})},
+      {"verifyTopology",         schema_fixed("Declared topology checked against each server.",
+                                   {{"connections", "array"}, {"findings", "array"}})},
+      {"ioStats",                schema_fixed("pg_stat_io rows per backend type and context.",
+                                   {{"io", "array"}})},
+      {"duplicateIndexes",       schema_fixed("Indexes that duplicate or cover another.",
+                                   {{"identical", "array"}, {"redundant", "array"}})},
+      {"progressStats",          schema_fixed("Running commands, one array per category; always all six.",
+                                   {{"vacuum", "array"}, {"analyze", "array"}, {"create_index", "array"},
+                                    {"cluster", "array"}, {"copy", "array"}, {"basebackup", "array"}})},
+      {"wraparoundStatus",       schema_fixed("Transaction id and multixact headroom.",
+                                   {{"databases", "object"}, {"tables", "array"}, {"limits", "object"}})},
+      {"checkpointStats",        schema_fixed("Checkpoint, WAL and background writer activity, normalised across versions.",
+                                   {{"checkpointer", "object"}, {"bgwriter", "object"}, {"backend_io", "object"},
+                                    {"wal", "object"}, {"settings", "object"}, {"source", "string"}})},
+      {"hostCapacity",           schema_fixed("Memory and parallelism settings against the host.",
+                                   {{"host", "object"}, {"server", "object"}, {"settings", "object"},
+                                    {"derived", "object"}})},
+      {"statementStats",         schema_fixed("pg_stat_statements rows with the extension's own counters.",
+                                   {{"statements", "array"}, {"info", "object"}})},
+      {"explainQuery",           schema_fixed("An EXPLAIN plan and what produced it.",
+                                   {{"plan", "array"}, {"sql", "string"}, {"source", "string"},
+                                    {"analyzed", "boolean"}, {"generic", "boolean"},
+                                    {"read_only", "boolean"}})},
+      {"tableBloat",             schema_fixed("Physical storage bloat for one table.", {})},
+      {"indexBloat",             schema_fixed("Physical statistics for one index, per access method.", {})},
+      {"bufferCacheSummary",     schema_fixed("Shared buffer occupancy across the instance.", {})},
+    };
+    return m;
+  }
+
   const json get_tools_list(const std::string& protocol) {
     json list = {
       {"tools", {
@@ -966,7 +1857,7 @@ private:
 	  },
 	  {
 	    {"name", "listTables"},
-	    {"description", "return table list with basic statistics"},
+	    {"description", "return the structure of every table, view and materialised view in a schema: kind, comment, storage options, columns and their per-column index counts, index count and constraint count. Structure only -- it changes when someone issues DDL and not otherwise. For row counts, scan counters, dead tuples and vacuum times call listTableStats; for measured on-disk sizes call listTableSizes"},
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", {
@@ -977,7 +1868,7 @@ private:
 	  },
 	  {
 	    {"name", "tableDetails"},
-	    {"description", "return table details like columns, foreign keys, inbound foreign keys (referenced_by), indexes, data histograms"},
+	    {"description", "return the structure of one table: columns with types, defaults, storage and compression, primary key, indexes, constraints, foreign keys, inbound foreign keys (referenced_by), triggers, rules, row-level security, policies and privileges. Structure only -- it changes when someone issues DDL and not otherwise, and it returns no sample column values. For row counts, scan counters, dead tuples, vacuum times and the pg_stats column histograms call tableStats; for measured on-disk sizes call tableSize"},
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", {
@@ -989,13 +1880,82 @@ private:
 	  },
 	  {
 	    {"name", "searchTables"},
-	    {"description", "return table list with basic statistics based on text search"},
+	    {"description", "find tables across every non-system schema by full-text search over table names, comments, column names and comments, enum labels and grantee names, and return their structure. Structure only -- there is no statistics counterpart, because a text search is how you find a table, not how you read a counter: name a match to tableStats or tableSize for those"},
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", {
 		    {"web_search", {{"type", "string"}}}
 		  }},
 		{"required", {"web_search"}}
+	      }}
+	  },
+	  {
+	    {"name", "evaluateIndex"},
+	    {"description", "plan a statement as if the indexes were different, using hypopg. 'create' takes CREATE INDEX statements to plan against without building them; 'hide' takes the names of existing indexes to plan without, which is how to ask whether an index is safe to drop. Nothing is built, no lock is taken and no catalog row is written, and the statement is never executed -- hypopg cannot serve EXPLAIN ANALYZE, so this is plan-only and safer than explainQuery with analyze. Returns the plan and total cost before and after, and for each index whether the planner actually used it, which is the answer that matters: a proposed index the planner ignores is the common case and a cost figure alone hides it. The cost is the planner's estimate, not a measurement. For a statement recovered from pg_stat_statements, call explainQuery with its queryid first and pass the sql it echoes back. Reports a clear error with setup instructions if hypopg is not installed"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", {
+		    {"sql", {{"type", "string"}}},
+		    {"create", {{"type", "array"}, {"items", {{"type", "string"}}},
+		                {"description", "CREATE INDEX statements to plan against"}}},
+		    {"hide", {{"type", "array"}, {"items", {{"type", "string"}}},
+		              {"description", "names of existing indexes to plan without"}}}
+		  }},
+		{"required", {"sql"}}
+	      }}
+	  },
+	  {
+	    {"name", "checkPrivileges"},
+	    {"description", "report which tools the current role can actually use on this connection, and how the rest fall short. Most of this server works for any role that can connect, because the catalog is world-readable; what varies is the monitoring extras and whether the role can read table data. Call this first when working against an unfamiliar connection or a restricted role -- the alternative is discovering the limits tool by tool, and a privilege-filtered answer is easy to mistake for an empty one. Names no role memberships and no GRANT statements: what a caller needs is which tools work. Tools absent from both lists are fully available"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", json::object()}
+	      }}
+	  },
+	  {
+	    {"name", "tableStats"},
+	    {"description", "return the statistics PostgreSQL keeps for one table: estimated row count, seq_scan and idx_scan counts, live and dead tuples, rows modified since the last analyze, rows inserted since the last vacuum, the last vacuum and analyze times, per-index scan counts, and the per-column pg_stats histograms (null_frac, avg_width, n_distinct, physical order correlation, most_common_vals and their frequencies). Reads the catalog and the statistics collector only -- no relation is opened and no file is measured. size_estimate is relpages*8192 and is only as fresh as estimated_from says: for a measured size call tableSize. Note that most_common_vals contains literal values sampled from the column. Not to be confused with tableIOStats, which reports pg_statio_all_tables -- whether reads came from the buffer cache or the disk"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", {
+		    {"table", {{"type", "string"}}},
+		    {"schema", {{"type", "string"}}}
+		  }},
+		{"required", {"table", "schema"}}
+	      }}
+	  },
+	  {
+	    {"name", "listTableStats"},
+	    {"description", "return the statistics PostgreSQL keeps for every table in a schema: estimated row count, seq_scan and idx_scan counts, live and dead tuples, rows modified since the last analyze, rows inserted since the last vacuum, and the last vacuum and analyze times. Reads the catalog and the statistics collector only -- no relation is opened and no file is measured. Carries no per-column histograms; name one table to tableStats for those. size_estimate is relpages*8192 and is only as fresh as estimated_from says: for measured sizes call listTableSizes"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", {
+		    {"schema", {{"type", "string"}}}
+		  }},
+		{"required", {"schema"}}
+	      }}
+	  },
+	  {
+	    {"name", "tableSize"},
+	    {"description", "measure one table on disk: main fork, total table size including TOAST and the free space and visibility maps, index size, grand total, the TOAST relation and each index individually. COSTS MORE THAN IT LOOKS: these functions open the relation with AccessShareLock, so on a table an ALTER TABLE is rewriting the call waits behind AccessExclusiveLock until statement_timeout fires. Prefer size_estimate from tableStats, which is free, and call this when the estimate is too stale to act on. A partitioned table reports its own storage, which is zero -- measure the partitions"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", {
+		    {"table", {{"type", "string"}}},
+		    {"schema", {{"type", "string"}}}
+		  }},
+		{"required", {"table", "schema"}}
+	      }}
+	  },
+	  {
+	    {"name", "listTableSizes"},
+	    {"description", "measure every table in a schema on disk: table size, index size and grand total per relation. COSTS MORE THAN IT LOOKS, and more here than in tableSize: one relation is opened per table, each taking AccessShareLock, so a single table held under AccessExclusiveLock by an ALTER TABLE blocks the whole call rather than one row of it, and on a large schema this is thousands of file-metadata calls. Prefer size_estimate from listTableStats, which is free, and call this when the estimates are too stale to act on. Partitioned tables report their own storage, which is zero"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", {
+		    {"schema", {{"type", "string"}}}
+		  }},
+		{"required", {"schema"}}
 	      }}
 	  },
 	  {
@@ -1407,7 +2367,7 @@ private:
 	  },
 	  {
 	    {"name", "tableIOStats"},
-	    {"description", "return per-object buffer cache hit ratios (pg_statio_all_tables): heap_blks_read versus heap_blks_hit, idx_blks_read versus idx_blks_hit, the TOAST and TOAST-index pairs, and a combined ratio, with relation size and scan counts. Naming a single table adds a per-index breakdown from pg_statio_all_indexes. Ratios are null, not zero, for an object that has seen no reads at all"},
+	    {"description", "return per-object buffer cache hit ratios (pg_statio_all_tables): heap_blks_read versus heap_blks_hit, idx_blks_read versus idx_blks_hit, the TOAST and TOAST-index pairs, and a combined ratio, with relation size and scan counts. Naming a single table adds a per-index breakdown from pg_statio_all_indexes. Ratios are null, not zero, for an object that has seen no reads at all. Not to be confused with tableStats, which reports pg_stat_user_tables -- scans, tuples and vacuum state; this tool answers only whether those reads came from the buffer cache or the disk"},
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", {
@@ -1462,7 +2422,7 @@ private:
 	  },
 	  {
 	    {"name", "tableBloat"},
-	    {"description", "return physical storage bloat for a table (pgstattuple/pgstattuple_approx): table size, live/dead tuple counts and percentages, free space and percentage. Defaults to the cheap visibility-map-based approximation; set exact=true for a precise but I/O-heavy full table scan. More accurate than the ANALYZE-time estimates in listTables/tableDetails. Returns a clear error with setup instructions if the pgstattuple extension is not installed"},
+	    {"description", "return physical storage bloat for a table (pgstattuple/pgstattuple_approx): table size, live/dead tuple counts and percentages, free space and percentage. Defaults to the cheap visibility-map-based approximation; set exact=true for a precise but I/O-heavy full table scan. More accurate than the ANALYZE-time estimates in listTableStats/tableStats. Returns a clear error with setup instructions if the pgstattuple extension is not installed"},
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", {
@@ -1589,6 +2549,10 @@ private:
     // them by date.
     const bool wants_annotations = protocol >= "2025-03-26";
     const bool wants_title       = protocol >= "2025-06-18";
+    // Same revision that defined structuredContent, and gated together on
+    // purpose: outputSchema describes the structured payload, so a client that
+    // will only ever be sent a text block has no use for it.
+    const bool wants_output_schema = protocol >= kStructuredContentRevision;
 
     for (auto& tool : list["tools"]) {
       const std::string name = tool["name"].get<std::string>();
@@ -1655,13 +2619,20 @@ private:
         tool["annotations"] = ann;
       }
       if (wants_title) tool["title"] = tool_title(name);
+      if (wants_output_schema) {
+        auto os = tool_output_schemas().find(name);
+        // A tool with no schema is a bug, not a default: declaring none for one
+        // tool while declaring them for the other 55 reads to a client as "this
+        // one is unstructured". A test asserts the table covers every tool.
+        if (os != tool_output_schemas().end()) tool["outputSchema"] = os->second;
+      }
     }
     return list;
   }
 
   // explainQuery aside, any tool that touches a database can be swept.
   static bool tool_name_is_sweepable(const std::string& name) {
-    return name != "explainQuery";
+    return name != "explainQuery" && name != "evaluateIndex";
   }
 
   // A human-readable label, derived from the tool name rather than stored
@@ -1717,19 +2688,15 @@ private:
     }
   }
 
+  // Structure only. Every reading this used to carry -- reltuples, the
+  // relpages size estimate and the whole pg_stat_user_tables row -- moved to
+  // listTableStats in 4.0.0, and the measured sizes to listTableSizes. What is
+  // left changes only when someone issues DDL, which is what lets the tool be
+  // classified per_database and refuse a replication-group sweep: a physical
+  // replica would return these bytes verbatim.
   const json tables(const std::string& schema) {
     Session sess{active_cfg()};
     pqxx::work& txn = sess.txn();
-
-    // PostgreSQL 16 additions. n_tup_newpage_upd counts updates that had to
-    // move the row to another page, which is the direct measure of failed HOT
-    // updates -- the usual cause is a too-high fillfactor or an index on a
-    // frequently updated column. last_seq_scan dates the last sequential scan,
-    // which turns a large seq_scan count into something you can act on.
-    const std::string pg16 = sess.server_version() >= 160000
-      ? R"(, 'n_tup_newpage_upd', s.n_tup_newpage_upd,
-            'last_seq_scan', s.last_seq_scan)"
-      : "";
 
     std::string query = R"(
       SELECT JSONB_OBJECT_AGG(c.relname,
@@ -1737,15 +2704,9 @@ private:
                'kind', CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table'
                                       WHEN 'm' THEN 'materialized view' WHEN 'v' THEN 'view' END,
                'description', COALESCE(obj_description(c.oid, 'pg_class'), ''),
-               'rows', c.reltuples, 'size', c.relpages::bigint * 8192,
-               'seq_scan', s.seq_scan, 'idx_scan', s.idx_scan, 'n_live_tup', s.n_live_tup, 'n_dead_tup', s.n_dead_tup,
-               'n_mod_since_analyze', s.n_mod_since_analyze, 'n_ins_since_vacuum', s.n_ins_since_vacuum,
-               'last_vacuum', GREATEST(s.last_vacuum, s.last_autovacuum), 'last_analyze', GREATEST(s.last_analyze, s.last_autoanalyze),
                'reloptions', c.reloptions,
-               'columns', columns, 'index_count', COALESCE(index_count, 0), 'constraint_count', COALESCE(constraint_count, 0))" + pg16 + R"(
-               ))
+               'columns', columns, 'index_count', COALESCE(index_count, 0), 'constraint_count', COALESCE(constraint_count, 0)))
       FROM pg_class AS c
-      LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(a.attname,
                         JSONB_BUILD_OBJECT(
                          'description', col_description(c.oid, a.attnum),
@@ -1777,6 +2738,10 @@ private:
     }
   }
 
+  // Structure only, for the same reason as tables() above. searchTables is the
+  // one tool of the three with no statistics counterpart: text search is a
+  // discovery path, and nobody runs a full-text query to read a counter. A
+  // caller who wants readings on a match names it to tableStats.
   const json search(const std::string& web_search) {
     Session sess{active_cfg()};
     pqxx::work& txn = sess.txn();
@@ -1787,15 +2752,10 @@ private:
                'kind', CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table'
                                       WHEN 'm' THEN 'materialized view' WHEN 'v' THEN 'view' END,
                'description', COALESCE(obj_description(c.oid, 'pg_class'), ''),
-               'rows', c.reltuples, 'size', c.relpages::bigint * 8192,
-               'seq_scan', s.seq_scan, 'idx_scan', s.idx_scan, 'n_live_tup', s.n_live_tup, 'n_dead_tup', s.n_dead_tup,
-               'n_mod_since_analyze', s.n_mod_since_analyze, 'n_ins_since_vacuum', s.n_ins_since_vacuum,
-               'last_vacuum', GREATEST(s.last_vacuum, s.last_autovacuum), 'last_analyze', GREATEST(s.last_analyze, s.last_autoanalyze),
                'reloptions', c.reloptions,
                'columns', columns, 'index_count', COALESCE(index_count, 0), 'constraint_count', COALESCE(constraint_count, 0),
                'roles', COALESCE(roles, '{}'::jsonb)))
       FROM pg_class AS c
-      LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(a.attname,
                                 JSONB_BUILD_OBJECT(
                                  'description', col_description(c.oid, a.attnum),
@@ -2222,10 +3182,14 @@ private:
       ? pqxx_exec(txn, query, pqxx::params{pid})
       : txn.exec(query);
 
+    // 4.0.0 wraps the rows in an object. `structuredContent` may only be a
+    // JSON object, so a top-level array is unrepresentable in the format
+    // modern clients receive -- the same reason, and the same fix, that 3.0.0
+    // applied to statementStats.
     if (!res.empty() && !res[0][0].is_null()) {
-      return json::parse(res[0][0].as<std::string>());
+      return json{{"locks", json::parse(res[0][0].as<std::string>())}};
     } else {
-      return json::array();
+      return json{{"locks", json::array()}};
     }
   }
 
@@ -5154,33 +6118,32 @@ private:
     }
   }
 
+  // Structure only. In 4.0.0 this shed reltuples, the measured sizes, the
+  // pg_stat_user_tables row, the per-column pg_stats histograms and the
+  // per-index scan counters; they are in tableStats and tableSize now.
+  //
+  // Two consequences worth naming. The tool no longer returns
+  // most_common_vals, which was literal column values -- on a customers table,
+  // customer names -- from the tool an agent calls most often to inspect
+  // structure. And nothing here is version-conditional any more, so the
+  // server_version() probe and the string-erase fixup that used to drop
+  // last_idx_scan on PostgreSQL 14 and 15 are both gone; that gate lives in
+  // table_stats() now.
   const json table(const std::string& schema, const std::string& table) {
     Session sess{active_cfg()};
     pqxx::work& txn = sess.txn();
 
-    // Same PostgreSQL 16 additions as listTables: failed HOT updates and the
-    // date of the last sequential scan.
-    const std::string pg16_tbl = sess.server_version() >= 160000
-      ? R"( 'n_tup_newpage_upd', s.n_tup_newpage_upd, 'last_seq_scan', s.last_seq_scan,)"
-      : "";
-
     std::string query = R"(
       SELECT JSONB_BUILD_OBJECT(
-               'table', c.relname, 'rows', c.reltuples, 'size', pg_table_size(c.oid), 'indexes_size', pg_indexes_size(c.oid),
+               'table', c.relname,
                'description', COALESCE(obj_description(c.oid, 'pg_class'), ''),
                'kind', CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table'
                                       WHEN 'm' THEN 'materialized view' WHEN 'v' THEN 'view' END,
                'definition', CASE WHEN c.relkind IN ('v', 'm') THEN pg_get_viewdef(c.oid, true) END,
-               'seq_scan', s.seq_scan, 'idx_scan', s.idx_scan, 'n_live_tup', s.n_live_tup, 'n_dead_tup', s.n_dead_tup,
-               'n_mod_since_analyze', s.n_mod_since_analyze, 'n_ins_since_vacuum', s.n_ins_since_vacuum,
-               'last_vacuum', GREATEST(s.last_vacuum, s.last_autovacuum), 'last_analyze', GREATEST(s.last_analyze, s.last_autoanalyze),
-               'reloptions', c.reloptions,)" + pg16_tbl + R"(
+               'reloptions', c.reloptions,
                'columns', columns,
                'toast', CASE WHEN c.reltoastrelid != 0 THEN
-                          JSONB_BUILD_OBJECT(
-                            'name',       tc.relname,
-                            'size',       pg_relation_size(c.reltoastrelid),
-                            'index_size', pg_indexes_size(c.reltoastrelid))
+                          JSONB_BUILD_OBJECT('name', tc.relname)
                         END,
                'primary_key', COALESCE(primary_key, '[]'::jsonb),
                'indexes', COALESCE(indexes, '{}'::jsonb),
@@ -5194,7 +6157,6 @@ private:
                'policies', COALESCE(policies, '{}'::jsonb),
                'roles', COALESCE(roles, '{}'::jsonb))
       FROM pg_class AS c
-      LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
       LEFT JOIN pg_class AS tc ON tc.oid = c.reltoastrelid
       LEFT JOIN LATERAL (SELECT JSONB_STRIP_NULLS(JSONB_OBJECT_AGG(a.attname,
                         JSONB_BUILD_OBJECT(
@@ -5206,27 +6168,16 @@ private:
                          'default', pg_get_expr(ad.adbin, ad.adrelid),
                          'storage', CASE a.attstorage WHEN 'p' THEN 'plain' WHEN 'e' THEN 'external'
                                                        WHEN 'm' THEN 'main' WHEN 'x' THEN 'extended' END,
-                         'compression', CASE a.attcompression WHEN 'p' THEN 'pglz' WHEN 'l' THEN 'lz4' ELSE 'default' END,
-                         'null_frac', ps.null_frac,
-                         'avg_width', ps.avg_width,
-                         'n_distinct', ps.n_distinct,
-                         'physical_order_correlation', ps.correlation,
-                         'most_common_vals', ps.most_common_vals,
-                         'most_common_freqs', ps.most_common_freqs))) AS columns
+                         'compression', CASE a.attcompression WHEN 'p' THEN 'pglz' WHEN 'l' THEN 'lz4' ELSE 'default' END))) AS columns
                        FROM pg_attribute AS a
                        JOIN pg_type AS t ON t.oid = a.atttypid
                        LEFT JOIN pg_attrdef AS ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
-                       LEFT JOIN pg_stats AS ps ON ps.schemaname = $1 AND ps.tablename = $2 AND ps.attname = a.attname
                        WHERE attnum > 0
                          AND attrelid = c.oid
                          AND NOT attisdropped) _lat29 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(indexname,
-                          JSONB_BUILD_OBJECT(
-                           'definition', indexdef, 'size', pg_relation_size(si.indexrelid), 'index_uses', idx_scan, 'last_use', last_idx_scan)) AS indexes
+                          JSONB_BUILD_OBJECT('definition', indexdef)) AS indexes
                          FROM pg_indexes AS i
-                         JOIN pg_stat_user_indexes si ON si.indexrelname = i.indexname
-                                                      AND si.schemaname = i.schemaname
-                                                      AND si.relname = i.tablename
                          WHERE i.schemaname = $1
                            AND i.tablename = c.relname) _lat30 ON true
       LEFT JOIN LATERAL (SELECT JSONB_AGG(a.attname ORDER BY array_position(pk.conkey, a.attnum)) AS primary_key
@@ -5312,16 +6263,6 @@ private:
         AND c.relname = $2;
     )";
 
-    // pg_stat_user_indexes.last_idx_scan is PostgreSQL 16+; drop the index
-    // 'last_use' field on older servers so the query still parses. If this
-    // literal ever drifts from the query above, the pg14/pg15 CI jobs fail
-    // loudly with an undefined-column error rather than silently.
-    if (sess.server_version() < 160000) {
-      const std::string frag = ", 'last_use', last_idx_scan";
-      auto pos = query.find(frag);
-      if (pos != std::string::npos) query.erase(pos, frag.size());
-    }
-
     pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, table});
 
     if (!res.empty() && !res[0][0].is_null()) {
@@ -5330,6 +6271,520 @@ private:
     } else {
       return {};
     }
+  }
+
+  // Plan a statement as if the indexes were different, using hypopg.
+  //
+  // This is what closes the asymmetry the diagnostic prompts otherwise have to
+  // admit to: a proposed rewrite can be explained on the spot, while a proposed
+  // index used to be a prediction. A hypothetical index is planned against but
+  // never built -- no lock, no catalog row, no file -- so the planner's verdict
+  // is available before anyone commits to the write cost an index carries for
+  // the rest of its life.
+  //
+  // It never executes the statement. hypopg cannot serve EXPLAIN ANALYZE (there
+  // is no index to scan), so this tool is plan-only and therefore strictly
+  // safer than explainQuery with analyze.
+  //
+  // THE RESET BRACKET IS NOT OPTIONAL. Measured against hypopg 1.4.3: a
+  // hypothetical index lives in backend-local memory for the whole session and
+  // is cleared by none of the things that would be expected to clear it --
+  // not ROLLBACK, not a new transaction, and not DISCARD ALL, which is exactly
+  // what PgBouncer issues as server_reset_query. Only hypopg_reset() removes
+  // it. Against a transaction-mode pooler that means one caller's hypothetical
+  // index would otherwise stay on the backend and silently reshape the next
+  // caller's plans -- a wrong answer with nothing to indicate it. So the reset
+  // runs on the way in, which protects this call from whatever a previous one
+  // left, and again on the way out through a scope guard that survives an
+  // exception, which protects the next call from this one. Either alone would
+  // do most of the job; both is cheap and neither depends on the other.
+  const json evaluate_index(const std::string& sql, const json& create_defs,
+                            const json& hide_names) {
+    if (sql.empty()) throw std::runtime_error("sql is required");
+    if (!create_defs.is_array() || !hide_names.is_array())
+      throw std::runtime_error("create and hide must be arrays");
+    if (create_defs.empty() && hide_names.empty())
+      throw std::runtime_error(
+        "name at least one index: 'create' takes CREATE INDEX statements to "
+        "plan against, 'hide' the names of existing indexes to plan without");
+    if (create_defs.size() + hide_names.size() > 16)
+      throw std::runtime_error("at most 16 indexes may be evaluated in one call");
+
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
+
+    const std::string hypo = extension_schema(txn, "hypopg");
+    if (hypo.empty())
+      return {{"error", "hypopg is not installed"},
+              {"hint", "Run: CREATE EXTENSION hypopg; -- it plans against "
+                       "indexes without building them, and creates nothing"}};
+
+    // hypopg_hide_index arrived in 1.4.0. Gated on the extension version rather
+    // than the server version, for the reason recorded when pg_buffercache
+    // needed the same treatment: the two move independently.
+    std::string ver;
+    {
+      pqxx::result r = pqxx_exec(
+        txn, "SELECT extversion FROM pg_extension WHERE extname = 'hypopg'", pqxx::params{});
+      if (!r.empty() && !r[0][0].is_null()) ver = r[0][0].as<std::string>();
+    }
+    const bool can_hide = ver >= "1.4";
+    if (!hide_names.empty() && !can_hide)
+      return {{"error", "hiding an existing index needs hypopg 1.4.0 or later"},
+              {"hint", "this server has hypopg " + ver +
+                       "; run ALTER EXTENSION hypopg UPDATE, or use 'create' "
+                       "alone, which every version supports"},
+              {"hypopg_version", ver}};
+
+    auto reset = [&]() {
+      try { txn.exec("SELECT " + hypo + ".hypopg_reset()"); } catch (...) {}
+      if (can_hide)
+        try { txn.exec("SELECT " + hypo + ".hypopg_unhide_all_indexes()"); } catch (...) {}
+    };
+    reset();
+    struct Guard {
+      std::function<void()> f;
+      ~Guard() { f(); }
+    } guard{reset};
+
+    // Each EXPLAIN runs inside a savepoint so that a failing statement leaves
+    // the transaction usable -- the reset on the way out needs it alive.
+    const bool pg16 = sess.server_version() >= 160000;
+    auto plan_of = [&]() -> json {
+      try {
+        pqxx::subtransaction sub{txn};
+        pqxx::result r = sub.exec("EXPLAIN (FORMAT JSON) " + sql);
+        json p = json::parse(r[0][0].as<std::string>());
+        sub.commit();
+        return p;
+      } catch (const pqxx::sql_error& e) {
+        // 42P02: the statement carries $n placeholders. GENERIC_PLAN is the
+        // same fallback explainQuery uses, and it is PostgreSQL 16+.
+        if (e.sqlstate() != "42P02" || !pg16) throw;
+        pqxx::subtransaction sub{txn};
+        pqxx::result r = sub.exec("EXPLAIN (FORMAT JSON, GENERIC_PLAN) " + sql);
+        json p = json::parse(r[0][0].as<std::string>());
+        sub.commit();
+        return p;
+      }
+    };
+    auto cost_of = [](const json& p) -> double {
+      if (p.is_array() && !p.empty() && p[0].contains("Plan") &&
+          p[0]["Plan"].contains("Total Cost"))
+        return p[0]["Plan"]["Total Cost"].get<double>();
+      return 0.0;
+    };
+
+    const json baseline = plan_of();
+
+    json indexes = json::array();
+    for (const auto& d : create_defs) {
+      if (!d.is_string())
+        throw std::runtime_error("every entry of create must be a CREATE INDEX statement");
+      const std::string def = d.get<std::string>();
+      try {
+        pqxx::result r = pqxx_exec(
+          txn, "SELECT indexrelid::text, indexname FROM " + hypo + ".hypopg_create_index($1)",
+          pqxx::params{def});
+        if (r.empty()) continue;
+        const std::string oid = r[0][0].as<std::string>();
+        const std::string nm  = r[0][1].as<std::string>();
+        pqxx::result sz = pqxx_exec(
+          txn, "SELECT " + hypo + ".hypopg_relation_size($1::oid)", pqxx::params{oid});
+        indexes.push_back({{"definition", def},
+                           {"name", nm},
+                           {"estimated_size", sz.empty() || sz[0][0].is_null()
+                              ? json(nullptr) : json(sz[0][0].as<long long>())}});
+      } catch (const pqxx::sql_error& e) {
+        return {{"error", "hypopg rejected an index definition"},
+                {"definition", def},
+                {"detail", e.what()}};
+      }
+    }
+
+    json hidden = json::array();
+    for (const auto& h : hide_names) {
+      if (!h.is_string())
+        throw std::runtime_error("every entry of hide must be an index name");
+      const std::string nm = h.get<std::string>();
+      try {
+        pqxx::result r = pqxx_exec(
+          txn,
+          // to_regclass rather than a ::regclass cast: the cast raises on an
+          // unknown name, which would surface a raw server error instead of
+          // the message below naming what to do about it.
+          "SELECT c.oid::text FROM pg_class AS c"
+          " WHERE c.oid = to_regclass($1) AND c.relkind IN ('i', 'I')",
+          pqxx::params{nm});
+        if (r.empty())
+          return {{"error", "no index named " + nm},
+                  {"hint", "name an existing index, schema-qualified if it is "
+                           "not on the search path; tableDetails lists them "
+                           "for one table"}};
+        txn.exec("SELECT " + hypo + ".hypopg_hide_index(" +
+                 txn.quote(r[0][0].as<std::string>()) + "::oid)");
+        hidden.push_back({{"index", nm}});
+      } catch (const pqxx::sql_error& e) {
+        return {{"error", "could not hide " + nm}, {"detail", e.what()}};
+      }
+    }
+
+    const json after = plan_of();
+    const std::string after_text = after.dump();
+    // Whether the planner took the index is the answer people actually want,
+    // and a cost figure alone hides it: hypopg's most useful verdict is often
+    // that a proposed index was ignored.
+    for (auto& e : indexes)
+      e["used"] = after_text.find(e["name"].get<std::string>()) != std::string::npos;
+
+    const double before_cost = cost_of(baseline), after_cost = cost_of(after);
+    json out = {
+      {"statement", sql},
+      {"hypopg_version", ver},
+      {"baseline", {{"total_cost", before_cost}, {"plan", baseline}}},
+      {"hypothetical", {{"total_cost", after_cost}, {"plan", after}}},
+      {"cost_ratio", before_cost > 0 ? json(after_cost / before_cost) : json(nullptr)},
+      {"indexes", indexes}
+    };
+    if (!hidden.empty()) out["hidden"] = hidden;
+    out["note"] = "Hypothetical indexes are planned against and never built. "
+                  "The cost is the planner's estimate, not a measurement: it "
+                  "says the plan would change, not how long it would take.";
+    return out;
+  }
+
+  // Which tools this role can actually use on this connection.
+  //
+  // The catalog is world-readable, so most of the tool set works for any role
+  // that can connect. What varies is a small, knowable set: the predefined
+  // roles that gate the monitoring extras, and whether the role can read table
+  // data at all. Measured against PostgreSQL 18: a bare login role runs 47 of
+  // the 58 tools at full fidelity, pg_monitor takes that to 54, and the ones
+  // that remain are exactly the three that touch row data.
+  //
+  // The point of asking once, up front, is that the alternative is discovering
+  // it tool by tool -- and the discovery is misleading, because a filtered
+  // answer looks like an empty one. tableStats on a role without SELECT
+  // returns every column with null statistics, which is byte-for-byte what a
+  // never-analyzed table looks like.
+  //
+  // Deliberately reports no role memberships and no GRANT statements. Which
+  // predefined role gates a tool is PostgreSQL's business, not the caller's --
+  // the caller needs to know what works. And emitting DDL would contradict what
+  // this server tells every client about itself: plans verbatim, no heuristics,
+  // no generated DDL. Naming a grant in the hint of a tool that *failed* is
+  // diagnosis; listing grants beside every unavailable tool is a standing
+  // recommendation to escalate privilege, which is not this server's to make.
+  const json check_privileges() {
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
+
+    // One round trip. pg_has_role is looked up through pg_roles rather than by
+    // name so that a predefined role missing on some version yields false
+    // instead of raising -- pg_read_all_data is PostgreSQL 14+, which is the
+    // floor this server supports, but the guard costs nothing and the next
+    // predefined role added upstream will not need this remembered.
+    auto has_role = [](const char* name) {
+      return std::string(
+        "COALESCE((SELECT pg_has_role(current_user, oid, 'USAGE')"
+        " FROM pg_roles WHERE rolname = '") + name + "'), false)";
+    };
+    const std::string query =
+      "SELECT JSONB_BUILD_OBJECT("
+      " 'role', current_user,"
+      " 'superuser', COALESCE((SELECT rolsuper FROM pg_roles"
+      "                        WHERE rolname = current_user), false),"
+      " 'monitor',      " + has_role("pg_monitor")           + ","
+      " 'read_stats',   " + has_role("pg_read_all_stats")    + ","
+      " 'read_settings'," + has_role("pg_read_all_settings") + ","
+      " 'scan_tables',  " + has_role("pg_stat_scan_tables")  + ","
+      " 'read_data',    " + has_role("pg_read_all_data")     + ")";
+
+    pqxx::result res = txn.exec(query);
+    const json p = json::parse(res[0][0].as<std::string>());
+
+    const bool super     = p.value("superuser", false);
+    const bool monitor   = super || p.value("monitor", false);
+    const bool stats     = monitor || p.value("read_stats", false);
+    const bool settings  = monitor || p.value("read_settings", false);
+    const bool scan      = monitor || p.value("scan_tables", false);
+    const bool data      = super  || p.value("read_data", false);
+
+    // Extension presence is a different failure from missing privilege, and
+    // conflating them would send an operator to the wrong fix. Checked here so
+    // the answer distinguishes "not installed" from "not permitted".
+    const bool has_pgstattuple  = !extension_schema(txn, "pgstattuple").empty();
+    const bool has_buffercache  = !extension_schema(txn, "pg_buffercache").empty();
+    const bool has_pgss         = !extension_schema(txn, "pg_stat_statements").empty();
+    const bool has_hypopg       = !extension_schema(txn, "hypopg").empty();
+
+    json denied = json::array(), degraded = json::array();
+    auto deny = [&](const char* tool, const std::string& why) {
+      denied.push_back({{"tool", tool}, {"reason", why}});
+    };
+    auto degrade = [&](const char* tool, const std::string& what) {
+      degraded.push_back({{"tool", tool}, {"what", what}});
+    };
+
+    // Denied means the tool cannot produce an answer for this role at all.
+    for (const char* t : {"tableBloat", "indexBloat"}) {
+      if (!has_pgstattuple) deny(t, "the pgstattuple extension is not installed");
+      else if (!scan)       deny(t, "the pgstattuple functions are restricted to "
+                                    "roles permitted to run table-scanning "
+                                    "monitoring functions");
+    }
+    for (const char* t : {"bufferCacheSummary", "bufferCacheContents"}) {
+      if (!has_buffercache) deny(t, "the pg_buffercache extension is not installed");
+      else if (!monitor)    deny(t, "pg_buffercache is readable only by roles "
+                                    "granted the monitoring role");
+    }
+    if (!has_hypopg)
+      deny("evaluateIndex", "the hypopg extension is not installed");
+    else if (!data)
+      degrade("evaluateIndex", "planning a statement needs SELECT on the tables "
+                               "it references, so this fails on any statement "
+                               "reaching a table this role cannot read");
+    if (!has_pgss)
+      deny("statementStats", "the pg_stat_statements extension is not installed");
+    else if (!stats)
+      degrade("statementStats", "the query text of statements run by other roles "
+                                "is replaced with <insufficient privilege>; the "
+                                "counters beside it are complete");
+
+    if (!settings)
+      degrade("serverSettings", "settings marked superuser-only are absent "
+                                "entirely rather than masked, so the category "
+                                "count is lower than a privileged role sees");
+    if (!stats)
+      degrade("currentActivity", "the query text and some columns of backends "
+                                 "belonging to other roles are hidden");
+
+    // The three that read row data. Not "denied": privilege here is per object,
+    // so a role without blanket read access may still hold SELECT on some
+    // tables and none on others. Reporting these as unavailable would be as
+    // wrong as reporting them as available.
+    if (!data) {
+      degrade("tableStats", "per-column statistics are omitted for any column "
+                            "this role cannot SELECT, and the columns still "
+                            "appear with null values -- indistinguishable from "
+                            "a table that was never analyzed");
+      degrade("checkKey", "fails on any table this role cannot SELECT");
+      degrade("explainQuery", "fails on any statement referencing a table this "
+                              "role cannot SELECT");
+    }
+
+    // Everything not named is fully available. Counting rather than listing:
+    // the exceptions are the answer, and enumerating 53 working tool names
+    // would be most of the payload.
+    const size_t total = tool_scopes().size();
+    json out = {
+      {"connection", active_cfg().name},
+      {"role", p.value("role", "")},
+      {"tools", total},
+      {"available", total - denied.size() - degraded.size()}
+    };
+    if (!degraded.empty()) out["degraded"] = degraded;
+    if (!denied.empty())   out["denied"]   = denied;
+    return out;
+  }
+
+  // --- Catalog statistics: readings, but free ones ------------------------
+  //
+  // Everything here comes out of pg_stat_user_tables, pg_stats and the
+  // pg_class counters that ANALYZE maintains. No relation is opened and no
+  // file is stat()ed, so the cost is a catalog scan and nothing else. That is
+  // the line these two tools sit on: they are volatile, which is why they are
+  // not in tableDetails, but they are cheap, which is why they are not behind
+  // the gate that tableSize is.
+  //
+  // size_estimate is relpages * 8192 and is deliberately not called `size`.
+  // relpages is set by VACUUM and ANALYZE, so between runs it can be arbitrarily
+  // stale -- on a table that has doubled since the last analyze it is half the
+  // truth. estimated_from carries the timestamp that produced it so a caller can
+  // judge the staleness instead of guessing at it, and tableSize is where an
+  // actually-measured number comes from.
+
+  // The PostgreSQL 16 additions, shared by both statistics tools.
+  // n_tup_newpage_upd counts updates that had to move the row to another page:
+  // the direct measure of failed HOT updates, whose usual cause is a too-high
+  // fillfactor or an index on a frequently updated column. last_seq_scan dates
+  // the last sequential scan, which turns a large seq_scan count into something
+  // actionable.
+  static std::string stats_pg16_fragment(int server_version) {
+    return server_version >= 160000
+      ? R"(, 'n_tup_newpage_upd', s.n_tup_newpage_upd,
+            'last_seq_scan', s.last_seq_scan)"
+      : "";
+  }
+
+  // The pg_stat_user_tables columns both tools return, in one place so the
+  // single-table and schema-wide forms cannot drift apart.
+  static constexpr const char* kTableStatsCommon = R"(
+               'rows', c.reltuples,
+               'size_estimate', c.relpages::bigint * 8192,
+               'estimated_from', GREATEST(s.last_vacuum, s.last_autovacuum,
+                                          s.last_analyze, s.last_autoanalyze),
+               'seq_scan', s.seq_scan, 'idx_scan', s.idx_scan,
+               'n_live_tup', s.n_live_tup, 'n_dead_tup', s.n_dead_tup,
+               'n_mod_since_analyze', s.n_mod_since_analyze,
+               'n_ins_since_vacuum', s.n_ins_since_vacuum,
+               'last_vacuum', GREATEST(s.last_vacuum, s.last_autovacuum),
+               'last_analyze', GREATEST(s.last_analyze, s.last_autoanalyze))";
+
+  const json table_stats(const std::string& schema, const std::string& table) {
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
+
+    const std::string pg16 = stats_pg16_fragment(sess.server_version());
+    // pg_stat_user_indexes.last_idx_scan is PostgreSQL 16+. Built the same way
+    // as the table fragment rather than by erasing a literal out of the
+    // finished query, which is what the pre-4.0.0 tableDetails did: if the two
+    // ever drifted the erase silently did nothing and the pg14/pg15 jobs failed
+    // on an undefined column.
+    const std::string idx_pg16 = sess.server_version() >= 160000
+      ? R"(, 'last_use', si.last_idx_scan)" : "";
+
+    std::string query = std::string(R"(
+      SELECT JSONB_BUILD_OBJECT(
+               'table', c.relname,)") + kTableStatsCommon + pg16 + R"(,
+               'columns', COALESCE(columns, '{}'::jsonb),
+               'indexes', COALESCE(indexes, '{}'::jsonb))
+      FROM pg_class AS c
+      LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
+      LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(a.attname,
+                          JSONB_BUILD_OBJECT(
+                           'null_frac', ps.null_frac,
+                           'avg_width', ps.avg_width,
+                           'n_distinct', ps.n_distinct,
+                           'physical_order_correlation', ps.correlation,
+                           'most_common_vals', ps.most_common_vals,
+                           'most_common_freqs', ps.most_common_freqs)) AS columns
+                         FROM pg_attribute AS a
+                         LEFT JOIN pg_stats AS ps ON ps.schemaname = $1
+                                                  AND ps.tablename = $2
+                                                  AND ps.attname = a.attname
+                         WHERE a.attnum > 0
+                           AND a.attrelid = c.oid
+                           AND NOT a.attisdropped) _lat40 ON true
+      LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(si.indexrelname,
+                          JSONB_BUILD_OBJECT(
+                           'index_uses', si.idx_scan)" + idx_pg16 + R"()) AS indexes
+                         FROM pg_stat_user_indexes AS si
+                         WHERE si.relid = c.oid) _lat41 ON true
+      WHERE c.relnamespace = $1::regnamespace
+        AND c.relname = $2;
+    )";
+
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, table});
+
+    if (!res.empty() && !res[0][0].is_null())
+      return json::parse(res[0][0].as<std::string>());
+    return {};
+  }
+
+  const json list_table_stats(const std::string& schema) {
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
+
+    const std::string pg16 = stats_pg16_fragment(sess.server_version());
+
+    // No per-column pg_stats here, deliberately. tableDetails never carried
+    // them in the schema-wide form either, and default_statistics_target
+    // sample values for every column of every table in a schema is a payload
+    // nobody asked for. Name a table to tableStats to get them.
+    std::string query = std::string(R"(
+      SELECT JSONB_OBJECT_AGG(c.relname,
+              JSONB_BUILD_OBJECT()") + kTableStatsCommon + pg16 + R"(
+               ))
+      FROM pg_class AS c
+      LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
+      WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
+        AND c.relkind IN ('r', 'p', 'm', 'v');
+    )";
+
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
+
+    if (!res.empty() && !res[0][0].is_null())
+      return json::parse(res[0][0].as<std::string>());
+    return {};
+  }
+
+  // --- Measured size: the gated tier --------------------------------------
+  //
+  // pg_table_size() and friends are not physical reads -- they stat() one file
+  // per 1 GB segment and read no blocks. What makes them worth gating is the
+  // lock: each opens the relation with AccessShareLock, so a size call on a
+  // table that an ALTER TABLE is rewriting waits behind AccessExclusiveLock.
+  // Across a schema that means the call stalls on precisely the table an
+  // incident is about. Since 3.2.1 every statement carries a statement_timeout,
+  // so it fails rather than hanging -- but it still fails, and it fails at the
+  // worst moment.
+  //
+  // Hence a separate tool rather than a flag: the cost note is in the
+  // description the model reads while choosing which tool to call, not in an
+  // argument it reads after it has already chosen.
+  const json table_size(const std::string& schema, const std::string& table) {
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
+
+    std::string query = R"(
+      SELECT JSONB_BUILD_OBJECT(
+               'table', c.relname,
+               'kind', CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table'
+                                      WHEN 'm' THEN 'materialized view' WHEN 'v' THEN 'view' END,
+               'main_size', pg_relation_size(c.oid, 'main'),
+               'size', pg_table_size(c.oid),
+               'indexes_size', pg_indexes_size(c.oid),
+               'total_size', pg_total_relation_size(c.oid),
+               'toast', CASE WHEN c.reltoastrelid != 0 THEN
+                          JSONB_BUILD_OBJECT(
+                            'name',       tc.relname,
+                            'size',       pg_relation_size(c.reltoastrelid),
+                            'index_size', pg_indexes_size(c.reltoastrelid))
+                        END,
+               'indexes', COALESCE(indexes, '{}'::jsonb))
+      FROM pg_class AS c
+      LEFT JOIN pg_class AS tc ON tc.oid = c.reltoastrelid
+      LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(i.relname, pg_relation_size(i.oid)) AS indexes
+                         FROM pg_index AS ix
+                         JOIN pg_class AS i ON i.oid = ix.indexrelid
+                         WHERE ix.indrelid = c.oid) _lat42 ON true
+      WHERE c.relnamespace = $1::regnamespace
+        AND c.relname = $2;
+    )";
+
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, table});
+
+    if (!res.empty() && !res[0][0].is_null())
+      return json::parse(res[0][0].as<std::string>());
+    return {};
+  }
+
+  const json list_table_sizes(const std::string& schema) {
+    Session sess{active_cfg()};
+    pqxx::work& txn = sess.txn();
+
+    // This is the form the lock caveat is really about: one relation_open per
+    // table in the schema, so a single table under AccessExclusiveLock blocks
+    // the whole call rather than one row of it.
+    std::string query = R"(
+      SELECT JSONB_OBJECT_AGG(c.relname,
+              JSONB_BUILD_OBJECT(
+               'kind', CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table'
+                                      WHEN 'm' THEN 'materialized view' WHEN 'v' THEN 'view' END,
+               'size', pg_table_size(c.oid),
+               'indexes_size', pg_indexes_size(c.oid),
+               'total_size', pg_total_relation_size(c.oid)))
+      FROM pg_class AS c
+      WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
+        AND c.relkind IN ('r', 'p', 'm', 'v');
+    )";
+
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
+
+    if (!res.empty() && !res[0][0].is_null())
+      return json::parse(res[0][0].as<std::string>());
+    return {};
   }
 
   // The three _meta keys the stateless revision defines, and the revision
@@ -5399,8 +6854,14 @@ private:
 
     send_response(id, {
         {"protocolVersion", reply},
+        // 4.0.0 adds resources, prompts and completions. Declared together
+        // because they were authored together against the finished tool
+        // surface, which is what the statistics split was blocking.
         {"capabilities", {
-            {"tools", json::object()}
+            {"tools", json::object()},
+            {"resources", json::object()},
+            {"prompts", json::object()},
+            {"completions", json::object()}
 	  }},
         {"serverInfo", {{"name", "pg-licht-cpp"}, {"version", PGLICHT_VERSION}}}
       });
@@ -5624,6 +7085,33 @@ private:
       std::string web_search = arguments.contains("web_search") ? arguments["web_search"].get<std::string>() : "";
       result_content = search(web_search);
     }
+    else if (tool_name == "evaluateIndex") {
+      std::string sql = arguments.contains("sql") ? arguments["sql"].get<std::string>() : "";
+      json creates = arguments.contains("create") ? arguments["create"] : json::array();
+      json hides   = arguments.contains("hide")   ? arguments["hide"]   : json::array();
+      result_content = evaluate_index(sql, creates, hides);
+    }
+    else if (tool_name == "checkPrivileges") {
+      result_content = check_privileges();
+    }
+    else if (tool_name == "tableStats") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      std::string target_table = arguments.contains("table") ? arguments["table"].get<std::string>() : "";
+      result_content = table_stats(target_schema, target_table);
+    }
+    else if (tool_name == "listTableStats") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      result_content = list_table_stats(target_schema);
+    }
+    else if (tool_name == "tableSize") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      std::string target_table = arguments.contains("table") ? arguments["table"].get<std::string>() : "";
+      result_content = table_size(target_schema, target_table);
+    }
+    else if (tool_name == "listTableSizes") {
+      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
+      result_content = list_table_sizes(target_schema);
+    }
     else if (tool_name == "listFunctions") {
       std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
       result_content = functions(target_schema);
@@ -5844,6 +7332,14 @@ private:
     else {
       return false;
     }
+    // Every tool payload is a JSON object, enforced here rather than trusted
+    // of ~50 query methods. `structuredContent` may only be an object, so from
+    // 4.0.0 a null payload is not merely untidy -- it is unrepresentable in the
+    // format modern clients receive. The methods return a value-initialised
+    // `json` (which is null, not `{}`) when a query matches no rows, so that is
+    // the case this catches. Reading "no rows" as an empty map is also the
+    // better answer: null invites "the tool failed", `{}` says "nothing there".
+    if (result_content.is_null()) result_content = json::object();
     return true;
   }
 
@@ -5895,12 +7391,17 @@ private:
     }
 
     if (method == "server/discover") {
-      send_response(req.value("id", json()), {
+      send_response(req.value("id", json()), cacheable({
           {"resultType", "complete"},
           {"supportedVersions", all_protocols()},
-          {"capabilities", {{"tools", json::object()}}},
+          {"capabilities", {{"tools", json::object()},
+                            {"resources", json::object()},
+                            {"prompts", json::object()},
+                            {"completions", json::object()}}},
           {"instructions", instructions()}
-        });
+        // Versions, capabilities and instructions are all compiled in, and
+        // none of it is specific to a caller.
+        }, kTtlStatic, "public"));
       return;
     }
 
@@ -5911,7 +7412,85 @@ private:
       return;
     }
     else if (method == "tools/list") {
-      send_response(req["id"], get_tools_list(request_protocol_));
+      json out = json::object();
+      // "private" rather than "public", for two reasons that both bite. The
+      // list varies by negotiated revision -- annotations, title and
+      // outputSchema are each gated -- while the cache key is the method and
+      // its params, and the revision travels in _meta. And the `connection`
+      // property description carries the operator's configured default
+      // connection name. Neither belongs in a cache a gateway may serve to
+      // another caller. A private cache still gives this client the full
+      // benefit, which is where the ~93 kB saving actually lands.
+      if (!paginate(get_tools_list(request_protocol_)["tools"], params, "tools", out)) {
+        send_error(req["id"], -32602, "invalid cursor");
+        return;
+      }
+      send_response(req["id"], cacheable(out, kTtlStatic, "private"));
+    }
+    else if (method == "resources/list") {
+      json out = json::object();
+      // Connection names and a live schema enumeration: deployment-specific,
+      // and short-lived because CREATE SCHEMA changes it.
+      if (!paginate(get_resources_list()["resources"], params, "resources", out)) {
+        send_error(req["id"], -32602, "invalid cursor");
+        return;
+      }
+      send_response(req["id"], cacheable(out, kTtlCatalog, "private"));
+    }
+    else if (method == "resources/templates/list") {
+      json out = json::object();
+      if (!paginate(get_resource_templates_list()["resourceTemplates"], params,
+                    "resourceTemplates", out)) {
+        send_error(req["id"], -32602, "invalid cursor");
+        return;
+      }
+      // Static URI templates, identical for every caller.
+      send_response(req["id"], cacheable(out, kTtlStatic, "public"));
+    }
+    else if (method == "resources/read") {
+      const std::string uri = params.value("uri", "");
+      try {
+        json body = read_resource(uri);
+        if (body.is_null()) body = json::object();
+        // A resource is a document, so it is served as one: the JSON text of
+        // the object, with its mimeType. There is no structuredContent form
+        // for resource contents in the spec, and the text is compact for the
+        // same reason a tool result is.
+        // Structure changes only on DDL, but it does change, so the hint is
+        // short. Private: this is the content of the operator's database.
+        send_response(req["id"], cacheable({
+            {"contents", {{{"uri", uri},
+                           {"mimeType", "application/json"},
+                           {"text", body.dump()}}}}
+          }, kTtlCatalog, "private"));
+      } catch (const std::invalid_argument& e) {
+        send_error(req["id"], -32602, e.what());
+      } catch (const std::exception& e) {
+        send_error(req["id"], -32603, std::string("resource read failed: ") + e.what());
+      }
+    }
+    else if (method == "prompts/list") {
+      json out = json::object();
+      if (!paginate(get_prompts_list()["prompts"], params, "prompts", out)) {
+        send_error(req["id"], -32602, "invalid cursor");
+        return;
+      }
+      // Compiled-in templates with no configuration in them.
+      send_response(req["id"], cacheable(out, kTtlStatic, "public"));
+    }
+    else if (method == "prompts/get") {
+      try {
+        send_response(req["id"], get_prompt(params.value("name", ""),
+                                            params.contains("arguments")
+                                              ? params["arguments"] : json::object()));
+      } catch (const std::invalid_argument& e) {
+        send_error(req["id"], -32602, e.what());
+      }
+    }
+    else if (method == "completion/complete") {
+      send_response(req["id"], complete(params.contains("ref") ? params["ref"] : json::object(),
+                                        params.contains("argument") ? params["argument"]
+                                                                    : json::object()));
     }
     else if (method == "tools/call") {
       std::string tool_name = params.value("name", "");
@@ -5980,10 +7559,7 @@ private:
 				   axis == "instance" ? want_instance
 				 : axis == "replication_group" ? want_repl : want_group,
 				   want_role, tool_name, arguments);
-	  send_response(req["id"], {
-	      {"content", {{{"type", "text"}, {"text", result_content.dump(2)}}}},
-	      {"isError", false}
-	    });
+	  send_response(req["id"], tool_result(result_content));
 	  return;
 	}
 
@@ -5998,13 +7574,7 @@ private:
 	  return;
 	}
 
-	send_response(req["id"], {
-	    {"content", {{
-                  {"type", "text"},
-                  {"text", result_content.dump(2)}
-		}}},
-	    {"isError", false}
-          });
+	send_response(req["id"], tool_result(result_content));
 
       } catch (const pqxx::sql_error& e) {
 	// Hitting the ceiling is reported as a result rather than an execution
@@ -6012,9 +7582,12 @@ private:
 	// connection allows, and the caller can act on that.
 	if (is_statement_timeout(e)) {
 	  send_response(req["id"], {
+	      // Errors stay a text block in both eras. `structuredContent` is the
+	      // format for a tool's answer; an error is a message about why there
+	      // is no answer, and the spec pairs isError with content.
 	      {"content", {{{"type", "text"},
 			    {"text", statement_timeout_error(
-			       Session::last_statement_timeout_ms(), e.what()).dump(2)}}}},
+			       Session::last_statement_timeout_ms(), e.what()).dump()}}}},
 	      {"isError", true}
 	    });
 	} else {
@@ -6035,6 +7608,163 @@ private:
         send_error(req["id"], -32601, "Method not available");
       }
     }
+  }
+
+  // ============ Caching hints and pagination (revision 2026-07-28) =========
+  //
+  // The caching utility requires `ttlMs` and `cacheScope` on every result with
+  // resultType "complete" from server/discover, tools/list, prompts/list,
+  // resources/list, resources/templates/list and resources/read. Both are
+  // therefore gated on modern_, exactly as resultType is: they are defined by
+  // the same revision, and a legacy result must not grow fields its era never
+  // had.
+  //
+  // This matters more here than it looks. tools/list is ~93 kB once 58 tools
+  // carry descriptions, annotations, titles and outputSchemas, and without a
+  // freshness hint a client SHOULD treat it as immediately stale and re-fetch
+  // it whenever it needs the list. That is the largest single payload the
+  // server produces and it is entirely static.
+
+  // Everything compiled into the binary or read from the config file at
+  // startup. None of it can change while the process lives: the registry is
+  // built once, the tool table is a static, and no `listChanged` capability is
+  // declared, so there is no mechanism by which a client could be told
+  // otherwise even if it could.
+  static constexpr int kTtlStatic = 3600000;   // 1 hour
+  // Anything derived from a live catalog. Structure changes only when someone
+  // issues DDL -- that is the whole premise of serving it as a resource -- but
+  // DDL does happen, so this is short enough that a CREATE SCHEMA or an ALTER
+  // TABLE is picked up on the next access rather than an hour later.
+  static constexpr int kTtlCatalog = 60000;    // 1 minute
+
+  // Page size for every paginated list. Deliberately larger than any list this
+  // server currently produces, so nothing is truncated for a client that
+  // ignores nextCursor: 58 tools, 8 prompts and 5 templates are each one page.
+  // The list that can genuinely outgrow it is resources/list, which is
+  // connections x schemas -- and that is the case pagination exists for.
+  static constexpr size_t kListPageSize = 100;
+
+  static std::string b64_encode(const std::string& in) {
+    static const char* t =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    unsigned val = 0;
+    int valb = -6;
+    for (char raw : in) {
+      val = (val << 8) + static_cast<unsigned char>(raw);
+      valb += 8;
+      while (valb >= 0) { out += t[(val >> static_cast<unsigned>(valb)) & 0x3Fu]; valb -= 6; }
+    }
+    if (valb > -6) out += t[((val << 8) >> static_cast<unsigned>(valb + 8)) & 0x3Fu];
+    while (out.size() % 4) out += '=';
+    return out;
+  }
+
+  static bool b64_decode(const std::string& in, std::string& out) {
+    static const char* t =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::vector<int> rev(256, -1);
+    for (int i = 0; i < 64; i++) rev[static_cast<unsigned char>(t[i])] = i;
+    unsigned val = 0;
+    int valb = -8;
+    out.clear();
+    for (char raw : in) {
+      const unsigned char c = static_cast<unsigned char>(raw);
+      if (c == '=') break;
+      if (rev[c] == -1) return false;
+      val = (val << 6) + static_cast<unsigned>(rev[c]);
+      valb += 6;
+      if (valb >= 0) {
+        out += static_cast<char>((val >> static_cast<unsigned>(valb)) & 0xFFu);
+        valb -= 8;
+      }
+    }
+    return true;
+  }
+
+  // Opaque by contract: clients MUST NOT parse these. Base64 rather than a
+  // bare offset so that a client which ignores that rule fails visibly instead
+  // of quietly depending on the encoding.
+  static std::string encode_cursor(size_t offset) {
+    return b64_encode("pglicht:" + std::to_string(offset));
+  }
+
+  static bool decode_cursor(const std::string& cursor, size_t& offset) {
+    std::string plain;
+    if (!b64_decode(cursor, plain)) return false;
+    const std::string prefix = "pglicht:";
+    if (plain.rfind(prefix, 0) != 0) return false;
+    const std::string digits = plain.substr(prefix.size());
+    if (digits.empty()) return false;
+    for (char c : digits) if (c < '0' || c > '9') return false;
+    try { offset = static_cast<size_t>(std::stoull(digits)); }
+    catch (const std::exception&) { return false; }
+    return true;
+  }
+
+  json cacheable(json result, int ttl_ms, const char* scope) const {
+    if (modern_) {
+      result["ttlMs"] = ttl_ms;
+      result["cacheScope"] = scope;
+    }
+    return result;
+  }
+
+  // Slices one page out of `items` under `key`, attaching nextCursor when more
+  // remain. Returns false for a cursor this server did not issue, which the
+  // caller turns into -32602 as the spec requires.
+  //
+  // An absent cursor and an empty-string cursor are deliberately not the same
+  // thing: the spec says an empty string is a valid cursor value and must not
+  // read as end-of-results, so only `contains` decides whether one was sent.
+  static bool paginate(const json& items, const json& params,
+                       const char* key, json& out) {
+    size_t offset = 0;
+    if (params.contains("cursor")) {
+      if (!params["cursor"].is_string()) return false;
+      if (!decode_cursor(params["cursor"].get<std::string>(), offset)) return false;
+      if (offset > items.size()) return false;
+    }
+    json page = json::array();
+    const size_t end = std::min(offset + kListPageSize, items.size());
+    for (size_t i = offset; i < end; i++) page.push_back(items[i]);
+    out[key] = page;
+    if (end < items.size()) out["nextCursor"] = encode_cursor(end);
+    return true;
+  }
+
+  // The revision that defined `outputSchema` and `structuredContent`. A client
+  // that negotiated it receives the structured payload and no text block; one
+  // that did not receives the text block and nothing else. Never both.
+  //
+  // The spec suggests serving both for backwards compatibility, and this
+  // deliberately does not. Sending both means serialising the same payload
+  // twice in one response, and a client that feeds tool results into a model's
+  // context may well inject both -- doubling the tokens for every call. The
+  // compatibility the suggestion protects is already covered here by the
+  // negotiated revision: a client that cannot read `structuredContent` does
+  // not ask for a revision that has it. This is the same rule 3.2.0 settled on
+  // for `annotations` and `title` (see the roadmap's refined rule): a
+  // protocol-revision feature is emitted only to a client that negotiated the
+  // revision defining it.
+  static constexpr const char* kStructuredContentRevision = "2025-06-18";
+
+  bool wants_structured_content() const {
+    return request_protocol_ >= kStructuredContentRevision;
+  }
+
+  // One success result, in whichever of the two formats the client negotiated.
+  //
+  // The text form is serialised compactly rather than with dump(2). The
+  // indentation was 18-39% of the payload measured across real catalog reads,
+  // and it buys a caller nothing: every consumer parses the text as JSON
+  // rather than reading it. This is the only remaining path that carries it,
+  // since a modern client no longer receives a text block at all.
+  json tool_result(const json& payload) const {
+    if (wants_structured_content())
+      return {{"structuredContent", payload}, {"isError", false}};
+    return {{"content", {{{"type", "text"}, {"text", payload.dump()}}}},
+            {"isError", false}};
   }
 
   void send_response(const json& id, const json& result) {

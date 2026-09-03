@@ -220,6 +220,21 @@ protected:
       // tools are exercised against a schema-qualified lookup rather than
       // whatever happens to be on the role's search_path.
       txn.exec("CREATE EXTENSION IF NOT EXISTS pg_buffercache SCHEMA extensions");
+      // hypopg, also out of public. Optional: it is third-party rather than
+      // contrib and is not packaged everywhere, so the tests that need it skip
+      // rather than fail when it is absent.
+      //
+      // The savepoint is what makes that true, and catching the exception is
+      // not enough on its own: a failed statement poisons the whole
+      // transaction, so every command after it errors with 25P02 until a
+      // rollback -- which took the rest of this fixture down with it. Same
+      // reason explain_query and evaluate_index wrap their EXPLAINs.
+      try {
+        pqxx::subtransaction sub{txn};
+        sub.exec("CREATE EXTENSION IF NOT EXISTS hypopg SCHEMA extensions");
+        sub.commit();
+      } catch (const std::exception&) {
+      }
       txn.exec(
         "CREATE SERVER grocery_remote FOREIGN DATA WRAPPER postgres_fdw"
         " OPTIONS (host 'localhost', dbname 'probe', port '5432')"
@@ -426,20 +441,38 @@ TEST_F(PostgresMCPServerTest, TablesReturnsKnownTables) {
 
 TEST_F(PostgresMCPServerTest, TablesHasExpectedFields) {
   json result = srv->call_tables("grocery");
+  EXPECT_TRUE(result["users"].contains("kind"));
   EXPECT_TRUE(result["users"].contains("description"));
-  EXPECT_TRUE(result["users"].contains("rows"));
-  EXPECT_TRUE(result["users"].contains("size"));
-  EXPECT_TRUE(result["users"].contains("seq_scan"));
-  EXPECT_TRUE(result["users"].contains("idx_scan"));
-  EXPECT_TRUE(result["users"].contains("n_live_tup"));
-  EXPECT_TRUE(result["users"].contains("n_dead_tup"));
-  EXPECT_TRUE(result["users"].contains("last_vacuum"));
-  EXPECT_TRUE(result["users"].contains("last_analyze"));
+  EXPECT_TRUE(result["users"].contains("reloptions"));
   EXPECT_TRUE(result["users"].contains("columns"));
   EXPECT_TRUE(result["users"].contains("index_count"));
   EXPECT_TRUE(result["users"].contains("constraint_count"));
   EXPECT_GT(result["users"]["index_count"].get<int>(), 0);
   EXPECT_GT(result["users"]["constraint_count"].get<int>(), 0);
+}
+
+// 4.0.0: the structure tools carry no readings at all. Asserted by absence
+// rather than trusted, because a field left behind here is exactly what would
+// keep the tool wrongly classified per_server in tool_scopes().
+TEST_F(PostgresMCPServerTest, TablesCarriesNoStatistics) {
+  json result = srv->call_tables("grocery");
+  for (const char* f : {"rows", "size", "size_estimate", "seq_scan", "idx_scan",
+                        "n_live_tup", "n_dead_tup", "n_mod_since_analyze",
+                        "n_ins_since_vacuum", "last_vacuum", "last_analyze",
+                        "n_tup_newpage_upd", "last_seq_scan"})
+    EXPECT_FALSE(result["users"].contains(f)) << f << " is still on listTables";
+}
+
+TEST_F(PostgresMCPServerTest, SearchCarriesNoStatistics) {
+  json result = srv->call_search("users");
+  ASSERT_TRUE(result.contains("grocery.users")) << result.dump(2);
+  for (const char* f : {"rows", "size", "size_estimate", "seq_scan", "idx_scan",
+                        "n_live_tup", "n_dead_tup", "last_vacuum", "last_analyze"})
+    EXPECT_FALSE(result["grocery.users"].contains(f)) << f << " is still on searchTables";
+  // What it does keep: structure, and the privileges that make it findable by
+  // grantee name.
+  EXPECT_TRUE(result["grocery.users"].contains("columns"));
+  EXPECT_TRUE(result["grocery.users"].contains("roles"));
 }
 
 TEST_F(PostgresMCPServerTest, TablesColumnsIncludePerColumnIndexCount) {
@@ -534,18 +567,50 @@ TEST_F(PostgresMCPServerTest, SearchSnakeCaseName) {
 TEST_F(PostgresMCPServerTest, TableReturnsExpectedTopLevelKeys) {
   json result = srv->call_table("grocery", "users");
   EXPECT_TRUE(result.contains("table"));
-  EXPECT_TRUE(result.contains("rows"));
-  EXPECT_TRUE(result.contains("size"));
-  EXPECT_TRUE(result.contains("indexes_size"));
+  EXPECT_TRUE(result.contains("kind"));
   EXPECT_TRUE(result.contains("description"));
-  EXPECT_TRUE(result.contains("seq_scan"));
-  EXPECT_TRUE(result.contains("idx_scan"));
+  EXPECT_TRUE(result.contains("reloptions"));
   EXPECT_TRUE(result.contains("columns"));
   EXPECT_TRUE(result.contains("indexes"));
   EXPECT_TRUE(result.contains("constraints"));
   EXPECT_TRUE(result.contains("foreign_keys"));
   EXPECT_TRUE(result.contains("referenced_by"));
   EXPECT_TRUE(result.contains("primary_key"));
+  EXPECT_TRUE(result.contains("triggers"));
+  EXPECT_TRUE(result.contains("rules"));
+  EXPECT_TRUE(result.contains("row_level_security"));
+  EXPECT_TRUE(result.contains("policies"));
+  EXPECT_TRUE(result.contains("roles"));
+}
+
+TEST_F(PostgresMCPServerTest, TableDetailsCarriesNoStatistics) {
+  json result = srv->call_table("grocery", "users");
+  for (const char* f : {"rows", "size", "indexes_size", "size_estimate",
+                        "seq_scan", "idx_scan", "n_live_tup", "n_dead_tup",
+                        "n_mod_since_analyze", "n_ins_since_vacuum",
+                        "last_vacuum", "last_analyze", "n_tup_newpage_upd",
+                        "last_seq_scan"})
+    EXPECT_FALSE(result.contains(f)) << f << " is still on tableDetails";
+
+  // Reason 3 of the split: most_common_vals is literal column values, and this
+  // is the tool an agent calls most often to inspect structure. It must return
+  // none of them.
+  ASSERT_TRUE(result["columns"].contains("email"));
+  for (const char* f : {"null_frac", "avg_width", "n_distinct",
+                        "physical_order_correlation", "most_common_vals",
+                        "most_common_freqs"})
+    EXPECT_FALSE(result["columns"]["email"].contains(f))
+        << f << " is still on a tableDetails column";
+
+  // Index definitions are structure and stay; their scan counters and sizes
+  // do not.
+  ASSERT_FALSE(result["indexes"].empty());
+  for (auto& [name, idx] : result["indexes"].items()) {
+    EXPECT_TRUE(idx.contains("definition")) << name;
+    EXPECT_FALSE(idx.contains("size")) << name;
+    EXPECT_FALSE(idx.contains("index_uses")) << name;
+    EXPECT_FALSE(idx.contains("last_use")) << name;
+  }
 }
 
 TEST_F(PostgresMCPServerTest, TableDetailsSingleColumnPrimaryKey) {
@@ -662,14 +727,28 @@ TEST_F(PostgresMCPServerTest, TableColumnsHaveNoDefaultWhenAbsent) {
   EXPECT_FALSE(result["columns"]["name"].contains("default"));
 }
 
+// 4.0.0 split this one test across the three tiers it now spans: the
+// definition stayed on tableDetails, the scan count went to tableStats, and
+// the size to tableSize.
 TEST_F(PostgresMCPServerTest, TableIndexesHaveSizeField) {
-  json result = srv->call_table("grocery", "users");
-  EXPECT_FALSE(result["indexes"].empty());
-  for (auto& [idx_name, idx_obj] : result["indexes"].items()) {
-    EXPECT_TRUE(idx_obj.contains("size")) << "Index " << idx_name << " missing size";
-    EXPECT_TRUE(idx_obj.contains("definition"));
-    EXPECT_TRUE(idx_obj.contains("index_uses"));
-  }
+  json structure = srv->call_table("grocery", "users");
+  EXPECT_FALSE(structure["indexes"].empty());
+  for (auto& [idx_name, idx_obj] : structure["indexes"].items())
+    EXPECT_TRUE(idx_obj.contains("definition")) << idx_name;
+
+  json stats = srv->call_table_stats("grocery", "users");
+  for (auto& [idx_name, idx_obj] : stats["indexes"].items())
+    EXPECT_TRUE(idx_obj.contains("index_uses")) << idx_name;
+
+  json sizes = srv->call_table_size("grocery", "users");
+  EXPECT_FALSE(sizes["indexes"].empty());
+  for (auto& [idx_name, sz] : sizes["indexes"].items())
+    EXPECT_TRUE(sz.is_number()) << "Index " << idx_name << " missing size";
+
+  // Every index the structure tool names is measured and counted, so a caller
+  // can join the three payloads on the index name without gaps.
+  EXPECT_EQ(structure["indexes"].size(), sizes["indexes"].size());
+  EXPECT_EQ(structure["indexes"].size(), stats["indexes"].size());
 }
 
 TEST_F(PostgresMCPServerTest, TableColumnsHaveTypeInfo) {
@@ -681,7 +760,9 @@ TEST_F(PostgresMCPServerTest, TableColumnsHaveTypeInfo) {
 }
 
 TEST_F(PostgresMCPServerTest, TableColumnsIncludeStatsForAnalyzedTable) {
-  json result = srv->call_table("grocery", "users");
+  // The histograms answer the same question they always did; 4.0.0 moved which
+  // tool asks it.
+  json result = srv->call_table_stats("grocery", "users");
   EXPECT_TRUE(result["columns"]["name"].contains("null_frac"));
   EXPECT_TRUE(result["columns"]["name"].contains("avg_width"));
   EXPECT_TRUE(result["columns"]["name"].contains("n_distinct"));
@@ -1468,9 +1549,12 @@ TEST_F(PostgresMCPServerTest, TableDetailsIncludesToastInfoWhenPresent) {
   json result = srv->call_table("grocery", "users"); // has VARCHAR columns
   ASSERT_TRUE(result.contains("toast"));
   ASSERT_FALSE(result["toast"].is_null());
+  // The name is a catalog fact and stays; the sizes are measured and moved to
+  // tableSize in 4.0.0. What this tool still answers is "does this table store
+  // anything out of line at all".
   EXPECT_TRUE(result["toast"]["name"].get<std::string>().rfind("pg_toast", 0) == 0);
-  EXPECT_TRUE(result["toast"].contains("size"));
-  EXPECT_TRUE(result["toast"].contains("index_size"));
+  EXPECT_FALSE(result["toast"].contains("size"));
+  EXPECT_FALSE(result["toast"].contains("index_size"));
 }
 
 TEST_F(PostgresMCPServerTest, TableDetailsToastIsNullWhenNoToastableColumns) {
@@ -1653,10 +1737,14 @@ TEST_F(PostgresMCPServerTest, LocksShowsHeldLockFromAnotherConnection) {
   lock_txn.exec("LOCK TABLE grocery.users IN ACCESS EXCLUSIVE MODE");
 
   json result = srv->call_locks();
-  ASSERT_TRUE(result.is_array());
+  // 4.0.0: the rows are under "locks" -- a top-level array cannot be a
+  // structuredContent payload.
+  ASSERT_TRUE(result.is_object());
+  ASSERT_TRUE(result.contains("locks"));
+  ASSERT_TRUE(result["locks"].is_array());
 
   bool found = false;
-  for (auto& lock : result) {
+  for (auto& lock : result["locks"]) {
     if (lock.contains("relation") && !lock["relation"].is_null() &&
         lock["relation"].get<std::string>() == "grocery.users" &&
         lock["granted"].get<bool>()) {
@@ -1939,9 +2027,9 @@ TEST_F(PostgresMCPServerTest, LocksResolveTheTransitiveBlockingChain) {
   json chain;
   for (int i = 0; i < 40 && chain.is_null(); i++) {
     json r = srv->call_locks(waiter_pid);
-    if (!r.is_array()) continue;
-    for (const auto& l : r) {
-      if (l.contains("chain_depth") && l["chain_depth"].get<int>() > 0) chain = r;
+    if (!r.is_object() || !r["locks"].is_array()) continue;
+    for (const auto& l : r["locks"]) {
+      if (l.contains("chain_depth") && l["chain_depth"].get<int>() > 0) chain = r["locks"];
     }
   }
 
@@ -2031,21 +2119,172 @@ TEST_F(PostgresMCPServerTest, DatabaseStatsIncludesSessionCounters) {
   EXPECT_EQ(s.contains("parallel_workers_launched"), pg18);
 }
 
-// --- listTables / tableDetails version-gated columns ---
+// --- listTableStats / tableStats version-gated columns ---
 
 TEST_F(PostgresMCPServerTest, TableStatsIncludeFailedHotUpdatesOnPg16AndLater) {
   const bool pg16 = pg_server_version_num(test_url) >= 160000;
 
-  json tables = srv->call_tables("grocery");
-  ASSERT_TRUE(tables.contains("users"));
+  // The gate followed the fields out of the structure tools in 4.0.0.
+  json listed = srv->call_list_table_stats("grocery");
+  ASSERT_TRUE(listed.contains("users")) << listed.dump(2);
   // n_tup_newpage_upd counts updates that had to move the row to another
   // page: the direct measure of failed HOT updates.
-  EXPECT_EQ(tables["users"].contains("n_tup_newpage_upd"), pg16);
-  EXPECT_EQ(tables["users"].contains("last_seq_scan"), pg16);
+  EXPECT_EQ(listed["users"].contains("n_tup_newpage_upd"), pg16);
+  EXPECT_EQ(listed["users"].contains("last_seq_scan"), pg16);
 
-  json detail = srv->call_table("grocery", "users");
-  EXPECT_EQ(detail.contains("n_tup_newpage_upd"), pg16);
-  EXPECT_EQ(detail.contains("last_seq_scan"), pg16);
+  json one = srv->call_table_stats("grocery", "users");
+  EXPECT_EQ(one.contains("n_tup_newpage_upd"), pg16);
+  EXPECT_EQ(one.contains("last_seq_scan"), pg16);
+
+  // pg_stat_user_indexes.last_idx_scan is gated on the same release, and it is
+  // built by concatenation now rather than erased out of a finished query --
+  // the older approach failed silently if the literal ever drifted.
+  ASSERT_FALSE(one["indexes"].empty()) << one.dump(2);
+  for (auto& [name, idx] : one["indexes"].items()) {
+    EXPECT_TRUE(idx.contains("index_uses")) << name;
+    EXPECT_EQ(idx.contains("last_use"), pg16) << name;
+  }
+}
+
+// --- 4.0.0 statistics split ---
+
+TEST_F(PostgresMCPServerTest, TableStatsCarriesTheReadingsTableDetailsLost) {
+  json r = srv->call_table_stats("grocery", "users");
+  for (const char* f : {"table", "rows", "size_estimate", "estimated_from",
+                        "seq_scan", "idx_scan", "n_live_tup", "n_dead_tup",
+                        "n_mod_since_analyze", "n_ins_since_vacuum",
+                        "last_vacuum", "last_analyze", "columns", "indexes"})
+    EXPECT_TRUE(r.contains(f)) << f << " missing from tableStats";
+  EXPECT_EQ(r["table"].get<std::string>(), "users");
+
+  // The pg_stats histograms live here now, including the sample values.
+  ASSERT_TRUE(r["columns"].contains("email")) << r["columns"].dump(2);
+  for (const char* f : {"null_frac", "avg_width", "n_distinct",
+                        "physical_order_correlation", "most_common_vals",
+                        "most_common_freqs"})
+    EXPECT_TRUE(r["columns"]["email"].contains(f)) << f;
+}
+
+TEST_F(PostgresMCPServerTest, TableStatsListsEveryColumnEvenWithoutStatistics) {
+  // Nulls are kept rather than stripped: a column with no row in pg_stats has
+  // never been analyzed, and that is the actionable signal. Stripping it would
+  // make "never analyzed" and "column does not exist" look the same.
+  json r = srv->call_table_stats("grocery", "users");
+  json structure = srv->call_table("grocery", "users");
+  EXPECT_EQ(r["columns"].size(), structure["columns"].size());
+}
+
+TEST_F(PostgresMCPServerTest, ListTableStatsCoversTheSchemaWithoutHistograms) {
+  json r = srv->call_list_table_stats("grocery");
+  ASSERT_TRUE(r.contains("users")) << r.dump(2);
+  for (const char* f : {"rows", "size_estimate", "estimated_from", "seq_scan",
+                        "idx_scan", "n_live_tup", "n_dead_tup", "last_vacuum",
+                        "last_analyze"})
+    EXPECT_TRUE(r["users"].contains(f)) << f << " missing from listTableStats";
+  // Per-column histograms for every table in a schema is a payload nobody
+  // asked for; name one table to tableStats instead.
+  EXPECT_FALSE(r["users"].contains("columns"));
+}
+
+TEST_F(PostgresMCPServerTest, SizeEstimateIsNamedAsAnEstimateAndDatedByIt) {
+  json stats = srv->call_table_stats("grocery", "users");
+  // The field is deliberately not called `size`: relpages is only as fresh as
+  // the last vacuum or analyze, and estimated_from is what lets a caller judge
+  // that rather than guess.
+  EXPECT_TRUE(stats.contains("size_estimate"));
+  EXPECT_FALSE(stats.contains("size"));
+  EXPECT_TRUE(stats.contains("estimated_from"));
+
+  json measured = srv->call_table_size("grocery", "users");
+  // ...and the measured tool uses the plain name, so the two can never be
+  // confused for one another.
+  EXPECT_TRUE(measured.contains("size"));
+  EXPECT_FALSE(measured.contains("size_estimate"));
+}
+
+TEST_F(PostgresMCPServerTest, TableSizeMeasuresEveryFork) {
+  json r = srv->call_table_size("grocery", "users");
+  for (const char* f : {"table", "kind", "main_size", "size", "indexes_size",
+                        "total_size", "toast", "indexes"})
+    EXPECT_TRUE(r.contains(f)) << f << " missing from tableSize";
+  // pg_table_size covers the main fork plus the free space and visibility
+  // maps, so it is at least the main fork; the grand total adds the indexes.
+  EXPECT_GE(r["size"].get<long long>(), r["main_size"].get<long long>());
+  EXPECT_GE(r["total_size"].get<long long>(), r["size"].get<long long>());
+  ASSERT_FALSE(r["indexes"].empty());
+  for (auto& [name, sz] : r["indexes"].items())
+    EXPECT_TRUE(sz.is_number()) << name;
+  // The TOAST sizes that left tableDetails landed here.
+  ASSERT_FALSE(r["toast"].is_null());
+  EXPECT_TRUE(r["toast"].contains("size"));
+  EXPECT_TRUE(r["toast"].contains("index_size"));
+}
+
+TEST_F(PostgresMCPServerTest, ListTableSizesMeasuresEveryRelationInTheSchema) {
+  json r = srv->call_list_table_sizes("grocery");
+  ASSERT_TRUE(r.contains("users")) << r.dump(2);
+  for (const char* f : {"kind", "size", "indexes_size", "total_size"})
+    EXPECT_TRUE(r["users"].contains(f)) << f;
+  EXPECT_GE(r["users"]["total_size"].get<long long>(),
+            r["users"]["size"].get<long long>());
+}
+
+TEST_F(PostgresMCPServerTest, SizeToolsDoNotFailOnRelationsWithNoStorage) {
+  // A view and a partitioned parent own no files. pg_table_size returns 0 for
+  // them rather than raising, which is what lets listTableSizes cover a whole
+  // schema without the caller pre-filtering by relkind -- but a caller reading
+  // 0 off a partitioned table is being told about the parent, not the data,
+  // and the tool description says so.
+  json r = srv->call_list_table_sizes("grocery");
+  bool saw_view = false;
+  for (auto& [name, v] : r.items()) {
+    if (v["kind"].get<std::string>() == "view") {
+      saw_view = true;
+      EXPECT_EQ(v["size"].get<long long>(), 0) << name;
+    }
+  }
+  EXPECT_TRUE(saw_view) << "the fixture has no view to prove this with";
+}
+
+TEST_F(PostgresMCPServerTest, StatisticsSplitCorrectsTheSweepClassification) {
+  // Reason 1, and the point of the whole exercise: structure is byte-identical
+  // on a physical replica, so the structure tools must refuse a
+  // replication_group sweep while the statistics tools accept one.
+  json tools = srv->call_tools_list();
+  std::map<std::string, json> by_name;
+  for (const auto& t : tools) by_name[t.value("name", "")] = t;
+
+  for (const char* n : {"listTables", "searchTables", "tableDetails",
+                        "tableSize", "listTableSizes"}) {
+    ASSERT_TRUE(by_name.count(n)) << n;
+    EXPECT_FALSE(by_name[n]["inputSchema"]["properties"].contains("replication_group"))
+        << n << " still advertises a replication-group sweep";
+    EXPECT_NE(by_name[n].value("description", "").find("byte-identical here"),
+              std::string::npos) << n;
+  }
+  for (const char* n : {"tableStats", "listTableStats"}) {
+    ASSERT_TRUE(by_name.count(n)) << n;
+    EXPECT_TRUE(by_name[n]["inputSchema"]["properties"].contains("replication_group"))
+        << n << " cannot sweep, and it is the half that should";
+    EXPECT_NE(by_name[n].value("description", "").find("each server's own"),
+              std::string::npos) << n;
+  }
+}
+
+TEST_F(PostgresMCPServerTest, TheGatedSizeToolsSayWhatTheyCost) {
+  // The gate is the description, because MCP has no annotation for "expensive"
+  // and a server cannot force a client to confirm. What it can do is make the
+  // cost visible where the model chooses the tool.
+  json tools = srv->call_tools_list();
+  for (const auto& t : tools) {
+    const std::string n = t.value("name", "");
+    if (n != "tableSize" && n != "listTableSizes") continue;
+    const std::string d = t.value("description", "");
+    EXPECT_NE(d.find("AccessShareLock"), std::string::npos) << n;
+    EXPECT_NE(d.find("AccessExclusiveLock"), std::string::npos) << n;
+    EXPECT_NE(d.find("size_estimate"), std::string::npos)
+        << n << " does not point at the free alternative";
+  }
 }
 
 // --- progressStats ---
@@ -3615,6 +3854,585 @@ TEST_F(PostgresMCPServerTest, AnnotationsAppearForClientsThatUnderstandThem) {
   EXPECT_EQ(explain_seen, 1);
 }
 
+// --- 4.0.0 outputSchema ---
+
+namespace {
+
+// A validator for exactly the JSON Schema subset these declarations use:
+// "type" (a name or a list of names) and "properties". Nothing here uses
+// "required" and every schema sets additionalProperties true, so conformance
+// reduces to "the top level is an object, and every declared property that is
+// present has one of its declared types". That is the whole drift risk: a
+// field whose type changes under a declared schema turns a working call into a
+// client-side validation error, which is what the roadmap warns about.
+bool json_type_matches(const json& v, const std::string& t) {
+  if (t == "null")    return v.is_null();
+  if (t == "object")  return v.is_object();
+  if (t == "array")   return v.is_array();
+  if (t == "string")  return v.is_string();
+  if (t == "boolean") return v.is_boolean();
+  if (t == "integer") return v.is_number_integer();
+  if (t == "number")  return v.is_number();
+  return false;
+}
+
+bool conforms(const json& value, const json& schema, std::string& why) {
+  if (schema.contains("type")) {
+    const json& t = schema["type"];
+    bool ok = false;
+    if (t.is_string()) ok = json_type_matches(value, t.get<std::string>());
+    else for (const auto& one : t) if (json_type_matches(value, one.get<std::string>())) ok = true;
+    if (!ok) { why = std::string("expected ") + t.dump() + ", got " + value.type_name(); return false; }
+  }
+  if (schema.contains("properties") && value.is_object()) {
+    for (auto& [key, sub] : schema["properties"].items()) {
+      if (!value.contains(key)) continue;   // nothing is required, by design
+      std::string inner;
+      if (!conforms(value[key], sub, inner)) { why = key + ": " + inner; return false; }
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
+TEST_F(PostgresMCPServerTest, EveryToolDeclaresAnOutputSchema) {
+  // Declaring one for 55 tools and not the 56th reads to a client as "that one
+  // is unstructured", which is worse than declaring none at all.
+  json tools = srv->call_tools_list("2025-06-18");
+  ASSERT_FALSE(tools.empty());
+  for (const auto& t : tools) {
+    const std::string name = t.value("name", "");
+    ASSERT_TRUE(t.contains("outputSchema")) << name << " declares no outputSchema";
+    EXPECT_EQ(t["outputSchema"]["type"], "object") << name;
+    // structuredContent may only be an object, so no schema may say otherwise.
+    EXPECT_TRUE(t["outputSchema"].value("additionalProperties", false))
+        << name << " forbids additional properties, which a catalog will grow";
+    EXPECT_FALSE(t["outputSchema"].contains("required"))
+        << name << " marks a field required; a version-conditional payload cannot";
+  }
+}
+
+TEST_F(PostgresMCPServerTest, OutputSchemaStartsAtTheRevisionThatDefinedIt) {
+  for (const char* proto : {"2024-11-05", "2025-03-26"})
+    for (const auto& t : srv->call_tools_list(proto))
+      EXPECT_FALSE(t.contains("outputSchema")) << proto << " " << t.value("name", "");
+  for (const auto& t : srv->call_tools_list("2025-06-18"))
+    EXPECT_TRUE(t.contains("outputSchema")) << t.value("name", "");
+}
+
+TEST_F(PostgresMCPServerTest, RealPayloadsConformToTheirDeclaredSchema) {
+  // The test that makes the declarations safe to ship. A schema that drifts
+  // from the payload turns a previously-working call into a validation error
+  // on the client, and that failure would be invisible from here otherwise.
+  json tools = srv->call_tools_list("2025-06-18");
+  std::map<std::string, json> schema;
+  for (const auto& t : tools) schema[t.value("name", "")] = t["outputSchema"];
+
+  // Negotiate the revision through initialize rather than per-request _meta,
+  // so this exercises the same path a real 2025-06-18 client takes.
+  PostgresMCPServer modern(test_url);
+  modern.call_rpc({{"jsonrpc", "2.0"}, {"id", 0}, {"method", "initialize"},
+                   {"params", {{"protocolVersion", "2025-06-18"},
+                               {"capabilities", json::object()},
+                               {"clientInfo", {{"name", "t"}, {"version", "0"}}}}}});
+
+  const std::vector<std::pair<std::string, json>> calls = {
+    {"listSchemas",      json::object()},
+    {"listTables",       {{"schema", "grocery"}}},
+    {"tableDetails",     {{"schema", "grocery"}, {"table", "users"}}},
+    {"tableStats",       {{"schema", "grocery"}, {"table", "users"}}},
+    {"tableSize",        {{"schema", "grocery"}, {"table", "users"}}},
+    {"listTableStats",   {{"schema", "grocery"}}},
+    {"listTableSizes",   {{"schema", "grocery"}}},
+    {"searchTables",     {{"web_search", "users"}}},
+    {"listFunctions",    {{"schema", "grocery"}}},
+    {"listEnums",        {{"schema", "grocery"}}},
+    {"listTypes",        {{"schema", "grocery"}}},
+    {"listSequences",    {{"schema", "grocery"}}},
+    {"listRoles",        json::object()},
+    {"listExtensions",   json::object()},
+    {"listTablespaces",  json::object()},
+    {"listCollations",   json::object()},
+    {"listAccessMethods",json::object()},
+    {"listLanguages",    json::object()},
+    {"listConnections",  json::object()},
+    {"listTopology",     json::object()},
+    {"currentLocks",     json::object()},
+    {"currentActivity",  json::object()},
+    {"databaseSize",     json::object()},
+    {"databaseStats",    json::object()},
+    {"progressStats",    json::object()},
+    {"wraparoundStatus", json::object()},
+    {"checkpointStats",  json::object()},
+    {"hostCapacity",     json::object()},
+    {"ioStats",          json::object()},
+    {"tableIOStats",     {{"schema", "grocery"}}},
+    {"duplicateIndexes", {{"schema", "grocery"}}},
+    {"serverSettings",   json::object()},
+    {"checkKey",         {{"schema", "grocery"}, {"table", "users"}, {"values", json::array({1})}}},
+    {"explainQuery",     {{"sql", "SELECT 1"}}},
+  };
+  int checked = 0;
+  for (const auto& [tool, args] : calls) {
+    json r = modern.call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", {{"name", tool}, {"arguments", args}}}});
+    if (!r["result"].contains("structuredContent")) continue;  // an isError path
+    const json& payload = r["result"]["structuredContent"];
+    ASSERT_TRUE(schema.count(tool)) << tool;
+    std::string why;
+    EXPECT_TRUE(conforms(payload, schema[tool], why))
+        << tool << " payload violates its declared outputSchema: " << why;
+    checked++;
+  }
+  EXPECT_GE(checked, 30) << "too few tools actually exercised to prove anything";
+}
+
+namespace {
+
+const char* kProtoVersion  = "io.modelcontextprotocol/protocolVersion";
+const char* kProtoCaps     = "io.modelcontextprotocol/clientCapabilities";
+const char* kProtoSrvInfo  = "io.modelcontextprotocol/serverInfo";
+
+json modern_meta(const std::string& version = "2026-07-28") {
+  return {{kProtoVersion, version}, {kProtoCaps, json::object()}};
+}
+
+}  // namespace
+
+// --- 4.0.0 caching hints and pagination (revision 2026-07-28) ---
+
+TEST_F(PostgresMCPServerTest, CacheableResultsCarryTheirHints) {
+  // The spec says servers MUST include caching hints on every result with
+  // resultType "complete" from these six operations. tools/list is ~91 kB, and
+  // without a hint a client SHOULD treat it as immediately stale and re-fetch
+  // it whenever it needs the list.
+  const std::vector<std::pair<std::string, json>> cacheable = {
+    {"server/discover",          json::object()},
+    {"tools/list",               json::object()},
+    {"prompts/list",             json::object()},
+    {"resources/list",           json::object()},
+    {"resources/templates/list", json::object()},
+    {"resources/read",           {{"uri", "pglicht://default/server/extensions"}}},
+  };
+  for (const auto& [method, extra] : cacheable) {
+    json params = extra;
+    params["_meta"] = modern_meta();
+    json r = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", method},
+                            {"params", params}});
+    ASSERT_TRUE(r.contains("result")) << method << " " << r.dump(2);
+    const json& res = r["result"];
+    ASSERT_EQ(res.value("resultType", ""), "complete") << method;
+    ASSERT_TRUE(res.contains("ttlMs")) << method << " carries no ttlMs";
+    EXPECT_TRUE(res["ttlMs"].is_number_integer()) << method;
+    EXPECT_GE(res["ttlMs"].get<long long>(), 0) << method << ": ttlMs MUST be >= 0";
+    ASSERT_TRUE(res.contains("cacheScope")) << method << " carries no cacheScope";
+    const std::string scope = res["cacheScope"].get<std::string>();
+    EXPECT_TRUE(scope == "public" || scope == "private") << method << ": " << scope;
+  }
+}
+
+TEST_F(PostgresMCPServerTest, CacheScopeIsPrivateWhereTheResultIsNotShareable) {
+  auto scope_of = [&](const std::string& method) {
+    json r = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", method},
+                            {"params", {{"_meta", modern_meta()}}}});
+    return r["result"].value("cacheScope", "");
+  };
+  // tools/list varies by negotiated revision (annotations, title and
+  // outputSchema are each gated) while the cache key is method plus params,
+  // and it embeds the configured default connection name. resources/list
+  // enumerates the operator's schemas. Neither may be served to another caller.
+  EXPECT_EQ(scope_of("tools/list"), "private");
+  EXPECT_EQ(scope_of("resources/list"), "private");
+  // These are compiled in and identical for everyone.
+  EXPECT_EQ(scope_of("prompts/list"), "public");
+  EXPECT_EQ(scope_of("resources/templates/list"), "public");
+  EXPECT_EQ(scope_of("server/discover"), "public");
+}
+
+TEST_F(PostgresMCPServerTest, LegacyResultsCarryNoCachingHints) {
+  // The hints are defined by the same revision that defines resultType, so
+  // they are gated the same way: a legacy result must not grow fields its era
+  // never had.
+  json r = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/list"},
+                          {"params", json::object()}});
+  EXPECT_FALSE(r["result"].contains("ttlMs"));
+  EXPECT_FALSE(r["result"].contains("cacheScope"));
+  EXPECT_FALSE(r["result"].contains("resultType"));
+}
+
+TEST_F(PostgresMCPServerTest, PaginationWalksEveryItemExactlyOnce) {
+  json items = json::array();
+  for (int i = 0; i < 250; i++) items.push_back({{"n", i}});
+
+  std::vector<int> seen;
+  json params = json::object();
+  int pages = 0;
+  for (;;) {
+    json page = json::object();
+    ASSERT_TRUE(PostgresMCPServer::call_paginate(items, params, "items", page)) << params.dump();
+    pages++;
+    for (const auto& e : page["items"]) seen.push_back(e["n"].get<int>());
+    if (!page.contains("nextCursor")) break;
+    params["cursor"] = page["nextCursor"];
+    ASSERT_LE(pages, 10) << "pagination did not terminate";
+  }
+  EXPECT_GT(pages, 1) << "250 items should not fit in one page";
+  ASSERT_EQ(seen.size(), 250u);
+  for (int i = 0; i < 250; i++) EXPECT_EQ(seen[static_cast<size_t>(i)], i);
+}
+
+TEST_F(PostgresMCPServerTest, CursorsAreOpaqueAndStable) {
+  json items = json::array();
+  for (int i = 0; i < 250; i++) items.push_back(i);
+
+  json first = json::object();
+  ASSERT_TRUE(PostgresMCPServer::call_paginate(items, json::object(), "items", first));
+  ASSERT_TRUE(first.contains("nextCursor"));
+  const std::string cursor = first["nextCursor"].get<std::string>();
+  // Opaque by contract: it must not read as a number a client could do
+  // arithmetic on.
+  EXPECT_TRUE(cursor.find_first_not_of("0123456789") != std::string::npos) << cursor;
+
+  // Stable: the same request yields the same cursor.
+  json again = json::object();
+  ASSERT_TRUE(PostgresMCPServer::call_paginate(items, json::object(), "items", again));
+  EXPECT_EQ(again["nextCursor"].get<std::string>(), cursor);
+}
+
+TEST_F(PostgresMCPServerTest, AnInvalidCursorIsInvalidParams) {
+  for (const char* bad : {"not-base64!!", "", "cGdsaWNodDo5OTk5OTk="}) {
+    json r = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/list"},
+                            {"params", {{"_meta", modern_meta()}, {"cursor", bad}}}});
+    ASSERT_TRUE(r.contains("error")) << "cursor '" << bad << "' was accepted";
+    EXPECT_EQ(r["error"]["code"], -32602) << bad;
+  }
+  // An empty string is a valid *cursor value* per the spec -- a client must not
+  // read it as end-of-results -- but it is not one this server ever issues, so
+  // it is refused rather than silently treated as "start from the beginning".
+}
+
+TEST_F(PostgresMCPServerTest, NoCurrentListIsTruncatedForAClientThatIgnoresCursors) {
+  // The page size is deliberately larger than anything this server lists
+  // today, so a client that never sends a cursor still sees every tool. A
+  // smaller page would silently hide 44 of the 56 tools from such a client.
+  for (const char* method : {"tools/list", "prompts/list", "resources/templates/list",
+                             "resources/list"}) {
+    json r = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", method},
+                            {"params", {{"_meta", modern_meta()}}}});
+    EXPECT_FALSE(r["result"].contains("nextCursor"))
+        << method << " paginates today, which would truncate a client that ignores it";
+  }
+  json tools = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/list"},
+                              {"params", {{"_meta", modern_meta()}}}});
+  EXPECT_EQ(tools["result"]["tools"].size(), srv->call_tools_list().size());
+}
+
+// --- 4.0.0 resources, prompts and completions ---
+
+namespace {
+json rpc1(PostgresMCPServer& s, const std::string& method, const json& params) {
+  return s.call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", method}, {"params", params}});
+}
+}  // namespace
+
+TEST_F(PostgresMCPServerTest, CapabilitiesDeclareTheThreeNewSurfaces) {
+  // A private server: initialize sets the negotiated revision for the rest of
+  // that server's life, and the fixture's is shared by every test in the suite.
+  PostgresMCPServer own(test_url);
+  json init = rpc1(own, "initialize",
+                   {{"protocolVersion", "2025-06-18"},
+                    {"capabilities", json::object()},
+                    {"clientInfo", {{"name", "t"}, {"version", "0"}}}});
+  const json& caps = init["result"]["capabilities"];
+  for (const char* c : {"tools", "resources", "prompts", "completions"})
+    EXPECT_TRUE(caps.contains(c)) << c << " missing from initialize";
+
+  // The stateless era advertises the same set, or a modern client would see a
+  // smaller server than a legacy one.
+  json disc = rpc1(own, "server/discover", json::object());
+  const json& dcaps = disc["result"]["capabilities"];
+  for (const char* c : {"tools", "resources", "prompts", "completions"})
+    EXPECT_TRUE(dcaps.contains(c)) << c << " missing from server/discover";
+}
+
+TEST_F(PostgresMCPServerTest, ResourcesListIsBoundedAndDoesNotEnumerateTables) {
+  json r = rpc1(*srv, "resources/list", json::object());
+  const json& res = r["result"]["resources"];
+  ASSERT_TRUE(res.is_array()) << r.dump(2);
+
+  bool saw_schemas = false, saw_grocery = false;
+  for (const auto& e : res) {
+    const std::string uri = e.value("uri", "");
+    EXPECT_EQ(e.value("mimeType", ""), "application/json") << uri;
+    if (uri.find("/schemas") != std::string::npos)          saw_schemas = true;
+    if (uri.find("/schema/grocery") != std::string::npos)   saw_grocery = true;
+    // A 10k-table database must not produce a 10k-entry list; tables are
+    // reached through the template instead.
+    EXPECT_EQ(uri.find("/table/"), std::string::npos)
+        << "resources/list enumerated a table: " << uri;
+  }
+  EXPECT_TRUE(saw_schemas);
+  EXPECT_TRUE(saw_grocery) << "schemas of a reachable connection should be listed";
+}
+
+TEST_F(PostgresMCPServerTest, ResourceTemplatesCoverWhatTheListDoesNot) {
+  json r = rpc1(*srv, "resources/templates/list", json::object());
+  const json& t = r["result"]["resourceTemplates"];
+  ASSERT_TRUE(t.is_array());
+  bool saw_table = false;
+  for (const auto& e : t)
+    if (e.value("uriTemplate", "") == "pglicht://{conn}/schema/{schema}/table/{table}")
+      saw_table = true;
+  EXPECT_TRUE(saw_table);
+}
+
+TEST_F(PostgresMCPServerTest, AResourceServesTheSamePayloadAsItsTool) {
+  // Resources are the existing query methods behind a URI, not a second
+  // implementation that can drift from the first.
+  json r = rpc1(*srv, "resources/read",
+                {{"uri", "pglicht://default/schema/grocery/table/users"}});
+  ASSERT_TRUE(r["result"].contains("contents")) << r.dump(2);
+  const json& c = r["result"]["contents"][0];
+  EXPECT_EQ(c.value("mimeType", ""), "application/json");
+  json body = json::parse(c["text"].get<std::string>());
+  EXPECT_EQ(body, srv->call_table("grocery", "users"));
+}
+
+TEST_F(PostgresMCPServerTest, ResourcesCarryStructureAndNoReadings) {
+  // The volatility principle, and the reason resources had to wait for the
+  // statistics split: a document a client pins into context and re-reads later
+  // must not carry a counter that moves under it.
+  json r = rpc1(*srv, "resources/read",
+                {{"uri", "pglicht://default/schema/grocery/table/users"}});
+  json body = json::parse(r["result"]["contents"][0]["text"].get<std::string>());
+  for (const char* f : {"n_dead_tup", "seq_scan", "idx_scan", "last_vacuum",
+                        "rows", "size", "size_estimate"})
+    EXPECT_FALSE(body.contains(f)) << f << " is a reading, and this is a document";
+  EXPECT_TRUE(body.contains("columns"));
+}
+
+TEST_F(PostgresMCPServerTest, AnUnknownResourceFailsWithInvalidParams) {
+  for (const char* uri : {"pglicht://default/nope",
+                          "pglicht://default/schema/grocery/table",
+                          "https://example.com/x"}) {
+    json r = rpc1(*srv, "resources/read", {{"uri", uri}});
+    ASSERT_TRUE(r.contains("error")) << uri << " " << r.dump(2);
+    EXPECT_EQ(r["error"]["code"], -32602) << uri;
+  }
+}
+
+TEST_F(PostgresMCPServerTest, AResourceNamingAnUnknownConnectionSaysWhichExist) {
+  json r = rpc1(*srv, "resources/read", {{"uri", "pglicht://nosuchconn/schemas"}});
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  // The registry throws a message listing the configured names, so a typo is
+  // answered rather than turned into a connect failure.
+  EXPECT_NE(r["error"]["message"].get<std::string>().find("default"), std::string::npos)
+      << r["error"].dump(2);
+}
+
+TEST_F(PostgresMCPServerTest, PromptsAreListedWithTheirArguments) {
+  json r = rpc1(*srv, "prompts/list", json::object());
+  const json& p = r["result"]["prompts"];
+  ASSERT_TRUE(p.is_array());
+  std::set<std::string> names;
+  for (const auto& e : p) {
+    names.insert(e.value("name", ""));
+    EXPECT_FALSE(e.value("description", "").empty()) << e.value("name", "");
+    EXPECT_TRUE(e["arguments"].is_array()) << e.value("name", "");
+  }
+  for (const char* n : {"diagnose-slow-query", "triage-lock-contention",
+                        "bloat-and-vacuum-review", "buffer-cache-review",
+                        "capacity-check", "replication-slot-review",
+                        "plan-schema-change", "explain-and-fix"})
+    EXPECT_TRUE(names.count(n)) << n << " is missing";
+}
+
+TEST_F(PostgresMCPServerTest, PromptsSendTheModelToCheckPrivilegesFirst) {
+  // Every prompt whose core tools are privilege-gated opens by checking. A
+  // restricted role gets null statistics rather than an error, so a plan built
+  // on tools that will not answer looks like it worked.
+  for (const char* n : {"diagnose-slow-query", "triage-lock-contention",
+                        "bloat-and-vacuum-review", "buffer-cache-review",
+                        "replication-slot-review", "plan-schema-change",
+                        "explain-and-fix"}) {
+    json r = rpc1(*srv, "prompts/get", {{"name", n},
+                                        {"arguments", {{"sql", "SELECT 1"},
+                                                       {"change", "add a column"}}}});
+    const std::string text = r["result"]["messages"][0]["content"]["text"].get<std::string>();
+    EXPECT_NE(text.find("checkPrivileges"), std::string::npos) << n;
+  }
+}
+
+TEST_F(PostgresMCPServerTest, TheSlowQueryPromptBranchesIntoBloatAndVacuum) {
+  // The richest path: a slow statement can end in a plan fix, a vacuum change,
+  // an index, or a schema change, and the prompt has to name all four routes.
+  json r = rpc1(*srv, "prompts/get", {{"name", "diagnose-slow-query"}});
+  const std::string t = r["result"]["messages"][0]["content"]["text"].get<std::string>();
+  for (const char* tool : {"statementStats", "explainQuery", "tableStats",
+                           "tableBloat", "indexBloat", "duplicateIndexes",
+                           "bloat-and-vacuum-review", "plan-schema-change"})
+    EXPECT_NE(t.find(tool), std::string::npos) << tool << " missing from the slow-query path";
+}
+
+TEST_F(PostgresMCPServerTest, TheDiagnosticPromptsChooseBetweenARewriteAndDDL) {
+  // Both prompts can end in four different kinds of fix, and which one it is
+  // has to be a decision rather than a default. Ending at "propose the fix as
+  // DDL" reaches for an index when an ANALYZE or a rewrite would have done --
+  // and an index is a write cost paid forever to buy one read pattern.
+  for (const char* n : {"diagnose-slow-query", "explain-and-fix"}) {
+    json r = rpc1(*srv, "prompts/get",
+                  {{"name", n}, {"arguments", {{"sql", "SELECT 1"}}}});
+    const std::string t = r["result"]["messages"][0]["content"]["text"].get<std::string>();
+    // The four kinds, and the instruction to pick one deliberately.
+    for (const char* k : {"the fix is a rewrite", "the fix is statistics",
+                          "the fix is configuration", "only then is the fix DDL",
+                          "Prefer them in that order"})
+      EXPECT_NE(t.find(k), std::string::npos) << n << " missing: " << k;
+    // The cost argument is what makes the ordering more than a preference.
+    EXPECT_NE(t.find("every INSERT and UPDATE"), std::string::npos) << n;
+    EXPECT_NE(t.find("why the cheaper options were rejected"), std::string::npos) << n;
+
+    // The asymmetry this server can actually exploit: a rewrite is checkable
+    // here, an index is not.
+    EXPECT_NE(t.find("call explainQuery on the rewritten statement"), std::string::npos) << n;
+    // With hypopg an index is checkable too, and the prompt must say so and
+    // say how to find out whether it is available.
+    EXPECT_NE(t.find("evaluateIndex"), std::string::npos) << n;
+    EXPECT_NE(t.find("checkPrivileges says whether hypopg is there"), std::string::npos) << n;
+    EXPECT_NE(t.find("an index is a prediction"), std::string::npos) << n;
+    EXPECT_NE(t.find("plan-schema-change"), std::string::npos)
+        << n << " must hand index creation to the prompt that measures the table";
+  }
+}
+
+TEST_F(PostgresMCPServerTest, TheSlotPromptLeadsWithWhatASlotHoldsBack) {
+  json r = rpc1(*srv, "prompts/get", {{"name", "replication-slot-review"}});
+  const std::string t = r["result"]["messages"][0]["content"]["text"].get<std::string>();
+  // The two consequences that get misdiagnosed as something else.
+  EXPECT_NE(t.find("xmin horizon"), std::string::npos);
+  EXPECT_NE(t.find("wal_status"), std::string::npos);
+  // Dropping a slot is irreversible for its consumer; the prompt must say so.
+  EXPECT_NE(t.find("irreversible"), std::string::npos);
+}
+
+TEST_F(PostgresMCPServerTest, TheSchemaChangePromptRequiresTheChangeAndStatesTheLocks) {
+  json missing = rpc1(*srv, "prompts/get", {{"name", "plan-schema-change"},
+                                            {"arguments", json::object()}});
+  ASSERT_TRUE(missing.contains("error")) << missing.dump(2);
+  EXPECT_EQ(missing["error"]["code"], -32602);
+
+  json r = rpc1(*srv, "prompts/get",
+                {{"name", "plan-schema-change"},
+                 {"arguments", {{"change", "add a NOT NULL enum column"},
+                                {"schema", "shop"}, {"table", "orders"}}}});
+  const std::string t = r["result"]["messages"][0]["content"]["text"].get<std::string>();
+  EXPECT_NE(t.find("add a NOT NULL enum column"), std::string::npos);
+  EXPECT_NE(t.find("shop.orders"), std::string::npos);
+
+  // It must send the model to measure, because the readings are the only thing
+  // the model cannot already know.
+  for (const char* k : {"checkPrivileges", "tableStats", "tableSize",
+                        "tableDetails", "currentActivity", "currentLocks",
+                        "most_common_vals", "oldest running transaction",
+                        "replicationSlots"})
+    EXPECT_NE(t.find(k), std::string::npos) << k << " missing from the measurement step";
+
+  // A statement naming one table routinely locks several, and the unnamed one
+  // is often the busier: a foreign key locks what it references, a partitioned
+  // table means every partition. Measuring only the target misses the lock
+  // that actually hurts.
+  for (const char* k : {"every object the change touches", "not only the one named",
+                        "the table it references", "every partition"})
+    EXPECT_NE(t.find(k), std::string::npos) << k << " missing; the prompt measures one object only";
+
+  // ...and it must ask for a classification and a threshold rather than an
+  // answer, so the reasoning is checkable against a different table.
+  for (const char* k : {"metadata only", "full rewrite", "would flip",
+                        "irreversible", "read-only"})
+    EXPECT_NE(t.find(k), std::string::npos) << k << " missing";
+}
+
+TEST_F(PostgresMCPServerTest, TheSchemaChangePromptTeachesAMethodNotARecipe) {
+  // The point of the prompt is the readings, not the DDL. A model already
+  // knows what CREATE INDEX CONCURRENTLY is; what it cannot know is this
+  // table's size, its indexes and what is holding a lock right now. Baking the
+  // recipe in also makes the prompt wrong at one end of the scale -- always
+  // reaching for the safest-at-scale option is machinery nobody needs on an
+  // empty table -- and version-specific rules go stale silently.
+  json r = rpc1(*srv, "prompts/get",
+                {{"name", "plan-schema-change"}, {"arguments", {{"change", "add an index"}}}});
+  const std::string t = r["result"]["messages"][0]["content"]["text"].get<std::string>();
+  for (const char* recipe : {"CONCURRENTLY", "NOT VALID", "VALIDATE CONSTRAINT",
+                             "ALTER COLUMN TYPE", "PostgreSQL 11"})
+    EXPECT_EQ(t.find(recipe), std::string::npos)
+        << recipe << " is a prescribed recipe; this prompt must derive from measurements";
+  // The principle itself has to be stated, or nothing stops it drifting back.
+  EXPECT_NE(t.find("Do not answer from a recipe"), std::string::npos);
+  EXPECT_NE(t.find("billion"), std::string::npos) << "the scale contrast is the argument";
+  EXPECT_NE(t.find("Partitioning"), std::string::npos) << "the extreme case is the clearest one";
+}
+
+TEST_F(PostgresMCPServerTest, APromptSubstitutesItsArguments) {
+  json r = rpc1(*srv, "prompts/get",
+                {{"name", "bloat-and-vacuum-review"}, {"arguments", {{"schema", "grocery"}}}});
+  ASSERT_TRUE(r["result"].contains("messages")) << r.dump(2);
+  const std::string text =
+      r["result"]["messages"][0]["content"]["text"].get<std::string>();
+  EXPECT_NE(text.find("grocery"), std::string::npos);
+  // The template exists to encode an order of investigation, so it must name
+  // the step that is most often skipped.
+  EXPECT_NE(text.find("replicationSlots"), std::string::npos)
+      << "the bloat prompt must send the model to check the slot first";
+}
+
+TEST_F(PostgresMCPServerTest, APromptFallsBackWhenAnOptionalArgumentIsOmitted) {
+  json r = rpc1(*srv, "prompts/get", {{"name", "bloat-and-vacuum-review"}});
+  ASSERT_TRUE(r["result"].contains("messages")) << r.dump(2);
+  EXPECT_NE(r["result"]["messages"][0]["content"]["text"].get<std::string>().find("public"),
+            std::string::npos);
+}
+
+TEST_F(PostgresMCPServerTest, APromptMissingARequiredArgumentIsRefused) {
+  json r = rpc1(*srv, "prompts/get", {{"name", "explain-and-fix"}, {"arguments", json::object()}});
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  EXPECT_EQ(r["error"]["code"], -32602);
+  EXPECT_NE(r["error"]["message"].get<std::string>().find("sql"), std::string::npos);
+
+  json unknown = rpc1(*srv, "prompts/get", {{"name", "no-such-prompt"}});
+  ASSERT_TRUE(unknown.contains("error"));
+  EXPECT_EQ(unknown["error"]["code"], -32602);
+}
+
+TEST_F(PostgresMCPServerTest, CompletionOffersConnectionsAndSchemas) {
+  json r = rpc1(*srv, "completion/complete",
+                {{"ref", {{"type", "ref/resource"}, {"uri", "pglicht://{conn}/schemas"}}},
+                 {"argument", {{"name", "conn"}, {"value", ""}}}});
+  const json& c = r["result"]["completion"];
+  ASSERT_TRUE(c["values"].is_array()) << r.dump(2);
+  EXPECT_EQ(c["values"][0], "default");
+  EXPECT_FALSE(c["hasMore"].get<bool>());
+
+  json sch = rpc1(*srv, "completion/complete",
+                  {{"ref", {{"type", "ref/resource"}, {"uri", "pglicht://{conn}/schema/{schema}"}}},
+                   {"argument", {{"name", "schema"}, {"value", "groc"}}}});
+  bool saw = false;
+  for (const auto& v : sch["result"]["completion"]["values"])
+    if (v == "grocery") saw = true;
+  EXPECT_TRUE(saw) << sch.dump(2);
+}
+
+TEST_F(PostgresMCPServerTest, CompletionNeverFailsTheSession) {
+  // A completion is a convenience. An argument it knows nothing about, or a
+  // catalog it cannot read, returns an empty list rather than an error.
+  json r = rpc1(*srv, "completion/complete",
+                {{"ref", {{"type", "ref/prompt"}, {"name", "capacity-check"}}},
+                 {"argument", {{"name", "something_unknown"}, {"value", "x"}}}});
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  EXPECT_TRUE(r["result"]["completion"]["values"].is_array());
+  EXPECT_EQ(r["result"]["completion"]["values"].size(), 0u);
+}
+
 TEST_F(PostgresMCPServerTest, TitlesAppearOnlyFromTheRevisionThatDefinedThem) {
   json tools = srv->call_tools_list("2025-06-18");
   bool checked = false;
@@ -3822,6 +4640,280 @@ TEST_F(PostgresMCPServerTest, BufferCacheToolsNameTheExtensionWhenItIsAbsent) {
   }
   pqxx::nontransaction n(*admin_conn);
   n.exec("DROP DATABASE \"" + other + "\" WITH (FORCE)");
+}
+
+TEST_F(PostgresMCPServerTest, EverySessionEndsInRollbackAndLeavesNothing) {
+  // Everything here is read-only, so there is nothing a commit could preserve,
+  // and ending in ROLLBACK makes "the server is as you found it" provable
+  // rather than incidental. Asserted through a temporary table, which is the
+  // one thing a committed transaction would leave visible to the next
+  // connection.
+  pqxx::connection probe(test_url);
+  {
+    pqxx::work w(probe);
+    w.exec("CREATE TABLE grocery.rollback_probe (x int)");
+    w.commit();
+  }
+  const size_t before = srv->call_tables("grocery").size();
+  // Exercise a spread of tools, including the ones that set transaction-scoped
+  // state of their own.
+  srv->call_table("grocery", "users");
+  srv->call_table_stats("grocery", "users");
+  srv->call_explain_query("", "SELECT 1", json::array(), false, 0);
+  srv->call_check_privileges();
+  EXPECT_EQ(srv->call_tables("grocery").size(), before);
+
+  pqxx::work w(probe);
+  // Still exactly one row in pg_class for it: nothing this server did created
+  // or dropped anything.
+  EXPECT_EQ(w.exec("SELECT count(*) FROM pg_class WHERE relname = 'rollback_probe'")[0][0]
+              .as<int>(), 1);
+  w.exec("DROP TABLE grocery.rollback_probe");
+  w.commit();
+}
+
+// --- evaluateIndex (hypopg) ---
+
+namespace {
+bool hypopg_available(PostgresMCPServer& s) {
+  json r = s.call_evaluate_index("SELECT 1", json::array({"CREATE INDEX ON grocery.users (name)"}),
+                                 json::array());
+  const bool present = !(r.contains("error") &&
+                         r["error"].get<std::string>().find("not installed") != std::string::npos);
+  // On a developer machine a missing hypopg is a reason to skip. In CI it is
+  // installed on purpose -- the pooled job is the only place the reset bracket
+  // can be proved -- so there a skip would mean something broke while looking
+  // exactly like something merely absent. PGLICHT_REQUIRE_HYPOPG turns that
+  // silence into a failure.
+  if (!present && std::getenv("PGLICHT_REQUIRE_HYPOPG"))
+    ADD_FAILURE() << "PGLICHT_REQUIRE_HYPOPG is set but hypopg is not installed: "
+                  << r.dump();
+  return present;
+}
+}  // namespace
+
+TEST_F(PostgresMCPServerTest, EvaluateIndexShowsWhetherThePlannerWouldUseIt) {
+  if (!hypopg_available(*srv)) GTEST_SKIP() << "hypopg is not installed here";
+  json r = srv->call_evaluate_index(
+      "SELECT id FROM grocery.orders WHERE amount = 10",
+      json::array({"CREATE INDEX ON grocery.orders (amount)"}), json::array());
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  ASSERT_EQ(r["indexes"].size(), 1u);
+  // "used" is the point of the tool: a proposed index the planner ignores is
+  // the common case, and a cost figure alone hides it.
+  EXPECT_TRUE(r["indexes"][0].contains("used"));
+  EXPECT_TRUE(r["indexes"][0]["used"].is_boolean());
+  EXPECT_TRUE(r["indexes"][0].contains("estimated_size"));
+  EXPECT_TRUE(r["baseline"].contains("plan"));
+  EXPECT_TRUE(r["hypothetical"].contains("plan"));
+  EXPECT_GT(r["baseline"]["total_cost"].get<double>(), 0.0);
+}
+
+TEST_F(PostgresMCPServerTest, EvaluateIndexBuildsNothingAndKeepsTheGuard) {
+  if (!hypopg_available(*srv)) GTEST_SKIP() << "hypopg is not installed here";
+  const std::string before = srv->call_table("grocery", "orders")["indexes"].dump();
+  srv->call_evaluate_index("SELECT id FROM grocery.orders WHERE amount = 10",
+                           json::array({"CREATE INDEX ON grocery.orders (amount)"}),
+                           json::array());
+  // Nothing was built: a hypothetical index exists only in backend memory.
+  EXPECT_EQ(srv->call_table("grocery", "orders")["indexes"].dump(), before);
+  // And the read-only guard is untouched by having planned against one.
+  json r = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                          {"params", {{"name", "explainQuery"},
+                                      {"arguments", {{"sql", "SELECT 1"}}}}}});
+  EXPECT_FALSE(r["result"]["isError"].get<bool>()) << r.dump(2);
+}
+
+TEST_F(PostgresMCPServerTest, AHypotheticalIndexDoesNotLeakToTheNextCall) {
+  // The reason the reset bracket exists. Measured against hypopg 1.4.3: a
+  // hypothetical index survives ROLLBACK, survives into a new transaction, and
+  // survives DISCARD ALL -- which is exactly what PgBouncer issues as
+  // server_reset_query. Behind a transaction pooler that means one caller's
+  // hypothetical index would reshape the next caller's plans, silently.
+  //
+  // A direct connection is fresh every call, so this can only ever fail behind
+  // the pooler; it passes trivially otherwise rather than failing spuriously.
+  if (!hypopg_available(*srv)) GTEST_SKIP() << "hypopg is not installed here";
+  const char* sql = "SELECT id FROM grocery.orders WHERE amount = 10";
+
+  json first = srv->call_evaluate_index(
+      sql, json::array({"CREATE INDEX ON grocery.orders (amount)"}), json::array());
+  ASSERT_FALSE(first.contains("error")) << first.dump(2);
+  const double baseline = first["baseline"]["total_cost"].get<double>();
+
+  // A second call must see the same baseline. If the first call's index had
+  // leaked onto the backend, this baseline would already be planning with it.
+  for (int i = 0; i < 3; i++) {
+    json again = srv->call_evaluate_index(
+        sql, json::array({"CREATE INDEX ON grocery.orders (id)"}), json::array());
+    ASSERT_FALSE(again.contains("error")) << again.dump(2);
+    EXPECT_DOUBLE_EQ(again["baseline"]["total_cost"].get<double>(), baseline)
+        << "a hypothetical index leaked onto a pooled backend";
+    EXPECT_EQ(again["indexes"].size(), 1u) << "a previous call's index is still present";
+  }
+  // And an ordinary explain must not be planning against one either.
+  json plain = srv->call_explain_query("", sql, json::array(), false, 0);
+  EXPECT_EQ(plain.dump().find("btree_orders"), std::string::npos)
+      << "explainQuery is planning against a leaked hypothetical index";
+}
+
+TEST_F(PostgresMCPServerTest, EvaluateIndexAnswersWhetherAnIndexIsSafeToDrop) {
+  if (!hypopg_available(*srv)) GTEST_SKIP() << "hypopg is not installed here";
+  // The fixture tables are a handful of rows, where a sequential scan costs the
+  // same as an index scan and hiding the index changes nothing. The signal only
+  // exists once the table is big enough for the planner to care.
+  {
+    pqxx::connection c(test_url);
+    pqxx::nontransaction n(c);
+    n.exec("DROP TABLE IF EXISTS grocery.hypo_probe");
+    n.exec("CREATE TABLE grocery.hypo_probe (id bigint PRIMARY KEY, pad text)");
+    n.exec("INSERT INTO grocery.hypo_probe "
+           "SELECT g, repeat('x', 80) FROM generate_series(1, 20000) g");
+    n.exec("ANALYZE grocery.hypo_probe");
+  }
+  json r = srv->call_evaluate_index("SELECT pad FROM grocery.hypo_probe WHERE id = 4242",
+                                    json::array(), json::array({"grocery.hypo_probe_pkey"}));
+  if (r.contains("error") &&
+      r["error"].get<std::string>().find("1.4.0") != std::string::npos) {
+    pqxx::connection c(test_url);
+    pqxx::nontransaction n(c);
+    n.exec("DROP TABLE IF EXISTS grocery.hypo_probe");
+    GTEST_SKIP() << "hypopg predates hypopg_hide_index";
+  }
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  ASSERT_TRUE(r.contains("hidden"));
+  // Hiding the primary key must make the plan worse; that is the whole signal
+  // that the index is not safe to drop.
+  EXPECT_GT(r["hypothetical"]["total_cost"].get<double>(),
+            r["baseline"]["total_cost"].get<double>()) << r["baseline"].dump();
+  {
+    pqxx::connection c(test_url);
+    pqxx::nontransaction n(c);
+    n.exec("DROP TABLE IF EXISTS grocery.hypo_probe");
+  }
+}
+
+TEST_F(PostgresMCPServerTest, EvaluateIndexRefusesAnUnknownIndexClearly) {
+  if (!hypopg_available(*srv)) GTEST_SKIP() << "hypopg is not installed here";
+  json r = srv->call_evaluate_index("SELECT 1", json::array(),
+                                    json::array({"no_such_index_xyz"}));
+  if (r.value("error", "").find("1.4.0") != std::string::npos) GTEST_SKIP();
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  // Named, not a raw server error leaked through.
+  EXPECT_NE(r["error"].get<std::string>().find("no index named"), std::string::npos)
+      << r.dump(2);
+}
+
+TEST_F(PostgresMCPServerTest, EvaluateIndexNeedsSomethingToEvaluate) {
+  json r = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                          {"params", {{"name", "evaluateIndex"},
+                                      {"arguments", {{"sql", "SELECT 1"}}}}}});
+  EXPECT_TRUE(r["result"]["isError"].get<bool>()) << r.dump(2);
+}
+
+TEST_F(PostgresMCPServerTest, EvaluateIndexIsNeverSwept) {
+  // Same reasoning as explainQuery: the statement is rarely valid elsewhere.
+  json tools = srv->call_tools_list();
+  for (const auto& t : tools) {
+    if (t.value("name", "") != "evaluateIndex") continue;
+    EXPECT_FALSE(t["inputSchema"]["properties"].contains("instance"));
+    EXPECT_FALSE(t["inputSchema"]["properties"].contains("replication_group"));
+    EXPECT_FALSE(t["inputSchema"]["properties"].contains("group"));
+  }
+}
+
+// --- checkPrivileges ---
+
+TEST_F(PostgresMCPServerTest, CheckPrivilegesCountsEveryToolExactlyOnce) {
+  json r = srv->call_check_privileges();
+  ASSERT_TRUE(r.contains("tools")) << r.dump(2);
+  const size_t total    = r["tools"].get<size_t>();
+  const size_t avail    = r["available"].get<size_t>();
+  const size_t degraded = r.contains("degraded") ? r["degraded"].size() : 0;
+  const size_t denied   = r.contains("denied")   ? r["denied"].size()   : 0;
+  // Tools absent from both lists are fully available, so the arithmetic has to
+  // close or the count is telling the caller something untrue.
+  EXPECT_EQ(avail + degraded + denied, total);
+  EXPECT_EQ(total, srv->call_tools_list().size());
+  EXPECT_EQ(r["connection"].get<std::string>(), "default");
+  EXPECT_FALSE(r["role"].get<std::string>().empty());
+}
+
+TEST_F(PostgresMCPServerTest, CheckPrivilegesNamesNoRolesAndNoGrants) {
+  // Which predefined role gates a tool is PostgreSQL's business; the caller
+  // needs to know what works. And emitting DDL would contradict what this
+  // server tells every client about itself -- plans verbatim, no heuristics,
+  // no generated DDL -- so an unavailable tool is described, never prescribed.
+  const std::string dump = srv->call_check_privileges().dump();
+  EXPECT_EQ(dump.find("GRANT"), std::string::npos) << dump;
+  EXPECT_EQ(dump.find("memberships"), std::string::npos);
+  for (const char* role : {"pg_monitor", "pg_read_all_stats", "pg_read_all_data",
+                           "pg_stat_scan_tables", "pg_read_all_settings"})
+    EXPECT_EQ(dump.find(role), std::string::npos) << role << " leaked into the payload";
+}
+
+TEST_F(PostgresMCPServerTest, CheckPrivilegesSeparatesNotInstalledFromNotPermitted) {
+  // Two different fixes for the operator: CREATE EXTENSION versus a grant.
+  // Conflating them is the same defect the 42501 handling fixed in 3.2.0.
+  json r = srv->call_check_privileges();
+  for (const auto& d : r.value("denied", json::array())) {
+    const std::string reason = d["reason"].get<std::string>();
+    const bool classified = reason.find("not installed") != std::string::npos ||
+                            reason.find("restricted to") != std::string::npos ||
+                            reason.find("readable only by") != std::string::npos;
+    EXPECT_TRUE(classified) << d["tool"] << ": " << reason;
+  }
+}
+
+TEST_F(PostgresMCPServerTest, CheckPrivilegesReportsARestrictedRoleAccurately) {
+  const std::string role = "licht_cp_" + std::to_string(getpid());
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+    n.exec("CREATE ROLE \"" + role + "\" LOGIN");
+  }
+  const std::string url = std::regex_replace(
+      test_url, std::regex(R"(\buser\s*=\s*\S+)"), "") + " user=" + role;
+
+  // Same two ways this cannot be exercised as the buffer-cache test: peer auth
+  // refuses the login, and a pooler with a forced user hands back the
+  // superuser's session whichever role was asked for.
+  bool usable = false;
+  try {
+    pqxx::connection probe(url);
+    pqxx::work t(probe);
+    usable = (t.exec("SELECT current_user")[0][0].as<std::string>() == role);
+  } catch (const std::exception&) {
+  }
+
+  if (usable) {
+    PostgresMCPServer unpriv{url};
+    json r = unpriv.call_check_privileges();
+    EXPECT_EQ(r["role"].get<std::string>(), role);
+
+    std::set<std::string> degraded, denied;
+    for (const auto& d : r.value("degraded", json::array())) degraded.insert(d["tool"]);
+    for (const auto& d : r.value("denied", json::array()))   denied.insert(d["tool"]);
+
+    // The three that read row data are degraded, never denied: privilege is
+    // per object, so this role may still hold SELECT on some tables. Calling
+    // them unavailable would be as wrong as calling them available.
+    for (const char* t : {"tableStats", "checkKey", "explainQuery"}) {
+      EXPECT_TRUE(degraded.count(t)) << t << " should be degraded for a bare role";
+      EXPECT_FALSE(denied.count(t)) << t << " is per-object, so it cannot be denied outright";
+    }
+    // pgstattuple is installed by the fixture, so this is a privilege denial
+    // rather than an absent extension.
+    EXPECT_TRUE(denied.count("tableBloat"));
+    EXPECT_NE(r["available"].get<size_t>(), r["tools"].get<size_t>());
+    // The catalog is world-readable, so the great majority still works.
+    EXPECT_GT(r["available"].get<size_t>(), r["tools"].get<size_t>() * 3 / 4);
+  } else {
+    GTEST_SKIP() << "cannot log in as an unprivileged role here";
+  }
+
+  pqxx::nontransaction n(*admin_conn);
+  n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
 }
 
 TEST_F(PostgresMCPServerTest, BufferCacheDeniedNamesTheGrantRatherThanTheExtension) {
@@ -4112,7 +5204,7 @@ TEST_F(TopologyFixture, ListTopologyCarriesInstanceCapacity) {
 TEST_F(TopologyFixture, ListConnectionsCarriesTopologyLabels) {
   auto s = server_from(ini_with(
       "instance = pg-01\nreplication_group = ha\ngroup = prod, billing\n"));
-  json c = s->call_connections();
+  json c = s->call_connections()["connections"];
   ASSERT_EQ(c.size(), 1u);
   EXPECT_EQ(c[0]["instance"], "pg-01");
   EXPECT_EQ(c[0]["instance_source"], "declared");
@@ -4237,21 +5329,13 @@ TEST_F(TopologyFixture, VerifyTopologyRejectsAStandbyDeclaredAsTheSameInstance) 
 
 // --- dual-era protocol ---
 
-namespace {
-
-const char* kProtoVersion  = "io.modelcontextprotocol/protocolVersion";
-const char* kProtoCaps     = "io.modelcontextprotocol/clientCapabilities";
-const char* kProtoSrvInfo  = "io.modelcontextprotocol/serverInfo";
-
-json modern_meta(const std::string& version = "2026-07-28") {
-  return {{kProtoVersion, version}, {kProtoCaps, json::object()}};
-}
-
-}  // namespace
 
 TEST_F(PostgresMCPServerTest, TheSameCallDrivenBothWaysReturnsIdenticalContent) {
-  // The compatibility claim of the whole release, made checkable: the payload
-  // a client reads must not depend on which era it spoke.
+  // Through 3.2.1 this asserted that the two eras returned identical `content`.
+  // 4.0.0 changes the carrier deliberately -- a client that negotiated
+  // 2025-06-18 receives structuredContent and no text block -- so what has to
+  // hold now is that the *payload* is the same either way, which is the claim
+  // that actually mattered.
   json legacy = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
                                {"params", {{"name", "listSchemas"},
                                            {"arguments", json::object()}}}});
@@ -4259,15 +5343,99 @@ TEST_F(PostgresMCPServerTest, TheSameCallDrivenBothWaysReturnsIdenticalContent) 
                                {"params", {{"name", "listSchemas"},
                                            {"arguments", json::object()},
                                            {"_meta", modern_meta()}}}});
-  EXPECT_EQ(legacy["result"]["content"], modern["result"]["content"]);
+  auto payload_of = [](const json& r) {
+    const json& res = r["result"];
+    if (res.contains("structuredContent")) return res["structuredContent"];
+    return json::parse(res["content"][0]["text"].get<std::string>());
+  };
+  EXPECT_EQ(payload_of(legacy), payload_of(modern));
+}
+
+TEST_F(PostgresMCPServerTest, NeitherEraReceivesBothFormats) {
+  // The point of the change: sending both would serialise the same payload
+  // twice in one response, and a client that feeds tool results into a model
+  // may inject both. Exactly one carrier, every time.
+  json legacy = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                               {"params", {{"name", "listSchemas"},
+                                           {"arguments", json::object()}}}});
+  EXPECT_TRUE(legacy["result"].contains("content"));
+  EXPECT_FALSE(legacy["result"].contains("structuredContent"));
+
+  json modern = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 2}, {"method", "tools/call"},
+                               {"params", {{"name", "listSchemas"},
+                                           {"arguments", json::object()},
+                                           {"_meta", modern_meta()}}}});
+  EXPECT_TRUE(modern["result"].contains("structuredContent"));
+  EXPECT_FALSE(modern["result"].contains("content"));
+}
+
+TEST_F(PostgresMCPServerTest, StructuredContentStartsAtTheRevisionThatDefinedIt) {
+  // 2025-03-26 brought annotations but not structuredContent, so a client
+  // there must still get the text block. The boundary is the revision that
+  // defined the feature, not "modern versus legacy".
+  for (const auto& [proto, structured] :
+       std::vector<std::pair<std::string, bool>>{{"2024-11-05", false},
+                                                 {"2025-03-26", false},
+                                                 {"2025-06-18", true},
+                                                 {"2025-11-25", true}}) {
+    PostgresMCPServer s(test_url);
+    s.call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"},
+                {"params", {{"protocolVersion", proto},
+                            {"capabilities", json::object()},
+                            {"clientInfo", {{"name", "t"}, {"version", "0"}}}}}});
+    json r = s.call_rpc({{"jsonrpc", "2.0"}, {"id", 2}, {"method", "tools/call"},
+                         {"params", {{"name", "listSchemas"},
+                                     {"arguments", json::object()}}}});
+    EXPECT_EQ(r["result"].contains("structuredContent"), structured) << proto;
+    EXPECT_EQ(r["result"].contains("content"), !structured) << proto;
+  }
+}
+
+TEST_F(PostgresMCPServerTest, TheTextBlockIsSerialisedCompactly) {
+  // Indentation was 18-39% of the payload across real catalog reads, and no
+  // consumer reads it -- they all parse the text as JSON.
+  json r = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                          {"params", {{"name", "listTables"},
+                                      {"arguments", {{"schema", "grocery"}}}}}});
+  const std::string text = r["result"]["content"][0]["text"].get<std::string>();
+  EXPECT_EQ(text.find("\n"), std::string::npos) << "text block is still pretty-printed";
+  // Still valid JSON, and still the same payload.
+  json reparsed;
+  ASSERT_NO_THROW(reparsed = json::parse(text));
+  EXPECT_TRUE(reparsed.is_object());
+}
+
+TEST_F(PostgresMCPServerTest, EveryToolPayloadIsAnObject) {
+  // structuredContent may only be a JSON object. A tool returning a top-level
+  // array or null is unrepresentable in the format modern clients receive, so
+  // this is an invariant now rather than a coincidence. currentLocks and
+  // listConnections were the two arrays; an empty result set was the null.
+  for (const auto& [tool, args] : std::vector<std::pair<std::string, json>>{
+           {"listConnections", json::object()},
+           {"currentLocks", json::object()},
+           {"listSchemas", json::object()},
+           {"listEnums", {{"schema", "pg_catalog"}}},   // empty result set
+           {"listTables", {{"schema", "grocery"}}}}) {
+    json r = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                            {"params", {{"name", tool},
+                                        {"arguments", args},
+                                        {"_meta", modern_meta()}}}});
+    ASSERT_TRUE(r["result"].contains("structuredContent")) << tool << r.dump(2);
+    EXPECT_TRUE(r["result"]["structuredContent"].is_object())
+        << tool << " returns a " << r["result"]["structuredContent"].type_name();
+  }
 }
 
 TEST_F(PostgresMCPServerTest, ALegacyResponseIsUnchangedFrom311) {
   json r = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
                           {"params", {{"name", "listSchemas"},
                                       {"arguments", json::object()}}}});
-  // Nothing new may appear in a legacy result, or the compatibility claim is
-  // assumed rather than proven.
+  // A legacy client keeps the text-block carrier and gains none of the
+  // modern-only result fields. It does *not* get 3.1.1's bytes any more:
+  // 4.0.0 compacted the serialisation and changed three payload shapes. That
+  // is the release being a major, not a regression -- but the envelope claim
+  // still has to hold, because a legacy client parses it.
+  EXPECT_TRUE(r["result"].contains("content"));
   EXPECT_FALSE(r["result"].contains("resultType"));
   EXPECT_FALSE(r["result"].contains("_meta"));
 }
@@ -4378,8 +5546,13 @@ json rpc_call(PostgresMCPServer& srv, const std::string& tool, json args) {
 }
 
 // The tool payload, unwrapped from the MCP text content block.
+// Era-aware: a modern client receives structuredContent and no text block, a
+// legacy one receives the text block and nothing else. Tests that only care
+// about the payload should not have to know which.
 json rpc_payload(const json& response) {
-  return json::parse(response["result"]["content"][0]["text"].get<std::string>());
+  const json& r = response["result"];
+  if (r.contains("structuredContent")) return r["structuredContent"];
+  return json::parse(r["content"][0]["text"].get<std::string>());
 }
 
 }  // namespace
@@ -4634,7 +5807,7 @@ TEST_F(TopologyFixture, SweepArgumentsAreAdvertisedOnlyWhereTheyApply) {
 TEST_F(PostgresMCPServerTest, ListConnectionsOmitsTopologyWhenNoneIsConfigured) {
   // A DATABASE_URL deployment has one connection and no topology; the fields
   // must be absent rather than empty, so 3.1.1 output is unchanged.
-  json c = srv->call_connections();
+  json c = srv->call_connections()["connections"];
   ASSERT_EQ(c.size(), 1u);
   EXPECT_FALSE(c[0].contains("instance"));
   EXPECT_FALSE(c[0].contains("replication_group"));
@@ -4666,7 +5839,10 @@ TEST_F(PostgresMCPServerTest, EveryOtherToolTakesAConnectionArgument) {
 }
 
 TEST_F(PostgresMCPServerTest, ListConnectionsReportsDefaultWithoutSecrets) {
-  json result = srv->call_connections();
+  json envelope = srv->call_connections();
+  // 4.0.0: wrapped, for the same reason as currentLocks.
+  ASSERT_TRUE(envelope.is_object());
+  json result = envelope["connections"];
   ASSERT_TRUE(result.is_array());
   ASSERT_EQ(result.size(), 1u);
   EXPECT_EQ(result[0]["name"].get<std::string>(), "default");

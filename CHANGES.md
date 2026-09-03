@@ -1,5 +1,458 @@
 # Changelog
 
+## 4.0.0 (2026-09-02)
+
+A breaking release, and the first since 3.0.0. It closes the roadmap: the
+statistics split, structured output, and the resources and prompts that were
+waiting on both. No configuration file needs an edit, and the connection
+registry and CLI flags are untouched.
+
+Two themes. The first is **volatility** — separating what changes only on DDL
+from what changes continuously, which is what makes the sweep classification
+correct and makes resources possible at all. The second is **one format per
+client**: a client that negotiated `2025-06-18` now receives `structuredContent`
+and no text block, which cuts 27–46% off the bytes of a typical call.
+
+The reason for the break is not the fields. `listTables`, `searchTables` and
+`tableDetails` each returned two unrelated kinds of thing in one payload — the
+shape of an object, which changes when someone issues DDL, and readings taken
+off it, which change continuously — and that made all three
+`per_server: true` in the sweep classification. A `replication_group` sweep of
+`tableDetails` therefore re-ran the entire structural payload (columns,
+constraints, triggers, policies, view definitions) once per replica to get
+byte-identical results back. Structure is replicated verbatim by definition;
+only the counters legitimately differ. Splitting the tools is what lets the
+classification be correct, and the classification is keyed on tool *name*, so
+no argument or flag could have fixed it.
+
+### Breaking
+
+- **`listTables`, `searchTables` and `tableDetails` return structure only.**
+  Every reading moved out. Where each field went:
+
+  | field | was on | now on |
+  |---|---|---|
+  | `rows` | all three | `tableStats`, `listTableStats` |
+  | `size` | `listTables`, `searchTables` (from `relpages`) | `tableStats`, `listTableStats` as **`size_estimate`** |
+  | `size`, `indexes_size` | `tableDetails` (measured) | `tableSize` |
+  | `seq_scan`, `idx_scan` | all three | `tableStats`, `listTableStats` |
+  | `n_live_tup`, `n_dead_tup` | all three | `tableStats`, `listTableStats` |
+  | `n_mod_since_analyze`, `n_ins_since_vacuum` | all three | `tableStats`, `listTableStats` |
+  | `last_vacuum`, `last_analyze` | all three | `tableStats`, `listTableStats` |
+  | `n_tup_newpage_upd`, `last_seq_scan` (16+) | all three | `tableStats`, `listTableStats` |
+  | `columns.*.null_frac`, `avg_width`, `n_distinct`, `physical_order_correlation`, `most_common_vals`, `most_common_freqs` | `tableDetails` | `tableStats` |
+  | `indexes.*.index_uses`, `last_use` | `tableDetails` | `tableStats` |
+  | `indexes.*.size` | `tableDetails` | `tableSize` |
+  | `toast.size`, `toast.index_size` | `tableDetails` | `tableSize` |
+
+  `toast.name` stays on `tableDetails`, so it still answers whether a table
+  stores anything out of line. `reloptions` stays: it is DDL.
+
+- **`size` is now `size_estimate` on the statistics tools, and it is not the
+  same number.** It is `relpages * 8192`, which is only as fresh as the last
+  vacuum or analyze — on a table that has doubled since, it is half the truth.
+  The rename is deliberate: the old field had the same name in `listTables`
+  (estimated) and `tableDetails` (measured), and callers had no way to tell.
+  An `estimated_from` timestamp now carries the reading that produced it, and
+  `tableSize` is where a measured number comes from.
+
+- **`tableDetails` no longer returns sampled column values.**
+  `most_common_vals` is literal data out of the column — on a customers table,
+  customer names — and it was returned by the tool an agent calls most often
+  to inspect structure, which the README describes as querying the catalog
+  "to inspect the structure (lower risk to leak data)". It is now on
+  `tableStats` alone, and that tool's description says what it contains.
+
+- **Every tool payload is a JSON object.** `structuredContent` may only be an
+  object, so two shapes that were legal before are not any more:
+
+  - **`listConnections` returns `{connections: [...]}`** and **`currentLocks`
+    returns `{locks: [...]}`**, where both previously returned a bare array.
+    This is the same fix, for the same reason, that 3.0.0 applied to
+    `statementStats`.
+  - **An empty result is `{}`, not `null`.** Any tool whose query matched no
+    rows previously returned JSON `null`. Beyond being unrepresentable as
+    structured content, `{}` is the better answer: `null` reads as "the tool
+    failed", `{}` says "nothing there".
+
+### Output format
+
+- **A client that negotiated `2025-06-18` or later receives `structuredContent`
+  and no `content` text block.** A client on an earlier revision receives the
+  text block and no `structuredContent`. Never both.
+
+  The spec suggests serving both for backwards compatibility, and this
+  deliberately does not. Sending both serialises the same payload twice in one
+  response, and a client that feeds tool results into a model's context may
+  inject both — doubling the tokens on every call. The compatibility that
+  suggestion protects is already covered by the negotiated revision: a client
+  that cannot read `structuredContent` does not ask for a revision that has it.
+  This is the rule 3.2.0 settled on for `annotations` and `title` — a
+  protocol-revision feature reaches only a client that negotiated the revision
+  defining it.
+
+  If you have a client that advertises `2025-06-18` but only reads `content`,
+  pin it to `2025-03-26` and it keeps working unchanged.
+
+- **The text block is serialised compactly.** It was pretty-printed with
+  two-space indentation, which measured 18–39% of the payload across real
+  catalog reads and which no consumer reads — every one parses the text as
+  JSON. Combined with dropping the duplicate block, a modern client's wire
+  bytes fall by 27–46%:
+
+  | call | 3.2.1 | 4.0.0 | saved |
+  |---|---:|---:|---:|
+  | `listTables pg_catalog` | 163,225 B | 88,312 B | 45.9% |
+  | `tableDetails pg_catalog.pg_class` | 8,656 B | 5,158 B | 40.4% |
+  | `listTableStats pg_catalog` | 58,502 B | 40,040 B | 31.6% |
+  | `listFunctions pg_catalog` | 1,126,238 B | 819,030 B | 27.3% |
+
+- **Errors stay a text block in both eras.** `structuredContent` is the format
+  for a tool's answer; an error is a message about why there is no answer, and
+  the spec pairs `isError` with `content`.
+
+- **`outputSchema` is declared for all 58 tools**, to clients that negotiated
+  `2025-06-18`. The schemas are deliberately permissive — they type the keys
+  that are unconditional, mark nothing `required`, and allow additional
+  properties. This is the design, not a shortcut: payloads here are
+  version-conditional (`tableStats` gains two fields on PostgreSQL 16), every
+  tool may answer `{error, hint}` when an extension is absent, and a client
+  that validates against a schema turns any drift into a failed call. A schema
+  that can describe but never reject is the only safe kind here. A test walks
+  real payloads from 35 tools against their declared schema on every run, which
+  already caught one wrong type before release.
+
+### Caching hints and pagination
+
+Both are required or supported by revision `2026-07-28` and were previously
+absent. Both are gated on `resultType: "complete"` — that is, on the modern
+era — for the same reason `resultType` itself is.
+
+- **`ttlMs` and `cacheScope`** now accompany every result the caching utility
+  names as cacheable: `server/discover`, `tools/list`, `prompts/list`,
+  `resources/list`, `resources/templates/list` and `resources/read`. The spec
+  says a client SHOULD treat a result with no `ttlMs` as immediately stale, so
+  their absence meant **`tools/list` — about 93 kB once 58 tools carry
+  descriptions, annotations, titles and output schemas — was re-fetched
+  whenever a client needed the tool list.** That payload is entirely static,
+  and it grew in this release.
+
+  | result | `ttlMs` | `cacheScope` |
+  |---|---:|---|
+  | `server/discover` | 1 h | `public` |
+  | `tools/list` | 1 h | `private` |
+  | `prompts/list` | 1 h | `public` |
+  | `resources/templates/list` | 1 h | `public` |
+  | `resources/list` | 1 min | `private` |
+  | `resources/read` | 1 min | `private` |
+
+  An hour for anything compiled in or read from the config at startup: none of
+  it can change while the process lives, and no `listChanged` capability is
+  declared, so there is no mechanism by which it could. A minute for anything
+  read from a live catalog — structure changes only on DDL, which is the
+  premise of serving it as a resource, but DDL does happen.
+
+  `tools/list` is `private` rather than `public` for two independent reasons.
+  Its content varies by negotiated revision (`annotations`, `title` and
+  `outputSchema` are each gated) while the cache key is the method and its
+  params, and the revision travels in `_meta`; and the `connection` property
+  description carries the operator's configured default connection name.
+  Neither belongs in a cache a shared gateway may serve to another caller. A
+  private cache still gives the calling client the full benefit, which is where
+  the saving actually lands.
+
+- **Pagination** (`cursor` in, `nextCursor` out) on `tools/list`,
+  `prompts/list`, `resources/list` and `resources/templates/list`. An invalid
+  cursor is rejected with `-32602`.
+
+  The page size is deliberately larger than any list this server currently
+  produces, so **nothing is truncated for a client that ignores `nextCursor`**
+  — 58 tools, 8 prompts and 5 templates are each a single page. The list that
+  can genuinely outgrow a page is `resources/list`, which is connections ×
+  schemas, and that is the case pagination exists for. Cursors are opaque and
+  stable.
+
+### New: resources, prompts and completions
+
+These were blocked on the statistics split, and are the reason it went first.
+Before it, `listTables` and `tableDetails` carried `n_dead_tup`, `last_vacuum`
+and `idx_scan` — serving them as documents would have invited a client to pin a
+number that moves under it.
+
+- **Resources** (`resources/list`, `resources/templates/list`,
+  `resources/read`) serve structure as documents under a per-connection URI
+  scheme:
+
+  ```
+  pglicht://{conn}/schemas
+  pglicht://{conn}/schema/{schema}
+  pglicht://{conn}/schema/{schema}/table/{table}
+  pglicht://{conn}/schema/{schema}/{functions,enums,types}
+  pglicht://{conn}/server/{roles,extensions,settings}
+  ```
+
+  `resources/list` is bounded: it enumerates connections and their schemas, and
+  exposes tables, functions, enums and types through templates instead — a
+  database with 10 000 tables would otherwise produce a 10 000-entry response
+  on a call clients make eagerly. Enumerating schemas costs one connection per
+  configured connection; one that cannot be reached is skipped rather than
+  failing the list. The topology axes are deliberately absent from the URI
+  space: a resource names exactly one object in one database, and partial
+  failure across members can only be reported per member, which belongs to
+  tools.
+
+  Readings stay tools. `currentActivity`, `currentLocks`, `statementStats`,
+  `progressStats`, `tableStats`, `tableSize`, `tableBloat`, `indexBloat`,
+  `wraparoundStatus`, `explainQuery` and both buffer-cache tools are
+  measurements, and the model must decide when to take them.
+
+- **Prompts** (`prompts/list`, `prompts/get`) — eight templates, each encoding
+  an order of investigation that is easy to get wrong. Static text with
+  argument substitution; they touch no database until the model acts on them.
+
+  | prompt | arguments |
+  |---|---|
+  | `diagnose-slow-query` | `query_id?`, `min_duration_s?` |
+  | `triage-lock-contention` | `connection?` |
+  | `bloat-and-vacuum-review` | `schema?` |
+  | `buffer-cache-review` | `connection?` |
+  | `capacity-check` | `connection?` |
+  | `replication-slot-review` | `connection?` |
+  | `plan-schema-change` | `change`, `schema?`, `table?` |
+  | `explain-and-fix` | `sql`, `params?` |
+
+  **`diagnose-slow-query` is the hub.** A slow statement can end in a plan fix,
+  a vacuum change, an index, or a schema change, so it now branches: if the
+  plan shows a sequential scan where an index exists, or an index scan fetching
+  far more heap pages than it returns rows, it routes to `tableBloat` and
+  `indexBloat`; if bloat is confirmed it routes to `bloat-and-vacuum-review`
+  rather than reaching for a REINDEX; and if the answer is DDL it routes to
+  `plan-schema-change`, because an index that is *correct* and an index that is
+  *safe to create on a live server* are different questions.
+
+  **`replication-slot-review`** is the runbook for the failure mode that
+  presents as something else: an unconsumed slot holds back the xmin horizon so
+  vacuum cannot remove dead tuples anywhere in the cluster, and pins WAL until
+  the disk fills. Both get diagnosed as bloat or as a disk problem. It reads
+  `wal_status` (`reserved` / `extended` / `unreserved` / `lost`), establishes
+  whose slot it is before proposing anything, weighs `max_slot_wal_keep_size`
+  against the disk, and treats dropping a slot as irreversible for its
+  consumer.
+
+  **`plan-schema-change`** answers "how should I apply this DDL here?" by
+  measuring the table rather than by prescribing a method. It deliberately
+  contains **no DDL recipes**. A model already knows what
+  `CREATE INDEX CONCURRENTLY` is; what it cannot know is this table's row
+  count, measured size, existing indexes and what is holding a lock right now,
+  and those are the only things that decide the answer.
+
+  The reason is that a recipe is wrong at one end of the scale. The same
+  statement that is instant on one table is an outage on another: a table with
+  no rows can be rewritten in place and nobody notices, while the same rewrite
+  at a billion rows is hours under an exclusive lock. Partitioning is the
+  extreme case — trivial before there is data, a migration with a cutover
+  after it. Reaching for the safest-at-scale approach on a small table is
+  machinery nobody needs; reaching for the simple one on a large table is the
+  outage.
+
+  So the prompt sends the model to measure — and to measure **every object the
+  change touches, not only the one named**. A statement that names one table
+  routinely locks more than one: a foreign key locks the table it references as
+  well as the table it is added to, a partitioned table means the parent and
+  every partition, and the object you did not name is often the busier one.
+  The readings are `tableStats` for rows and `most_common_vals`, `tableSize`
+  for what a rewrite would move, `tableDetails` for the indexes and constraints
+  that multiply it and for foreign keys in both directions, `currentActivity`
+  and `currentLocks` for the oldest transaction and anything already queued on
+  any of those objects, `replicationSlots` if it rewrites — then asks it to classify the change as metadata-only, a scan,
+  or a full rewrite, and to state **the size at which its answer would flip**,
+  so the reasoning can be checked against a different table later. It also
+  insists that lock *level* settles nothing on its own: a strong lock held for
+  a millisecond is safe and a weak one held for an hour may not be, and
+  duration comes from the measurements.
+
+  **`diagnose-slow-query` and `explain-and-fix` now choose the *kind* of fix
+  rather than defaulting to DDL.** Both end by classifying the remedy as one of
+  four — a query rewrite, a statistics fix, a configuration change, or DDL —
+  and preferring them in that order, because that is the order of what they
+  cost: an `ANALYZE` is free and instant, a rewrite costs a deploy and nothing
+  in the database, configuration changes the behaviour of every other query
+  too, and an index is a write cost paid by every `INSERT` and `UPDATE` for as
+  long as it exists to buy speed for one read pattern. They must say why the
+  cheaper options were rejected rather than passing over them.
+
+  They then verify what can be verified, which is an asymmetry this server can
+  actually exploit: a rewrite is checkable on the spot — call `explainQuery` on
+  the rewritten statement and show the plan changed — while an index's benefit
+  is a prediction, and must be presented as one. Index creation is handed to
+  `plan-schema-change`, because whether an index is *correct* and whether it is
+  *safe to build on this server* are different questions.
+
+  **Every prompt whose core tools are privilege-gated now opens by calling
+  `checkPrivileges`.** A restricted role gets null statistics rather than an
+  error, so a plan built on tools that will not answer looks like it worked.
+
+- **Completions** (`completion/complete`) for the `conn`, `schema` and `table`
+  variables that appear in prompt arguments and resource templates, backed by
+  the queries that already exist. A completion is a convenience, so an argument
+  it does not know or a catalog it cannot read returns an empty list rather
+  than an error.
+
+- The `resources`, `prompts` and `completions` capabilities are declared in
+  both `initialize` and `server/discover`, so a modern client does not see a
+  smaller server than a legacy one.
+
+### New tools
+
+- **`evaluateIndex`** — plan a statement as if the indexes were different,
+  using [hypopg](https://github.com/HypoPG/hypopg). `create` takes
+  `CREATE INDEX` statements to plan against without building them; `hide` takes
+  the names of existing indexes to plan *without*, which is how to ask whether
+  an index is safe to drop — the question `duplicateIndexes` raises and cannot
+  settle, since neither redundancy nor a zero `idx_scan` proves the planner
+  would not miss it.
+
+  Nothing is built, no lock is taken, no catalog row is written, and the
+  statement is never executed: hypopg cannot serve `EXPLAIN ANALYZE`, so this
+  is plan-only and strictly safer than `explainQuery` with `analyze`. It
+  returns the plan and total cost before and after, and **for each index
+  whether the planner actually used it** — a proposed index the planner ignores
+  is the common case, and a cost figure alone hides it.
+
+  Measured on hypopg 1.4.3: a candidate index on a 200k-row table moved the
+  plan from a Seq Scan at cost 4970 to a Bitmap Index Scan at 2709; hiding a
+  primary key moved it the other way, 8.44 → 4970, which is the answer to "can
+  I drop this".
+
+  **The reset bracket is not optional, and this is the finding worth carrying
+  forward.** A hypothetical index lives in backend-local memory for the whole
+  session and is cleared by none of the things that would be expected to clear
+  it — measured: not `ROLLBACK`, not a new transaction, and **not `DISCARD
+  ALL`**, which is exactly what PgBouncer issues as `server_reset_query`. Only
+  `hypopg_reset()` removes it. Behind a transaction-mode pooler that would
+  leave one caller's hypothetical index on the backend, silently reshaping the
+  next caller's plans. So `hypopg_reset()` runs on the way in, protecting this
+  call from whatever a previous one left, and again on the way out through a
+  scope guard that survives an exception. A test asserts a second call's
+  baseline is unchanged — it can only fail behind the pooler, and passes
+  trivially without one.
+
+  `hide` needs hypopg 1.4.0+ and is gated on the extension version, not the
+  server version — the same treatment `pg_buffercache` needed, for the same
+  reason: the two move independently.
+
+- **`checkPrivileges`** — which tools the current role can actually use on this
+  connection, and how the rest fall short.
+
+  Most of this server works for any role that can connect, because the catalog
+  is world-readable. Measured on PostgreSQL 18: a bare `LOGIN` role with no
+  grants runs **47 of 58 tools** at full fidelity; the monitoring role takes
+  that to **54**; the three that remain are exactly the three that read row
+  data (`tableStats` histograms, `checkKey`, `explainQuery`).
+
+  The reason to ask once rather than discover it tool by tool is that the
+  discovery is misleading. `tableStats` on a role without `SELECT` returns
+  every column present with null statistics — byte-for-byte what a table that
+  was never analyzed looks like. `statementStats` returns rows whose query text
+  is `<insufficient privilege>`, with no count of what was hidden.
+
+  Three deliberate choices in the payload:
+
+  - **Tools absent from both lists are fully available**, and `available` is a
+    count rather than a list. Enumerating 53 working tool names would be most
+    of the payload, and the exceptions are the answer.
+  - **No role memberships and no `GRANT` statements.** Which predefined role
+    gates a tool is PostgreSQL's business; the caller needs to know what works.
+    And emitting DDL would contradict what this server tells every client about
+    itself — plans verbatim, no heuristics, no generated DDL. Naming a grant in
+    the hint of a tool that *failed* is diagnosis; listing grants beside every
+    unavailable tool is a standing recommendation to escalate privilege, which
+    is not this server's to make.
+  - **`denied` means the tool cannot answer at all; `degraded` means it answers
+    less.** The three row-data tools are always `degraded`, never `denied`,
+    because privilege there is per object — a role without blanket read access
+    may still hold `SELECT` on some tables and not others. Reporting them as
+    unavailable would be as wrong as reporting them as available.
+
+  It distinguishes an absent extension from a missing privilege, because those
+  send an operator to different fixes — the same defect the `42501` handling
+  corrected in 3.2.0.
+
+- **`tableStats`** and **`listTableStats`** — the readings, from
+  `pg_stat_user_tables`, `pg_stats` and the `pg_class` counters that ANALYZE
+  maintains. No relation is opened and no file is measured, so they cost a
+  catalog scan and nothing else. `tableStats` adds the per-column histograms
+  and per-index scan counts; `listTableStats` omits the histograms, because
+  `default_statistics_target` sample values for every column of every table in
+  a schema is a payload nobody asked for.
+
+  Both are `{per_database: true, per_server: true, primary_authoritative:
+  true}`: scan counts and dead tuples are each server's own, and vacuum only
+  runs on a primary. This is the half of the split that is worth sweeping, and
+  the reason to do it.
+
+- **`tableSize`** and **`listTableSizes`** — measured size, and the only place
+  a measured number now comes from. `tableSize` reports the main fork, table
+  size including TOAST and the free space and visibility maps, index size,
+  grand total, the TOAST relation, and each index individually;
+  `listTableSizes` reports table, index and total size for every relation in a
+  schema.
+
+  These are separate tools rather than a flag because of what they cost, and
+  the cost is not what it looks like. `pg_table_size()` and its relatives are
+  not physical reads — they `stat()` one file per 1 GB segment and read no
+  blocks. What makes them worth gating is the lock: each opens the relation
+  with `AccessShareLock`, so a table being rewritten by an `ALTER TABLE` holds
+  the call behind `AccessExclusiveLock` until `statement_timeout_ms` fires.
+  Across a schema that means the call stalls on precisely the table an
+  incident is about. A separate tool puts that warning in the description the
+  model reads while *choosing* a tool, rather than in an argument it reads
+  after having already chosen.
+
+  Both are `per_server: false`: the same files are measured on every member of
+  a replication group.
+
+### Changed
+
+- **Every session now ends in `ROLLBACK`, explicitly.** `pqxx::work` already
+  aborted an uncommitted transaction on destruction, so no behaviour changed —
+  but nothing here ever commits, every statement runs under
+  `SET TRANSACTION READ ONLY`, and stating it makes "the server is as you found
+  it" provable rather than incidental. A test asserts it across a spread of
+  tools.
+
+  One thing rollback does *not* undo, worth naming because the assumption is
+  natural: backend-local state set by an extension. A hypopg hypothetical index
+  survives `ROLLBACK`, the next transaction, and `DISCARD ALL`, which is why
+  `evaluateIndex` resets it explicitly.
+
+
+- **The sweep classification is corrected, which is the point of the
+  release.** `listTables`, `searchTables` and `tableDetails` are now
+  `{per_database: true, per_server: false, primary_authoritative: false}` and
+  no longer advertise `replication_group` or `role`; a sweep across replicas
+  is refused with the same reasoning `tableBloat` has always used. `tableSize`
+  and `listTableSizes` join them. `tableStats` and `listTableStats` take their
+  place on the per-server row.
+
+- **`tableDetails` is no longer version-conditional.** Every field it dropped
+  on PostgreSQL 14 and 15 was a statistic, so the `server_version()` probe and
+  the string-erase fixup that removed `last_idx_scan` from the finished query
+  are both gone. The gate lives in `tableStats` now, and is built by
+  concatenation rather than by erasing a literal — the old approach failed
+  silently if the literal ever drifted from the query.
+
+- `tableBloat`'s description pointed at "the ANALYZE-time estimates in
+  `listTables`/`tableDetails`"; it now points at `listTableStats`/`tableStats`.
+
+- `tableIOStats` and `tableStats` now cross-reference each other. They sit
+  next to each other alphabetically and report different views —
+  `pg_statio_all_tables` against `pg_stat_user_tables` — so each description
+  now says what the other one answers.
+
+- Tool count is 58, up from 52. The server now also serves 9 resource kinds,
+  5 resource templates and 8 prompts.
+
 ## 3.2.1 (2026-08-21)
 
 Three fixes to behaviour shipped in 3.2.0 and earlier. No payload shape
