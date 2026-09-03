@@ -130,6 +130,11 @@ jobs:
       # The suite reads cpp/test/connections.example.ini through a path baked
       # in at compile time, so the source tree has to be present even though
       # nothing here is compiled.
+      #
+      # These jobs talk to the stock postgres:NN image, which carries contrib
+      # but not hypopg, so the evaluateIndex tests skip here and are covered by
+      # the pooled job instead -- which is also the only place their pooling
+      # behaviour means anything.
       - uses: actions/checkout@v4
 
       - name: Install runtime dependencies
@@ -218,7 +223,17 @@ jobs:
         # bundled contrib extensions (pg_stat_statements, postgres_fdw,
         # pgstattuple, pg_buffercache) the fixtures install; pgbouncer is the
         # companion pooler.
-        run: .github/scripts/apt-pgdg.sh libpq5 postgresql-${{ matrix.pg }} pgbouncer
+        #
+        # hypopg is third-party rather than contrib, and it is installed only
+        # here. That is deliberate: this is the one job that runs behind a
+        # transaction-mode pooler, and the pooler is the only place the
+        # evaluateIndex reset bracket can be proved. A hypothetical index
+        # survives ROLLBACK, a new transaction and DISCARD ALL -- which is what
+        # PgBouncer issues as server_reset_query -- so without the reset one
+        # caller's hypothetical index reshapes the next caller's plans. The
+        # test for that passes vacuously on a direct connection.
+        run: .github/scripts/apt-pgdg.sh libpq5 postgresql-${{ matrix.pg }} \
+                                         postgresql-${{ matrix.pg }}-hypopg pgbouncer
 
       - uses: actions/download-artifact@v4
         with:
@@ -230,6 +245,11 @@ jobs:
           # Pin the cluster to the matrix version rather than letting the script
           # autodetect the newest one the runner happens to have installed.
           PG_BINDIR: /usr/lib/postgresql/${{ matrix.pg }}/bin
+          # The hypopg tests skip themselves when the extension is absent, which
+          # is right for a developer machine and wrong here: this job installs
+          # it, so a skip means something broke rather than something is
+          # missing. Turn the skip into a failure.
+          PGLICHT_REQUIRE_HYPOPG: "1"
         run: |
           chmod +x cpp/build/pg_licht_mcp_test
           cpp/test/run-pooled-tests.sh
