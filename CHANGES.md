@@ -1,6 +1,6 @@
 # Changelog
 
-## 4.1.1 (unreleased)
+## 4.1.1 (2026-09-04)
 
 A compatibility fix for the output format 4.0.0 introduced, and the escape
 hatch that release should have shipped with.
