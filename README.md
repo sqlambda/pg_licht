@@ -49,6 +49,27 @@ man pg_licht_mcp
 
 Other install channels — deb, rpm, tarball, source — are in [INSTALL.md](INSTALL.md).
 
+## Remote databases
+
+A tool call opens no connection of its own beyond the first: connections are
+held between calls and closed after 60 seconds idle, one per configured
+connection. Startup opens none at all — the registry is validated without
+touching the network, so one unreachable database no longer prevents the server
+from starting.
+
+Fan-out sweeps visit up to 16 members concurrently, one connection per server.
+A thirteen-member replication group that took 449 ms sequentially takes 91 ms.
+The payload stays in configuration order regardless of which member answers
+first.
+
+For databases across a WAN, a connection pooler in front of pg_licht is still
+worth running — it amortises the TLS handshake across restarts, and
+`server_idle_timeout` gives you the same idle policy at the pooler. Point every
+`connections.ini` entry at the local pooler and let its `[databases]` section
+carry the real hosts. Note that PgBouncer reads neither `.pgpass` nor
+`service=`, so that section has to be generated rather than shared, and in
+transaction mode it does not run `server_reset_query` at all by default.
+
 ## Output format
 
 A client that negotiates MCP revision `2025-06-18` or later receives

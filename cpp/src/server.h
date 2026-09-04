@@ -1,5 +1,9 @@
 #pragma once
 
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
 #include <functional>
 #include <cctype>
 #include <iostream>
@@ -53,57 +57,187 @@ inline pqxx::result pqxx_exec(pqxx::work& txn, const std::string& sql, P&& param
 // transaction pooler preserves. The GUC cannot be pushed into the connection
 // string either -- PgBouncer rejects it outright:
 //   FATAL: unsupported startup parameter in options: default_transaction_read_only
+// Live connections, keyed by the configured connection name, reused across
+// calls and closed once idle.
+//
+// Why this exists: every tool call used to open a connection and close it
+// again. Against a local socket that is free; against a remote database it is
+// the majority of what a call spends -- TCP, TLS and authentication, repeated
+// for the next call to the same database milliseconds later. Holding the
+// connection between calls removes all of it.
+//
+// The cache holds ONLY idle connections. Acquiring removes the entry;
+// releasing puts it back with a fresh timestamp. That is what makes the reaper
+// thread safe without an in-use flag and without a race to get wrong: a
+// connection being used by a call is not in the map, so the reaper cannot see
+// it, let alone close it. The mutex guards a small map and is held for
+// microseconds.
+//
+// Keyed on the connection *name*, and every registry entry carries its own
+// user, so a reused connection is never shared across identities.
+class ConnectionCache {
+public:
+  explicit ConnectionCache(std::chrono::seconds idle_ttl = std::chrono::seconds{60})
+    : idle_ttl_(idle_ttl) {
+    reaper_ = std::thread([this] { reap_loop(); });
+  }
+
+  // Joined rather than detached. A detached thread racing PQfinish against
+  // process exit is the classic source of an intermittent crash at shutdown,
+  // and it would show up in CI long before anyone reproduced it by hand.
+  ~ConnectionCache() {
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    if (reaper_.joinable()) reaper_.join();
+  }
+
+  ConnectionCache(const ConnectionCache&) = delete;
+  ConnectionCache& operator=(const ConnectionCache&) = delete;
+
+  // Takes the cached connection for `name` if one is idle, else nothing. The
+  // caller owns it until it calls release(); it is out of the map meanwhile.
+  std::unique_ptr<pqxx::connection> take(const std::string& name) {
+    std::lock_guard<std::mutex> lk(m_);
+    auto it = idle_.find(name);
+    if (it == idle_.end()) return nullptr;
+    auto conn = std::move(it->second.conn);
+    idle_.erase(it);
+    return conn;
+  }
+
+  void release(const std::string& name, std::unique_ptr<pqxx::connection> conn) {
+    if (!conn) return;
+    // A connection the server closed under us is worth nothing to the next
+    // caller; dropping it here means the next take() misses and reconnects,
+    // rather than handing out a corpse.
+    if (!conn->is_open()) return;
+    std::lock_guard<std::mutex> lk(m_);
+    idle_[name] = Entry{std::move(conn), Clock::now()};
+  }
+
+  // Test hook: how many connections are being held right now.
+  size_t idle_count() {
+    std::lock_guard<std::mutex> lk(m_);
+    return idle_.size();
+  }
+
+  // Test hook: close everything now, without waiting for the TTL.
+  void reap_now() {
+    std::lock_guard<std::mutex> lk(m_);
+    idle_.clear();
+  }
+
+private:
+  using Clock = std::chrono::steady_clock;
+  struct Entry {
+    std::unique_ptr<pqxx::connection> conn;
+    Clock::time_point idle_since;
+  };
+
+  void reap_loop() {
+    std::unique_lock<std::mutex> lk(m_);
+    while (!stop_) {
+      // Waking on the TTL rather than polling a short interval: the point of
+      // the thread is to not hold a socket open to a remote database while
+      // nobody is working, and a wakeup a minute costs nothing.
+      cv_.wait_for(lk, idle_ttl_, [this] { return stop_; });
+      if (stop_) break;
+      const auto now = Clock::now();
+      for (auto it = idle_.begin(); it != idle_.end();) {
+        if (now - it->second.idle_since >= idle_ttl_) it = idle_.erase(it);
+        else ++it;
+      }
+    }
+  }
+
+  std::chrono::seconds idle_ttl_;
+  std::mutex m_;
+  std::condition_variable cv_;
+  bool stop_ = false;
+  std::map<std::string, Entry> idle_;
+  std::thread reaper_;
+};
+
 class Session {
 public:
   // timeout_ms overrides the connection's configured statement ceiling; omit it
   // and the connection's own value applies. Only explainQuery passes one, since
   // it is the one tool whose caller states how long it is willing to wait.
+  // cache may be null, in which case the connection is opened and closed for
+  // this session alone -- which is what the tests and any single-shot use get.
   explicit Session(const pglicht::ConnConfig& cfg,
-                   std::optional<int> timeout_ms = std::nullopt)
-    : conn_(cfg.conninfo), txn_(conn_) {
-    // Must be the first statement in the transaction. This is the real write
-    // backstop: it catches writes a query plan cannot reveal, such as a
-    // VOLATILE function that modifies data, aborting with SQLSTATE 25006.
+                   std::optional<int> timeout_ms = std::nullopt,
+                   ConnectionCache* cache = nullptr,
+                   const std::string& name = std::string())
+    : cache_(cache), name_(name) {
+    // A cached connection can have been closed by the server under us --
+    // idle_session_timeout, a restart, a NAT table that forgot us. There is no
+    // way to know but to use it, so a failure here discards it and tries once
+    // more with a fresh one. That retry is safe precisely because nothing of
+    // the caller's has run yet: the only statements attempted are BEGIN and
+    // the setup batch below, and neither is anything to replay.
+    for (int attempt = 0; attempt < 2; attempt++) {
+      const bool reused = (attempt == 0 && cache_ != nullptr);
+      conn_ = reused ? cache_->take(name_) : nullptr;
+      if (!conn_) conn_ = std::make_unique<pqxx::connection>(cfg.conninfo);
+      try {
+        txn_.emplace(*conn_);
+        break;
+      } catch (const std::exception&) {
+        conn_.reset();
+        if (attempt == 1) throw;   // a fresh connection failed too: real error
+      }
+    }
+    // One round trip sets up the whole session. PQexec takes several
+    // statements separated by semicolons and returns the last result, so the
+    // guard, the ceiling and the role probe cost what any one of them would.
     //
-    // pg_is_in_recovery() rides along on the same round trip. PQexec takes
-    // several statements separated by semicolons and returns the last result,
-    // so the role costs nothing beyond what the guard already spends -- which
-    // is why every session observes it rather than only the calls that think
-    // they need it.
+    // SET TRANSACTION READ ONLY must be first, and is the real write backstop:
+    // it catches writes a query plan cannot reveal, such as a VOLATILE function
+    // that modifies data, aborting with SQLSTATE 25006. The property this could
+    // break is the guard itself, and a test asserts a later write is still
+    // rejected with 25006, because the failure mode of getting it wrong is
+    // silent.
     //
-    // The property this could have broken is the guard itself, and it does
-    // not: a write attempted later in the same transaction is still rejected
-    // with 25006. A test asserts exactly that, because the failure mode of
-    // getting it wrong is silent.
-    pqxx::result role = txn_.exec(
-      "SET TRANSACTION READ ONLY; SELECT pg_is_in_recovery()");
+    // The ceiling used to cost a round trip of its own. It was written as
+    // set_config(..., is_local => true) with the value bound as a parameter,
+    // and a parameterised statement cannot be batched with others in one
+    // PQexec. But the value is an int this server computes -- from the config
+    // file or from explainQuery's own validated argument -- never a string a
+    // caller supplies, so SET LOCAL with the number written out is exactly as
+    // safe and rides along here instead. On a remote database that is one
+    // round trip saved on every single call, which is a fifth of what a call
+    // spends once a pooler has removed the connect.
+    //
+    // The role rides along too, which is why every session observes it rather
+    // than only the calls that think they need it: during a failover, a stale
+    // role is the worst answer available.
+    statement_timeout_ms_ = timeout_ms.value_or(cfg.statement_timeout_ms);
+    last_statement_timeout_ms() = statement_timeout_ms_;
+
+    std::string setup = "SET TRANSACTION READ ONLY";
+    if (statement_timeout_ms_ > 0) {
+      // std::to_string of an int: nothing here can carry a quote or a
+      // semicolon, so there is no statement to inject into.
+      setup += "; SET LOCAL statement_timeout = " +
+               std::to_string(statement_timeout_ms_);
+    }
+    setup += "; SELECT pg_is_in_recovery()";
+
+    pqxx::result role = txn_->exec(setup);
     if (!role.empty() && !role[0][0].is_null())
       in_recovery_ = role[0][0].as<bool>();
     last_observed_role() = this->role();
-
-    // The statement ceiling. Costs one round trip, which is why it is worth
-    // saying what it buys: without it every tool but explainQuery ran with no
-    // upper bound at all, and the three that scale with the server rather than
-    // the query (tableBloat, indexBloat, bufferCacheContents) could run for as
-    // long as the relation or shared_buffers took to read.
-    //
-    // It cannot ride along in the batch above: set_config(..., is_local => true)
-    // is SET LOCAL, transaction-scoped like the read-only guard, and binds the
-    // value as a parameter rather than concatenating it -- and a parameterised
-    // statement cannot be batched with others in one PQexec.
-    statement_timeout_ms_ = timeout_ms.value_or(cfg.statement_timeout_ms);
-    last_statement_timeout_ms() = statement_timeout_ms_;
-    if (statement_timeout_ms_ > 0) {
-      pqxx_exec(txn_, "SELECT set_config('statement_timeout', $1, true)",
-                pqxx::params{std::to_string(statement_timeout_ms_)});
-    }
   }
 
   // The ceiling this session applied, so a cancellation can be reported as the
   // limit being reached rather than as an unexplained error. 0 means none.
   int statement_timeout_ms() const { return statement_timeout_ms_; }
 
-  pqxx::work& txn() { return txn_; }
+  pqxx::work& txn() { return *txn_; }
 
   // Whether this server is a standby, observed on connect rather than declared.
   //
@@ -130,8 +264,12 @@ public:
   // in flight, and each call opens one Session. The sweep resets it before
   // every member so a member that never connects cannot inherit the previous
   // one's role.
+  // thread_local, not merely static: a parallel sweep runs members on
+  // different threads, and a shared static would attribute one member's role
+  // to another -- silently, and precisely during a failover, which is when
+  // this tool gets used.
   static const char*& last_observed_role() {
-    static const char* r = "unknown";
+    static thread_local const char* r = "unknown";
     return r;
   }
 
@@ -142,7 +280,7 @@ public:
   // reader is the handler that turns a cancellation into a message, which runs
   // after the Session has been destroyed and so cannot ask it directly.
   static int& last_statement_timeout_ms() {
-    static int ms = 0;
+    static thread_local int ms = 0;
     return ms;
   }
 
@@ -150,7 +288,7 @@ public:
   // handshake -- no round trip. Used to gate catalog columns and SQL features
   // that don't exist on older majors; correct per connection, which matters
   // when different configured connections point at different-version servers.
-  int server_version() const { return conn_.server_version(); }
+  int server_version() const { return conn_->server_version(); }
 
   // txn_ is destroyed before conn_, rolling back; conn_ then disconnects.
   // Every session ends in ROLLBACK, explicitly. pqxx::work already aborts an
@@ -169,15 +307,22 @@ public:
   ~Session() {
     // A destructor must not throw, and a connection already gone is not an
     // error worth reporting: the transaction dies with it either way.
-    try { txn_.abort(); } catch (...) {}
+    try { if (txn_) txn_->abort(); } catch (...) {}
+    // End the transaction before handing the connection back, so what returns
+    // to the cache is idle and clean. txn_ is destroyed here rather than left
+    // to member order, because it holds a reference to *conn_.
+    txn_.reset();
+    if (cache_ && conn_) cache_->release(name_, std::move(conn_));
   }
 
   Session(const Session&) = delete;
   Session& operator=(const Session&) = delete;
 
 private:
-  pqxx::connection conn_;
-  pqxx::work txn_;
+  ConnectionCache* cache_ = nullptr;
+  std::string name_;
+  std::unique_ptr<pqxx::connection> conn_;
+  std::optional<pqxx::work> txn_;
   std::optional<bool> in_recovery_;
   int statement_timeout_ms_ = 0;
 };
@@ -185,16 +330,31 @@ private:
 class PostgresMCPServer {
 public:
   // Single-connection form: DATABASE_URL, an explicit conninfo, or argv[1].
+  // Deliberately does not connect. The registry is parsed and validated here,
+  // so a malformed conninfo still fails at startup; only *reachability* is left
+  // to the first call that needs it.
+  //
+  // Connecting eagerly cost more than it bought. It is one full round trip to a
+  // remote database before the client can do anything -- and worse, it was
+  // fatal: an unreachable default connection aborted the constructor, main
+  // reported "Fatal DB Error", and the server did not start at all. A registry
+  // of twenty databases was therefore unusable in its entirety because one of
+  // them was behind a VPN that happened to be down. Reachability is a property
+  // of the moment a call is made, not of startup.
   explicit PostgresMCPServer(const std::string& conn_str)
-    : registry_(pglicht::ConnectionRegistry::from_url(conn_str, app_name())) {
-    probe();
-  }
+    : registry_(pglicht::ConnectionRegistry::from_url(conn_str, app_name())) {}
 
   // Multi-connection form, from an INI file of named sections.
   explicit PostgresMCPServer(pglicht::ConnectionRegistry registry)
-    : registry_(std::move(registry)) {
-    probe();
-  }
+    : registry_(std::move(registry)) {}
+
+  // A worker for one member of a parallel sweep. Shares the registry (read
+  // only after construction) and the connection cache, and owns its own
+  // active_, sweep_cfg_ and ext_schemas_ -- which is the whole reason the 58
+  // query methods need no change at all to run concurrently.
+  PostgresMCPServer(const pglicht::ConnectionRegistry& registry,
+                    std::shared_ptr<ConnectionCache> cache)
+    : registry_(registry), cache_(std::move(cache)) {}
 
   void run() {
     std::string line;
@@ -360,6 +520,9 @@ public:
 
 private:
   pglicht::ConnectionRegistry registry_;
+  // shared_ptr because parallel fan-out gives each worker its own server
+  // object; they must share one cache or each would open its own connection.
+  std::shared_ptr<ConnectionCache> cache_ = std::make_shared<ConnectionCache>();
   // Which configured connection the in-flight tool call targets. Resolved once
   // per request by handle_request so the ~40 query methods keep their existing
   // signatures. The server reads stdin line by line, so only one call is ever
@@ -396,6 +559,15 @@ private:
 
   const pglicht::ConnConfig& active_cfg() const {
     return sweep_cfg_ ? *sweep_cfg_ : registry_.get(active_);
+  }
+
+  // Every session goes through here, so reuse is a property of the server
+  // rather than something ~50 query methods each have to remember. The cache
+  // is keyed on the connection name, and each registry entry carries its own
+  // user, so a reused connection never crosses identities.
+  Session open_session(std::optional<int> timeout = std::nullopt) {
+    const pglicht::ConnConfig& cfg = active_cfg();
+    return Session{cfg, timeout, cache_.get(), cfg.name};
   }
 
   // Where each extension actually lives, per connection.
@@ -555,13 +727,6 @@ private:
                "TO <role>; (or grant EXECUTE on the function directly)"},
       {"detail", detail}
     };
-  }
-
-  // Fail fast on an unusable default connection, matching the previous
-  // behaviour where the constructor connected eagerly.
-  void probe() {
-    Session s{registry_.get(registry_.default_name())};
-    s.txn().exec("SELECT 1");
   }
 
   const json connections() {
@@ -1075,15 +1240,18 @@ private:
             {"mimeType", "application/json"}};
   }
 
-  // Bounded on purpose. Per connection this lists the handful of documents
-  // that exist without knowing the catalog, plus one entry per schema. Tables,
-  // functions, enums and types are reached through a template instead: a
-  // database with 10 000 tables would otherwise produce a 10 000-entry
-  // response on every resources/list, which clients call eagerly.
+  // Bounded on purpose, and it opens no connection at all. Everything here is
+  // read from the registry; schemas, tables, functions, enums and types are all
+  // reached through resources/templates/list instead.
   //
-  // Enumerating schemas does cost one connection per configured connection. A
-  // connection that cannot be reached is skipped rather than failing the list,
-  // so one unreachable database does not hide every other one's schemas.
+  // 4.0.0 enumerated schemas here, which meant one connection per configured
+  // connection, sequentially, on a call clients make eagerly at startup. On a
+  // registry of remote databases that is the single most expensive thing this
+  // server does: twenty databases at 80 ms round-trip is upwards of ten seconds
+  // before the client is usable, and one host that blackholes packets adds the
+  // operating system's full connect timeout on top. The schema list is still
+  // available -- pglicht://{conn}/schemas returns it -- but now only when
+  // somebody actually reads it.
   json get_resources_list() {
     json out = json::array();
     for (const auto& conn : registry_.names()) {
@@ -1097,24 +1265,6 @@ private:
                                    "Installed extensions, their versions and schemas."));
       out.push_back(resource_entry(base + "/server/settings", conn + " settings",
                                    "Server configuration, grouped by category."));
-      const std::string prev = active_;
-      try {
-        active_ = conn;
-        const json schema_list = schemas();   // bound: .items() on a temporary dangles
-        if (schema_list.is_object()) {
-          for (const auto& item : schema_list.items()) {
-            const std::string schema = item.key();
-            out.push_back(resource_entry(
-                base + "/schema/" + uri_encode(schema),
-                conn + "." + schema,
-                "Structure of every table and view in schema " + schema + "."));
-          }
-        }
-      } catch (const std::exception&) {
-        // Unreachable, or the caller cannot read the catalog. Its static
-        // entries above still stand.
-      }
-      active_ = prev;
     }
     return {{"resources", out}};
   }
@@ -2654,7 +2804,7 @@ private:
   }
 
   const json schemas() {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -2695,7 +2845,7 @@ private:
   // classified per_database and refuse a replication-group sweep: a physical
   // replica would return these bytes verbatim.
   const json tables(const std::string& schema) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -2743,7 +2893,7 @@ private:
   // discovery path, and nobody runs a full-text query to read a counter. A
   // caller who wants readings on a match names it to tableStats.
   const json search(const std::string& web_search) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -2822,7 +2972,7 @@ private:
   }
 
   const json functions(const std::string& schema) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -2856,7 +3006,7 @@ private:
   }
 
   const json function_detail(const std::string& schema, const std::string& func_name) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -2913,7 +3063,7 @@ private:
       return {};
     }
 
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -2968,7 +3118,7 @@ private:
   }
 
   const json server_settings() {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -3001,7 +3151,7 @@ private:
   }
 
   const json extensions() {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -3033,7 +3183,7 @@ private:
   // processes, and the entry the caller wants is one row in several hundred.
   const json activity(int pid, const std::string& query_id,
                       double min_duration_s, const std::string& state) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     // pg_wait_events (PostgreSQL 17+) carries a prose description of every
@@ -3119,7 +3269,7 @@ private:
   // reconstructing that graph by hand from the full dump is exactly the work
   // the tool should be doing.
   const json locks(int pid) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     // chain_depth is 0 for the pid asked about, 1 for what blocks it, and so
@@ -3194,7 +3344,7 @@ private:
   }
 
   const json replication_slots() {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     // retained_wal_bytes is the key diagnostic: a lagging or unused slot holds
@@ -3256,7 +3406,7 @@ private:
   }
 
   const json database_stats() {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     // The session counters (PostgreSQL 14+) are what distinguish a database
@@ -3348,7 +3498,7 @@ private:
       if (!ok) throw std::runtime_error("query_id must be a decimal integer string");
     }
 
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     // Qualified with the schema the extension was installed into; see
@@ -3451,7 +3601,7 @@ private:
   }
 
   const json progress_stats(int pid, const std::string& relation) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     // The relation is matched by name against pg_class rather than by casting
@@ -3625,7 +3775,7 @@ private:
 
   const json io_stats(int pid, const std::string& backend_type,
                       const std::string& object, const std::string& context) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
 
     // pg_stat_io arrived in PostgreSQL 16. Saying so plainly beats an
     // undefined-table error, and matches how a missing extension is reported.
@@ -3745,7 +3895,7 @@ private:
   }
 
   const json wraparound_status(const std::string& schema, int limit) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     // 2^31 - 1000000: the point at which PostgreSQL stops accepting commands
@@ -3865,7 +4015,7 @@ private:
   }
 
   const json duplicate_indexes(const std::string& schema, const std::string& table_name) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     // Two indexes are interchangeable only if every property the planner cares
@@ -4000,7 +4150,7 @@ private:
   }
 
   const json checkpoint_stats() {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     // PostgreSQL 17 split the checkpointer counters out of pg_stat_bgwriter
@@ -4135,7 +4285,7 @@ private:
   }
 
   const json table_io_stats(const std::string& schema, const std::string& table_name, int limit) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     // A per-index breakdown is attached only when a single table was named:
@@ -4235,7 +4385,7 @@ private:
       cap = from_args;
     }
 
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     // Byte-valued GUCs are reported in their own unit (8kB pages for
@@ -4480,7 +4630,7 @@ private:
     if (tmo < 100)   tmo = 100;
     if (tmo > 30000) tmo = 30000;
 
-    Session sess{active_cfg(), tmo};
+    Session sess = open_session(tmo);
     pqxx::work& txn = sess.txn();
 
     // --- resolve the statement text ---
@@ -4744,7 +4894,7 @@ private:
   }
 
   const json table_bloat(const std::string& schema, const std::string& table_name, bool exact) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     // Schema-qualified from pg_extension rather than left to search_path; see
@@ -4854,7 +5004,7 @@ private:
   // into shared field names would invent a comparison that does not exist.
   // 'access_method' names which set came back.
   const json index_bloat(const std::string& schema, const std::string& index_name) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     const std::string pgst = extension_schema(txn, "pgstattuple");
@@ -5041,7 +5191,7 @@ private:
   // everything sitting at 0-1 with no unused buffers is clock-sweep churn --
   // the same ratio, the opposite diagnosis.
   const json buffer_cache_summary() {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     const std::string ext = extension_schema(txn, "pg_buffercache");
@@ -5139,7 +5289,7 @@ private:
     if (limit <= 0) limit = 20;
     if (limit > 200) limit = 200;
 
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     const std::string ext = extension_schema(txn, "pg_buffercache");
@@ -5224,7 +5374,7 @@ private:
   }
 
   const json database_size() {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -5247,7 +5397,7 @@ private:
     if (!values.is_array())
       throw std::runtime_error("values must be an array");
 
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     // Step 1: fetch PK column names, types, and type schemas
@@ -5337,7 +5487,7 @@ private:
   }
 
   const json enums(const std::string& schema) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -5368,7 +5518,7 @@ private:
   }
 
   const json enum_detail(const std::string& schema, const std::string& enum_name) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -5414,7 +5564,7 @@ private:
       return {};
     }
 
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -5457,7 +5607,7 @@ private:
   }
 
   const json types(const std::string& schema) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -5519,7 +5669,7 @@ private:
   }
 
   const json type_detail(const std::string& schema, const std::string& type_name) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -5592,7 +5742,7 @@ private:
   }
 
   const json roles() {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -5631,7 +5781,7 @@ private:
   }
 
   const json foreign_tables(const std::string& schema) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     // Deliberately excludes user mapping options: pg_user_mapping/pg_user_mappings
@@ -5672,7 +5822,7 @@ private:
   }
 
   const json foreign_servers() {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     // Server options only (host/port/dbname-style); never user mapping credentials.
@@ -5701,7 +5851,7 @@ private:
   }
 
   const json tablespaces() {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -5727,7 +5877,7 @@ private:
   }
 
   const json collations(const std::string& schema) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     // Restrict to collations usable in this database's encoding (collencoding = -1
@@ -5760,7 +5910,7 @@ private:
   }
 
   const json event_triggers() {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -5788,7 +5938,7 @@ private:
   }
 
   const json publications() {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -5822,7 +5972,7 @@ private:
   }
 
   const json subscriptions() {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     // Deliberately excludes subconninfo: pg_subscription is a shared (cluster-wide)
@@ -5855,7 +6005,7 @@ private:
   }
 
   const json languages() {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -5882,7 +6032,7 @@ private:
   }
 
   const json extended_statistics(const std::string& schema) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -5920,7 +6070,7 @@ private:
   }
 
   const json operators(const std::string& schema) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -5949,7 +6099,7 @@ private:
   }
 
   const json operator_classes(const std::string& schema) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -5977,7 +6127,7 @@ private:
   }
 
   const json access_methods() {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -6002,7 +6152,7 @@ private:
   }
 
   const json casts() {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     // Filtered to casts involving at least one user-defined type; unfiltered this
@@ -6036,7 +6186,7 @@ private:
   }
 
   const json text_search_configs(const std::string& schema) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -6075,7 +6225,7 @@ private:
   }
 
   const json sequences(const std::string& schema) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -6130,7 +6280,7 @@ private:
   // last_idx_scan on PostgreSQL 14 and 15 are both gone; that gate lives in
   // table_stats() now.
   const json table(const std::string& schema, const std::string& table) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -6310,7 +6460,7 @@ private:
     if (create_defs.size() + hide_names.size() > 16)
       throw std::runtime_error("at most 16 indexes may be evaluated in one call");
 
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     const std::string hypo = extension_schema(txn, "hypopg");
@@ -6476,7 +6626,7 @@ private:
   // diagnosis; listing grants beside every unavailable tool is a standing
   // recommendation to escalate privilege, which is not this server's to make.
   const json check_privileges() {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     // One round trip. pg_has_role is looked up through pg_roles rather than by
@@ -6632,7 +6782,7 @@ private:
                'last_analyze', GREATEST(s.last_analyze, s.last_autoanalyze))";
 
   const json table_stats(const std::string& schema, const std::string& table) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     const std::string pg16 = stats_pg16_fragment(sess.server_version());
@@ -6683,7 +6833,7 @@ private:
   }
 
   const json list_table_stats(const std::string& schema) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     const std::string pg16 = stats_pg16_fragment(sess.server_version());
@@ -6724,7 +6874,7 @@ private:
   // description the model reads while choosing which tool to call, not in an
   // argument it reads after it has already chosen.
   const json table_size(const std::string& schema, const std::string& table) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     std::string query = R"(
@@ -6761,7 +6911,7 @@ private:
   }
 
   const json list_table_sizes(const std::string& schema) {
-    Session sess{active_cfg()};
+    Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
     // This is the form the lock caveat is really about: one relation_open per
@@ -6872,6 +7022,19 @@ private:
   // wall-clock, and a sweep that quietly covered 10 of 40 databases would read
   // as "nothing else is affected".
   static constexpr size_t kMaxSweepMembers = 32;
+
+  // How many members a sweep visits at once.
+  //
+  // Bounded, but not as tightly as it first looks like it should be. The worry
+  // with concurrency is piling connections onto one server -- and a sweep
+  // cannot do that: members of a replication group are distinct servers by
+  // definition, and a group sweep already collapses members that would answer
+  // identically. So the width is spread across machines, one connection each,
+  // which is the same load a single-connection call places on any one of them.
+  //
+  // Sized so an ordinary production replication group -- a primary and a dozen
+  // replicas -- finishes in one round rather than two.
+  static constexpr size_t kSweepConcurrency = 16;
 
   // Why a sweep on this axis is refused, or "" when it is allowed.
   //
@@ -6994,44 +7157,70 @@ private:
       ~SweepScope() { slot.reset(); }
     } sweep_scope{sweep_cfg_};
 
-    for (const auto& m : members) {
-      // Reset first: a member that never connects must not inherit the
-      // previous member's role.
-      Session::last_observed_role() = "unknown";
-      active_ = m;
-      const auto& cfg = registry_.get(m);
-      // Every connect this member makes is bounded, not just the role probe.
-      sweep_cfg_ = with_connect_timeout(cfg, kSweepConnectTimeoutSeconds);
+    // Members run concurrently, one connection each -- which is the same rule
+    // a single-connection call obeys, applied to several connections at once.
+    // A thirteen-member replication group used to cost thirteen round trips
+    // end to end; it now costs the slowest member.
+    //
+    // Each worker is its own server object sharing this one's registry and
+    // connection cache, so active_, sweep_cfg_ and ext_schemas_ are per worker
+    // and none of the 58 query methods had to learn about threads.
+    //
+    // Results are written to a fixed slot rather than appended, so the payload
+    // stays in configuration order however the members finish. The output is
+    // byte-identical to the sequential version.
+    std::vector<json> slots(members.size());
+    {
+      const size_t width = std::min<size_t>(members.size(), kSweepConcurrency);
+      std::atomic<size_t> next{0};
+      auto worker = [&]() {
+        PostgresMCPServer w(registry_, cache_);
+        for (size_t i = next.fetch_add(1); i < members.size(); i = next.fetch_add(1)) {
+          const std::string& m = members[i];
+          // Reset first: a member that never connects must not inherit the
+          // previous member's role. thread_local, so this is per worker.
+          Session::last_observed_role() = "unknown";
+          w.active_ = m;
+          const auto& cfg = registry_.get(m);
+          // Every connect this member makes is bounded, not just the role probe.
+          w.sweep_cfg_ = with_connect_timeout(cfg, kSweepConnectTimeoutSeconds);
 
-      json entry = {{"connection", m}};
-      if (!cfg.instance.empty())          entry["instance"] = cfg.instance;
-      if (!cfg.replication_group.empty()) entry["replication_group"] = cfg.replication_group;
+          json entry = {{"connection", m}};
+          if (!cfg.instance.empty())          entry["instance"] = cfg.instance;
+          if (!cfg.replication_group.empty()) entry["replication_group"] = cfg.replication_group;
 
-      json result;
-      try {
-        if (!dispatch_tool(tool_name, arguments, result)) {
-          entry["error"] = "Tool not found: " + tool_name;
-        } else {
-          entry["result"] = result;
+          json result;
+          try {
+            if (!w.dispatch_tool(tool_name, arguments, result)) {
+              entry["error"] = "Tool not found: " + tool_name;
+            } else {
+              entry["result"] = result;
+            }
+          } catch (const pqxx::sql_error& e) {
+            // A member that ran out of time is a finding about that member, not
+            // a failure of the sweep -- and it is the member most worth looking
+            // at, so it must not be flattened into the same string as a refused
+            // connection.
+            if (is_statement_timeout(e))
+              entry["error"] = statement_timeout_error(
+                Session::last_statement_timeout_ms(), e.what());
+            else
+              entry["error"] = e.what();
+          } catch (const std::exception& e) {
+            // One unreachable host must not fail the sweep: a partial answer
+            // during an incident beats an exception.
+            entry["error"] = e.what();
+          }
+          entry["role"] = Session::last_observed_role();
+          slots[i] = std::move(entry);
         }
-      } catch (const pqxx::sql_error& e) {
-        // A member that ran out of time is a finding about that member, not a
-        // failure of the sweep -- and it is the member most worth looking at,
-        // so it must not be flattened into the same string as a refused
-        // connection.
-        if (is_statement_timeout(e))
-          entry["error"] = statement_timeout_error(
-            Session::last_statement_timeout_ms(), e.what());
-        else
-          entry["error"] = e.what();
-      } catch (const std::exception& e) {
-        // One unreachable host must not fail the sweep: a partial answer
-        // during an incident beats an exception.
-        entry["error"] = e.what();
-      }
-      entry["role"] = Session::last_observed_role();
-      out.push_back(entry);
+      };
+      std::vector<std::thread> pool;
+      pool.reserve(width);
+      for (size_t t = 0; t < width; t++) pool.emplace_back(worker);
+      for (auto& th : pool) th.join();
     }
+    for (auto& e : slots) out.push_back(std::move(e));
     active_.clear();
 
     json payload = {
