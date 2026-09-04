@@ -73,14 +73,13 @@ transaction mode it does not run `server_reset_query` at all by default.
 ## Output format
 
 A client that negotiates MCP revision `2025-06-18` or later receives
-`structuredContent` and no text block; one on an earlier revision receives the
-text block and no `structuredContent`. Never both — sending both would
-serialise the same payload twice, and a client that feeds tool results into a
-model's context may inject both, doubling the tokens on every call. Combined
-with dropping the pretty-printing, a modern client's wire bytes fall by 27–46%.
+`structuredContent`; every client receives the text block as well.
 
-If you have a client that advertises `2025-06-18` but only reads `content`, pin
-it to `2025-03-26` and it keeps working unchanged.
+Both are sent by default, because a client can advertise a revision it does not
+fully implement and this server cannot tell. Set `PG_LICHT_STRUCTURED_ONLY=1`
+to send only the structured payload once you have confirmed your client reads
+it, or `PG_LICHT_MAX_PROTOCOL=2025-03-26` to refuse to negotiate anything
+newer.
 
 Every tool declares an `outputSchema` to clients that can use it. The schemas
 describe but never reject: payloads here are version-conditional, and any tool
