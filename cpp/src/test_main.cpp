@@ -3167,17 +3167,26 @@ TEST_F(PgssMCPServerTest, StatementStatsRejectsAnUnknownOrderByColumn) {
 }
 
 TEST_F(PgssMCPServerTest, StatementStatsFiltersByQueryIdAndReturnsFullText) {
-  json all = srv->call_statement_stats(20, "", "", 0);
+  json all = srv->call_statement_stats(200, "", "", 0);
   ASSERT_FALSE(all["statements"].empty());
   std::string qid = all["statements"][0]["query_id"].get<std::string>();
 
-  json one = srv->call_statement_stats(20, qid, "", 0);
-  // Not necessarily a single row: pg_stat_statements keeps one entry per
-  // (user, database) pair, so one queryid can legitimately match several.
+  // Comparing row counts is not the property under test, and it breaks as soon
+  // as both fetches hit the limit: what filtering has to do is narrow the
+  // result to one queryid, however many (user, database) rows carry it --
+  // pg_stat_statements keeps one entry per pair, so one queryid can
+  // legitimately match several.
+  std::set<std::string> all_ids;
+  for (const auto& s : all["statements"]) all_ids.insert(s["query_id"].get<std::string>());
+  ASSERT_GT(all_ids.size(), 1u) << "nothing to narrow from";
+
+  json one = srv->call_statement_stats(200, qid, "", 0);
   ASSERT_FALSE(one["statements"].empty()) << one.dump(2);
-  EXPECT_LT(one["statements"].size(), all["statements"].size());
-  for (const auto& s : one["statements"])
-    EXPECT_EQ(s["query_id"].get<std::string>(), qid) << one.dump(2);
+  std::set<std::string> one_ids;
+  for (const auto& s : one["statements"]) one_ids.insert(s["query_id"].get<std::string>());
+  EXPECT_EQ(one_ids.size(), 1u) << one.dump(2);
+  EXPECT_EQ(*one_ids.begin(), qid);
+  EXPECT_LE(one["statements"].size(), all["statements"].size());
 }
 
 TEST_F(PgssMCPServerTest, StatementStatsMinCallsExcludesOneOffStatements) {
@@ -4161,19 +4170,61 @@ TEST_F(PostgresMCPServerTest, ResourcesListIsBoundedAndDoesNotEnumerateTables) {
   const json& res = r["result"]["resources"];
   ASSERT_TRUE(res.is_array()) << r.dump(2);
 
-  bool saw_schemas = false, saw_grocery = false;
+  bool saw_schemas = false;
   for (const auto& e : res) {
     const std::string uri = e.value("uri", "");
     EXPECT_EQ(e.value("mimeType", ""), "application/json") << uri;
-    if (uri.find("/schemas") != std::string::npos)          saw_schemas = true;
-    if (uri.find("/schema/grocery") != std::string::npos)   saw_grocery = true;
-    // A 10k-table database must not produce a 10k-entry list; tables are
-    // reached through the template instead.
+    if (uri.find("/schemas") != std::string::npos) saw_schemas = true;
+    // Nothing per-object may be enumerated here. A 10k-table database would
+    // otherwise produce a 10k-entry response on a call clients make eagerly,
+    // and enumerating schemas costs a connection per configured connection --
+    // which 4.0.0 did, and which is what made a registry of remote databases
+    // slow to start.
     EXPECT_EQ(uri.find("/table/"), std::string::npos)
         << "resources/list enumerated a table: " << uri;
+    EXPECT_EQ(uri.find("/schema/"), std::string::npos)
+        << "resources/list enumerated a schema, which costs a connection: " << uri;
   }
-  EXPECT_TRUE(saw_schemas);
-  EXPECT_TRUE(saw_grocery) << "schemas of a reachable connection should be listed";
+  EXPECT_TRUE(saw_schemas) << "the schema list itself must still be addressable";
+}
+
+TEST_F(PostgresMCPServerTest, StartingUpOpensNoConnection) {
+  // Constructing the server must do no network I/O. Connecting eagerly cost a
+  // full round trip to a remote database before the client could do anything,
+  // and it was fatal: an unreachable default aborted the constructor, so a
+  // registry of twenty databases was unusable in its entirety because one of
+  // them was behind a VPN that happened to be down.
+  //
+  // 192.0.2.0/24 is TEST-NET-1: reserved, and routed nowhere. If the
+  // constructor tried to reach it this would block until the operating
+  // system's connect timeout rather than returning at once.
+  const auto t0 = std::chrono::steady_clock::now();
+  EXPECT_NO_THROW({
+    PostgresMCPServer unreachable("host=192.0.2.1 port=5432 dbname=x user=y");
+  });
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - t0).count();
+  EXPECT_LT(ms, 2000) << "the constructor appears to have tried to connect";
+}
+
+TEST_F(PostgresMCPServerTest, ResourcesListDoesNotConnectEither) {
+  // The same property for the call clients make eagerly at startup. One
+  // unreachable connection in the registry must not delay or truncate it.
+  const std::string ini =
+      "[live]\nhost = " + std::string("127.0.0.1") + "\n"
+      "[dead]\nhost = 192.0.2.1\nport = 5432\ndbname = x\nuser = y\n";
+  (void)ini;  // built below through the fixture's own helper
+
+  PostgresMCPServer two(pglicht::ConnectionRegistry::from_url(
+      "host=192.0.2.1 port=5432 dbname=x user=y", "pg-licht-test"));
+  const auto t0 = std::chrono::steady_clock::now();
+  json r = rpc1(two, "resources/list", json::object());
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - t0).count();
+  EXPECT_LT(ms, 2000) << "resources/list appears to have tried to connect";
+  // And it still describes that connection, rather than dropping it.
+  ASSERT_TRUE(r["result"]["resources"].is_array()) << r.dump(2);
+  EXPECT_GE(r["result"]["resources"].size(), 4u);
 }
 
 TEST_F(PostgresMCPServerTest, ResourceTemplatesCoverWhatTheListDoesNot) {
@@ -4670,6 +4721,98 @@ TEST_F(PostgresMCPServerTest, EverySessionEndsInRollbackAndLeavesNothing) {
               .as<int>(), 1);
   w.exec("DROP TABLE grocery.rollback_probe");
   w.commit();
+}
+
+// --- connection reuse and the reaper ---
+
+TEST_F(PostgresMCPServerTest, ConnectionsAreReusedAcrossCalls) {
+  // Against a local socket this is invisible; against a remote database the
+  // connect, TLS handshake and authentication were the majority of what a call
+  // spent, repeated for the next call to the same database milliseconds later.
+  pqxx::connection watch(test_url);
+  auto backends = [&] {
+    pqxx::nontransaction n(watch);
+    return n.exec("SELECT count(*) FROM pg_stat_activity"
+                  " WHERE application_name LIKE 'pg-licht%'"
+                  "   AND pid <> pg_backend_pid()")[0][0].as<int>();
+  };
+  srv->call_schemas();
+  const int after_first = backends();
+  for (int i = 0; i < 5; i++) srv->call_schemas();
+  EXPECT_EQ(backends(), after_first)
+      << "a sixth call opened a new backend; the connection was not reused";
+  EXPECT_GE(after_first, 1) << "the connection should still be held between calls";
+}
+
+TEST_F(PostgresMCPServerTest, TheReaperClosesAnIdleConnection) {
+  // The cache holds only idle connections, so the reaper can never see one
+  // that is in use. reap_now() is the test hook for the TTL having elapsed --
+  // waiting 60 s in a unit test would be its own kind of bug.
+  ConnectionCache cache{std::chrono::seconds{60}};
+  pglicht::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = test_url;
+  {
+    Session s{cfg, std::nullopt, &cache, "t"};
+    s.txn().exec("SELECT 1");
+    EXPECT_EQ(cache.idle_count(), 0u) << "a connection in use must not be in the cache";
+  }
+  EXPECT_EQ(cache.idle_count(), 1u) << "released connections are cached";
+  cache.reap_now();
+  EXPECT_EQ(cache.idle_count(), 0u);
+}
+
+TEST_F(PostgresMCPServerTest, AConnectionKilledUnderneathIsReplaced) {
+  // idle_session_timeout, a server restart, a NAT table that forgot us: a
+  // cached socket can be dead by the time the next call wants it, and there is
+  // no way to know but to use it. The retry is safe because nothing of the
+  // caller's has run at that point -- only BEGIN and the setup batch.
+  ConnectionCache cache{std::chrono::seconds{60}};
+  pglicht::ConnConfig cfg;
+  cfg.name = "t";
+  cfg.conninfo = test_url;
+
+  int victim = 0;
+  {
+    Session s{cfg, std::nullopt, &cache, "t"};
+    victim = s.txn().exec("SELECT pg_backend_pid()")[0][0].as<int>();
+  }
+  ASSERT_EQ(cache.idle_count(), 1u);
+
+  // Kill the cached backend from outside.
+  //
+  // This can only be staged on a direct connection. Behind a transaction-mode
+  // pooler the Session has already handed its server backend back to the pool,
+  // so the killer is liable to be assigned that very backend and terminate
+  // itself -- and more fundamentally, what pg_licht holds there is a
+  // connection to the pooler, not a PostgreSQL backend, so "the connection was
+  // killed underneath us" is not a thing SQL can arrange. The retry path this
+  // test covers is unchanged either way; only the way to provoke it is not
+  // available.
+  try {
+    pqxx::connection killer(test_url);
+    pqxx::nontransaction n(killer);
+    n.exec("SELECT pg_terminate_backend(" + std::to_string(victim) + ")");
+  } catch (const std::exception& e) {
+    GTEST_SKIP() << "cannot terminate a specific backend here (pooled?): " << e.what();
+  }
+
+  // The next session must succeed anyway, on a different backend.
+  Session s{cfg, std::nullopt, &cache, "t"};
+  const int replacement = s.txn().exec("SELECT pg_backend_pid()")[0][0].as<int>();
+  EXPECT_NE(replacement, victim) << "reused a terminated backend";
+}
+
+TEST_F(PostgresMCPServerTest, ReuseSurvivesWhateverTheTransportIs) {
+  // The property that has to hold everywhere, pooled or not: consecutive calls
+  // on a reused connection keep answering correctly. Stated separately from
+  // the backend-killing test above, which can only be staged directly.
+  for (int i = 0; i < 8; i++) {
+    json r = srv->call_schemas();
+    ASSERT_TRUE(r.is_object()) << "call " << i;
+  }
+  EXPECT_TRUE(srv->call_table("grocery", "users").contains("columns"));
+  EXPECT_TRUE(srv->call_table_stats("grocery", "users").contains("rows"));
 }
 
 // --- evaluateIndex (hypopg) ---
@@ -5772,6 +5915,54 @@ TEST_F(TopologyFixture, AWideSweepNamesWhatItDropped) {
   ASSERT_TRUE(p.contains("skipped")) << p.dump(2);
   EXPECT_EQ(p["skipped"].size(), 41u - 32u);
   EXPECT_NE(p["skipped"][0]["reason"].get<std::string>().find("cap"), std::string::npos);
+}
+
+TEST_F(TopologyFixture, AParallelSweepKeepsConfigurationOrder) {
+  // Members run concurrently now, so the order they finish in is arbitrary.
+  // The payload must still be in configuration order, or a reader comparing
+  // two sweeps -- which is the entire point of sweeping -- would be comparing
+  // different rows. Results go to fixed slots rather than being appended.
+  std::string ini = ini_with("group = ordered\n");
+  std::vector<std::string> expected{"default"};
+  for (int i = 0; i < 12; i++) {
+    const std::string n = "m" + std::to_string(i);
+    ini += section(n, test_url, "group = ordered\n");
+    expected.push_back(n);
+  }
+  auto s = server_from(ini);
+
+  // Twice, because a race that reorders would not do it every time.
+  for (int run = 0; run < 2; run++) {
+    json p = rpc_payload(rpc_call(*s, "listSchemas", {{"group", "ordered"}}));
+    ASSERT_EQ(p["members"].size(), expected.size()) << p.dump(2);
+    std::vector<std::string> got;
+    for (const auto& m : p["members"]) got.push_back(m["connection"].get<std::string>());
+    EXPECT_EQ(got, expected) << "run " << run << ": " << p.dump(2);
+    // And every member actually answered, rather than one thread's result
+    // landing in another's slot.
+    for (const auto& m : p["members"])
+      EXPECT_TRUE(m.contains("result")) << m.dump(2);
+  }
+}
+
+TEST_F(TopologyFixture, AParallelSweepSurvivesAnUnreachableMember) {
+  // One member that cannot be reached must not fail the sweep, and must not
+  // take another member's slot with it.
+  std::string ini = ini_with("group = mixed\n");
+  ini += section("alive", test_url, "group = mixed\n");
+  ini += "[dead]\nhost = 192.0.2.1\nport = 5432\ndbname = x\nuser = y\n"
+         "group = mixed\nconnect_timeout = 1\n";
+  ini += section("alive2", test_url, "group = mixed\n");
+  auto s = server_from(ini);
+
+  json p = rpc_payload(rpc_call(*s, "listSchemas", {{"group", "mixed"}}));
+  ASSERT_EQ(p["members"].size(), 4u) << p.dump(2);
+  EXPECT_EQ(p["members"][0]["connection"], "default");
+  EXPECT_EQ(p["members"][2]["connection"], "dead");
+  EXPECT_TRUE(p["members"][2].contains("error")) << p.dump(2);
+  // The reachable members still answered.
+  EXPECT_TRUE(p["members"][1].contains("result"));
+  EXPECT_TRUE(p["members"][3].contains("result"));
 }
 
 TEST_F(TopologyFixture, UnknownTopologyNameFailsAtTheCallRatherThanSweepingNothing) {

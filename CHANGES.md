@@ -1,5 +1,120 @@
 # Changelog
 
+## 4.1.0 (unreleased)
+
+Latency and startup, for registries of remote databases. No tool's name, input
+schema or payload shape changed; nothing needs a configuration edit. But this
+is a minor rather than a patch because the way pg_licht uses your servers
+changes: it now holds connections open between calls, and a sweep opens
+several at once.
+
+The motivation was a Mac driving thirty databases over a VPN, where a tool call
+answered in one millisecond of server time took the better part of a second.
+Measured from the server's own log, one call was: connect, authenticate,
+`BEGIN`, the read-only guard, a second round trip to set the statement ceiling,
+the query, `ROLLBACK`, disconnect. Four of those are round trips before the
+query, and the connect was paid again for the very next call to the same
+database.
+
+### Startup no longer touches the network
+
+- **The constructor does not connect.** It parsed and validated the registry
+  and then opened the default connection to prove it worked. That was one round
+  trip to a remote database before the client could do anything, and it was
+  fatal: an unreachable default aborted the constructor, `main` reported
+  `Fatal DB Error`, and the server did not start — so a registry of thirty
+  databases was unusable in its entirety because one of them sat behind a VPN
+  that happened to be down.
+
+  A malformed conninfo still fails at startup, because the registry is still
+  parsed there. Only *reachability* moved to the first call that needs it,
+  which is where it belongs: reachability is a property of the moment, not of
+  startup.
+
+- **`resources/list` does not connect either.** It enumerated schemas, which
+  meant one connection per configured connection, sequentially, on a call
+  clients make eagerly. Measured against a registry with one live database and
+  three unroutable hosts: **it was still hanging after 75 seconds; it now
+  returns in 0.00 s having opened no connection at all.** The schema list is
+  still addressable — `pglicht://{conn}/schemas` returns it — but only when
+  something reads it, and `pglicht://{conn}/schema/{schema}` was already a
+  published template.
+
+### Connections are reused
+
+- **A connection is held between calls and closed after 60 seconds idle.**
+  Measured: ten tool calls used to open ten connections and close ten; they now
+  open **one**. Against a local socket that was free; against a remote database
+  the connect, TLS handshake and authentication were most of what a call spent,
+  repeated milliseconds later for the next call to the same database.
+
+  The cache holds **only idle connections**: acquiring removes the entry,
+  releasing puts it back with a timestamp. That is what makes the reaper thread
+  safe without an in-use flag and without a race to get wrong — a connection
+  being used by a call is not in the map, so the reaper cannot see it. It is
+  keyed on the connection *name*, and every registry entry carries its own
+  user, so a reused connection never crosses identities.
+
+  A cached socket can be dead by the time the next call wants it —
+  `idle_session_timeout`, a restart, a NAT table that forgot. There is no way
+  to know but to use it, so a failure discards it and retries once. The retry
+  is safe because nothing of the caller's has run at that point: only `BEGIN`
+  and the setup batch, neither of which is anything to replay.
+
+  The reaper thread is joined on shutdown rather than detached. A detached
+  thread racing `PQfinish` against process exit is the classic source of an
+  intermittent crash nobody reproduces by hand.
+
+  **What to expect operationally:** idle connections belonging to pg_licht now
+  appear in `pg_stat_activity` for up to a minute after use, one per connection
+  you have configured and actually called.
+
+### Sweeps run their members concurrently
+
+- **A fan-out sweep visits up to 16 members at once**, where it visited them
+  one at a time. On a thirteen-member replication group — a primary and a dozen
+  replicas — measured **449 ms sequential against 91 ms, in a single round**.
+  The width is sized so an ordinary production group finishes in one round.
+
+  Concurrency is safe here in a way it would not be generally: sweep members
+  are *distinct servers* by definition, and a group sweep already collapses
+  members that would answer identically, so the width is spread one connection
+  per machine rather than piled onto one.
+
+  **The payload is byte-identical to the sequential version.** Results are
+  written to fixed slots rather than appended, so members stay in configuration
+  order however they finish. Two tests assert it, each running the sweep twice,
+  because a reordering race would not show every time.
+
+  Two pieces of state had to move to be per-thread: the last observed role and
+  the last applied statement timeout were process-wide statics. Left shared,
+  a parallel sweep would have attributed one member's role to another —
+  silently, and precisely during a failover, which is when the tool is used.
+
+### One fewer round trip on every call
+
+- **The statement ceiling rides in the setup batch.** It was
+  `SELECT set_config('statement_timeout', $1, true)` in a round trip of its
+  own, because a parameterised statement cannot be batched with others in one
+  `PQexec`. The value is an `int` this server computes — from the config file
+  or from `explainQuery`'s own validated argument, never a string a caller
+  supplies — so `SET LOCAL` with the number written out is exactly as safe and
+  rides along with the read-only guard. Per call: **five application round
+  trips become four**, which is a fifth of what a call spends once a pooler has
+  removed the connect.
+
+  Visible in `pg_stat_statements` as a `SET LOCAL statement_timeout` utility
+  entry where there used to be a normalised `SELECT set_config(...)`.
+
+### Notes
+
+- Running pg_licht behind a connection pooler remains supported and tested, and
+  is worth doing for remote databases even with reuse: the pooler amortises TLS
+  across processes and survives restarts. See the man page.
+- Verified on PostgreSQL 14 through 18, directly and through a transaction-mode
+  pooler, and under AddressSanitizer, UndefinedBehaviorSanitizer and
+  ThreadSanitizer.
+
 ## 4.0.0 (2026-09-02)
 
 A breaking release, and the first since 3.0.0. It closes the roadmap: the

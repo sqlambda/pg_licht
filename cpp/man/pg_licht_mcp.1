@@ -1,7 +1,7 @@
 .\" Copyright (c) 2026 Daniel Cristian.
 .\" Licensed under the Apache License, Version 2.0; see LICENSE.
 .\"
-.Dd September 2, 2026
+.Dd September 3, 2026
 .Dt PG_LICHT_MCP 1
 .Os pg-licht
 .Sh NAME
@@ -1577,6 +1577,53 @@ The page size is larger than any list this server currently produces, so a
 client that ignores cursors still receives every operation.
 .Ic resources/list
 is the one that grows, being connections multiplied by schemas.
+.Ss Connections
+Startup opens no connection.
+The registry is parsed and validated, so a malformed conninfo still fails
+immediately, but reachability is left to the first call that needs it \(em
+otherwise one unreachable database prevents the server from starting at all,
+taking every other database with it.
+.Pp
+A connection is held between calls and closed after 60 seconds idle, one per
+configured connection, keyed on the connection name.
+Every registry entry carries its own user, so a reused connection never crosses
+identities.
+Idle connections belonging to
+.Nm
+therefore appear in
+.Li pg_stat_activity
+for up to a minute after use.
+.Pp
+A cached connection can be closed by the server underneath \(em
+.Va idle_session_timeout ,
+a restart, a firewall that forgot the flow.
+There is no way to know but to use it, so a failure discards it and reconnects
+once; the retry is safe because only
+.Ic BEGIN
+and the setup batch have run at that point.
+.Pp
+A fan-out sweep visits up to 16 members at once.
+This is safe where general concurrency would not be: members of a replication
+group are distinct servers by definition, and a group sweep already collapses
+members that would answer identically, so the width is one connection per
+machine rather than several onto one.
+The payload stays in configuration order however the members finish.
+.Pp
+Running behind a connection pooler remains supported and tested, and is still
+worth it across a WAN: a pooler amortises the TLS handshake across restarts of
+this process.
+Note that PgBouncer reads neither
+.Pa .pgpass
+nor a libpq
+.Va service
+definition, so its
+.Li [databases]
+section duplicates whatever the connections file already says; and in
+transaction mode it does not run
+.Va server_reset_query
+at all unless
+.Va server_reset_query_always
+is set.
 .Ss Transactions
 Every session runs inside a transaction opened with
 .Ic SET TRANSACTION READ ONLY
