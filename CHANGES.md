@@ -1,5 +1,77 @@
 # Changelog
 
+## 4.1.1 (2026-09-04)
+
+A compatibility fix for the output format 4.0.0 introduced, and the escape
+hatch that release should have shipped with.
+
+### Fixed
+
+- **Every client gets a text block again, by default.** 4.0.0 sent
+  `structuredContent` *instead of* `content` to any client that negotiated MCP
+  revision `2025-06-18` or later, on the reasoning that sending both serialises
+  the same payload twice and a client feeding results into a model's context
+  may inject both — doubling the tokens on every call. The compatibility the
+  spec's "send both" advice protects was assumed to be covered by the
+  negotiated revision: a client that cannot read `structuredContent` would not
+  ask for a revision that has it.
+
+  **That assumption was wrong, and a first-party client disproved it on the
+  first day.** Claude Code negotiates `2025-06-18` and reads `content`, so
+  every tool call came back looking empty — reported as *"the content was
+  missing from the response object"*. A client can advertise a revision it does
+  not fully implement, and this server cannot tell.
+
+  The default is now what the specification advises. The single-format
+  behaviour is opt-in:
+
+  ```
+  PG_LICHT_STRUCTURED_ONLY=1
+  ```
+
+  The token saving is real — 27–46% on a typical call — but it is not worth a
+  silently empty answer, and only an operator who has confirmed their client
+  reads structured content can know it is safe. That is the right way round for
+  a switch whose failure mode is a result that looks like nothing at all.
+
+- **The mitigation documented in 4.0.0 was unreachable.** CHANGES, the README
+  and the man page all said that a client advertising `2025-06-18` while
+  reading only `content` could be pinned to `2025-03-26`. There is no such
+  setting: `claude mcp add` offers transport, environment, headers and scope,
+  and no protocol version — the revision is chosen by the client's MCP library.
+  Documenting a workaround nobody can apply was worse than the original
+  decision. It is corrected wherever it appeared, and replaced with a switch
+  that works:
+
+  ```
+  PG_LICHT_MAX_PROTOCOL=2025-03-26
+  ```
+
+  `initialize` answers with the requested revision only when this server will
+  speak it, so trimming that list is how an operator forces an older response
+  shape from the server side, without the client offering any way to ask.
+
+- **An unsupported revision is answered with the highest this server speaks,
+  not the oldest.** The fallback was hardcoded to `2024-11-05`, so capping at
+  `2025-03-26` and being asked for `2025-06-18` dropped all the way to
+  `2024-11-05` — costing the client the annotations and titles it could have
+  used. The specification says to answer with another revision the server
+  supports; the highest one is the useful choice.
+
+### Notes
+
+- `PG_LICHT_MAX_PROTOCOL` governs the `initialize` handshake. The stateless
+  revision carries its version per request in `_meta` and is not negotiated, so
+  a client using it is unaffected by the cap — which is why the default change
+  above matters more: it covers both eras.
+- Both switches are read once per process. A server that changed its wire shape
+  mid-session would be worse than one that cannot, so they are deliberately not
+  reloadable.
+- A new `protocol_compat` ctest pins the whole contract end to end against the
+  real binary: which client gets a text block, what each switch does, and that
+  a nonsense cap is ignored rather than leaving nothing to negotiate. It needs
+  no database, because `listConnections` answers from the registry.
+
 ## 4.1.0 (2026-09-03)
 
 Latency and startup, for registries of remote databases. No tool's name, input
@@ -207,7 +279,9 @@ no argument or flag could have fixed it.
   defining it.
 
   If you have a client that advertises `2025-06-18` but only reads `content`,
-  pin it to `2025-03-26` and it keeps working unchanged.
+  see 4.1.1: this was the wrong default, and the mitigation originally
+  documented here — "pin it to `2025-03-26`" — was not something a client could
+  be made to do.
 
 - **The text block is serialised compactly.** It was pretty-printed with
   two-space indentation, which measured 18–39% of the payload across real

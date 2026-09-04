@@ -1,7 +1,7 @@
 .\" Copyright (c) 2026 Daniel Cristian.
 .\" Licensed under the Apache License, Version 2.0; see LICENSE.
 .\"
-.Dd September 3, 2026
+.Dd September 4, 2026
 .Dt PG_LICHT_MCP 1
 .Os pg-licht
 .Sh NAME
@@ -1480,28 +1480,43 @@ argument.
 A client that negotiated MCP revision
 .Li 2025-06-18
 or later receives its answer as
-.Va structuredContent
-and no text block.
-A client on an earlier revision receives the text block and no
 .Va structuredContent .
-Never both.
+Every client, whatever it negotiated, also receives the text block.
 .Pp
-The specification suggests serving both for backwards compatibility, and this
-implementation deliberately does not.
-Sending both serialises the same payload twice in one response, and a client
-that feeds tool results into a model's context may inject both, doubling the
-tokens on every call.
-The compatibility that suggestion protects is already covered by the negotiated
-revision: a client that cannot read
+Sending both is what the specification advises, and 4.0.0 did not: it sent the
+structured payload instead of the text block, reasoning that a client which
+cannot read
 .Va structuredContent
-does not ask for a revision that has it.
-If a client advertises
+would not ask for a revision that has it.
+A client can advertise a revision it does not fully implement, and this server
+cannot tell \(em Claude Code negotiates
 .Li 2025-06-18
-but reads only
+and reads
 .Va content ,
-pin it to
-.Li 2025-03-26
-and it behaves as before.
+so every call came back appearing to have no content at all.
+The token saving from sending one format is real, but not at the price of an
+answer that looks empty.
+.Pp
+Two environment variables change this, both read once at startup.
+.Bl -tag -width Ds
+.It Ev PG_LICHT_STRUCTURED_ONLY
+Send only
+.Va structuredContent
+to clients that negotiated
+.Li 2025-06-18
+or later, which is what 4.0.0 and 4.1.0 did by default.
+Worth setting once you have confirmed your client reads structured content: it
+removes 27-46% of the bytes on a typical call.
+.It Ev PG_LICHT_MAX_PROTOCOL
+Refuse to negotiate any revision above this one.
+.Ic initialize
+answers with the revision the client asked for only when it appears in the list
+this server will speak, and with the highest it will speak otherwise, so
+capping the list is how an operator forces an older response shape from the
+server side.
+This governs the handshake only: the stateless revision carries its version per
+request and is not negotiated.
+.El
 .Pp
 The text block is serialised compactly.
 Indentation measured 18-39% of the payload across real catalog reads and no

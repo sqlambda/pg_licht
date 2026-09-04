@@ -89,12 +89,18 @@ jobs:
             -DPGLICHT_SANITIZER=${{ matrix.sanitizer }}
           cmake --build cpp/build --target pg_licht_mcp_test
 
-      # Needs no database and does not vary by PostgreSQL version, so it runs
-      # once here rather than twenty times downstream.
-      - name: Lint the man page
+      # Neither needs a database nor varies by PostgreSQL version, so they run
+      # once here rather than twenty times downstream. protocol_compat pins the
+      # response-shape contract -- which client gets a text block, and what the
+      # two environment switches do -- end to end against the real binary,
+      # because both switches are read once per process and cannot be toggled
+      # from inside the gtest suite.
+      - name: Lint the man page and check the response-shape contract
         if: matrix.config == 'plain'
         working-directory: cpp/build
-        run: ctest -R manpage_lint --output-on-failure
+        run: |
+          cmake --build . --target pg_licht_mcp
+          ctest -R "manpage_lint|protocol_compat" --output-on-failure
 
       - uses: actions/upload-artifact@v4
         with:

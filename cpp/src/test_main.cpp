@@ -5494,22 +5494,32 @@ TEST_F(PostgresMCPServerTest, TheSameCallDrivenBothWaysReturnsIdenticalContent) 
   EXPECT_EQ(payload_of(legacy), payload_of(modern));
 }
 
-TEST_F(PostgresMCPServerTest, NeitherEraReceivesBothFormats) {
-  // The point of the change: sending both would serialise the same payload
-  // twice in one response, and a client that feeds tool results into a model
-  // may inject both. Exactly one carrier, every time.
+TEST_F(PostgresMCPServerTest, EveryClientGetsATextBlockByDefault) {
+  // 4.0.0 sent structuredContent *instead of* the text block to a client that
+  // negotiated 2025-06-18, and a first-party client that advertises that
+  // revision while reading `content` was left with nothing -- reported as "the
+  // content was missing from the response object". A client can advertise a
+  // revision it does not fully implement, and this server cannot tell.
+  //
+  // So the default is what the spec advises: both.
   json legacy = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
                                {"params", {{"name", "listSchemas"},
                                            {"arguments", json::object()}}}});
   EXPECT_TRUE(legacy["result"].contains("content"));
-  EXPECT_FALSE(legacy["result"].contains("structuredContent"));
+  EXPECT_FALSE(legacy["result"].contains("structuredContent"))
+      << "a pre-2025-06-18 client must not be sent a field its revision lacks";
 
   json modern = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 2}, {"method", "tools/call"},
                                {"params", {{"name", "listSchemas"},
                                            {"arguments", json::object()},
                                            {"_meta", modern_meta()}}}});
   EXPECT_TRUE(modern["result"].contains("structuredContent"));
-  EXPECT_FALSE(modern["result"].contains("content"));
+  EXPECT_TRUE(modern["result"].contains("content"))
+      << "the text block is what a client reading `content` needs to see";
+
+  // Whichever it reads, it reads the same thing.
+  EXPECT_EQ(modern["result"]["structuredContent"],
+            json::parse(modern["result"]["content"][0]["text"].get<std::string>()));
 }
 
 TEST_F(PostgresMCPServerTest, StructuredContentStartsAtTheRevisionThatDefinedIt) {
@@ -5530,7 +5540,8 @@ TEST_F(PostgresMCPServerTest, StructuredContentStartsAtTheRevisionThatDefinedIt)
                          {"params", {{"name", "listSchemas"},
                                      {"arguments", json::object()}}}});
     EXPECT_EQ(r["result"].contains("structuredContent"), structured) << proto;
-    EXPECT_EQ(r["result"].contains("content"), !structured) << proto;
+    // The text block goes to everyone by default, whatever the revision.
+    EXPECT_TRUE(r["result"].contains("content")) << proto;
   }
 }
 

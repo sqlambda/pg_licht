@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pg_licht_mcp VERSION 4.1.0 LANGUAGES CXX)
+project(pg_licht_mcp VERSION 4.1.1 LANGUAGES CXX)
 
 # Standard bin/ and share/man/ layout, so `cmake --install` produces a tree that
 # can be dropped onto a prefix as-is: the release tarballs are staged this way,
@@ -77,6 +77,14 @@ if(BUILD_TESTING)
     else()
         message(STATUS "mandoc not found: skipping the manpage_lint test")
     endif()
+
+    # The response-shape contract, end to end against the real binary. Both
+    # switches it covers are read once per process from the environment, so
+    # they cannot be exercised from inside the gtest suite. It needs no
+    # database: listConnections answers from the registry without connecting.
+    add_test(NAME protocol_compat
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/protocol-compat.sh
+                     $<TARGET_FILE:pg_licht_mcp>)
 endif()
 
 message(STATUS "Using compiler: ${CMAKE_CXX_COMPILER} (${CMAKE_CXX_COMPILER_ID})")

@@ -6953,9 +6953,32 @@ private:
   // open-ended, because echoing a version nobody exercises asserts support for
   // features that may not exist.
   static const std::vector<std::string>& supported_protocols() {
-    static const std::vector<std::string> v = {
-      "2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"
-    };
+    static const std::vector<std::string> v = [] {
+      std::vector<std::string> all = {
+        "2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"
+      };
+      // PG_LICHT_MAX_PROTOCOL caps what this server will agree to in the
+      // handshake. initialize replies with the client's requested revision only
+      // if it appears here, and falls back to 2024-11-05 otherwise -- so
+      // trimming this list is how an operator forces an older, text-only
+      // response shape without the client offering any way to ask for one.
+      //
+      // It exists because a client can advertise a revision it does not fully
+      // implement. Claude Code negotiates 2025-06-18 and reads `content`; a
+      // server that answers such a client with structuredContent alone leaves
+      // it with nothing, reported as "the content was missing from the response
+      // object". There is no client-side setting for this: `claude mcp add`
+      // offers transport, env, headers and scope, and no protocol version.
+      //
+      // Revision strings are ISO dates, so a string comparison orders them.
+      const char* cap = std::getenv("PG_LICHT_MAX_PROTOCOL");
+      if (cap == nullptr || *cap == '\0') return all;
+      std::vector<std::string> kept;
+      for (const auto& p : all) if (p <= cap) kept.push_back(p);
+      // A cap below every known revision would leave nothing to negotiate,
+      // which is worse than ignoring it.
+      return kept.empty() ? all : kept;
+    }();
     return v;
   }
 
@@ -6996,9 +7019,17 @@ private:
     // 3.1.1 ignored params.protocolVersion and always replied 2024-11-05.
     // Honouring it is what lets tool annotations reach a client that
     // understands them while a 2024-11-05 client keeps byte-identical output.
-    std::string want = params.value("protocolVersion", std::string());
-    std::string reply = "2024-11-05";
-    for (const auto& v : supported_protocols())
+    //
+    // When the requested revision is one this server will not speak, the spec
+    // says to answer with another it does support. Answering with the *highest*
+    // rather than the oldest is what makes PG_LICHT_MAX_PROTOCOL behave as an
+    // operator would expect: capping at 2025-03-26 and being asked for
+    // 2025-06-18 should yield 2025-03-26, not drop all the way to 2024-11-05
+    // and silently cost the client annotations and titles it can use.
+    const std::string want = params.value("protocolVersion", std::string());
+    const auto& supported = supported_protocols();
+    std::string reply = supported.back();   // highest this server will speak
+    for (const auto& v : supported)
       if (v == want) { reply = v; break; }
     client_protocol_ = reply;
 
@@ -7922,21 +7953,37 @@ private:
     return true;
   }
 
-  // The revision that defined `outputSchema` and `structuredContent`. A client
-  // that negotiated it receives the structured payload and no text block; one
-  // that did not receives the text block and nothing else. Never both.
+  // The revision that defined `outputSchema` and `structuredContent`.
   //
-  // The spec suggests serving both for backwards compatibility, and this
-  // deliberately does not. Sending both means serialising the same payload
-  // twice in one response, and a client that feeds tool results into a model's
-  // context may well inject both -- doubling the tokens for every call. The
-  // compatibility the suggestion protects is already covered here by the
-  // negotiated revision: a client that cannot read `structuredContent` does
-  // not ask for a revision that has it. This is the same rule 3.2.0 settled on
-  // for `annotations` and `title` (see the roadmap's refined rule): a
-  // protocol-revision feature is emitted only to a client that negotiated the
-  // revision defining it.
+  // 4.0.0 sent the structured payload *instead of* the text block to any client
+  // that negotiated this revision, on the reasoning that sending both
+  // serialises the same payload twice and a client feeding results into a
+  // model's context may inject both, doubling the tokens. The compatibility the
+  // spec's "send both" advice protects was assumed to be covered by the
+  // negotiated revision: a client that cannot read structuredContent would not
+  // ask for a revision that has it.
+  //
+  // That assumption was wrong, and a first-party client disproved it on the
+  // first day: Claude Code negotiates 2025-06-18 and reads `content`, so it
+  // received a result it reported as having no content at all. A client can
+  // advertise a revision it does not fully implement, and there is no way for
+  // this server to tell.
+  //
+  // So the default is now what the spec advises -- both -- and the single
+  // format is opt-in through PG_LICHT_STRUCTURED_ONLY, for operators who have
+  // confirmed their client reads structured content and want the bytes back.
+  // The token saving is real, but it is not worth a silently empty answer, and
+  // an operator who has verified their client is the only one who can know.
   static constexpr const char* kStructuredContentRevision = "2025-06-18";
+
+  // Opt in to the single-format behaviour 4.0.0 and 4.1.0 had by default.
+  static bool structured_only() {
+    static const bool v = [] {
+      const char* e = std::getenv("PG_LICHT_STRUCTURED_ONLY");
+      return e != nullptr && *e != '\0' && std::string(e) != "0";
+    }();
+    return v;
+  }
 
   bool wants_structured_content() const {
     return request_protocol_ >= kStructuredContentRevision;
@@ -7950,10 +7997,16 @@ private:
   // rather than reading it. This is the only remaining path that carries it,
   // since a modern client no longer receives a text block at all.
   json tool_result(const json& payload) const {
-    if (wants_structured_content())
-      return {{"structuredContent", payload}, {"isError", false}};
-    return {{"content", {{{"type", "text"}, {"text", payload.dump()}}}},
-            {"isError", false}};
+    json out;
+    const bool structured = wants_structured_content();
+    if (structured) out["structuredContent"] = payload;
+    // The text block goes to everyone unless an operator has opted out of it.
+    // It is still compact: the indentation was 18-39% of the payload and no
+    // consumer reads it, since every one parses the text as JSON.
+    if (!structured || !structured_only())
+      out["content"] = {{{"type", "text"}, {"text", payload.dump()}}};
+    out["isError"] = false;
+    return out;
   }
 
   void send_response(const json& id, const json& result) {
