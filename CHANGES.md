@@ -1,6 +1,6 @@
 # Changelog
 
-## 4.1.0 (unreleased)
+## 4.1.0 (2026-09-03)
 
 Latency and startup, for registries of remote databases. No tool's name, input
 schema or payload shape changed; nothing needs a configuration edit. But this
