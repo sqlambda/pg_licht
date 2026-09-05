@@ -4762,6 +4762,36 @@ TEST_F(PostgresMCPServerTest, TheReaperClosesAnIdleConnection) {
   EXPECT_EQ(cache.idle_count(), 0u);
 }
 
+TEST_F(PostgresMCPServerTest, TheCacheIsBoundedAndEvictsTheLeastRecentlyUsed) {
+  // The TTL alone does not bound the cache. A sweep releases one connection per
+  // member, so a registry of 400 databases holds 400 open sockets for the full
+  // minute after a single group sweep. macOS ships a 256 file-descriptor limit,
+  // so that does not present as "slow" -- it presents as a wall of connect
+  // failures from the members that ran after the limit was hit, which reads as
+  // an unreachable fleet rather than a local resource limit.
+  //
+  // Cap of 4 rather than the shipped kMaxIdle, so the test states its own bound
+  // instead of depending on a constant it is not testing.
+  ConnectionCache cache{std::chrono::seconds{60}, 4};
+  pglicht::ConnConfig cfg;
+  cfg.conninfo = test_url;
+
+  for (int i = 0; i < 10; i++) {
+    cfg.name = "c" + std::to_string(i);
+    Session s{cfg, std::nullopt, &cache, cfg.name};
+    s.txn().exec("SELECT 1");
+  }
+  EXPECT_EQ(cache.idle_count(), 4u) << "the cache grew past its cap";
+
+  // Which four survive is the whole point: evicting arbitrarily would throw
+  // away the connection the next call is most likely to want. The four most
+  // recently released must be the ones kept.
+  EXPECT_EQ(cache.take("c0"), nullptr) << "the least recently used entry survived";
+  EXPECT_EQ(cache.take("c5"), nullptr) << "an entry past the cap survived";
+  EXPECT_NE(cache.take("c9"), nullptr) << "the most recently released entry was evicted";
+  EXPECT_NE(cache.take("c6"), nullptr) << "the oldest of the survivors was evicted";
+}
+
 TEST_F(PostgresMCPServerTest, AConnectionKilledUnderneathIsReplaced) {
   // idle_session_timeout, a server restart, a NAT table that forgot us: a
   // cached socket can be dead by the time the next call wants it, and there is

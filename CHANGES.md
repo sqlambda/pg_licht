@@ -1,5 +1,57 @@
 # Changelog
 
+## 4.2.0 (unreleased)
+
+Three paths that walked the configured databases one at a time now use the
+bounded worker pool 4.1.0 built, and the connection cache that release added is
+given a ceiling.
+
+### Fixed
+
+- **`verifyTopology` no longer walks the registry one server at a time.** It
+  opened one connection per configured database sequentially, which made the
+  one tool whose entire job is to touch every server the slowest thing in the
+  server. Measured against twelve unreachable hosts at the five-second sweep
+  connect timeout: **60.1s before, 5.0s after** — one timeout rather than
+  twelve. The cost scaled with the registry, so a 400-database configuration
+  spent roughly half an hour on a call that reads as cheap.
+
+  Only the observing is parallel. Every conclusion the tool draws comes from
+  comparing members against each other, so the comparison passes still run
+  sequentially over results held in configuration order, and the payload is
+  byte-identical to 4.1.1's.
+
+- **`role:` is no longer a serial pre-pass in front of a parallel sweep.**
+  Filtering a sweep by observed role costs one connect per member before the
+  tool's own, and that loop sat directly in front of the worker pool without
+  using it. On twelve members with no topology labels to collapse, adding
+  `role: "primary"` took the same call from **5.0s to 60.1s**; it is now 5.0s
+  either way.
+
+  This is the call an operator makes during a failover, when they can least
+  afford to wait. Every member is still probed even when only the primary is
+  wanted — stopping at the first would hide split brain — and the ordering of
+  `matched`, of the skip reasons and of the split-brain note is unchanged.
+
+- **The connection cache is bounded.** It held one idle connection per database
+  touched, evicted only by the sixty-second idle timer, so a single sweep of a
+  large registry left one open socket per member for a full minute. macOS ships
+  a 256 file-descriptor limit, so this did not present as slowness: the members
+  that ran after the limit was reached reported connect failures, which read as
+  an unreachable fleet rather than a local resource limit.
+
+  At most 32 idle connections are now held, the least recently released being
+  dropped first. An ordinary registry never reaches the cap and nothing about
+  its behaviour changes; past it the cache reconnects, which is what every
+  release before 4.1.0 did.
+
+### Compatibility
+
+Additive. No tool's name, input schema or output payload changes, and no
+response is a byte different from 4.1.1's. The three changes are timing and
+resource behaviour only.
+
+
 ## 4.1.1 (2026-09-04)
 
 A compatibility fix for the output format 4.0.0 introduced, and the escape

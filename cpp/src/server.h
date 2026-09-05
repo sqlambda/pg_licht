@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -77,8 +78,26 @@ inline pqxx::result pqxx_exec(pqxx::work& txn, const std::string& sql, P&& param
 // user, so a reused connection is never shared across identities.
 class ConnectionCache {
 public:
-  explicit ConnectionCache(std::chrono::seconds idle_ttl = std::chrono::seconds{60})
-    : idle_ttl_(idle_ttl) {
+  // How many idle connections may be held at once.
+  //
+  // The TTL alone does not bound this. A sweep releases one connection per
+  // member, so an operator with 400 configured databases holds 400 open
+  // sockets for the full minute after a single group sweep -- and macOS ships
+  // a 256 file-descriptor limit, so the sweep exhausts descriptors partway
+  // through and the remaining members report connect failures that read as a
+  // network outage rather than a local limit. A cap makes the worst case
+  // arithmetic instead of a function of the registry: at most kMaxIdle held
+  // plus kSweepConcurrency in flight.
+  //
+  // 32 covers an ordinary registry entirely -- every connection stays warm and
+  // no eviction ever runs -- while staying far below any platform's limit. Past
+  // that the cache degrades to reconnecting, which is exactly what it did
+  // before 4.1.0 and is never worse than that.
+  static constexpr size_t kMaxIdle = 32;
+
+  explicit ConnectionCache(std::chrono::seconds idle_ttl = std::chrono::seconds{60},
+                           size_t max_idle = kMaxIdle)
+    : idle_ttl_(idle_ttl), max_idle_(max_idle == 0 ? 1 : max_idle) {
     reaper_ = std::thread([this] { reap_loop(); });
   }
 
@@ -116,6 +135,7 @@ public:
     if (!conn->is_open()) return;
     std::lock_guard<std::mutex> lk(m_);
     idle_[name] = Entry{std::move(conn), Clock::now()};
+    evict_over_cap();
   }
 
   // Test hook: how many connections are being held right now.
@@ -137,6 +157,23 @@ private:
     Clock::time_point idle_since;
   };
 
+  // Drops the least recently released entries until the cap holds. Called with
+  // m_ held, from release() only -- the map grows nowhere else.
+  //
+  // A linear scan per eviction rather than a maintained LRU list: the map is
+  // capped at kMaxIdle, so this is a scan of at most 32 entries on the one path
+  // that has already paid for a network round trip. An intrusive list would be
+  // faster and would be the third place in this class that has to stay in sync
+  // with the map.
+  void evict_over_cap() {
+    while (idle_.size() > max_idle_) {
+      auto oldest = idle_.begin();
+      for (auto it = std::next(idle_.begin()); it != idle_.end(); ++it)
+        if (it->second.idle_since < oldest->second.idle_since) oldest = it;
+      idle_.erase(oldest);
+    }
+  }
+
   void reap_loop() {
     std::unique_lock<std::mutex> lk(m_);
     while (!stop_) {
@@ -154,6 +191,7 @@ private:
   }
 
   std::chrono::seconds idle_ttl_;
+  size_t max_idle_;
   std::mutex m_;
   std::condition_variable cv_;
   bool stop_ = false;
@@ -844,7 +882,18 @@ private:
       long long port = 0;
       bool ok = false, endpoint_known = false;
     };
-    std::vector<Observed> seen;
+    // Every conclusion below is drawn by comparing members against each other,
+    // so all of them have to be observed before any of it runs. That made the
+    // observation loop serial for three releases: one connect at a time across
+    // the whole registry, which is the widest walk in the server. Measured at
+    // 57s for twelve unreachable hosts on a 5s connect timeout, and it scales
+    // with the registry -- 400 configured databases is half an hour.
+    //
+    // Only the observing is parallel. Results land in fixed slots, so the
+    // comparison passes read the registry in configuration order exactly as
+    // before and the payload is byte-identical.
+    const std::vector<std::string> names = registry_.names();
+    std::vector<Observed> seen(names.size());
 
     const std::string q = R"(
       SELECT JSONB_BUILD_OBJECT(
@@ -857,11 +906,11 @@ private:
              );
     )";
 
-    for (const auto& name : registry_.names()) {
-      Observed o;
-      o.name = name;
-      const auto& cfg = registry_.get(name);
+    parallel_for(names.size(), [&](size_t i) {
+      Observed& o = seen[i];
+      o.name = names[i];
       try {
+        const auto& cfg = registry_.get(names[i]);
         Session sess{with_connect_timeout(cfg, kSweepConnectTimeoutSeconds)};
         o.role = sess.role();
         pqxx::result r = pqxx_exec(sess.txn(), q, pqxx::params{});
@@ -880,9 +929,12 @@ private:
         o.ok = true;
       } catch (const std::exception& e) {
         o.error = e.what();
+      } catch (...) {
+        // parallel_for runs this on a worker thread, where an escaping
+        // exception is std::terminate rather than a failed member.
+        o.error = "unknown error";
       }
-      seen.push_back(o);
-    }
+    });
 
     json findings = json::array();
     auto finding = [&](const char* topic, const std::string& name,
@@ -7067,6 +7119,38 @@ private:
   // replicas -- finishes in one round rather than two.
   static constexpr size_t kSweepConcurrency = 16;
 
+  // Runs body(0..n-1) on at most kSweepConcurrency threads and joins them all.
+  //
+  // Every place this server talks to more than one database at a time goes
+  // through here, so "how wide does pg_licht ever go" has one answer in one
+  // place. 4.1.0 built this pool inline in fan_out() and left two other paths
+  // walking the registry one server at a time: verify_topology(), and the role
+  // probe in fan_out() itself, which sat directly in front of the pool it did
+  // not use. Measured on twelve unreachable hosts at a 5s connect timeout, both
+  // took 60s against 5s for the same call swept without a role filter.
+  //
+  // body must not throw. Each caller wraps its own work in try/catch, because
+  // an exception crossing a std::thread boundary calls std::terminate and one
+  // unreachable host must never take the process with it.
+  static void parallel_for(size_t n, const std::function<void(size_t)>& body) {
+    if (n == 0) return;
+    const size_t width = std::min<size_t>(n, kSweepConcurrency);
+    // One member is the overwhelmingly common case, and spawning a thread to
+    // wait on a single connect is pure latency.
+    if (width == 1) {
+      for (size_t i = 0; i < n; i++) body(i);
+      return;
+    }
+    std::atomic<size_t> next{0};
+    std::vector<std::thread> pool;
+    pool.reserve(width);
+    for (size_t w = 0; w < width; w++)
+      pool.emplace_back([&] {
+        for (size_t i = next.fetch_add(1); i < n; i = next.fetch_add(1)) body(i);
+      });
+    for (auto& t : pool) t.join();
+  }
+
   // Why a sweep on this axis is refused, or "" when it is allowed.
   //
   // These are -32602 rather than a shrug because the failure they prevent is
@@ -7146,18 +7230,31 @@ private:
     // "never pick one of two primaries" outranks saving a connect.
     json notes = json::array();
     if (!role_filter.empty()) {
-      std::vector<std::string> matched, primaries;
-      for (const auto& m : members) {
-        std::string observed;
+      // The probe is one connect per member and nothing else, so it runs
+      // through the same pool the sweep below uses. Only the waiting is
+      // parallel: the classification that follows stays a sequential pass over
+      // the results in configuration order, so `matched`, `primaries` and the
+      // skip reasons come out in the order they always did.
+      std::vector<std::string> observed(members.size());
+      parallel_for(members.size(), [&](size_t i) {
         try {
-          Session probe{with_connect_timeout(registry_.get(m), kSweepConnectTimeoutSeconds)};
-          observed = probe.role();
+          Session probe{with_connect_timeout(registry_.get(members[i]),
+                                             kSweepConnectTimeoutSeconds)};
+          observed[i] = probe.role();
         } catch (const std::exception&) {
-          observed = "unknown";
+          observed[i] = "unknown";
+        } catch (...) {
+          // See verify_topology(): terminate, not a failed member.
+          observed[i] = "unknown";
         }
-        if (observed == "primary") primaries.push_back(m);
-        if (observed == role_filter) matched.push_back(m);
-        else skip(m, "role is " + observed + ", not " + role_filter);
+      });
+
+      std::vector<std::string> matched, primaries;
+      for (size_t i = 0; i < members.size(); i++) {
+        const std::string& m = members[i];
+        if (observed[i] == "primary") primaries.push_back(m);
+        if (observed[i] == role_filter) matched.push_back(m);
+        else skip(m, "role is " + observed[i] + ", not " + role_filter);
       }
       if (role_filter == "primary" && primaries.size() > 1)
         notes.push_back("more than one member reports itself a primary (" +

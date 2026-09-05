@@ -53,9 +53,14 @@ Other install channels — deb, rpm, tarball, source — are in [INSTALL.md](INS
 
 A tool call opens no connection of its own beyond the first: connections are
 held between calls and closed after 60 seconds idle, one per configured
-connection. Startup opens none at all — the registry is validated without
-touching the network, so one unreachable database no longer prevents the server
-from starting.
+connection and at most 32 at a time. Startup opens none at all — the registry is
+validated without touching the network, so one unreachable database no longer
+prevents the server from starting.
+
+The ceiling matters only above 32 configured databases, where the least recently
+used connection is dropped to make room and the next call to that database
+reconnects. It exists so a single wide sweep cannot hold one socket per member
+for a minute and exhaust a file-descriptor limit — macOS defaults to 256.
 
 Fan-out sweeps visit up to 16 members concurrently, one connection per server.
 A thirteen-member replication group that took 449 ms sequentially takes 91 ms.
