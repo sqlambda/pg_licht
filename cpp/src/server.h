@@ -1692,11 +1692,16 @@ private:
            "statistics rather than an error when it cannot read a column -- "
            "which looks exactly like a table nobody has analyzed.\n"
            "1. Call listTableStats for " + sch + ". Rank by n_dead_tup and read "
-           "last_vacuum beside it: a large dead-tuple count on a table vacuumed "
-           "minutes ago is a busy table, not a neglected one. That field is the "
-           "later of the manual and automatic vacuum, so it answers when the table "
-           "was last vacuumed, not by whom -- wraparoundStatus is where the two "
-           "are still reported apart.\n"
+           "last_vacuum and last_autovacuum beside it: a large dead-tuple count on "
+           "a table vacuumed minutes ago is a busy table, not a neglected one.\n"
+           "   Read those two apart, because together they answer the question "
+           "this review is actually for. A recent last_autovacuum means autovacuum "
+           "is reaching the table and the settings are working. A recent "
+           "last_vacuum beside a null or ancient last_autovacuum means the "
+           "opposite: somebody is keeping this table alive by hand, autovacuum is "
+           "not doing it, and the cron job is hiding the finding rather than being "
+           "it. Both look identical if you only ask when the table was last "
+           "vacuumed. last_analyze and last_autoanalyze divide the same way.\n"
            "   Ranking by dead tuples alone misses the table most likely to hurt "
            "you, because an insert-only table never accumulates any. Read "
            "n_ins_since_vacuum as a second ranking: a large value beside an old "
@@ -2373,7 +2378,7 @@ private:
 	  },
 	  {
 	    {"name", "tableStats"},
-	    {"description", "return the statistics PostgreSQL keeps for one table: estimated row count, seq_scan and idx_scan counts, live and dead tuples, rows modified since the last analyze, rows inserted since the last vacuum, the last vacuum and analyze times, per-index scan counts, and the per-column pg_stats histograms (null_frac, avg_width, n_distinct, physical order correlation, most_common_vals and their frequencies). Reads the catalog and the statistics collector only -- no relation is opened and no file is measured. size_estimate is relpages*8192 and is only as fresh as estimated_from says: for a measured size call tableSize. Note that most_common_vals contains literal values sampled from the column. Not to be confused with tableIOStats, which reports pg_statio_all_tables -- whether reads came from the buffer cache or the disk"},
+	    {"description", "return the statistics PostgreSQL keeps for one table: estimated row count, seq_scan and idx_scan counts, live and dead tuples, rows modified since the last analyze, rows inserted since the last vacuum, the manual and automatic vacuum and analyze times as four separate fields (last_vacuum and last_analyze are the manual ones, exactly as in pg_stat_user_tables -- a recent last_vacuum beside a null last_autovacuum means the table is being kept alive by hand and autovacuum is not reaching it), per-index scan counts, and the per-column pg_stats histograms (null_frac, avg_width, n_distinct, physical order correlation, most_common_vals and their frequencies). Reads the catalog and the statistics collector only -- no relation is opened and no file is measured. size_estimate is relpages*8192 and is only as fresh as estimated_from says: for a measured size call tableSize. Note that most_common_vals contains literal values sampled from the column. Not to be confused with tableIOStats, which reports pg_statio_all_tables -- whether reads came from the buffer cache or the disk"},
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", {
@@ -2385,7 +2390,7 @@ private:
 	  },
 	  {
 	    {"name", "listTableStats"},
-	    {"description", "return the statistics PostgreSQL keeps for every table in a schema: estimated row count, seq_scan and idx_scan counts, live and dead tuples, rows modified since the last analyze, rows inserted since the last vacuum, and the last vacuum and analyze times. Reads the catalog and the statistics collector only -- no relation is opened and no file is measured. Carries no per-column histograms; name one table to tableStats for those. size_estimate is relpages*8192 and is only as fresh as estimated_from says: for measured sizes call listTableSizes"},
+	    {"description", "return the statistics PostgreSQL keeps for every table in a schema: estimated row count, seq_scan and idx_scan counts, live and dead tuples, rows modified since the last analyze, rows inserted since the last vacuum, and the manual and automatic vacuum and analyze times as four separate fields (last_vacuum and last_analyze are the manual ones, exactly as in pg_stat_user_tables -- a recent last_vacuum beside a null last_autovacuum means the table is being kept alive by hand and autovacuum is not reaching it). Reads the catalog and the statistics collector only -- no relation is opened and no file is measured. Carries no per-column histograms; name one table to tableStats for those. size_estimate is relpages*8192 and is only as fresh as estimated_from says: for measured sizes call listTableSizes"},
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", {
@@ -7232,6 +7237,19 @@ private:
 
   // The pg_stat_user_tables columns both tools return, in one place so the
   // single-table and schema-wide forms cannot drift apart.
+  //
+  // The four timestamps are returned separately, under the catalog's own names.
+  // Through 4.1.1 they were two, each a GREATEST() of the manual and automatic
+  // column, which was wrong in the one direction that does not look wrong: a
+  // table kept alive by a cron job reported "vacuumed five minutes ago" and
+  // read as healthy, when the finding was that autovacuum is not reaching it at
+  // all. "Is autovacuum keeping up" is the question these tools exist to answer
+  // and the merge made it unanswerable -- bloat-and-vacuum-review had to be
+  // pointed at wraparoundStatus, which had never merged them, to recover a
+  // reading its natural tool already held.
+  //
+  // estimated_from stays a GREATEST of all four, and that merge is correct:
+  // it dates relpages and reltuples, which any of the four refreshes equally.
   static constexpr const char* kTableStatsCommon = R"(
                'rows', c.reltuples,
                'size_estimate', c.relpages::bigint * 8192,
@@ -7241,8 +7259,10 @@ private:
                'n_live_tup', s.n_live_tup, 'n_dead_tup', s.n_dead_tup,
                'n_mod_since_analyze', s.n_mod_since_analyze,
                'n_ins_since_vacuum', s.n_ins_since_vacuum,
-               'last_vacuum', GREATEST(s.last_vacuum, s.last_autovacuum),
-               'last_analyze', GREATEST(s.last_analyze, s.last_autoanalyze))";
+               'last_vacuum', s.last_vacuum,
+               'last_autovacuum', s.last_autovacuum,
+               'last_analyze', s.last_analyze,
+               'last_autoanalyze', s.last_autoanalyze)";
 
   const json table_stats(const std::string& schema, const std::string& table) {
     Session sess = open_session();

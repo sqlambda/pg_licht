@@ -4788,6 +4788,52 @@ TEST_F(PostgresMCPServerTest, TheReaperClosesAnIdleConnection) {
   EXPECT_EQ(cache.idle_count(), 0u);
 }
 
+TEST_F(PostgresMCPServerTest, StatsSeparateManualVacuumFromAutovacuum) {
+  // Through 4.1.1 both statistics tools returned
+  // GREATEST(last_vacuum, last_autovacuum) under the name last_vacuum, and the
+  // same for analyze. That collapsed the one distinction the fields exist to
+  // draw: a table kept alive by a cron job and a table autovacuum is reaching
+  // both reported "vacuumed recently", and the first is a finding while the
+  // second is health. The names now mean what pg_stat_user_tables means by
+  // them.
+  pqxx::connection c(test_url);
+  {
+    pqxx::work w(c);
+    w.exec("CREATE TABLE grocery.vac_split (id int)");
+    w.exec("INSERT INTO grocery.vac_split SELECT generate_series(1, 50)");
+    w.commit();
+  }
+  { pqxx::nontransaction n(c); n.exec("ANALYZE grocery.vac_split"); }
+
+  // Statistics reporting is not synchronous on every supported major: the
+  // PostgreSQL 14 collector flushes on an interval rather than at statement
+  // end, so this polls rather than asserting on the first read.
+  json r;
+  for (int i = 0; i < 40; i++) {
+    r = srv->call_table_stats("grocery", "vac_split");
+    if (!r["last_analyze"].is_null()) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+
+  ASSERT_TRUE(r.contains("last_analyze"));
+  ASSERT_TRUE(r.contains("last_autoanalyze"));
+  ASSERT_TRUE(r.contains("last_vacuum"));
+  ASSERT_TRUE(r.contains("last_autovacuum"));
+
+  EXPECT_FALSE(r["last_analyze"].is_null())
+      << "ANALYZE was just run by hand: " << r.dump(2);
+  EXPECT_TRUE(r["last_autoanalyze"].is_null())
+      << "autovacuum has not touched a table created seconds ago; a non-null "
+         "here means the two columns are still merged: " << r.dump(2);
+
+  // estimated_from stays the GREATEST of all four: it dates relpages and
+  // reltuples, which any of them refreshes equally, so the merge is correct
+  // there and only there.
+  EXPECT_EQ(r["estimated_from"], r["last_analyze"]) << r.dump(2);
+
+  { pqxx::work w(c); w.exec("DROP TABLE grocery.vac_split"); w.commit(); }
+}
+
 TEST_F(PostgresMCPServerTest, TheCacheIsBoundedAndEvictsTheLeastRecentlyUsed) {
   // The TTL alone does not bound the cache. A sweep releases one connection per
   // member, so a registry of 400 databases holds 400 open sockets for the full

@@ -50,11 +50,11 @@ given a ceiling, and logical replication gains the runtime half it never had.
   the server cannot answer, which is not the same as zero.
 
 - **Every prompt was audited against what its tools actually return**, and one
-  named a field that does not exist. `bloat-and-vacuum-review` said to read
-  `last_vacuum` *and* `last_autovacuum`; both stats tools merge those into a
-  single `last_vacuum` with `GREATEST()`, so the second was never in the
-  payload. `wraparoundStatus` is the only tool that still reports them apart,
-  and the prompt now says so.
+  named a field that did not exist. `bloat-and-vacuum-review` said to read
+  `last_vacuum` *and* `last_autovacuum`, and no payload contained the second.
+  That turned out to be the tool's bug rather than the prompt's — see the
+  `last_vacuum` entry under Fixed — so the field now exists and the prompt
+  reads both, which is what it wanted all along.
 
   Six prompts gained readings the tools were already returning:
 
@@ -136,6 +136,28 @@ given a ceiling, and logical replication gains the runtime half it never had.
 
 ### Fixed
 
+- **`last_vacuum` did not mean `last_vacuum`.** `tableStats` and
+  `listTableStats` returned `GREATEST(last_vacuum, last_autovacuum)` under the
+  name `last_vacuum`, and the same for analyze. The four
+  `pg_stat_user_tables` timestamps are now four fields with the catalog's own
+  names and meanings.
+
+  The merge collapsed the one distinction those columns exist to draw. A recent
+  `last_autovacuum` says autovacuum is reaching the table; a recent
+  `last_vacuum` beside a null `last_autovacuum` says the opposite — somebody is
+  keeping the table alive by hand and the cron job is hiding the finding rather
+  than being it. Merged, both read as "vacuumed recently", and *"is autovacuum
+  keeping up"* is the question these tools exist to answer.
+
+  Measured on a real database while fixing it: a table reporting
+  `last_analyze: 2026-09-04T03:30:30` under 4.1.1 reports
+  `last_analyze: null, last_autoanalyze: 2026-09-04T03:30:30` now. Nobody had
+  ever run `ANALYZE` on it; the old shape said otherwise.
+
+  `estimated_from` stays the latest of all four. That merge is correct and
+  unchanged: it dates `relpages` and `reltuples`, which any of the four
+  refreshes equally.
+
 - **`verifyTopology` no longer walks the registry one server at a time.** It
   opened one connection per configured database sequentially, which made the
   one tool whose entire job is to touch every server the slowest thing in the
@@ -175,10 +197,25 @@ given a ceiling, and logical replication gains the runtime half it never had.
 
 ### Compatibility
 
-Additive. No tool's name or input schema changes, and no existing response
-field changes type or meaning: `listSubscriptions` gains keys, and every other
-payload is a byte identical to 4.1.1's. The performance work is timing and
-resource behaviour only.
+Additive except for one corrected field, and that exception is stated here
+rather than buried, because it is observable.
+
+`tableStats` and `listTableStats` change what `last_vacuum` and `last_analyze`
+contain. Both previously carried the later of the manual and automatic
+timestamp; each now carries the manual one, with `last_autovacuum` and
+`last_autoanalyze` added beside them. A caller reading `last_vacuum` will start
+seeing null for any table only autovacuum has touched.
+
+This is shipped as a fix rather than held for a major version because the field
+was not doing what its name says: it is named for a `pg_stat_user_tables`
+column and returned something else, in the direction that reads as healthy. No
+other tool ever merged them — `wraparoundStatus` has always reported both — so
+the change also removes a disagreement between two tools about the same two
+catalog columns.
+
+Everything else is additive. No tool's name or input schema changes,
+`listSubscriptions` gains keys, and every other payload is byte-identical to
+4.1.1's. The performance work is timing and resource behaviour only.
 
 
 ## 4.1.1 (2026-09-04)

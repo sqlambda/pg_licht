@@ -553,8 +553,11 @@ Statistics PostgreSQL already keeps for one table: estimated row count,
 .Va seq_scan
 and
 .Va idx_scan ,
-live and dead tuples, mods-since-analyze, inserts-since-vacuum, last vacuum and
-analyze, per-index scan counts, and the per-column
+live and dead tuples, mods-since-analyze, inserts-since-vacuum, the four
+.Li pg_stat_user_tables
+timestamps
+.Pq Va last_vacuum , Va last_autovacuum , Va last_analyze , Va last_autoanalyze ,
+per-index scan counts, and the per-column
 .Li pg_stats
 histograms
 .Pq Va null_frac , Va avg_width , Va n_distinct , physical order correlation , Va most_common_vals No and their frequencies .
@@ -566,6 +569,25 @@ is literal values sampled from the column, up to
 .Va default_statistics_target
 of them.
 This is the only operation that returns them.
+.Pp
+The manual and automatic timestamps are separate, and mean what the catalog
+means by them.
+A recent
+.Va last_autovacuum
+says autovacuum is reaching the table; a recent
+.Va last_vacuum
+beside a null
+.Va last_autovacuum
+says the opposite \(em somebody is keeping the table alive by hand and the cron
+job is hiding the finding rather than being it.
+Through 4.1.1 both were returned merged under
+.Va last_vacuum ,
+which made those two indistinguishable.
+.Va estimated_from
+remains the latest of all four, since any of them refreshes
+.Li relpages
+and
+.Li reltuples .
 .It Ic listTableStats Ar schema
 The same statistics for every table in
 .Ar schema ,
