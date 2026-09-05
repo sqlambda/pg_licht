@@ -267,7 +267,7 @@ tool accepts depends on where its answer actually varies, and its input schema s
 | | varies across the databases of one instance | varies across members of a replication group |
 |---|---|---|
 | catalogs, `tableBloat`, the structure and size tools | yes | no — a physical replica is byte-identical |
-| `duplicateIndexes`, `indexBloat`, `tableIOStats`, `tableStats`, `listTableStats` | yes | **yes** — they carry `idx_scan` |
+| `duplicateIndexes`, `indexBloat`, `tableIOStats`, `tableStats`, `listTableStats`, `subscriptionStats` | yes | **yes** — they carry `idx_scan`, or a worker of their own |
 | `currentActivity`, `currentLocks`, `statementStats`, buffer cache | no — instance-wide | yes |
 
 That middle row is the one worth knowing: an index that reads as unused on the primary may
@@ -313,7 +313,7 @@ the tool, which takes precedence over both.
 
 | | |
 |---|---|
-| `man pg_licht_mcp` | configuration, connection strings, all 52 operations, MCP client setup |
+| `man pg_licht_mcp` | configuration, connection strings, all 59 operations, MCP client setup |
 | [INSTALL.md](INSTALL.md) | Homebrew, deb, rpm, tarball, verifying, uninstalling |
 | [BUILD.md](BUILD.md) | building from source, tests, sanitizers, CI, release process |
 | [CHANGES.md](CHANGES.md) | changelog |

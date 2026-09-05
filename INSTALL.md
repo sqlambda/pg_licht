@@ -9,7 +9,7 @@ Every channel below installs the manual page, so once installed:
 man pg_licht_mcp
 ```
 
-is the reference for configuration, connection strings, all 40 operations, and MCP client
+is the reference for configuration, connection strings, all 59 operations, and MCP client
 setup.
 
 ## Homebrew (macOS and Linux)

@@ -1641,7 +1641,12 @@ private:
            "anything else, establish whose it is: listTopology and "
            "verifyTopology for physical replicas, listSubscriptions and "
            "listPublications for logical ones. A slot with no owner anybody "
-           "recognises is the common case and the easy one.\n"
+           "recognises is the common case and the easy one. If the owner is a "
+           "subscriber you can reach, call subscriptionStats on THAT connection "
+           "-- not this one -- to separate a subscriber that is stuck from one "
+           "that is merely gone: a stuck apply worker shows an error count or a "
+           "table still copying, while a decommissioned one shows nothing at "
+           "all and the slot is simply abandoned.\n"
            "3. Measure how fast it grows before deciding how urgent it is. "
            "checkpointStats reports WAL volume, and serverSettings carries "
            "max_slot_wal_keep_size -- if that is set, PostgreSQL will "
@@ -1904,7 +1909,7 @@ private:
   //   1. Payloads are version-conditional. tableStats gains
   //      n_tup_newpage_upd and last_seq_scan on PostgreSQL 16, checkpointStats
   //      is normalised across three different sets of underlying views, and a
-  //      schema would have to be re-proved on five majors for 58 tools.
+  //      schema would have to be re-proved on five majors for 59 tools.
   //   2. Every tool carries the same escape hatch: when an extension is absent
   //      or a grant is missing, the payload is {error, hint} instead of the
   //      documented shape. A schema that enumerated the documented shape would
@@ -2480,7 +2485,7 @@ private:
 	  },
 	  {
 	    {"name", "replicationSlots"},
-	    {"description", "return replication slots with retained WAL bytes; a lagging or unused slot holds back WAL indefinitely and is a common cause of disk bloat incidents"},
+	    {"description", "return replication slots with retained WAL bytes; a lagging or unused slot holds back WAL indefinitely and is a common cause of disk bloat incidents. A logical slot's consumer is a subscriber on another server: call subscriptionStats there to see whether it is stuck, and note that retained_wal_bytes here is the byte lag that a subscriber cannot measure for itself"},
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", json::object()}
@@ -2535,7 +2540,7 @@ private:
 	  },
 	  {
 	    {"name", "progressStats"},
-	    {"description", "return every long-running maintenance command currently reporting progress (pg_stat_progress_vacuum, _analyze, _create_index, _cluster, _copy, _basebackup), with the phase, the blocks or tuples done against the total, a completion percentage, and how long it has been running. Use it to decide whether a VACUUM will finish before wraparound, or whether a CREATE INDEX is stuck waiting on a locker. The PostgreSQL 17 rename of the vacuum dead-tuple columns is normalized, and 'dead_tuple_unit' says whether the server counts tuples or bytes"},
+	    {"description", "return every long-running maintenance command currently reporting progress (pg_stat_progress_vacuum, _analyze, _create_index, _cluster, _copy, _basebackup), with the phase, the blocks or tuples done against the total, a completion percentage, and how long it has been running. Use it to decide whether a VACUUM will finish before wraparound, or whether a CREATE INDEX is stuck waiting on a locker. The PostgreSQL 17 rename of the vacuum dead-tuple columns is normalized, and 'dead_tuple_unit' says whether the server counts tuples or bytes. A logical replication table sync also reports here: take the worker pid from subscriptionStats and pass it as pid. Note that such a copy streams from the publisher rather than reading a file, so bytes_total is 0 and bytes_percent is null -- bytes_processed and tuples_processed are the figures that move"},
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", {
@@ -6822,8 +6827,8 @@ private:
   // The catalog is world-readable, so most of the tool set works for any role
   // that can connect. What varies is a small, knowable set: the predefined
   // roles that gate the monitoring extras, and whether the role can read table
-  // data at all. Measured against PostgreSQL 18: a bare login role runs 47 of
-  // the 58 tools at full fidelity, pg_monitor takes that to 54, and the ones
+  // data at all. Measured against PostgreSQL 18: a bare login role runs 48 of
+  // the 59 tools at full fidelity, pg_monitor takes that to 55, and the ones
   // that remain are exactly the three that touch row data.
   //
   // The point of asking once, up front, is that the alternative is discovering
@@ -8101,7 +8106,7 @@ private:
   // the same revision, and a legacy result must not grow fields its era never
   // had.
   //
-  // This matters more here than it looks. tools/list is ~93 kB once 58 tools
+  // This matters more here than it looks. tools/list is ~93 kB once 59 tools
   // carry descriptions, annotations, titles and outputSchemas, and without a
   // freshness hint a client SHOULD treat it as immediately stale and re-fetch
   // it whenever it needs the list. That is the largest single payload the
@@ -8121,7 +8126,7 @@ private:
 
   // Page size for every paginated list. Deliberately larger than any list this
   // server currently produces, so nothing is truncated for a client that
-  // ignores nextCursor: 58 tools, 8 prompts and 5 templates are each one page.
+  // ignores nextCursor: 59 tools, 8 prompts and 5 templates are each one page.
   // The list that can genuinely outgrow it is resources/list, which is
   // connections x schemas -- and that is the case pagination exists for.
   static constexpr size_t kListPageSize = 100;
