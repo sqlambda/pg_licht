@@ -49,6 +49,28 @@ given a ceiling, and logical replication gains the runtime half it never had.
   relation), and the seven `conflicts` counters need 18. An absent key means
   the server cannot answer, which is not the same as zero.
 
+- **`diagnose-deadlock`, a ninth prompt.** A deadlock is over before anyone
+  reads about it: PostgreSQL detects the cycle, kills a transaction and
+  releases the other, so the pids in the log no longer exist and the live lock
+  views describe a server that has moved on. `triage-lock-contention` follows a
+  wait chain you can still see and is the wrong tool for it, which is why this
+  is a separate prompt rather than a branch of that one.
+
+  It reconstructs the deadlock from the log entry plus the schema. The lock
+  kind in the report already names the shape — `ShareLock on transaction N` is
+  a row-ordering problem, `ExclusiveLock on tuple` is a queue for one row, a
+  relation lock means DDL was in the cycle — and the statements alone do not
+  show the lock footprint: a foreign key locks the parent row the statement
+  never names, a trigger runs statements the log never shows, and the plan
+  decides the order rows are locked, so an index scan against a sequential scan
+  is enough to start a deadlock that was not happening last week.
+
+  It ranks fixes as consistent acquisition order, then a smaller lock
+  footprint, then a shorter transaction, and says plainly that
+  `deadlock_timeout` is not a fix — it changes when the cycle is detected,
+  never whether it forms — and that a retry loop is a mitigation that hides an
+  ordering bug rather than fixing one.
+
 - **`listSubscriptions` returns five more of the columns it can already read.**
   `stream`, `disable_on_error`, `origin`, `run_as_owner` and `failover` were
   omitted; it returned 6 of the 17 publicly-readable `pg_subscription` columns.

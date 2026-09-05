@@ -119,10 +119,10 @@ Readings stay tools, because the model has to decide *when* to take them.
 a template, so a 10 000-table database does not produce a 10 000-entry
 response.
 
-Eight **prompts** encode an order of investigation that is easy to get wrong:
-`diagnose-slow-query`, `triage-lock-contention`, `bloat-and-vacuum-review`,
-`buffer-cache-review`, `capacity-check`, `replication-slot-review`,
-`plan-schema-change` and `explain-and-fix`. They are static text and touch no
+Nine **prompts** encode an order of investigation that is easy to get wrong:
+`diagnose-slow-query`, `triage-lock-contention`, `diagnose-deadlock`,
+`bloat-and-vacuum-review`, `buffer-cache-review`, `capacity-check`,
+`replication-slot-review`, `plan-schema-change` and `explain-and-fix`. They are static text and touch no
 database until the model acts on them, and each one whose tools are
 privilege-gated opens by calling `checkPrivileges`.
 

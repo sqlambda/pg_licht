@@ -1515,6 +1515,10 @@ private:
            "of what this investigation reads.\n\n"
            "Read before you write. Do not kill anything, and do not recommend "
            "killing anything until the last step.\n\n"
+           "This is for a wait that is still happening. If what you have is a "
+           "deadlock the server already detected and logged, the sessions in it "
+           "are gone and nothing below will find them -- use diagnose-deadlock, "
+           "which reconstructs it from the log and the schema instead.\n\n"
            "1. Call currentLocks. The rows carry a chain_depth: 0 is the "
            "backend asked about, and the largest depth is the backend at the "
            "root of the wait chain. That is the one to look at first.\n"
@@ -1527,6 +1531,96 @@ private:
            "4. Report the chain root, what it is doing, how long it has held "
            "the lock, and what is queued behind it. Only then discuss whether "
            "terminating it is safe, and say what would be lost.";
+       }},
+
+      {"diagnose-deadlock",
+       "Work out why a logged deadlock happened, from the log entry plus the schema.",
+       {{"deadlock_log", "the deadlock report from the server log: the ERROR line, "
+                         "the DETAIL block naming each process, and the statements", true},
+        {"connection", "connection the deadlock happened on; defaults to the configured default", false}},
+       [](const json& a) -> std::string {
+         const std::string log = arg_or(a, "deadlock_log", "");
+         const std::string c = arg_or(a, "connection", "");
+         const std::string on = c.empty() ? std::string() : " on connection " + c;
+         return
+           "Investigate this deadlock" + on + ".\n\n"
+           "The log:\n" + log + "\n\n"
+           "Start from what is no longer true. The deadlock is over: PostgreSQL "
+           "detected the cycle, killed one transaction and released the other. "
+           "The pids in that log do not exist any more, so currentActivity and "
+           "currentLocks describe a server that has already moved on, and "
+           "triage-lock-contention -- which is about a wait chain you can still "
+           "see -- does not apply. Everything below reconstructs the deadlock "
+           "from the log and the schema. Reach for the live tools only in step "
+           "6, and only if it is still recurring.\n\n"
+           "0. Call checkPrivileges. explainQuery and statementStats are the two "
+           "this needs and the two a restricted role loses; without them say so "
+           "rather than guessing at plans.\n"
+           "1. Read the log before touching the database, because it already "
+           "settles more than it is usually given credit for. For each process "
+           "extract three things: the statement it was running, the lock it "
+           "waited for, and the lock it held. The kind of lock names the shape "
+           "before you look at anything:\n"
+           "   - 'ShareLock on transaction N' means it was waiting for a row "
+           "another transaction had written and not yet committed. This is the "
+           "common case and it is a row-ordering problem.\n"
+           "   - 'ExclusiveLock on tuple (x,y)' is the queue for one specific "
+           "row: several transactions want the same row and are lined up.\n"
+           "   - a relation-level lock, especially AccessExclusiveLock, means "
+           "DDL or an explicit LOCK TABLE was in the cycle, not ordinary DML.\n"
+           "2. The statement text is not the lock footprint, and assuming it is "
+           "is why deadlocks between statements that name different tables look "
+           "impossible. For every table named, call tableDetails and read:\n"
+           "   - foreign keys in BOTH directions. Writing a row that references "
+           "a parent takes a lock on the parent row too, so a statement that "
+           "names only the child touches the parent, and two children pointing "
+           "at two parents in opposite orders deadlock without ever naming the "
+           "same table.\n"
+           "   - triggers. A trigger runs statements the log never shows, "
+           "against tables the statement never names.\n"
+           "   - unique indexes. Two inserts of the same key do not conflict on "
+           "a row that exists; the second waits on the first transaction to end.\n"
+           "   If a statement calls a function or procedure, call "
+           "functionDetails and read the body: the transaction is the whole "
+           "body, and the ordering that matters is the order the body takes.\n"
+           "3. Now reconstruct the acquisition ORDER for each transaction, "
+           "because that is the only thing that ever causes a deadlock. Two "
+           "transactions took the same locks in different orders; nothing else "
+           "produces a cycle. Write the order out per transaction, including "
+           "the locks step 2 found that the statements do not mention, and say "
+           "where the two orders cross.\n"
+           "4. Call explainQuery for each statement. The plan decides the order "
+           "rows are locked, so two UPDATEs with identical WHERE clauses lock "
+           "in different orders when one uses an index scan and the other a "
+           "sequential scan -- and a plan flip is enough to start a deadlock "
+           "that was not happening last week. Where the statement came from "
+           "pg_stat_statements, recover it with explainQuery by queryid first. "
+           "Do not use analyze: it executes, and this is a post mortem.\n"
+           "5. Classify it, and say which reading decided it: rows taken in "
+           "different orders, a foreign key pulling in a parent, a trigger "
+           "widening the footprint, contention on one unique key, or explicit "
+           "locking in inconsistent order.\n"
+           "6. Only now ask whether it is still happening. statementStats by "
+           "queryid says how often those statements run -- a deadlock needs "
+           "concurrency, so a statement called twice a day and one called "
+           "hundreds of times a second are different problems. If it is live "
+           "and frequent, currentLocks may catch the near-miss; serverSettings "
+           "gives deadlock_timeout, and log_lock_waits being off means the long "
+           "waits that did not quite deadlock were never logged at all.\n"
+           "7. Rank the fixes, and rank them in this order: make the "
+           "acquisition order consistent between the two paths, then shrink the "
+           "lock footprint, then shorten the transaction so the window is "
+           "smaller. Be explicit that deadlock_timeout is not a fix -- it "
+           "changes when the cycle is detected, never whether it forms -- and "
+           "that max_locks_per_transaction has nothing to do with this. "
+           "Retrying on SQLSTATE 40P01 belongs in the application and is a "
+           "mitigation, not a diagnosis: say so plainly if you recommend it, "
+           "because a retry loop over an ordering bug hides it rather than "
+           "fixing it.\n"
+           "8. If the fix is DDL -- an index to change a plan, a constraint to "
+           "drop, a trigger to rewrite -- hand it to plan-schema-change rather "
+           "than proposing the statement here. What is safe to apply depends on "
+           "the size and traffic of the table, which that prompt measures.";
        }},
 
       {"bloat-and-vacuum-review",
@@ -8151,7 +8245,7 @@ private:
 
   // Page size for every paginated list. Deliberately larger than any list this
   // server currently produces, so nothing is truncated for a client that
-  // ignores nextCursor: 59 tools, 8 prompts and 5 templates are each one page.
+  // ignores nextCursor: 59 tools, 9 prompts and 5 templates are each one page.
   // The list that can genuinely outgrow it is resources/list, which is
   // connections x schemas -- and that is the case pagination exists for.
   static constexpr size_t kListPageSize = 100;

@@ -1760,6 +1760,21 @@ to a plan to a fix, reading
 first so a truncated list is not mistaken for the whole picture.
 .It Ic triage-lock-contention Op Va connection
 Follow the wait chain to its root before proposing to terminate anything.
+For a wait that is still happening; a deadlock the server already logged needs
+.Ic diagnose-deadlock .
+.It Ic diagnose-deadlock Va deadlock_log Op Va connection
+Reconstruct a logged deadlock from the log entry and the schema.
+The deadlock is over before anyone reads about it, so the live lock views
+describe a server that has moved on; what settles it is the acquisition order
+each transaction took, which the statements alone do not show.
+A foreign key locks the parent row a statement never names, a trigger runs
+statements the log never shows, and the plan decides the order rows are locked
+\(em so an index scan against a sequential scan is enough to start a deadlock
+that was not happening last week.
+Ranks the fixes and says plainly that
+.Va deadlock_timeout
+is not one of them: it changes when the cycle is detected, never whether it
+forms.
 .It Ic bloat-and-vacuum-review Op Va schema
 Check
 .Ic replicationSlots
