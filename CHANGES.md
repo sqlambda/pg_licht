@@ -66,6 +66,39 @@ given a ceiling, and logical replication gains the runtime half it never had.
   | `buffer-cache-review` | `usage_counts`/`usagecount_avg`, `evictions`/`reuses` | it asked in step 5 whether the cache is being churned, using a tool that answers exactly that in step 1 |
   | `diagnose-slow-query`, `explain-and-fix` | `temp_blks_written`, `listExtendedStatistics` | the spill is already in hand from the first call, and extended statistics were recommended without checking whether any exist |
 
+- **`explain-and-fix` was rebuilt to investigate before it proposes.** It went
+  from plan to fix, and a plan is evidence rather than a verdict — a statement
+  can be slow with a perfect plan because the data is cold, the table is
+  bloated, or it waited instead of working.
+
+  It had a functional bug: it told the model to call `explainQuery` with
+  `analyze: true`, which is refused without a `timeout_ms`. That call errored.
+
+  The larger gap was `params`. Supplying them decides which plan comes back —
+  without them a statement carrying `$n` placeholders is planned `GENERIC_PLAN`,
+  which is what a prepared statement settles on — and the *difference between
+  the two plans* is the whole diagnosis for "fast when I run it by hand, slow
+  from the application". The prompt now asks for that comparison in both
+  directions and reads the `generic`/`analyzed` flags rather than assuming.
+
+  It reads what `EXPLAIN (ANALYZE, BUFFERS)` was already returning and it was
+  ignoring: `shared_read` against `shared_hit` (a cold cache or an oversized
+  working set is a capacity answer, not a query one), `Heap Fetches` on an
+  index-only scan (a stale visibility map, fixed by vacuum and not by an
+  index), and time no node accounts for (it waited). It grounds all of it in
+  `tableStats` — row count first, since a sequential scan of a few thousand rows
+  is the right plan, then the analyze timestamps, then `most_common_vals` for
+  the skew that makes one plan right for a common value and wrong for a rare
+  one.
+
+  It can now conclude that no fix is needed, which is a legitimate and often
+  correct outcome. An index proposal is shaped deliberately rather than named:
+  `duplicateIndexes` first because a prefix of an existing index buys nothing
+  and costs writes forever, then column order (equality before range), `INCLUDE`
+  for an index-only scan, a partial predicate, and the operator class where the
+  default will not be used. And the report says how anyone would confirm the fix
+  afterwards, which it never did.
+
   `triage-lock-contention` also hands off to `bloat-and-vacuum-review` when the
   chain root holds an old `backend_xmin`, since a backend blocking one wait
   chain is simultaneously stopping vacuum cluster-wide.

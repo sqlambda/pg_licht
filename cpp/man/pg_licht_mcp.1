@@ -1940,10 +1940,57 @@ Distinct from
 which reports which of this server's own operations the connecting role can
 run.
 This prompt is about another role's access to a database object.
-.It Ic explain-and-fix Ar sql Op Va params
-Plan without
-.Va analyze
-first, then with it if needed, and check existing indexes before proposing one.
+.It Ic explain-and-fix Ar sql Op Va params , schema
+Establish why a statement is slow, then propose a fix that is verified rather
+than guessed.
+A plan is evidence, not a verdict: a statement can be slow with a perfect plan
+because the data is cold, the table is bloated, or it waited rather than worked.
+.Pp
+Whether
+.Va params
+is supplied decides which plan comes back, and the difference between the two is
+itself a diagnosis.
+Without them a statement carrying
+.Li $n
+placeholders is planned with
+.Ic GENERIC_PLAN ,
+which is what a prepared statement settles on \(em frequently the whole answer to
+\(lqfast by hand, slow from the application\(rq.
+The prompt asks for the comparison in both directions.
+.Pp
+Reads estimates against actuals, then buffers
+.Pq Va shared_read No is a cold cache or an oversized working set, not a bad plan ,
+then
+.Va Heap Fetches
+on an index-only scan
+.Pq a stale visibility map, fixed by vacuum and not by an index ,
+then time no node accounts for
+.Pq it waited .
+Grounds all of it in
+.Ic tableStats :
+row count first, since a sequential scan of a few thousand rows needs no fix at
+all, then the analyze timestamps, then
+.Va most_common_vals
+for the skew that makes one plan right for a common value and wrong for a rare
+one.
+.Pp
+Ranks fixes by what they cost \(em analyze, rewrite, configuration, DDL \(em and
+treats \(lqalready as fast as it can be\(rq as a legitimate outcome.
+An index proposal is shaped deliberately: existing coverage checked with
+.Ic duplicateIndexes ,
+equality columns before range,
+.Ic INCLUDE
+for an index-only scan, a partial predicate where the constant is always the
+same, and the operator class where the default will not be used.
+.Pp
+Verifies before recommending: a rewrite is re-planned and compared, an index is
+put to
+.Ic evaluateIndex
+so the planner says whether it would take it.
+Creation is handed to
+.Ic plan-schema-change ,
+since whether an index is correct and whether it is safe to build are different
+questions.
 .Pp
 Both this and
 .Ic diagnose-slow-query
