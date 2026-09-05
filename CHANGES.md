@@ -165,6 +165,18 @@ given a ceiling, and logical replication gains the runtime half it never had.
   filters on `has_column_privilege`, so a role without `SELECT` on the column
   gets nulls rather than data.
 
+  Three prompts reach for them. `explain-and-fix` uses the three points to
+  decide whether the plan is stable and escalates to `columnHistogram` when it
+  needs to find *where* the plan turns rather than merely that it does.
+  `diagnose-slow-query` uses them to separate skew from staleness — statistics
+  that are current with an estimate still wrong is a different fix from
+  statistics nobody has refreshed. And `plan-schema-change` uses the full array
+  for partition boundaries: choosing them without the distribution is guessing,
+  the guess is usually uniform when the data is not, and a table partitioned by
+  month is a table with one enormous partition wherever the traffic actually
+  was. The bounds are equal-frequency, so every Nth one divides the existing
+  rows evenly.
+
 - **`checkRoleAccess`** — whether one role holds privileges on one table, view,
   sequence, function or procedure, answered by `has_table_privilege` and its
   relatives rather than reconstructed from ACLs. Role inheritance, grants to
