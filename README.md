@@ -119,13 +119,21 @@ Readings stay tools, because the model has to decide *when* to take them.
 a template, so a 10 000-table database does not produce a 10 000-entry
 response.
 
-Ten **prompts** encode an order of investigation that is easy to get wrong:
+Eleven **prompts** encode an order of investigation that is easy to get wrong:
 `diagnose-slow-query`, `triage-lock-contention`, `diagnose-deadlock`,
-`bloat-and-vacuum-review`, `buffer-cache-review`, `capacity-check`,
-`replication-slot-review`, `plan-schema-change`, `check-role-access` and
-`explain-and-fix`. They are static text and touch no
+`triage-active-sessions`, `bloat-and-vacuum-review`, `buffer-cache-review`,
+`capacity-check`, `replication-slot-review`, `plan-schema-change`,
+`check-role-access` and `explain-and-fix`. They are static text and touch no
 database until the model acts on them, and each one whose tools are
 privilege-gated opens by calling `checkPrivileges`.
+
+`triage-active-sessions` is for a server running more sessions at once than it
+has cores. Its first move is to stop trusting the word *active*: a backend
+waiting on a lock or a disk read is executing a statement, so only the ones with
+no wait event are competing for CPU, and parallel workers collapse into their
+leaders before anything is counted. Its second is that concurrency is arrival
+rate times duration — so it rises when statements get slower even though the
+load did not change, and more cores treat the symptom.
 
 `check-role-access` answers whether a role can use a table, view, function or
 procedure — walking the gates in order, since the one people forget is `USAGE`

@@ -214,6 +214,38 @@ given a ceiling, and logical replication gains the runtime half it never had.
   "never", and `role.inherits` and `role.member_of` are returned so the two can
   be told apart.
 
+- **`triage-active-sessions`, for a server running more sessions at once than
+  it has cores.** Two things it establishes before anything else, because both
+  are routinely assumed instead.
+
+  **`active` does not mean on-CPU.** `pg_stat_activity` calls a backend active
+  while it is executing a statement, and a backend waiting on a lock, on a disk
+  read or on a parallel sibling is executing a statement. Fifty active sessions
+  of which forty-five are lock waits is one blocker and a queue, not a shortage
+  of cores. Only backends with no wait event compete for CPU, and that is the
+  number compared against the core count — after parallel workers are collapsed
+  into their leaders via `leader_pid`, since one query with four workers is five
+  rows and one unit of user concurrency.
+
+  The split by `wait_event_type` then decides which investigation this actually
+  is, and hands off: locks to `triage-lock-contention`, I/O to
+  `buffer-cache-review`, IPC back to the parallelism settings, LWLock to the
+  write path.
+
+  **High concurrency is usually a symptom.** Sessions in flight is arrival rate
+  multiplied by duration, so it rises when statements get slower even though
+  nothing about the load changed. Where the server really is CPU-bound,
+  `statementStats` says which term moved: more calls is growth and a capacity
+  answer, the same calls taking longer is a regression that belongs to
+  `diagnose-slow-query`. A plan that flipped, statistics gone stale, a table
+  that bloated or a working set that outgrew the cache all present as a load
+  problem and none of them is one — and the prompt says plainly that a
+  connection pooler bounds the damage without making any statement faster.
+
+  `capacity-check` flags `max_parallel_workers_per_gather` as the setting that
+  lets one query oversubscribe a machine; this is where that consequence is
+  observed, and the two now name each other.
+
 - **`check-role-access`, a tenth prompt.** Whether a role can use a table,
   view, function or procedure — and, separately, which rows it then sees.
 

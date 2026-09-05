@@ -1885,6 +1885,37 @@ because the chains forming now are the near-miss version of the one that closed
 \(em at which point
 .Ic triage-lock-contention
 takes over.
+.It Ic triage-active-sessions Op Va connection
+Why a server is running more sessions at once than it has CPUs.
+.Pp
+Begins by distrusting the word
+.Dq active :
+.Li pg_stat_activity
+calls a backend active while it executes a statement, and one waiting on a
+lock, on a disk read or on a parallel sibling is executing a statement.
+Only backends with no wait event compete for CPU, and that is the count
+compared against the core count \(em a server with fifty active sessions of
+which forty-five are lock waits has one blocker and a queue, not a shortage of
+cores.
+Parallel workers are collapsed into their leaders first, since one query with
+four workers is five rows and one unit of user concurrency.
+.Pp
+The split by
+.Va wait_event_type
+then decides which investigation this is:
+.Ic triage-lock-contention
+for locks,
+.Ic buffer-cache-review
+for I/O, the parallelism settings for IPC, the write path for LWLock.
+.Pp
+Where the server really is CPU-bound, concurrency is arrival rate multiplied by
+duration, so it rises when statements get slower even though nothing about the
+load changed.
+.Ic statementStats
+says which term moved: more calls is growth and a capacity answer, the same
+calls taking longer is a regression and belongs to
+.Ic diagnose-slow-query .
+A connection pooler bounds the damage and makes no statement faster.
 .It Ic bloat-and-vacuum-review Op Va schema
 Check
 .Ic replicationSlots
