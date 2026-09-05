@@ -49,6 +49,26 @@ given a ceiling, and logical replication gains the runtime half it never had.
   relation), and the seven `conflicts` counters need 18. An absent key means
   the server cannot answer, which is not the same as zero.
 
+- **`replication-slot-review` reads the fields the tool was already
+  returning.** It ranked slots by `active`, `restart_lsn` and `wal_status` and
+  ignored three readings that answer questions it was otherwise estimating:
+  `inactive_since` dates the problem exactly, where a slot idle for an hour and
+  one idle since a deploy three weeks ago are different findings with identical
+  `retained_wal_bytes`; `conflicting` and `invalidation_reason` say the server
+  retired the slot rather than it merely falling behind, and `wal_removed`,
+  `rows_removed`, `wal_level_insufficient` and `idle_timeout` each need a
+  different fix; and the spill counters separate logical decoding that does not
+  fit in `logical_decoding_work_mem` from a consumer that is simply slow.
+
+  It also gains the state that looks like abandonment and is not. A
+  subscription created with `disable_on_error` switches *itself* off the first
+  time apply fails, so the symptom is an inactive slot, a disabled
+  subscription, and WAL piling up behind a consumer that is neither broken nor
+  gone. Dropping the slot there destroys a subscriber that was one
+  `ALTER SUBSCRIPTION ENABLE` from resuming — which is why the prompt now reads
+  `enabled` beside `disable_on_error` rather than treating inactive as
+  abandoned.
+
 - **`diagnose-deadlock`, a ninth prompt.** A deadlock is over before anyone
   reads about it: PostgreSQL detects the cycle, kills a transaction and
   releases the other, so the pids in the log no longer exist and the live lock

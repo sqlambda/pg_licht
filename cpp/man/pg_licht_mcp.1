@@ -1805,6 +1805,21 @@ Worst-case committed memory against host RAM; stops with a partial answer
 rather than guessing an undeclared host.
 .It Ic replication-slot-review Op Va connection
 The runbook for the failure mode that presents as something else.
+Reads
+.Va inactive_since
+to date the problem rather than infer it from WAL volume,
+.Va invalidation_reason
+to tell a slot the server retired from one merely falling behind, and the spill
+counters to tell logical decoding that does not fit in memory from a slow
+consumer.
+For a logical slot it goes on to the subscriber:
+.Ic subscriptionStats
+separates one that is stuck from one that is gone, and
+.Va disable_on_error
+in
+.Ic listSubscriptions
+identifies the third case, a subscriber that switched itself off on an apply
+error and is one command from resuming.
 An unconsumed slot holds back the xmin horizon, so vacuum cannot remove dead
 tuples anywhere in the cluster, and pins WAL until the disk fills; both get
 diagnosed as bloat or as a disk problem.
