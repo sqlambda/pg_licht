@@ -460,7 +460,7 @@ Most of this server works for any role that can connect, because the catalog is
 world-readable.
 Measured on PostgreSQL 18: a bare
 .Ic LOGIN
-role with no grants runs 48 of the 59 operations at full fidelity, the
+role with no grants runs 49 of the 60 operations at full fidelity, the
 monitoring role takes that to 54, and the three that remain are exactly the
 three that read row data \(em the
 .Ic tableStats
@@ -512,6 +512,46 @@ escalate privilege, which is not this server's to make.
 .El
 .Ss Schema exploration
 .Bl -tag -width Ds
+.It Ic checkRoleAccess Ar grantee Ar schema Ar object
+Whether one role holds privileges on one table, view, sequence, function or
+procedure, answered by
+.Fn has_table_privilege
+and its relatives rather than reconstructed from ACLs, so inheritance, grants to
+.Va PUBLIC ,
+ownership and superuser fold in the way the server folds them.
+Needs no grant of its own: these functions and the catalog are world-readable,
+so any role that can connect may ask about any other.
+The argument is
+.Ar grantee
+because
+.Va role
+is reserved server-wide for narrowing a sweep to a primary or a replica.
+.Pp
+Schema
+.Ic USAGE
+and database
+.Ic CONNECT
+come back beside the object privileges, since a grant on the table is inert
+without them and the resulting error names the table.
+Where a table-level privilege is absent but individual columns carry it, those
+columns are listed.
+A routine name reports every overload with its signature and
+.Va security_definer .
+.Pp
+.Sy Row-level security is not folded in ,
+because
+.Fn has_table_privilege
+does not consider it: a true here can still return no rows.
+The
+.Va row_level_security
+block carries whether RLS is enabled, whether it is forced, whether this
+particular role is subject to it \(em the owner is exempt unless forced \(em and
+every policy with whether it applies to the role.
+Enabled with no applicable permissive policy denies everything.
+.Pp
+Not to be confused with
+.Ic checkPrivileges ,
+which reports which of this server's own operations the connecting role can run.
 .It Ic listSchemas
 All schemas with their table and view names and role grants.
 .It Ic listTables Ar schema
@@ -1635,7 +1675,7 @@ capability is declared, so there is no mechanism by which it could.
 Anything read from a live catalog is hinted at one minute.
 This matters most for
 .Ic tools/list ,
-which is roughly 93 kB once 59 operations carry descriptions, annotations,
+which is roughly 93 kB once 60 operations carry descriptions, annotations,
 titles and output schemas, and which a client would otherwise re-fetch whenever
 it needed the list.
 .Pp

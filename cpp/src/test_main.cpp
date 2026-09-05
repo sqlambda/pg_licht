@@ -4788,6 +4788,71 @@ TEST_F(PostgresMCPServerTest, TheReaperClosesAnIdleConnection) {
   EXPECT_EQ(cache.idle_count(), 0u);
 }
 
+TEST_F(PostgresMCPServerTest, CheckRoleAccessSeparatesTheGatesThatLookAlike) {
+  // The cases this tool exists for all look identical from a grants map: a
+  // grant that is real but unreachable, a table-level no that is a per-column
+  // yes, and a complete set of grants that returns no rows because RLS is on.
+  pqxx::connection c(test_url);
+  const std::string sfx = std::to_string(getpid());
+  const std::string reach = "cra_reach_" + sfx, part = "cra_part_" + sfx;
+  {
+    pqxx::nontransaction n(c);
+    n.exec("CREATE ROLE " + reach + " NOLOGIN");
+    n.exec("CREATE ROLE " + part + " NOLOGIN");
+    // Its own schema, because the fixture grants USAGE on grocery to PUBLIC and
+    // the whole point of the first case is a schema the role cannot enter.
+    n.exec("CREATE SCHEMA cra_s");
+    n.exec("CREATE TABLE cra_s.cra (id int, note text)");
+    // reach: granted the table, never granted the schema.
+    n.exec("GRANT SELECT ON cra_s.cra TO " + reach);
+    // part: no table grant at all, only two columns.
+    n.exec("GRANT USAGE ON SCHEMA cra_s TO " + part);
+    n.exec("GRANT SELECT (id, note) ON cra_s.cra TO " + part);
+    n.exec("ALTER TABLE cra_s.cra ENABLE ROW LEVEL SECURITY");
+  }
+
+  json r = srv->call_check_role_access(reach, "cra_s", "cra");
+  EXPECT_EQ(r["privileges"]["SELECT"], true);
+  EXPECT_EQ(r["schema_access"]["usage"], false)
+      << "the gate that is missed most often has to be reported on its own: "
+      << r.dump(2);
+
+  json p2 = srv->call_check_role_access(part, "cra_s", "cra");
+  EXPECT_EQ(p2["privileges"]["SELECT"], false);
+  ASSERT_TRUE(p2["columns"].contains("SELECT")) << p2.dump(2);
+  EXPECT_EQ(p2["columns"]["SELECT"].size(), 2u)
+      << "a table-level no that is a per-column yes must not read as a flat no";
+
+  // RLS is enabled with no policy at all, which denies everything -- and
+  // has_table_privilege knows nothing about it, which is exactly why the block
+  // is returned separately rather than folded into the verdict.
+  EXPECT_EQ(p2["row_level_security"]["enabled"], true);
+  EXPECT_EQ(p2["row_level_security"]["applies_to_role"], true);
+  EXPECT_TRUE(p2["row_level_security"]["policies"].empty()) << p2.dump(2);
+
+  // The owner is exempt unless FORCE, which is why testing as the owner proves
+  // nothing about anybody else.
+  json owner = srv->call_check_role_access(
+      admin_conn->username(), "cra_s", "cra");
+  EXPECT_EQ(owner["object"]["is_owner"], true) << owner.dump(2);
+  EXPECT_EQ(owner["row_level_security"]["applies_to_role"], false)
+      << "owner is exempt while forced is false: " << owner.dump(2);
+
+  // Neither a missing role nor a missing object is an error: both are answers.
+  json ghost = srv->call_check_role_access("cra_no_such_role", "cra_s", "cra");
+  EXPECT_EQ(ghost["role"]["exists"], false);
+  EXPECT_TRUE(ghost.contains("note"));
+  json nothing = srv->call_check_role_access(part, "cra_s", "cra_no_such_table");
+  EXPECT_TRUE(nothing.contains("note")) << nothing.dump(2);
+
+  {
+    pqxx::nontransaction n(c);
+    n.exec("DROP SCHEMA cra_s CASCADE");
+    n.exec("DROP ROLE " + reach);
+    n.exec("DROP ROLE " + part);
+  }
+}
+
 TEST_F(PostgresMCPServerTest, StatsSeparateManualVacuumFromAutovacuum) {
   // Through 4.1.1 both statistics tools returned
   // GREATEST(last_vacuum, last_autovacuum) under the name last_vacuum, and the

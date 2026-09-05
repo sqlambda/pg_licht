@@ -90,6 +90,43 @@ given a ceiling, and logical replication gains the runtime half it never had.
   `enabled` beside `disable_on_error` rather than treating inactive as
   abandoned.
 
+- **`checkRoleAccess`** — whether one role holds privileges on one table, view,
+  sequence, function or procedure, answered by `has_table_privilege` and its
+  relatives rather than reconstructed from ACLs. Role inheritance, grants to
+  `PUBLIC`, ownership and superuser fold in the way the server folds them, which
+  is laborious and easy to get subtly wrong by hand.
+
+  It needs no grant of its own — those functions and the catalog are
+  world-readable, so any role that can connect may ask about any other. The
+  argument is `grantee` rather than `role`, because `role` is reserved
+  server-wide for narrowing a sweep to a primary or a replica.
+
+  Three things it reports rather than folds in, because folding them in would
+  produce a confident wrong answer:
+
+  - **Schema `USAGE` and database `CONNECT` come back beside the object
+    privileges.** `SELECT` on a table is inert without `USAGE` on its schema,
+    and the error names the *table*, which sends people to the wrong object.
+  - **Column-level grants are listed when the table-level answer is no**, so a
+    partial yes does not read as a flat no.
+  - **Row-level security is not considered by `has_table_privilege` at all.** A
+    true can still return zero rows. The `row_level_security` block carries
+    whether RLS is on, whether it is *forced*, whether this particular role is
+    subject to it, and every policy with whether it applies — because the owner
+    is exempt unless forced, which is why checking as the owner proves nothing
+    about anyone else.
+
+  A routine name reports every overload with its signature and
+  `security_definer`. A missing role and a missing object are both answers
+  rather than errors.
+
+  Measured against a purpose-built rig while writing it, and one result
+  corrected the design: `has_table_privilege` **does** honour `rolinherit`, so a
+  `NOINHERIT` member of a granted group gets `false` even though the privilege
+  is one `SET ROLE` away. A false is therefore "not right now" rather than
+  "never", and `role.inherits` and `role.member_of` are returned so the two can
+  be told apart.
+
 - **`check-role-access`, a tenth prompt.** Whether a role can use a table,
   view, function or procedure — and, separately, which rows it then sees.
 
@@ -122,10 +159,9 @@ given a ceiling, and logical replication gains the runtime half it never had.
   back into play; a `SECURITY DEFINER` function runs its body as the owner, so
   `EXECUTE` on it is effectively a grant of whatever the body can do.
 
-  The prompt closes by saying how the answer was reached. It is reconstructed
-  from catalog ACLs, role membership and policy expressions, which is sound but
-  is not the same as asking the server — so it recommends confirming with
-  `has_table_privilege` and its relatives before anyone acts on it.
+  The prompt leads with `checkRoleAccess` rather than reconstructing the answer,
+  and the manual walk below it is how a verdict becomes something an operator
+  can act on: which gate said no, or what a yes does not cover.
 
   `checkPrivileges` is unrelated despite the name and now says so: that tool
   reports which of *this server's operations* the *connecting* role can run.

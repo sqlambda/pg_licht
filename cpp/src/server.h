@@ -445,6 +445,8 @@ public:
   const json call_publications() { return publications(); }
   const json call_subscriptions() { return subscriptions(); }
   const json call_subscription_stats() { return subscription_stats(); }
+  const json call_check_role_access(const std::string& r, const std::string& sc,
+                                    const std::string& o) { return check_role_access(r, sc, o); }
   const json call_languages() { return languages(); }
   const json call_extended_statistics(const std::string& schema) { return extended_statistics(schema); }
   const json call_operators(const std::string& schema) { return operators(schema); }
@@ -1171,6 +1173,9 @@ private:
       // legitimately differs between two databases of one instance. A physical
       // replica returns it verbatim.
       {"checkPrivileges",       {true,  false, false, false}},
+      // Roles are cluster-wide but the grants asked about are per object,
+      // so the answer varies by database and not across a replication group.
+      {"checkRoleAccess",       {true,  false, false, false}},
       // Planning is per database, and a physical replica plans identically off
       // the same statistics. Like explainQuery it is never swept: the same
       // statement is rarely valid in another database.
@@ -2022,9 +2027,18 @@ private:
            "and WHICH ROWS it then sees. Grants settle the first. Row-level "
            "security settles the second and can reduce a complete set of grants "
            "to nothing without touching them. Answer both explicitly.\n\n"
-           "0. Call checkPrivileges. The catalog is world-readable so most of "
-           "this works for any role that can connect, but say what is degraded "
-           "rather than reporting a filtered answer as a finding.\n"
+           "0. Call checkRoleAccess with grantee " + role + ", the schema and "
+           "the object. It answers the grant question outright, the way "
+           "PostgreSQL answers it: has_table_privilege and its relatives fold in "
+           "inheritance, grants to PUBLIC, ownership and superuser exactly as the "
+           "server does. Everything below interprets that answer rather than "
+           "recomputing it -- do not add up ACLs by hand when the server has "
+           "already been asked.\n"
+           "   Read four parts of it before anything else. privileges is the "
+           "verdict per privilege. schema_access.usage is a separate gate and a "
+           "false there beats a true above it. columns lists a partial grant "
+           "where the table-level answer was no. row_level_security is a "
+           "different question entirely and step 4 is where it is read.\n"
            "1. Call listRoles and establish what " + role + " IS before asking "
            "what it has. Three attributes can end the investigation here:\n"
            "   - superuser bypasses every check below, including row-level "
@@ -2041,7 +2055,10 @@ private:
            "closure counts, subject to inherit. Say which role in the chain "
            "actually carries the grant, because that is where an operator has "
            "to go to change it.\n"
-           "2. Walk the gates in order, stopping at the first failure.\n"
+           "2. Where checkRoleAccess said no, walk the gates to find WHICH one "
+           "said it -- the tool gives the verdict, and this is how you turn a "
+           "verdict into something an operator can act on. Where it said yes, "
+           "read the same list to say what the yes does not cover.\n"
            "   a. CONNECT on the database, and whether the role can log in at "
            "all -- a group role with every grant in the cluster still cannot "
            "open a session.\n"
@@ -2106,14 +2123,14 @@ private:
            "the answer is yes, say what it does not include -- the columns "
            "outside the grant, the rows outside the policy, the write that the "
            "read does not imply.\n"
-           "7. Say how the answer was reached. This is reconstructed from "
-           "catalog ACLs, role membership and policy expressions, which is "
-           "sound but is not the same as asking the server. An operator who can "
-           "run SQL should confirm it with has_table_privilege, "
-           "has_schema_privilege or has_function_privilege, which evaluate "
-           "inheritance, PUBLIC and superuser the way PostgreSQL actually does. "
-           "Recommend that confirmation whenever the answer is going to be "
-           "acted on rather than merely read.";
+           "7. One thing checkRoleAccess cannot fold in, so say it when it "
+           "applies: a false for a NOINHERIT member of a granted group means "
+           "\'not right now\' rather than \'never\'. The has_* functions honour "
+           "rolinherit, so the privilege is real and one SET ROLE away -- and "
+           "application code almost never issues one, which is usually what "
+           "makes the answer no in practice rather than in principle. The role "
+           "block carries inherits and member_of precisely so the two can be "
+           "told apart.";
        }},
 
       {"explain-and-fix",
@@ -2278,7 +2295,7 @@ private:
   //   1. Payloads are version-conditional. tableStats gains
   //      n_tup_newpage_upd and last_seq_scan on PostgreSQL 16, checkpointStats
   //      is normalised across three different sets of underlying views, and a
-  //      schema would have to be re-proved on five majors for 59 tools.
+  //      schema would have to be re-proved on five majors for 60 tools.
   //   2. Every tool carries the same escape hatch: when an extension is absent
   //      or a grant is missing, the payload is {error, hint} instead of the
   //      documented shape. A schema that enumerated the documented shape would
@@ -2347,6 +2364,13 @@ private:
       {"listForeignServers",     schema_map("server name", "its wrapper, options and user mappings")},
       {"listForeignTables",      schema_map("foreign table name", "its server and column list")},
       {"listPublications",       schema_map("publication name", "its tables and replicated operations")},
+      {"checkRoleAccess",        schema_fixed("Whether one role holds privileges on one object, "
+                                              "as PostgreSQL itself evaluates it.",
+                                              {{"role", "object"}, {"object", "object"},
+                                               {"database_access", "object"}, {"schema_access", "object"},
+                                               {"privileges", "object"}, {"columns", "object"},
+                                               {"row_level_security", "object"},
+                                               {"overloads", "array"}, {"note", "string"}})},
       {"listSubscriptions",      schema_map("subscription name", "its publication, slot and state")},
       {"subscriptionStats",      schema_map("subscription name", "its worker state, table sync progress and error counters")},
       {"replicationSlots",       schema_map("slot name", "its type, activity and retained WAL")},
@@ -2701,6 +2725,19 @@ private:
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", json::object()}
+	      }}
+	  },
+	  {
+	    {"name", "checkRoleAccess"},
+	    {"description", "answer whether one role holds privileges on one table, view, sequence, function or procedure -- as PostgreSQL evaluates it, via has_table_privilege and its relatives, so role inheritance, grants to PUBLIC, ownership and superuser are all folded in the way the server folds them rather than reconstructed from ACLs. Needs no grant of its own: these functions and the catalog are world-readable, so any role that can connect may ask about any other. Returns schema USAGE and database CONNECT beside the object privileges, because a grant on the table is inert without them and the resulting error names the table. Where a table-level privilege is absent but individual columns carry it, the columns are listed. IMPORTANT: has_table_privilege does not consider row-level security, so a true here can still return no rows -- row_level_security carries whether RLS is on, whether this role is subject to it (the owner is exempt unless FORCE ROW LEVEL SECURITY), and every policy with whether it applies to this role. RLS enabled with no applicable permissive policy denies everything. Not to be confused with checkPrivileges, which reports which of THIS SERVER's operations the CONNECTING role can run"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", {
+		    {"grantee", {{"type", "string"}, {"description", "the role to ask about; need not be the role this server connects as, and need not hold an actual GRANT -- ownership and superuser answer true too. Named grantee rather than role because role is reserved server-wide for narrowing a sweep to a primary or a replica"}}},
+		    {"schema", {{"type", "string"}}},
+		    {"object", {{"type", "string"}, {"description", "table, view, sequence, function or procedure name. A routine name reports every overload"}}}
+		  }},
+		{"required", {"grantee", "schema", "object"}}
 	      }}
 	  },
 	  {
@@ -6592,7 +6629,174 @@ private:
     }
   }
 
+  // Does `role` hold privileges on one object, answered by PostgreSQL rather
+  // than reconstructed from ACLs.
+  //
+  // The catalog is world-readable and so are the has_*_privilege functions, so
+  // this needs no grant of its own: any role that can connect can ask about any
+  // other. What it saves is not access but correctness -- inheritance, PUBLIC,
+  // ownership and superuser all fold into the answer the way the server itself
+  // folds them, which is laborious and easy to get subtly wrong by hand.
+  //
+  // Three things this deliberately reports rather than resolves:
+  //
+  // 1. has_table_privilege does NOT consider row-level security. A role can
+  //    hold SELECT and see no rows at all. The rls block carries what decides
+  //    that, including whether this particular role is subject to it, because
+  //    the owner is exempt unless FORCE ROW LEVEL SECURITY is set and that is
+  //    the single most common wrong test.
+  // 2. Schema USAGE is returned beside the object privileges rather than folded
+  //    into them. SELECT on a table is inert without it, and the error names the
+  //    table, which sends people to the wrong object.
+  // 3. inherits false cuts the other way from what one might expect, and it was
+  //    measured rather than assumed: the has_* functions DO honour rolinherit,
+  //    so a NOINHERIT member of a granted group gets false here even though the
+  //    privilege is one SET ROLE away. A false is therefore "not right now"
+  //    rather than "never", and the role block carries inherits and member_of
+  //    so a caller can tell the two apart.
+  const json check_role_access(const std::string& role,
+                               const std::string& schema,
+                               const std::string& object) {
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+    const int v = sess.server_version();
+
+    // A role that does not exist makes every has_*_privilege call raise, so it
+    // is established first and reported as a fact rather than an error: "no
+    // such role" is an answer to the question that was asked.
+    pqxx::result who = pqxx_exec(txn,
+      "SELECT JSONB_BUILD_OBJECT("
+      "  'name', r.rolname, 'exists', true"
+      ", 'can_login', r.rolcanlogin, 'superuser', r.rolsuper"
+      ", 'inherits', r.rolinherit, 'bypass_rls', r.rolbypassrls"
+      ", 'member_of', COALESCE((SELECT JSONB_AGG(g.rolname ORDER BY g.rolname)"
+      "                          FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid"
+      "                         WHERE m.member = r.oid), '[]'::jsonb))"
+      " FROM pg_roles AS r WHERE r.rolname = $1",
+      pqxx::params{role});
+
+    if (who.empty() || who[0][0].is_null())
+      return {{"role", {{"name", role}, {"exists", false}}},
+              {"note", "no such role on this server; nothing else was evaluated"}};
+
+    json out;
+    out["role"] = json::parse(who[0][0].as<std::string>());
+
+    // MAINTAIN is PostgreSQL 17. Asking for it on an older server raises
+    // rather than returning false, so it is gated rather than probed.
+    const std::string maintain =
+      v >= 170000 ? ", 'MAINTAIN', has_table_privilege($1, c.oid, 'MAINTAIN')" : "";
+
+    pqxx::result rel = pqxx_exec(txn,
+      "SELECT JSONB_BUILD_OBJECT("
+      "  'object', JSONB_BUILD_OBJECT("
+      "      'schema', n.nspname, 'name', c.relname"
+      "    , 'kind', CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table'"
+      "                             WHEN 'v' THEN 'view'  WHEN 'm' THEN 'materialized view'"
+      "                             WHEN 'f' THEN 'foreign table' WHEN 'S' THEN 'sequence'"
+      "                             ELSE c.relkind::text END"
+      "    , 'owner', pg_get_userbyid(c.relowner)"
+      "    , 'is_owner', pg_get_userbyid(c.relowner) = $1)"
+      // Schema USAGE is a gate of its own, and the one most often missed.
+      ", 'schema_access', JSONB_BUILD_OBJECT("
+      "      'usage',  has_schema_privilege($1, n.oid, 'USAGE')"
+      "    , 'create', has_schema_privilege($1, n.oid, 'CREATE'))"
+      ", 'database_access', JSONB_BUILD_OBJECT("
+      "      'connect', has_database_privilege($1, current_database(), 'CONNECT'))"
+      ", 'privileges', CASE WHEN c.relkind = 'S' THEN JSONB_BUILD_OBJECT("
+      "        'USAGE',  has_sequence_privilege($1, c.oid, 'USAGE')"
+      "      , 'SELECT', has_sequence_privilege($1, c.oid, 'SELECT')"
+      "      , 'UPDATE', has_sequence_privilege($1, c.oid, 'UPDATE'))"
+      "    ELSE JSONB_BUILD_OBJECT("
+      "        'SELECT',     has_table_privilege($1, c.oid, 'SELECT')"
+      "      , 'INSERT',     has_table_privilege($1, c.oid, 'INSERT')"
+      "      , 'UPDATE',     has_table_privilege($1, c.oid, 'UPDATE')"
+      "      , 'DELETE',     has_table_privilege($1, c.oid, 'DELETE')"
+      "      , 'TRUNCATE',   has_table_privilege($1, c.oid, 'TRUNCATE')"
+      "      , 'REFERENCES', has_table_privilege($1, c.oid, 'REFERENCES')"
+      "      , 'TRIGGER',    has_table_privilege($1, c.oid, 'TRIGGER')" + maintain +
+      "      ) END"
+      // Only the columns that carry a grant the table itself does not: a
+      // table-level yes makes the per-column answer noise, and the interesting
+      // case is a table-level no that is really a partial yes.
+      ", 'columns', CASE WHEN c.relkind = 'S' THEN NULL ELSE ("
+      "     SELECT NULLIF(JSONB_STRIP_NULLS(JSONB_OBJECT_AGG(p.priv, cols)), '{}'::jsonb)"
+      "       FROM (VALUES ('SELECT'),('INSERT'),('UPDATE'),('REFERENCES')) AS p(priv)"
+      "       CROSS JOIN LATERAL ("
+      "         SELECT CASE WHEN has_table_privilege($1, c.oid, p.priv) THEN NULL ELSE ("
+      "                  SELECT JSONB_AGG(a.attname ORDER BY a.attnum)"
+      "                    FROM pg_attribute AS a"
+      "                   WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped"
+      "                     AND has_column_privilege($1, c.oid, a.attnum, p.priv)) END AS cols) _c"
+      "   ) END"
+      // has_table_privilege knows nothing about RLS, so what decides the rows
+      // is reported separately and in full.
+      ", 'row_level_security', JSONB_BUILD_OBJECT("
+      "      'enabled', c.relrowsecurity, 'forced', c.relforcerowsecurity"
+      "    , 'applies_to_role', c.relrowsecurity"
+      "        AND NOT (SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = $1)"
+      "        AND NOT (pg_get_userbyid(c.relowner) = $1 AND NOT c.relforcerowsecurity)"
+      "    , 'policies', COALESCE((SELECT JSONB_OBJECT_AGG(pol.polname, JSONB_BUILD_OBJECT("
+      "          'command', CASE pol.polcmd WHEN 'r' THEN 'SELECT' WHEN 'a' THEN 'INSERT'"
+      "                                     WHEN 'w' THEN 'UPDATE' WHEN 'd' THEN 'DELETE'"
+      "                                     ELSE 'ALL' END"
+      "        , 'permissive', pol.polpermissive"
+      "        , 'roles', COALESCE((SELECT JSONB_AGG(rolname ORDER BY rolname)"
+      "                              FROM pg_roles WHERE oid = ANY(pol.polroles)), '[\"PUBLIC\"]'::jsonb)"
+      "        , 'applies_to_role', pol.polroles IS NULL"
+      "             OR 0 = ANY(pol.polroles)"
+      "             OR EXISTS (SELECT 1 FROM pg_roles pr WHERE pr.oid = ANY(pol.polroles)"
+      "                          AND pg_has_role($1, pr.oid, 'USAGE'))"
+      "        , 'using', pg_get_expr(pol.polqual, pol.polrelid)"
+      "        , 'with_check', pg_get_expr(pol.polwithcheck, pol.polrelid)))"
+      "        FROM pg_policy AS pol WHERE pol.polrelid = c.oid), '{}'::jsonb)))"
+      "  FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace"
+      " WHERE c.oid = to_regclass($2)",
+      pqxx::params{role, schema + "." + object});
+
+    if (!rel.empty() && !rel[0][0].is_null()) {
+      out.update(json::parse(rel[0][0].as<std::string>()));
+      return out;
+    }
+
+    // Not a relation. Functions and procedures overload, so every signature of
+    // that name is reported rather than one guessed at.
+    pqxx::result fn = pqxx_exec(txn,
+      "SELECT JSONB_BUILD_OBJECT("
+      "  'schema_access', JSONB_BUILD_OBJECT("
+      "      'usage', has_schema_privilege($1, n.oid, 'USAGE'))"
+      ", 'database_access', JSONB_BUILD_OBJECT("
+      "      'connect', has_database_privilege($1, current_database(), 'CONNECT'))"
+      ", 'overloads', JSONB_AGG(JSONB_BUILD_OBJECT("
+      "      'signature', p.oid::regprocedure::text"
+      "    , 'kind', CASE p.prokind WHEN 'p' THEN 'procedure' WHEN 'a' THEN 'aggregate'"
+      "                             WHEN 'w' THEN 'window' ELSE 'function' END"
+      "    , 'owner', pg_get_userbyid(p.proowner)"
+      "    , 'is_owner', pg_get_userbyid(p.proowner) = $1"
+      "    , 'security_definer', p.prosecdef"
+      "    , 'privileges', JSONB_BUILD_OBJECT("
+      "          'EXECUTE', has_function_privilege($1, p.oid, 'EXECUTE')))"
+      "    ORDER BY p.oid::regprocedure::text))"
+      "  FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace"
+      " WHERE n.nspname = $2 AND p.proname = $3"
+      " GROUP BY n.oid",
+      pqxx::params{role, schema, object});
+
+    if (!fn.empty() && !fn[0][0].is_null()) {
+      out.update(json::parse(fn[0][0].as<std::string>()));
+      out["object"] = {{"schema", schema}, {"name", object}, {"kind", "routine"}};
+      return out;
+    }
+
+    out["object"] = {{"schema", schema}, {"name", object}};
+    out["note"] = "no table, view, sequence, function or procedure by that name "
+                  "in that schema; nothing was evaluated. Names are case "
+                  "sensitive here exactly as they are in the catalog.";
+    return out;
+  }
+
   const json languages() {
+
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
@@ -7196,8 +7400,8 @@ private:
   // The catalog is world-readable, so most of the tool set works for any role
   // that can connect. What varies is a small, knowable set: the predefined
   // roles that gate the monitoring extras, and whether the role can read table
-  // data at all. Measured against PostgreSQL 18: a bare login role runs 48 of
-  // the 59 tools at full fidelity, pg_monitor takes that to 55, and the ones
+  // data at all. Measured against PostgreSQL 18: a bare login role runs 49 of
+  // the 60 tools at full fidelity, pg_monitor takes that to 56, and the ones
   // that remain are exactly the three that touch row data.
   //
   // The point of asking once, up front, is that the alternative is discovering
@@ -8044,6 +8248,12 @@ private:
     else if (tool_name == "subscriptionStats") {
       result_content = subscription_stats();
     }
+    else if (tool_name == "checkRoleAccess") {
+      result_content = check_role_access(
+        arguments.value("grantee", std::string()),
+        arguments.value("schema", std::string()),
+        arguments.value("object", std::string()));
+    }
     else if (tool_name == "listLanguages") {
       result_content = languages();
     }
@@ -8490,7 +8700,7 @@ private:
   // the same revision, and a legacy result must not grow fields its era never
   // had.
   //
-  // This matters more here than it looks. tools/list is ~93 kB once 59 tools
+  // This matters more here than it looks. tools/list is ~93 kB once 60 tools
   // carry descriptions, annotations, titles and outputSchemas, and without a
   // freshness hint a client SHOULD treat it as immediately stale and re-fetch
   // it whenever it needs the list. That is the largest single payload the
@@ -8510,7 +8720,7 @@ private:
 
   // Page size for every paginated list. Deliberately larger than any list this
   // server currently produces, so nothing is truncated for a client that
-  // ignores nextCursor: 59 tools, 10 prompts and 5 templates are each one page.
+  // ignores nextCursor: 60 tools, 10 prompts and 5 templates are each one page.
   // The list that can genuinely outgrow it is resources/list, which is
   // connections x schemas -- and that is the case pagination exists for.
   static constexpr size_t kListPageSize = 100;
