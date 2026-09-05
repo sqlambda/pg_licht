@@ -4853,6 +4853,117 @@ TEST_F(PostgresMCPServerTest, CheckRoleAccessSeparatesTheGatesThatLookAlike) {
   }
 }
 
+TEST_F(PostgresMCPServerTest, ColumnHistogramIsTheDetailTableStatsSummarises) {
+  // Two tools rather than a flag, per locked decision 3: tableStats carries
+  // three points for every column, this carries the whole distribution for one.
+  // The test that matters is that they agree -- a summary that disagrees with
+  // its detail is worse than either alone.
+  pqxx::connection c(test_url);
+  {
+    pqxx::work w(c);
+    w.exec("CREATE TABLE grocery.ch (id int, flag bool)");
+    w.exec("INSERT INTO grocery.ch SELECT g, g % 2 = 0 FROM generate_series(1, 4000) g");
+    w.commit();
+  }
+  { pqxx::nontransaction n(c); n.exec("ANALYZE grocery.ch"); }
+
+  json h;
+  for (int i = 0; i < 40; i++) {
+    h = srv->call_column_histogram("grocery", "ch", "id");
+    if (!h["histogram_bounds"].is_null()) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  ASSERT_FALSE(h["histogram_bounds"].is_null()) << h.dump(2);
+  ASSERT_TRUE(h["histogram_bounds"].is_array());
+  EXPECT_GT(h["histogram_bounds"].size(), 3u)
+      << "the point of this tool is the whole array, not the three tableStats has";
+  EXPECT_EQ(h["histogram_buckets"].get<int>(),
+            static_cast<int>(h["histogram_bounds"].size()) - 1)
+      << "n bounds delimit n-1 equal-frequency buckets";
+  EXPECT_TRUE(h["statistics_target"].contains("effective"));
+
+  // The summary must be a selection from this exact array, not a second
+  // computation that could drift from it.
+  json t = srv->call_table_stats("grocery", "ch");
+  const auto& three = t["columns"]["id"]["histogram_bounds"];
+  ASSERT_FALSE(three.is_null()) << t.dump(2);
+  const auto& full = h["histogram_bounds"];
+  EXPECT_EQ(three["low"], full.front());
+  EXPECT_EQ(three["high"], full.back());
+  EXPECT_EQ(three["count"].get<size_t>(), full.size());
+
+  // A boolean has too few distinct values to leave anything over once the
+  // common ones are taken, so it has no histogram at all -- and the tool has to
+  // say why rather than returning a bare null.
+  json flag = srv->call_column_histogram("grocery", "ch", "flag");
+  EXPECT_TRUE(flag["histogram_bounds"].is_null()) << flag.dump(2);
+  EXPECT_EQ(flag["histogram_buckets"], 0);
+  ASSERT_TRUE(flag.contains("note")) << flag.dump(2);
+  EXPECT_NE(flag["note"].get<std::string>().find("most_common_vals"), std::string::npos);
+
+  json bad = srv->call_column_histogram("grocery", "ch", "no_such_column");
+  EXPECT_TRUE(bad.contains("error")) << bad.dump(2);
+  EXPECT_TRUE(bad.contains("hint"));
+
+  { pqxx::work w(c); w.exec("DROP TABLE grocery.ch"); w.commit(); }
+}
+
+TEST_F(PostgresMCPServerTest, TableStatsOffersRealValuesToRePlanWith) {
+  // The point of histogram_bounds here is not to describe the distribution but
+  // to hand back values that actually occur in the column, so a statement can
+  // be re-planned with a real extreme instead of an invented constant that may
+  // match nothing.
+  pqxx::connection c(test_url);
+  {
+    pqxx::work w(c);
+    w.exec("CREATE TABLE grocery.hist (id int, label text)");
+    // Skewed on purpose: one value dominates, and the rest spread out, so the
+    // column gets both an MCV list and a histogram.
+    w.exec("INSERT INTO grocery.hist "
+           "SELECT CASE WHEN g % 2 = 0 THEN 7 ELSE g END, 'x' FROM generate_series(1, 4000) g");
+    w.commit();
+  }
+  { pqxx::nontransaction n(c); n.exec("ANALYZE grocery.hist"); }
+
+  json r;
+  for (int i = 0; i < 40; i++) {
+    r = srv->call_table_stats("grocery", "hist");
+    if (!r["columns"]["id"]["histogram_bounds"].is_null()) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  const auto& id = r["columns"]["id"];
+  ASSERT_TRUE(id.contains("histogram_bounds")) << r.dump(2);
+  ASSERT_FALSE(id["histogram_bounds"].is_null())
+      << "a column with 2000 distinct values must have a histogram: " << r.dump(2);
+
+  for (const char* k : {"low", "mid", "high", "count"})
+    EXPECT_TRUE(id["histogram_bounds"].contains(k)) << k;
+  EXPECT_GT(id["histogram_bounds"]["count"].get<int>(), 1);
+
+  // Bounded on purpose. The array is statistics_target wide, and inlining it
+  // per column is the unbounded-payload defect this project already has one of.
+  EXPECT_EQ(id["histogram_bounds"].size(), 4u)
+      << "three points and a count, not the whole array";
+
+  // The bounds keep the column's own JSON type -- an integer column gives
+  // numbers, not stringified numbers -- so they compare directly, and compare
+  // equal to what columnHistogram returns for the same column.
+  EXPECT_TRUE(id["histogram_bounds"]["low"].is_number()) << id.dump(2);
+  EXPECT_LE(id["histogram_bounds"]["low"].get<long long>(),
+            id["histogram_bounds"]["high"].get<long long>());
+
+  // The skewed value is the frequent one, and it is what the other half of the
+  // test matrix uses.
+  ASSERT_FALSE(id["most_common_vals"].is_null()) << r.dump(2);
+
+  // A column whose values are all common has no histogram at all, and that is
+  // a null rather than an empty object -- the caller has to be able to tell.
+  const auto& label = r["columns"]["label"];
+  EXPECT_TRUE(label["histogram_bounds"].is_null()) << r.dump(2);
+
+  { pqxx::work w(c); w.exec("DROP TABLE grocery.hist"); w.commit(); }
+}
+
 TEST_F(PostgresMCPServerTest, StatsSeparateManualVacuumFromAutovacuum) {
   // Through 4.1.1 both statistics tools returned
   // GREATEST(last_vacuum, last_autovacuum) under the name last_vacuum, and the

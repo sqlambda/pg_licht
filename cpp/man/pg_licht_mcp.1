@@ -460,7 +460,7 @@ Most of this server works for any role that can connect, because the catalog is
 world-readable.
 Measured on PostgreSQL 18: a bare
 .Ic LOGIN
-role with no grants runs 49 of the 60 operations at full fidelity, the
+role with no grants runs 50 of the 61 operations at full fidelity, the
 monitoring role takes that to 54, and the three that remain are exactly the
 three that read row data \(em the
 .Ic tableStats
@@ -628,6 +628,36 @@ remains the latest of all four, since any of them refreshes
 .Li relpages
 and
 .Li reltuples .
+.It Ic columnHistogram Ar schema Ar table Ar column
+The whole value distribution of one column: the most common values with their
+frequencies, and the full histogram of everything else.
+.Ic tableStats
+carries three points off that histogram \(em low, mid and high \(em which is
+enough to pick parameters to re-plan a statement with; this is for when the
+shape of the distribution is itself the question.
+.Pp
+The two halves are complements, not alternatives.
+.Ic ANALYZE
+puts the most frequent values in
+.Va most_common_vals
+and builds the histogram only from what is left, so a value in the MCV list
+never appears in the bounds however common it is, and reading either alone
+misdescribes the column.
+The bounds are equal-frequency: consecutive entries delimit buckets holding
+roughly the same number of rows, so bounds bunched together are a dense region
+and a wide gap a sparse one.
+.Va statistics_target
+says why the histogram is the width it is, and is the knob that changes it.
+.Pp
+Costs nothing to read, and returns more literal column values than any other
+operation here: the bounds and the most common values are rows sampled out of
+the table.
+.Li pg_stats
+filters on
+.Fn has_column_privilege ,
+so a role without
+.Ic SELECT
+on the column gets nulls rather than data.
 .It Ic listTableStats Ar schema
 The same statistics for every table in
 .Ar schema ,
@@ -1675,7 +1705,7 @@ capability is declared, so there is no mechanism by which it could.
 Anything read from a live catalog is hinted at one minute.
 This matters most for
 .Ic tools/list ,
-which is roughly 93 kB once 60 operations carry descriptions, annotations,
+which is roughly 93 kB once 61 operations carry descriptions, annotations,
 titles and output schemas, and which a client would otherwise re-fetch whenever
 it needed the list.
 .Pp

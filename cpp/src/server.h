@@ -445,6 +445,8 @@ public:
   const json call_publications() { return publications(); }
   const json call_subscriptions() { return subscriptions(); }
   const json call_subscription_stats() { return subscription_stats(); }
+  const json call_column_histogram(const std::string& sc, const std::string& t,
+                                   const std::string& c) { return column_histogram(sc, t, c); }
   const json call_check_role_access(const std::string& r, const std::string& sc,
                                     const std::string& o) { return check_role_access(r, sc, o); }
   const json call_languages() { return languages(); }
@@ -1176,6 +1178,9 @@ private:
       // Roles are cluster-wide but the grants asked about are per object,
       // so the answer varies by database and not across a replication group.
       {"checkRoleAccess",       {true,  false, false, false}},
+      // pg_statistic is an ordinary catalog and is replicated, so a physical
+      // replica holds the primary's histogram byte for byte.
+      {"columnHistogram",       {true,  false, false, false}},
       // Planning is per database, and a physical replica plans identically off
       // the same statistics. Like explainQuery it is never swept: the same
       // statement is rarely valid in another database.
@@ -2211,10 +2216,27 @@ private:
            "stale statistics explain more bad plans than missing indexes do, and "
            "the two timestamps say whether anything is analyzing this table at "
            "all.\n"
-           "   - most_common_vals and n_distinct for any column in a predicate. "
-           "This is the empirical answer to whether the column is skewed, and "
-           "skew is what makes one plan right for a common value and wrong for a "
-           "rare one -- the same thing that makes a generic plan dangerous.\n"
+           "   - most_common_vals, n_distinct and histogram_bounds for any "
+           "column in a predicate. This is the empirical answer to whether the "
+           "column is skewed, and skew is what makes one plan right for a common "
+           "value and wrong for a rare one -- the same thing that makes a generic "
+           "plan dangerous.\n"
+           "   Then use them, rather than only reading them. Both carry values "
+           "that actually occur in the column, so they are usable directly as "
+           "parameters: most_common_vals[0] is the most frequent value the table "
+           "holds, and histogram_bounds low, mid and high are the observed "
+           "minimum, median and maximum. Re-plan the statement with each in turn "
+           "and compare. A plan that is identical across all of them is stable "
+           "and the parameters are not the problem; a plan that flips between a "
+           "common value and an extreme one is parameter-sensitive, and that is "
+           "the finding -- an index chosen for one end of the distribution will "
+           "be wrong at the other, and the generic plan is wrong for both.\n"
+           "   This is the one test that needs no invention. A constant you made "
+           "up may match no rows and produce a plan for a case that never "
+           "happens; these values are what is actually there. Where "
+           "histogram_bounds is null the column has no histogram at all -- every "
+           "value is in the MCV list, or nothing has analyzed it -- and which of "
+           "those it is comes from the analyze timestamps above.\n"
            "   If a scan reads far more heap than it returns rows and the "
            "statistics are current, suspect bloat: tableBloat measures the table "
            "and indexBloat one index, and bloat-and-vacuum-review is the fuller "
@@ -2381,7 +2403,7 @@ private:
   //   1. Payloads are version-conditional. tableStats gains
   //      n_tup_newpage_upd and last_seq_scan on PostgreSQL 16, checkpointStats
   //      is normalised across three different sets of underlying views, and a
-  //      schema would have to be re-proved on five majors for 60 tools.
+  //      schema would have to be re-proved on five majors for 61 tools.
   //   2. Every tool carries the same escape hatch: when an extension is absent
   //      or a grant is missing, the payload is {error, hint} instead of the
   //      documented shape. A schema that enumerated the documented shape would
@@ -2450,6 +2472,16 @@ private:
       {"listForeignServers",     schema_map("server name", "its wrapper, options and user mappings")},
       {"listForeignTables",      schema_map("foreign table name", "its server and column list")},
       {"listPublications",       schema_map("publication name", "its tables and replicated operations")},
+      {"columnHistogram",        schema_fixed("The full value distribution of one column: the "
+                                              "most common values and the histogram of what is left.",
+                                              {{"schema", "string"}, {"table", "string"}, {"column", "string"},
+                                               {"null_frac", "number"}, {"avg_width", "integer"},
+                                               {"n_distinct", "number"},
+                                               {"physical_order_correlation", "number"},
+                                               {"most_common_vals", "array"}, {"most_common_freqs", "array"},
+                                               {"histogram_bounds", "array"}, {"histogram_buckets", "integer"},
+                                               {"statistics_target", "object"}, {"inherited", "boolean"},
+                                               {"note", "string"}})},
       {"checkRoleAccess",        schema_fixed("Whether one role holds privileges on one object, "
                                               "as PostgreSQL itself evaluates it.",
                                               {{"role", "object"}, {"object", "object"},
@@ -2608,7 +2640,7 @@ private:
 	  },
 	  {
 	    {"name", "tableStats"},
-	    {"description", "return the statistics PostgreSQL keeps for one table: estimated row count, seq_scan and idx_scan counts, live and dead tuples, rows modified since the last analyze, rows inserted since the last vacuum, the manual and automatic vacuum and analyze times as four separate fields (last_vacuum and last_analyze are the manual ones, exactly as in pg_stat_user_tables -- a recent last_vacuum beside a null last_autovacuum means the table is being kept alive by hand and autovacuum is not reaching it), per-index scan counts, and the per-column pg_stats histograms (null_frac, avg_width, n_distinct, physical order correlation, most_common_vals and their frequencies). Reads the catalog and the statistics collector only -- no relation is opened and no file is measured. size_estimate is relpages*8192 and is only as fresh as estimated_from says: for a measured size call tableSize. Note that most_common_vals contains literal values sampled from the column. Not to be confused with tableIOStats, which reports pg_statio_all_tables -- whether reads came from the buffer cache or the disk"},
+	    {"description", "return the statistics PostgreSQL keeps for one table: estimated row count, seq_scan and idx_scan counts, live and dead tuples, rows modified since the last analyze, rows inserted since the last vacuum, the manual and automatic vacuum and analyze times as four separate fields (last_vacuum and last_analyze are the manual ones, exactly as in pg_stat_user_tables -- a recent last_vacuum beside a null last_autovacuum means the table is being kept alive by hand and autovacuum is not reaching it), per-index scan counts, and the per-column pg_stats histograms (null_frac, avg_width, n_distinct, physical order correlation, most_common_vals and their frequencies, and three points off the histogram -- histogram_bounds gives low, mid and high, the observed extremes and median of the distribution, which are real values that occur in the column and so are usable directly as parameters to re-plan a statement with. It is three points rather than the whole array because the array is statistics_target wide, 101 entries by default; for the whole distribution of one column call columnHistogram. Null when the column has no histogram, meaning every value is in the MCV list or the column was never analyzed). Reads the catalog and the statistics collector only -- no relation is opened and no file is measured. size_estimate is relpages*8192 and is only as fresh as estimated_from says: for a measured size call tableSize. Note that most_common_vals and histogram_bounds both contain literal values sampled from the column. Not to be confused with tableIOStats, which reports pg_statio_all_tables -- whether reads came from the buffer cache or the disk"},
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", {
@@ -2811,6 +2843,19 @@ private:
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", json::object()}
+	      }}
+	  },
+	  {
+	    {"name", "columnHistogram"},
+	    {"description", "return the whole value distribution of one column: the most common values with their frequencies, and the full histogram of everything else. tableStats carries three points off that histogram -- low, mid and high -- which is enough to pick parameters to re-plan with; this is the tool for when the shape of the distribution itself is the question. The two are complements rather than alternatives: ANALYZE puts the most frequent values in most_common_vals and builds the histogram only from what is LEFT, so a value in the MCV list never appears in the bounds however common it is, and reading either alone misdescribes the column. The bounds are equal-frequency, so consecutive entries delimit buckets holding roughly the same number of rows -- bounds bunched together are a dense region and a wide gap is a sparse one, which is what makes them usable as sample points across the distribution rather than one corner of it. statistics_target says why the histogram is the width it is and is the knob that changes it. COSTS NOTHING TO READ but RETURNS LITERAL COLUMN VALUES, more of them than any other operation here: the bounds and the MCVs are rows sampled out of the table. pg_stats filters on has_column_privilege, so a role without SELECT on the column gets nulls rather than data"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", {
+		    {"schema", {{"type", "string"}}},
+		    {"table", {{"type", "string"}}},
+		    {"column", {{"type", "string"}}}
+		  }},
+		{"required", {"schema", "table", "column"}}
 	      }}
 	  },
 	  {
@@ -6881,7 +6926,90 @@ private:
     return out;
   }
 
+  // The whole distribution of one column: the MCV list and the full histogram,
+  // rather than the three points tableStats carries.
+  //
+  // Two tools rather than a flag on tableStats, on the reasoning locked in
+  // decision 3 and already shipped for the buffer cache: a summary asked on
+  // every table and a detail asked about one column have different call
+  // frequencies and different shapes. histogram_bounds is statistics_target
+  // wide -- 101 entries by default and up to 10001 -- so inlining it per column
+  // of a wide table is the unbounded payload this project has one of already.
+  // Here it is one column, named deliberately, and the caller has asked for it.
+  //
+  // MCVs and the histogram are complements, not alternatives, and returning one
+  // without the other invites a wrong reading: ANALYZE puts the most frequent
+  // values in the MCV list and builds the histogram from what is LEFT OVER. So
+  // the histogram describes the tail, and a value in the MCV list will not
+  // appear in it however common it is.
+  //
+  // The bounds are equal-frequency: consecutive entries delimit buckets holding
+  // roughly the same number of rows each, so bounds bunched close together are a
+  // dense region of the distribution and a wide gap is a sparse one. That is
+  // what makes them useful as parameters -- picking across the buckets samples
+  // the distribution rather than one corner of it.
+  const json column_histogram(const std::string& schema, const std::string& table,
+                              const std::string& column) {
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+
+    pqxx::result res = pqxx_exec(txn,
+      "SELECT JSONB_BUILD_OBJECT("
+      "  'schema', $1::text, 'table', $2::text, 'column', $3::text"
+      ", 'null_frac', ps.null_frac"
+      ", 'avg_width', ps.avg_width"
+      ", 'n_distinct', ps.n_distinct"
+      ", 'physical_order_correlation', ps.correlation"
+      ", 'most_common_vals',  ps.most_common_vals"
+      ", 'most_common_freqs', ps.most_common_freqs"
+      ", 'histogram_bounds',  ps.histogram_bounds"
+      ", 'histogram_buckets', CASE WHEN ps.histogram_bounds IS NULL THEN 0"
+      "     ELSE ARRAY_LENGTH(ps.histogram_bounds::text::text[], 1) - 1 END"
+      // Why the histogram is the width it is, and the knob that changes it.
+      // -1 means the column inherits default_statistics_target.
+      ", 'statistics_target', JSONB_BUILD_OBJECT("
+      "      'column', NULLIF(a.attstattarget, -1)"
+      "    , 'default', current_setting('default_statistics_target')::int"
+      "    , 'effective', COALESCE(NULLIF(a.attstattarget, -1),"
+      "                            current_setting('default_statistics_target')::int))"
+      ", 'inherited', ps.inherited)"
+      "  FROM pg_attribute AS a"
+      "  JOIN pg_class AS c ON c.oid = a.attrelid"
+      "  JOIN pg_namespace AS n ON n.oid = c.relnamespace"
+      "  LEFT JOIN pg_stats AS ps ON ps.schemaname = n.nspname"
+      "                          AND ps.tablename  = c.relname"
+      "                          AND ps.attname    = a.attname"
+      " WHERE n.nspname = $1 AND c.relname = $2 AND a.attname = $3"
+      "   AND a.attnum > 0 AND NOT a.attisdropped"
+      " ORDER BY ps.inherited NULLS LAST LIMIT 1",
+      pqxx::params{schema, table, column});
+
+    if (res.empty() || res[0][0].is_null())
+      return {{"error", "no such column"},
+              {"hint", "checked " + schema + "." + table + "." + column +
+                       ". Names are case sensitive here exactly as they are in "
+                       "the catalog; listTables names the columns of a table."}};
+
+    json out = json::parse(res[0][0].as<std::string>());
+    // A column with no row in pg_stats at all is a different statement from one
+    // whose values are all common, and both come back as nulls otherwise.
+    if (out["n_distinct"].is_null())
+      out["note"] = "no pg_stats row for this column: either nothing has "
+                    "analyzed the table, or the current role cannot read its "
+                    "statistics -- pg_stats filters on has_column_privilege. "
+                    "tableStats carries the analyze timestamps that tell those "
+                    "apart, and checkRoleAccess says whether the role can read "
+                    "the column.";
+    else if (out["histogram_bounds"].is_null())
+      out["note"] = "no histogram for this column. ANALYZE builds one only from "
+                    "the values left after the most common ones are taken into "
+                    "most_common_vals, so a column with few distinct values has "
+                    "none at all and the MCV list is the whole distribution.";
+    return out;
+  }
+
   const json languages() {
+
 
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
@@ -7486,8 +7614,8 @@ private:
   // The catalog is world-readable, so most of the tool set works for any role
   // that can connect. What varies is a small, knowable set: the predefined
   // roles that gate the monitoring extras, and whether the role can read table
-  // data at all. Measured against PostgreSQL 18: a bare login role runs 49 of
-  // the 60 tools at full fidelity, pg_monitor takes that to 56, and the ones
+  // data at all. Measured against PostgreSQL 18: a bare login role runs 50 of
+  // the 61 tools at full fidelity, pg_monitor takes that to 57, and the ones
   // that remain are exactly the three that touch row data.
   //
   // The point of asking once, up front, is that the alternative is discovering
@@ -7701,7 +7829,43 @@ private:
                            'n_distinct', ps.n_distinct,
                            'physical_order_correlation', ps.correlation,
                            'most_common_vals', ps.most_common_vals,
-                           'most_common_freqs', ps.most_common_freqs)) AS columns
+                           'most_common_freqs', ps.most_common_freqs,
+                           -- Three points off the histogram rather than the
+                           -- histogram itself. The array is statistics_target
+                           -- entries wide -- 101 by default, up to 10001 -- and
+                           -- inlining it for every column of a wide table is the
+                           -- unbounded-payload mistake this project has already
+                           -- made once elsewhere.
+                           --
+                           -- What these three are FOR is picking real parameter
+                           -- values to re-plan a statement with: low and high are
+                           -- the observed extremes of the distribution and mid is
+                           -- its median, all of them values that actually occur in
+                           -- the column, so a plan built for them is a plan for
+                           -- real data rather than for an invented constant. Pair
+                           -- them with most_common_vals, which gives the other end
+                           -- of the same question: the plan for a frequent value
+                           -- against the plan for a rare one is where parameter
+                           -- sensitivity shows itself.
+                           --
+                           -- Null when the column has no histogram at all, which
+                           -- means every value is in the MCV list or the column
+                           -- was never analyzed. count says which by being 0.
+                           -- Selected through to_jsonb rather than a text[] cast
+                           -- so the three points carry the same JSON types the
+                           -- full array does in columnHistogram: an integer
+                           -- column gives numbers here and numbers there. A
+                           -- summary whose values do not compare equal to the
+                           -- detail it summarises is worse than either alone.
+                           'histogram_bounds',
+                             CASE WHEN ps.histogram_bounds IS NULL THEN NULL
+                             ELSE (SELECT JSONB_BUILD_OBJECT(
+                                     'low',   hb -> 0,
+                                     'mid',   hb -> (JSONB_ARRAY_LENGTH(hb) / 2),
+                                     'high',  hb -> (JSONB_ARRAY_LENGTH(hb) - 1),
+                                     'count', JSONB_ARRAY_LENGTH(hb))
+                                   FROM TO_JSONB(ps.histogram_bounds) AS _h(hb))
+                             END)) AS columns
                          FROM pg_attribute AS a
                          LEFT JOIN pg_stats AS ps ON ps.schemaname = $1
                                                   AND ps.tablename = $2
@@ -8334,6 +8498,12 @@ private:
     else if (tool_name == "subscriptionStats") {
       result_content = subscription_stats();
     }
+    else if (tool_name == "columnHistogram") {
+      result_content = column_histogram(
+        arguments.value("schema", std::string()),
+        arguments.value("table", std::string()),
+        arguments.value("column", std::string()));
+    }
     else if (tool_name == "checkRoleAccess") {
       result_content = check_role_access(
         arguments.value("grantee", std::string()),
@@ -8786,7 +8956,7 @@ private:
   // the same revision, and a legacy result must not grow fields its era never
   // had.
   //
-  // This matters more here than it looks. tools/list is ~93 kB once 60 tools
+  // This matters more here than it looks. tools/list is ~93 kB once 61 tools
   // carry descriptions, annotations, titles and outputSchemas, and without a
   // freshness hint a client SHOULD treat it as immediately stale and re-fetch
   // it whenever it needs the list. That is the largest single payload the
@@ -8806,7 +8976,7 @@ private:
 
   // Page size for every paginated list. Deliberately larger than any list this
   // server currently produces, so nothing is truncated for a client that
-  // ignores nextCursor: 60 tools, 10 prompts and 5 templates are each one page.
+  // ignores nextCursor: 61 tools, 10 prompts and 5 templates are each one page.
   // The list that can genuinely outgrow it is resources/list, which is
   // connections x schemas -- and that is the case pagination exists for.
   static constexpr size_t kListPageSize = 100;

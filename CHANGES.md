@@ -123,6 +123,48 @@ given a ceiling, and logical replication gains the runtime half it never had.
   `enabled` beside `disable_on_error` rather than treating inactive as
   abandoned.
 
+- **`columnHistogram`**, and three points off the histogram added to
+  `tableStats`. Both exist to answer one question: which real values to re-plan
+  a statement with.
+
+  `tableStats` claimed to return "the per-column `pg_stats` histograms" and
+  returned everything except the histogram. It now carries `histogram_bounds`
+  as `low`, `mid`, `high` and `count` — the observed minimum, median and maximum
+  of the distribution. These are values that **actually occur in the column**,
+  so they can be passed straight back to `explainQuery` as parameters: a plan
+  built for them is a plan for real data rather than for an invented constant
+  that may match nothing. Paired with `most_common_vals`, which is the other end
+  of the same question, they make a test matrix — the plan for a frequent value
+  against the plan for a rare one is where parameter sensitivity shows itself.
+
+  Three points rather than the array, because the array is `statistics_target`
+  wide — 101 entries by default, up to 10001 — and inlining that for every
+  column of a wide table is the unbounded-payload defect this project already
+  has one of.
+
+  `columnHistogram` is the detail half, for one named column: the full bounds
+  array, the MCV list with frequencies, and `statistics_target`, which says why
+  the histogram is the width it is and is the knob that changes it. Two tools
+  rather than a flag, on the reasoning locked for `bufferCacheSummary` and
+  `bufferCacheContents` — a summary asked of every column and a detail asked
+  about one have different call frequencies and different shapes.
+
+  The two halves of a distribution are complements, not alternatives, and the
+  descriptions say so: `ANALYZE` puts the most frequent values in
+  `most_common_vals` and builds the histogram from **what is left**, so a value
+  in the MCV list never appears in the bounds however common it is. A column
+  with too few distinct values has no histogram at all, and that comes back as
+  a null with the reason rather than as an empty array.
+
+  Writing the test caught the summary and the detail disagreeing about types —
+  `"1"` against `1`, because the summary reached the array through a `text[]`
+  cast. Both now go through `to_jsonb`, so an integer column gives numbers in
+  both and the summary compares equal to the detail it summarises.
+
+  These return more literal column values than anything else here. `pg_stats`
+  filters on `has_column_privilege`, so a role without `SELECT` on the column
+  gets nulls rather than data.
+
 - **`checkRoleAccess`** — whether one role holds privileges on one table, view,
   sequence, function or procedure, answered by `has_table_privilege` and its
   relatives rather than reconstructed from ACLs. Role inheritance, grants to
