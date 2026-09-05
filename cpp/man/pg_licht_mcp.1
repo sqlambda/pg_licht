@@ -1775,6 +1775,24 @@ Ranks the fixes and says plainly that
 .Va deadlock_timeout
 is not one of them: it changes when the cycle is detected, never whether it
 forms.
+.Pp
+Recurrence is established in three stages, where the statement merely appearing
+in a view is the finding.
+Still present in
+.Ic statementStats
+on a cluster that is evicting means it runs often enough to survive eviction,
+which is what a deadlock needs; absent settles nothing, since it may have been
+evicted, reset, or never tracked.
+Present in
+.Ic currentActivity
+means it is running now, so the next occurrence can be watched rather than the
+last one inferred.
+Live and slow earns
+.Ic currentLocks ,
+because the chains forming now are the near-miss version of the one that closed
+\(em at which point
+.Ic triage-lock-contention
+takes over.
 .It Ic bloat-and-vacuum-review Op Va schema
 Check
 .Ic replicationSlots

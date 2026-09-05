@@ -71,6 +71,19 @@ given a ceiling, and logical replication gains the runtime half it never had.
   never whether it forms — and that a retry loop is a mitigation that hides an
   ordering bug rather than fixing one.
 
+  Recurrence escalates in three stages, and in each of them the statement
+  merely *appearing* in a view is the finding, before any counter is read.
+  Still in `statementStats` on a cluster that is evicting means it runs often
+  enough to survive eviction, which is exactly what a deadlock needs — so
+  `info.dealloc` has to be read first, because it decides what presence means.
+  Absence settles nothing: evicted, reset, or never tracked are three different
+  things and the prompt asks which were ruled out. Present in
+  `currentActivity` means it is running now, so the next occurrence can be
+  watched rather than the last one inferred. Live and slow earns
+  `currentLocks`, because a deadlock is a wait chain that closed into a loop
+  and the chains forming now are the same edges caught before the last one
+  joined up — at which point `triage-lock-contention` takes over.
+
 - **`listSubscriptions` returns five more of the columns it can already read.**
   `stream`, `disable_on_error`, `origin`, `run_as_owner` and `failover` were
   omitted; it returned 6 of the 17 publicly-readable `pg_subscription` columns.
