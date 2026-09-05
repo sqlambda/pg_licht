@@ -49,6 +49,27 @@ given a ceiling, and logical replication gains the runtime half it never had.
   relation), and the seven `conflicts` counters need 18. An absent key means
   the server cannot answer, which is not the same as zero.
 
+- **Every prompt was audited against what its tools actually return**, and one
+  named a field that does not exist. `bloat-and-vacuum-review` said to read
+  `last_vacuum` *and* `last_autovacuum`; both stats tools merge those into a
+  single `last_vacuum` with `GREATEST()`, so the second was never in the
+  payload. `wraparoundStatus` is the only tool that still reports them apart,
+  and the prompt now says so.
+
+  Six prompts gained readings the tools were already returning:
+
+  | prompt | now reads | because |
+  |---|---|---|
+  | `bloat-and-vacuum-review` | `n_ins_since_vacuum`, `n_tup_newpage_upd` | ranking by dead tuples misses insert-only tables entirely, and failing HOT updates are a cause of bloat rather than a symptom of it |
+  | `triage-lock-contention` | `mode`/`lock_type`, `granted`, `wait_start`, `leader_pid`, `backend_xmin`, `application_name`/`client_addr` | it concluded "the fix is in the application that left it open" without ever saying how to name that application |
+  | `capacity-check` | `temp_files`/`temp_bytes`, the session counters | it computed worst-case memory and never checked whether anything actually spilled |
+  | `buffer-cache-review` | `usage_counts`/`usagecount_avg`, `evictions`/`reuses` | it asked in step 5 whether the cache is being churned, using a tool that answers exactly that in step 1 |
+  | `diagnose-slow-query`, `explain-and-fix` | `temp_blks_written`, `listExtendedStatistics` | the spill is already in hand from the first call, and extended statistics were recommended without checking whether any exist |
+
+  `triage-lock-contention` also hands off to `bloat-and-vacuum-review` when the
+  chain root holds an old `backend_xmin`, since a backend blocking one wait
+  chain is simultaneously stopping vacuum cluster-wide.
+
 - **`replication-slot-review` reads the fields the tool was already
   returning.** It ranked slots by `active`, `restart_lsn` and `wal_status` and
   ignored three readings that answer questions it was otherwise estimating:
