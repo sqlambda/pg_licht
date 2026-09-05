@@ -1996,6 +1996,126 @@ private:
            "as irreversible whatever the size.";
        }},
 
+      {"check-role-access",
+       "Work out whether a role can use a table, view, function or procedure, and which rows.",
+       {{"role", "the role to check; not necessarily the role this server connects as", true},
+        {"object", "schema-qualified object name, e.g. billing.invoices", true},
+        {"privilege", "SELECT, INSERT, UPDATE, DELETE or EXECUTE; omit to cover all of them", false},
+        {"connection", "connection to check; defaults to the configured default", false}},
+       [](const json& a) -> std::string {
+         const std::string role = arg_or(a, "role", "");
+         const std::string obj  = arg_or(a, "object", "");
+         const std::string priv = arg_or(a, "privilege", "");
+         const std::string c    = arg_or(a, "connection", "");
+         const std::string on = c.empty() ? std::string() : " on connection " + c;
+         return
+           "Determine whether " + role + " can use " + obj + on +
+           (priv.empty() ? ", for every privilege that applies to it"
+                         : ", specifically " + priv) + ".\n\n"
+           "Access is a chain of gates, not a grant. Every one has to pass, and "
+           "the first that fails is the whole answer -- so find that one and "
+           "name it, rather than reporting the object ACL and stopping. The "
+           "usual wrong answer comes from checking the table and forgetting the "
+           "schema.\n\n"
+           "Two questions hide inside the one being asked, and they have "
+           "different answers: whether the role may REACH the object at all, "
+           "and WHICH ROWS it then sees. Grants settle the first. Row-level "
+           "security settles the second and can reduce a complete set of grants "
+           "to nothing without touching them. Answer both explicitly.\n\n"
+           "0. Call checkPrivileges. The catalog is world-readable so most of "
+           "this works for any role that can connect, but say what is degraded "
+           "rather than reporting a filtered answer as a finding.\n"
+           "1. Call listRoles and establish what " + role + " IS before asking "
+           "what it has. Three attributes can end the investigation here:\n"
+           "   - superuser bypasses every check below, including row-level "
+           "security. The answer is yes to everything; say so and stop rather "
+           "than tracing grants that do not matter.\n"
+           "   - bypass_rls means step 4 does not apply to this role, however "
+           "the policies read.\n"
+           "   - inherit decides whether membership counts by itself. A "
+           "NOINHERIT member holds a role's privileges only after SET ROLE, and "
+           "application code almost never issues one -- so a grant that looks "
+           "present is absent in practice. That distinction is the answer, not "
+           "a footnote to it.\n"
+           "   Then walk member_of transitively: a grant to any role in the "
+           "closure counts, subject to inherit. Say which role in the chain "
+           "actually carries the grant, because that is where an operator has "
+           "to go to change it.\n"
+           "2. Walk the gates in order, stopping at the first failure.\n"
+           "   a. CONNECT on the database, and whether the role can log in at "
+           "all -- a group role with every grant in the cluster still cannot "
+           "open a session.\n"
+           "   b. USAGE on the schema. Call listSchemas and read its roles map. "
+           "This is the gate that is missed most often: SELECT on the table is "
+           "inert without it, and the resulting error names permission on the "
+           "table, which sends people to the wrong object.\n"
+           "   c. The object\'s own privileges, from tableDetails or "
+           "functionDetails. PUBLIC is a grantee like any other and applies to "
+           "every role, so a grant to PUBLIC answers the question on its own -- "
+           "and EXECUTE is granted to PUBLIC by default on every new function, "
+           "which surprises people who never granted anything.\n"
+           "   d. Ownership. The owner holds every privilege implicitly and "
+           "need not appear in the grants map at all, so an empty map is not an "
+           "empty answer.\n"
+           "   e. Column-level grants, where the columns list carries them. "
+           "SELECT on three of ten columns is a real yes that fails the moment "
+           "a query names the fourth, so report it as the partial it is.\n"
+           "3. If the object is a VIEW, the privileges checked are the view\'s "
+           "own, and the base tables are read as the VIEW OWNER. So a role can "
+           "hold SELECT on a view while holding nothing at all on what it "
+           "selects from, and that is normal rather than a misconfiguration. "
+           "Check reloptions for security_invoker: on PostgreSQL 15 and later a "
+           "view can be defined to run as the caller instead, which flips this "
+           "entirely -- base-table grants and base-table policies both come "
+           "back into play. Say which of the two you are looking at.\n"
+           "4. Now row-level security, and only for a table or a view over one. "
+           "Read row_level_security from tableDetails first: if enabled is "
+           "false, the grants above are the complete answer and this step is "
+           "over. If it is true, everything above answers only whether the role "
+           "may reach the table.\n"
+           "   - The OWNER BYPASSES RLS unless forced is also true. This is the "
+           "single most common wrong test: someone checks as the owner, sees "
+           "every row, and concludes the policies are permissive. FORCE ROW "
+           "LEVEL SECURITY is what makes the owner subject to them, and without "
+           "it the owner\'s experience says nothing about anyone else\'s.\n"
+           "   - Read the policies map. Each policy names a command and a set of "
+           "roles, and a policy whose roles are PUBLIC applies to everybody. "
+           "Only policies matching both " + role + " and the command in question "
+           "are in play.\n"
+           "   - RLS ENABLED WITH NO APPLICABLE PERMISSIVE POLICY IS DENY ALL. "
+           "This is the state nobody can explain: every grant checks out, "
+           "has_table_privilege would say yes, and the table returns zero rows. "
+           "If you find it, that is the finding -- say it in those words.\n"
+           "   - Permissive policies OR together and restrictive ones AND, so "
+           "adding a restrictive policy can veto everything the permissive ones "
+           "allow. Report the combination, not a list.\n"
+           "   - using gates which rows can be read or affected; with_check "
+           "gates which rows may be written. They are frequently different, and "
+           "a role that can read a row it cannot write back is a normal and "
+           "confusing result worth stating outright.\n"
+           "5. For a FUNCTION or PROCEDURE the privilege is EXECUTE, and "
+           "security_definer changes who the body runs as. Under a security "
+           "definer function the caller borrows the owner\'s privileges for "
+           "everything inside, so the caller\'s own grants on the tables it "
+           "touches are irrelevant -- and EXECUTE on it is effectively a grant "
+           "of whatever the body can do. Say so plainly when you find one: it is "
+           "the intended mechanism for controlled escalation and also the way "
+           "access is given by accident.\n"
+           "6. Report the chain, not a verdict. Name the gate that decided, and "
+           "if the answer is no, name the single grant that would change it. If "
+           "the answer is yes, say what it does not include -- the columns "
+           "outside the grant, the rows outside the policy, the write that the "
+           "read does not imply.\n"
+           "7. Say how the answer was reached. This is reconstructed from "
+           "catalog ACLs, role membership and policy expressions, which is "
+           "sound but is not the same as asking the server. An operator who can "
+           "run SQL should confirm it with has_table_privilege, "
+           "has_schema_privilege or has_function_privilege, which evaluate "
+           "inheritance, PUBLIC and superuser the way PostgreSQL actually does. "
+           "Recommend that confirmation whenever the answer is going to be "
+           "acted on rather than merely read.";
+       }},
+
       {"explain-and-fix",
        "Explain one statement and propose a concrete fix.",
        {{"sql", "the statement to explain", true},
@@ -2370,7 +2490,7 @@ private:
 	  },
 	  {
 	    {"name", "checkPrivileges"},
-	    {"description", "report which tools the current role can actually use on this connection, and how the rest fall short. Most of this server works for any role that can connect, because the catalog is world-readable; what varies is the monitoring extras and whether the role can read table data. Call this first when working against an unfamiliar connection or a restricted role -- the alternative is discovering the limits tool by tool, and a privilege-filtered answer is easy to mistake for an empty one. Names no role memberships and no GRANT statements: what a caller needs is which tools work. Tools absent from both lists are fully available"},
+	    {"description", "report which tools the current role can actually use on this connection, and how the rest fall short. Most of this server works for any role that can connect, because the catalog is world-readable; what varies is the monitoring extras and whether the role can read table data. Call this first when working against an unfamiliar connection or a restricted role -- the alternative is discovering the limits tool by tool, and a privilege-filtered answer is easy to mistake for an empty one. Names no role memberships and no GRANT statements: what a caller needs is which tools work. This is about THIS server's operations for the CONNECTING role, and is not an object permission check -- for whether some other role may read a given table, view or function, and which rows row-level security then leaves it, use the check-role-access prompt. Tools absent from both lists are fully available"},
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", json::object()}
@@ -8390,7 +8510,7 @@ private:
 
   // Page size for every paginated list. Deliberately larger than any list this
   // server currently produces, so nothing is truncated for a client that
-  // ignores nextCursor: 59 tools, 9 prompts and 5 templates are each one page.
+  // ignores nextCursor: 59 tools, 10 prompts and 5 templates are each one page.
   // The list that can genuinely outgrow it is resources/list, which is
   // connections x schemas -- and that is the case pagination exists for.
   static constexpr size_t kListPageSize = 100;

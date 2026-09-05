@@ -119,12 +119,20 @@ Readings stay tools, because the model has to decide *when* to take them.
 a template, so a 10 000-table database does not produce a 10 000-entry
 response.
 
-Nine **prompts** encode an order of investigation that is easy to get wrong:
+Ten **prompts** encode an order of investigation that is easy to get wrong:
 `diagnose-slow-query`, `triage-lock-contention`, `diagnose-deadlock`,
 `bloat-and-vacuum-review`, `buffer-cache-review`, `capacity-check`,
-`replication-slot-review`, `plan-schema-change` and `explain-and-fix`. They are static text and touch no
+`replication-slot-review`, `plan-schema-change`, `check-role-access` and
+`explain-and-fix`. They are static text and touch no
 database until the model acts on them, and each one whose tools are
 privilege-gated opens by calling `checkPrivileges`.
+
+`check-role-access` answers whether a role can use a table, view, function or
+procedure — walking the gates in order, since the one people forget is `USAGE`
+on the schema and the resulting error names the table. It treats row-level
+security as a second gate that opens after the grants already said yes: RLS
+enabled with no applicable permissive policy is deny-all, so every grant checks
+out and the table returns nothing.
 
 `diagnose-slow-query` is the hub — a slow statement can end in a plan fix, a
 vacuum change, an index, or a schema change, and it routes to the others

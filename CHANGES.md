@@ -90,6 +90,46 @@ given a ceiling, and logical replication gains the runtime half it never had.
   `enabled` beside `disable_on_error` rather than treating inactive as
   abandoned.
 
+- **`check-role-access`, a tenth prompt.** Whether a role can use a table,
+  view, function or procedure — and, separately, which rows it then sees.
+
+  Access is a chain of gates and the first failure is the whole answer, so the
+  prompt walks them in order rather than reporting an object ACL and stopping.
+  The gate people miss is `USAGE` on the schema, because `SELECT` on the table
+  is inert without it and the resulting error names the *table*, sending
+  everyone to the wrong object. It also covers the cases where a grant map
+  answers a different question than it appears to: `PUBLIC` is a grantee like
+  any other, `EXECUTE` is granted to `PUBLIC` by default on every new function,
+  an owner holds everything implicitly and need not appear at all, and a
+  `NOINHERIT` member holds a role's privileges only after `SET ROLE` — which
+  application code almost never issues, so a grant that looks present is absent
+  in practice.
+
+  **Row-level security is treated as a second gate, opening only after the
+  grants have already said yes.** That ordering is the point: RLS enabled with
+  no applicable permissive policy is deny-all, so every grant checks out,
+  `has_table_privilege` says yes, and the table returns nothing — the state
+  nobody can explain. The owner bypasses RLS unless `FORCE ROW LEVEL SECURITY`
+  is set, which is why checking as the owner proves nothing about anyone else;
+  permissive policies OR together while restrictive ones AND, so one
+  restrictive policy vetoes everything; and `USING` gates reads while
+  `WITH CHECK` gates writes, so reading a row you cannot write back is normal
+  rather than broken.
+
+  Views and functions each redirect whose privileges apply: a view's base
+  tables are read as the *view owner*, unless `security_invoker` (PostgreSQL 15
+  and later) flips it to the caller and brings base-table grants and policies
+  back into play; a `SECURITY DEFINER` function runs its body as the owner, so
+  `EXECUTE` on it is effectively a grant of whatever the body can do.
+
+  The prompt closes by saying how the answer was reached. It is reconstructed
+  from catalog ACLs, role membership and policy expressions, which is sound but
+  is not the same as asking the server — so it recommends confirming with
+  `has_table_privilege` and its relatives before anyone acts on it.
+
+  `checkPrivileges` is unrelated despite the name and now says so: that tool
+  reports which of *this server's operations* the *connecting* role can run.
+
 - **`diagnose-deadlock`, a ninth prompt.** A deadlock is over before anyone
   reads about it: PostgreSQL detects the cycle, kills a transaction and
   releases the other, so the pids in the log no longer exist and the live lock

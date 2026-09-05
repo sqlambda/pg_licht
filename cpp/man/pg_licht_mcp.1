@@ -1877,6 +1877,29 @@ full rewrite, and for the size at which the answer would flip.
 Lock level alone settles nothing: a strong lock held for a millisecond is safe
 and a weak one held for an hour may not be, and duration comes from the
 measurements.
+.It Ic check-role-access Ar role Ar object Op Va privilege , connection
+Whether a role can use a table, view, function or procedure, and which rows it
+then sees.
+Access is a chain of gates and the first failure is the answer; the one most
+often missed is
+.Ic USAGE
+on the schema, whose error names the table and sends people to the wrong object.
+.Pp
+Row-level security is a second gate, opening only after the grants have already
+said yes.
+Enabled with no applicable permissive policy it is deny-all \(em every grant
+checks out,
+.Fn has_table_privilege
+would say yes, and the table returns nothing.
+The owner bypasses it unless
+.Ic FORCE ROW LEVEL SECURITY
+is set, which is why checking as the owner proves nothing about anybody else.
+.Pp
+Distinct from
+.Ic checkPrivileges ,
+which reports which of this server's own operations the connecting role can
+run.
+This prompt is about another role's access to a database object.
 .It Ic explain-and-fix Ar sql Op Va params
 Plan without
 .Va analyze
