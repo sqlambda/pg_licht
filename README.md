@@ -137,7 +137,7 @@ indexes and current lock waits can tell the two apart. **Completions** are offer
 
 ## Tools
 
-58 read-only operations, grouped as schema exploration, catalog search, cluster-wide
+59 read-only operations, grouped as schema exploration, catalog search, cluster-wide
 objects, extensibility and text search, foreign data and replication, monitoring and
 statistics, diagnostics and query planning, topology, and connections. Highlights include
 `tableDetails` (columns, indexes, constraints, foreign keys in both directions, triggers,
@@ -147,8 +147,8 @@ its `EXPLAIN` plan).
 
 `checkPrivileges` reports which of them the current role can actually use on a given
 connection. Most work for any role that can connect, since the catalog is world-readable:
-measured on PostgreSQL 18, a bare login role runs 47 of 58 at full fidelity, the monitoring
-role 54, and the ones that remain are those that read row data. Worth calling first
+measured on PostgreSQL 18, a bare login role runs 48 of 59 at full fidelity, the monitoring
+role 55, and the ones that remain are those that read row data. Worth calling first
 against an unfamiliar connection — a privilege-filtered answer is easy to mistake for an
 empty one, since `tableStats` on a role without `SELECT` returns columns with null
 statistics, exactly like a table that was never analyzed.

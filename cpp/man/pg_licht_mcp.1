@@ -460,7 +460,7 @@ Most of this server works for any role that can connect, because the catalog is
 world-readable.
 Measured on PostgreSQL 18: a bare
 .Ic LOGIN
-role with no grants runs 47 of the 58 operations at full fidelity, the
+role with no grants runs 48 of the 59 operations at full fidelity, the
 monitoring role takes that to 54, and the three that remain are exactly the
 three that read row data \(em the
 .Ic tableStats
@@ -740,7 +740,57 @@ flags, and member tables.
 .It Ic listSubscriptions
 Logical replication subscriptions for the current database with owner, enabled
 status, publications, slot name, and sync settings.
+Structure only: what
+.Ic CREATE SUBSCRIPTION
+declared, changing on DDL and not otherwise.
+For whether the subscriber is keeping up, call
+.Ic subscriptionStats .
+.Pp
 The connection string is never exposed, as it may contain credentials.
+PostgreSQL agrees: the catalog revokes
+.Va subconninfo
+from
+.Va public
+and grants every one of its other seventeen columns, so selecting it would
+fail for any non-superuser as well as leaking a password.
+.It Ic subscriptionStats
+Runtime state of every logical replication subscription in this database: each
+worker with its type, pid, the relation it is syncing, and how long since it
+last heard from the publisher; per-table sync state, with the tables not yet
+ready listed individually against counts for the rest; and the apply and sync
+error counters with the per-conflict-type counters beside them.
+.Pp
+Answers whether a subscriber is keeping up and, if not, whether it is stuck
+copying a table or failing to apply.
+Reports no byte lag, because a subscriber cannot measure it:
+.Va received_lsn
+and
+.Va latest_end_lsn
+track each other rather than the publisher, so their difference is zero even
+when the subscriber is far behind.
+For lag in bytes call
+.Ic replicationSlots
+on the
+.Em publisher
+and read
+.Va retained_wal_bytes .
+.Pp
+When a table is still copying, the worker pid is a real backend pid: pass it to
+.Ic progressStats
+for the byte and tuple counts of that exact copy.
+.Va bytes_total
+is zero there, and so
+.Va bytes_percent
+is null: a table sync streams from the publisher rather than reading a file of
+known size.
+.Pp
+.Va errors
+is absent entirely on PostgreSQL 14, which has no
+.Va pg_stat_subscription_stats ,
+and its
+.Va conflicts
+are PostgreSQL 18.
+An absent key means the server cannot answer, which is not the same as no errors.
 .It Ic replicationSlots
 Replication slots with retained WAL bytes.
 A lagging or unused slot holds back WAL indefinitely and is a common cause of
@@ -1563,7 +1613,7 @@ capability is declared, so there is no mechanism by which it could.
 Anything read from a live catalog is hinted at one minute.
 This matters most for
 .Ic tools/list ,
-which is roughly 93 kB once 58 operations carry descriptions, annotations,
+which is roughly 93 kB once 59 operations carry descriptions, annotations,
 titles and output schemas, and which a client would otherwise re-fetch whenever
 it needed the list.
 .Pp

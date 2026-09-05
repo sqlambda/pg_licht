@@ -444,6 +444,7 @@ public:
   const json call_event_triggers() { return event_triggers(); }
   const json call_publications() { return publications(); }
   const json call_subscriptions() { return subscriptions(); }
+  const json call_subscription_stats() { return subscription_stats(); }
   const json call_languages() { return languages(); }
   const json call_extended_statistics(const std::string& schema) { return extended_statistics(schema); }
   const json call_operators(const std::string& schema) { return operators(schema); }
@@ -1200,6 +1201,12 @@ private:
       // runs on the primary.
       {"listTableStats",        {true,  true,  true,  false}},
       {"tableStats",            {true,  true,  true,  false}},
+      // Same row, and for the same reason. pg_subscription is a shared catalog
+      // scoped by subdbid, so the answer is per database; the workers, their
+      // message ages and the error counters are each server's own; and apply
+      // only runs where the subscription does, which is the primary. A replica
+      // of a subscriber has no apply worker of its own to report.
+      {"subscriptionStats",     {true,  true,  true,  false}},
       // Frozen xids are replicated, but the vacuum counters beside them are not
       // meaningful on a server where vacuum never runs.
       {"wraparoundStatus",      {true,  false, true,  false}},
@@ -1967,6 +1974,7 @@ private:
       {"listForeignTables",      schema_map("foreign table name", "its server and column list")},
       {"listPublications",       schema_map("publication name", "its tables and replicated operations")},
       {"listSubscriptions",      schema_map("subscription name", "its publication, slot and state")},
+      {"subscriptionStats",      schema_map("subscription name", "its worker state, table sync progress and error counters")},
       {"replicationSlots",       schema_map("slot name", "its type, activity and retained WAL")},
 
       // --- statistics keyed by object ---
@@ -2315,7 +2323,15 @@ private:
 	  },
 	  {
 	    {"name", "listSubscriptions"},
-	    {"description", "return logical replication subscriptions for the current database with owner, enabled status, publications, slot name, and sync settings (never exposes the connection string, which may contain credentials)"},
+	    {"description", "return logical replication subscriptions for the current database with owner, enabled status, publications, slot name, and sync settings (never exposes the connection string, which may contain credentials). Structure only -- what CREATE SUBSCRIPTION declared. For whether the subscriber is actually keeping up call subscriptionStats"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", json::object()}
+	      }}
+	  },
+	  {
+	    {"name", "subscriptionStats"},
+	    {"description", "return the runtime state of every logical replication subscription in this database: each worker with its type, pid, the relation it is syncing and how long since it last heard from the publisher; per-table sync state, with the tables that are not yet ready listed individually; and the apply and sync error counters plus the per-conflict-type counters. Answers whether a subscriber is keeping up and, if not, whether it is stuck syncing a table or failing to apply. Reports no byte lag, because a subscriber cannot measure it -- received_lsn and latest_end_lsn track each other rather than the publisher, so their difference is zero even when the subscriber is far behind. For lag in bytes call replicationSlots on the PUBLISHER and read retained_wal_bytes. When a table is still copying, its worker pid is a real backend pid: pass it to progressStats to get the byte count of that exact copy. Complements listSubscriptions, which is the structural half"},
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", json::object()}
@@ -6029,12 +6045,26 @@ private:
 
     // Deliberately excludes subconninfo: pg_subscription is a shared (cluster-wide)
     // catalog and that column holds the full connection string, which may embed a
-    // password. Scoped to the current database via subdbid to avoid leaking
-    // subscriptions that belong to other databases in the same cluster.
-    // subtwophasestate is PostgreSQL 15+; omit it on older servers rather than
-    // fail with an undefined-column error. subbinary is PG14, the supported floor.
-    std::string two_phase =
-      sess.server_version() >= 150000 ? ", 'two_phase', subtwophasestate" : "";
+    // password. PostgreSQL agrees strongly enough to revoke it: the catalog
+    // carries REVOKE ALL FROM public and then a column-level GRANT SELECT on
+    // every column except that one, so 17 of its 18 columns are world-readable
+    // and selecting the eighteenth would turn a working tool into a permission
+    // error for every non-superuser rather than leaking anything.
+    //
+    // Scoped to the current database via subdbid to avoid leaking subscriptions
+    // that belong to other databases in the same cluster.
+    //
+    // The rest are version gates, omitted rather than returned as null on a
+    // server that has no such column: absent means "this server cannot answer",
+    // which is not what a null would say. subbinary and substream are PG14, the
+    // supported floor.
+    const int v = sess.server_version();
+    const std::string opt =
+      std::string(v >= 150000 ? ", 'two_phase', subtwophasestate"
+                                ", 'disable_on_error', subdisableonerr" : "") +
+                 (v >= 160000 ? ", 'origin', suborigin"
+                                ", 'run_as_owner', subrunasowner" : "") +
+                 (v >= 170000 ? ", 'failover', subfailover" : "");
     std::string query =
       "SELECT JSONB_OBJECT_AGG(subname, JSONB_BUILD_OBJECT("
       "  'owner',              subowner::regrole::text"
@@ -6042,10 +6072,142 @@ private:
       ", 'publications',       subpublications"
       ", 'slot_name',          subslotname"
       ", 'synchronous_commit', subsynccommit"
-      ", 'binary',             subbinary" + two_phase +
+      ", 'binary',             subbinary"
+      ", 'stream',             substream" + opt +
       ")) "
       "FROM pg_subscription "
       "WHERE subdbid = (SELECT oid FROM pg_database WHERE datname = current_database());";
+
+    pqxx::result res = txn.exec(query);
+
+    if (!res.empty() && !res[0][0].is_null()) {
+      return json::parse(res[0][0].as<std::string>());
+    } else {
+      return {};
+    }
+  }
+
+  // The runtime half of listSubscriptions: worker identity, per-table sync
+  // state, and the error and conflict counters. listSubscriptions reads
+  // pg_subscription, which is what CREATE SUBSCRIPTION declared and changes
+  // only on DDL; everything here is a reading. The two compose by name.
+  //
+  // Scoped by subdbid, and it has to be. pg_subscription is a shared catalog
+  // and neither statistics view filters by database -- both are defined over
+  // pg_subscription with no WHERE clause -- so an unfiltered query would report
+  // the workers and counters of subscriptions belonging to other databases in
+  // the cluster, which is exactly the leak subscriptions() guards against.
+  // pg_subscription_rel is a local catalog by contrast, so joining it through
+  // the already-filtered set scopes it for free.
+  //
+  // There is deliberately no byte-lag field. received_lsn and latest_end_lsn
+  // track each other rather than the publisher: measured against a 19 MB
+  // backlog, both sat at the same LSN and their difference was zero in either
+  // direction, so any figure derived from them reads as "no lag" at exactly the
+  // moment there is some. Byte lag is a publisher-side quantity -- the slot's
+  // confirmed_flush_lsn against pg_current_wal_lsn() -- and replicationSlots
+  // already reports it as retained_wal_bytes. msg_age_s is the honest
+  // subscriber-side signal, and it needs no clock agreement with the caller.
+  const json subscription_stats() {
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+    const int v = sess.server_version();
+
+    // worker_type is PG17. Below it the type is inferred from whether the
+    // worker is bound to a relation, which is what the pre-17 idiom was. That
+    // collapses 'parallel apply' into 'apply' -- both are apply workers with a
+    // null relid -- and leader_pid still tells them apart on 16.
+    const std::string worker_type =
+      v >= 170000 ? "st.worker_type"
+                  : "CASE WHEN st.relid IS NOT NULL THEN 'table synchronization' "
+                    "ELSE 'apply' END";
+    const std::string leader_pid = v >= 160000 ? "st.leader_pid" : "NULL::int";
+
+    // pg_stat_subscription_stats is PG15. On 14, the supported floor, the view
+    // does not exist at all, so the whole errors key is omitted rather than
+    // returned as nulls: absent means "this server cannot answer", which is
+    // not the same as zero errors.
+    const bool has_stats = v >= 150000;
+    // The seven conflict counters are PG18.
+    const std::string conflicts = v >= 180000 ?
+      ", 'conflicts', JSONB_BUILD_OBJECT("
+      "   'insert_exists',             ss.confl_insert_exists"
+      " , 'update_origin_differs',     ss.confl_update_origin_differs"
+      " , 'update_exists',             ss.confl_update_exists"
+      " , 'update_missing',            ss.confl_update_missing"
+      " , 'delete_origin_differs',     ss.confl_delete_origin_differs"
+      " , 'delete_missing',            ss.confl_delete_missing"
+      " , 'multiple_unique_conflicts', ss.confl_multiple_unique_conflicts)" : "";
+
+    const std::string errors_cte = has_stats ?
+      ", e AS ("
+      "  SELECT ss.subid, JSONB_BUILD_OBJECT("
+      "           'apply_error_count', ss.apply_error_count"
+      "         , 'sync_error_count',  ss.sync_error_count"
+      "         , 'stats_reset',       ss.stats_reset" + conflicts + ") AS errors"
+      "    FROM pg_stat_subscription_stats AS ss"
+      "    JOIN sub ON sub.oid = ss.subid)" : "";
+    const std::string errors_key  = has_stats ? ", 'errors', e.errors" : "";
+    const std::string errors_join = has_stats ? " LEFT JOIN e ON e.subid = sub.oid" : "";
+
+    const std::string query =
+      "WITH sub AS ("
+      "  SELECT oid, subname FROM pg_subscription"
+      "   WHERE subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())"
+      "), w AS ("
+      "  SELECT st.subid, JSONB_AGG(JSONB_BUILD_OBJECT("
+      "           'worker_type',           " + worker_type +
+      "         , 'pid',                   st.pid"
+      "         , 'leader_pid',            " + leader_pid +
+      "         , 'relation',              st.relid::regclass::text"
+      "         , 'received_lsn',          st.received_lsn::text"
+      "         , 'latest_end_lsn',        st.latest_end_lsn::text"
+      "         , 'latest_end_time',       st.latest_end_time"
+      "         , 'last_msg_send_time',    st.last_msg_send_time"
+      "         , 'last_msg_receipt_time', st.last_msg_receipt_time"
+      "         , 'msg_age_s', round(EXTRACT(EPOCH FROM now() - st.last_msg_receipt_time)::numeric, 1)"
+      "         ) ORDER BY st.pid) AS workers"
+      "    FROM pg_stat_subscription AS st"
+      "    JOIN sub ON sub.oid = st.subid"
+      "   GROUP BY st.subid"
+      "), r AS ("
+      "  SELECT sr.srsubid"
+      "       , count(*)                                        AS total"
+      "       , count(*) FILTER (WHERE sr.srsubstate = 'r')      AS ready"
+      "       , count(*) FILTER (WHERE sr.srsubstate = 'i')      AS initializing"
+      "       , count(*) FILTER (WHERE sr.srsubstate = 'd')      AS copying"
+      "       , count(*) FILTER (WHERE sr.srsubstate = 'f')      AS copy_finished"
+      "       , count(*) FILTER (WHERE sr.srsubstate = 's')      AS synchronized"
+      // Only the exceptional set is listed. On a subscription of two thousand
+      // tables the ready ones are the whole catalog and say nothing; total and
+      // ready already carry that. An empty not_ready with total = ready is
+      // unambiguous, which is the property a bare count would lose.
+      "       , COALESCE(JSONB_AGG(JSONB_BUILD_OBJECT("
+      "             'relation', sr.srrelid::regclass::text"
+      "           , 'state', CASE sr.srsubstate WHEN 'i' THEN 'initializing'"
+      "                                         WHEN 'd' THEN 'copying'"
+      "                                         WHEN 'f' THEN 'copy_finished'"
+      "                                         WHEN 's' THEN 'synchronized'"
+      "                                         ELSE sr.srsubstate::text END)"
+      "           ORDER BY sr.srrelid::regclass::text)"
+      "           FILTER (WHERE sr.srsubstate <> 'r'), '[]'::jsonb) AS not_ready"
+      "    FROM pg_subscription_rel AS sr"
+      "    JOIN sub ON sub.oid = sr.srsubid"
+      "   GROUP BY sr.srsubid"
+      ")" + errors_cte +
+      " SELECT JSONB_OBJECT_AGG(sub.subname, JSONB_BUILD_OBJECT("
+      "          'workers', COALESCE(w.workers, '[]'::jsonb)"
+      "        , 'tables',  JSONB_BUILD_OBJECT("
+      "              'total',         COALESCE(r.total, 0)"
+      "            , 'ready',         COALESCE(r.ready, 0)"
+      "            , 'initializing',  COALESCE(r.initializing, 0)"
+      "            , 'copying',       COALESCE(r.copying, 0)"
+      "            , 'copy_finished', COALESCE(r.copy_finished, 0)"
+      "            , 'synchronized',  COALESCE(r.synchronized, 0)"
+      "            , 'not_ready',     COALESCE(r.not_ready, '[]'::jsonb))" + errors_key +
+      "        ))"
+      "   FROM sub LEFT JOIN w ON w.subid   = sub.oid"
+      "            LEFT JOIN r ON r.srsubid = sub.oid" + errors_join + ";";
 
     pqxx::result res = txn.exec(query);
 
@@ -7489,6 +7651,9 @@ private:
     }
     else if (tool_name == "listSubscriptions") {
       result_content = subscriptions();
+    }
+    else if (tool_name == "subscriptionStats") {
+      result_content = subscription_stats();
     }
     else if (tool_name == "listLanguages") {
       result_content = languages();

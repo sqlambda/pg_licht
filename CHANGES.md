@@ -3,8 +3,60 @@
 ## 4.2.0 (unreleased)
 
 Three paths that walked the configured databases one at a time now use the
-bounded worker pool 4.1.0 built, and the connection cache that release added is
-given a ceiling.
+bounded worker pool 4.1.0 built, the connection cache that release added is
+given a ceiling, and logical replication gains the runtime half it never had.
+
+### Added
+
+- **`subscriptionStats`** — the runtime state of every logical replication
+  subscription in the current database. `listSubscriptions` reads
+  `pg_subscription`, which is entirely static configuration: a subscription
+  that is `enabled: true` and eight hours behind was indistinguishable from a
+  healthy one. This reads the three sources that say otherwise —
+  `pg_stat_subscription` for each worker, `pg_subscription_rel` for per-table
+  sync state, and `pg_stat_subscription_stats` for the error and conflict
+  counters — and answers whether the subscriber is keeping up and, if not,
+  whether it is stuck copying a table or failing to apply.
+
+  Tables that are not yet ready are listed individually; the ready ones are
+  counted, because on a large subscription that list is the whole catalog and
+  says nothing.
+
+  **It reports no byte lag, deliberately.** `received_lsn` and `latest_end_lsn`
+  track each other rather than the publisher: measured against a 19 MB backlog
+  on a live subscriber, both sat at the same LSN and their difference was zero
+  in either direction, before and after catch-up. Any field derived from them
+  would read "no lag" at exactly the moment there was some. Byte lag is a
+  publisher-side quantity — the slot's `confirmed_flush_lsn` against
+  `pg_current_wal_lsn()` — and `replicationSlots` already reports it as
+  `retained_wal_bytes`. What this tool carries instead is `msg_age_s`, which
+  needs no clock agreement with the caller.
+
+  It composes with `progressStats`: a table still copying has a worker with a
+  real backend pid, and passing that pid to `progressStats` gives the byte and
+  tuple counts of that exact copy. Note that `bytes_total` is zero there — a
+  table sync streams from the publisher rather than reading a file of known
+  size — so `bytes_percent` and `elapsed_s` are null and `bytes_processed` is
+  the figure that moves.
+
+  No role grants it. The catalog is world-readable here, so this works for a
+  bare login role; `checkPrivileges` gains no entry for it and the counts move
+  to 48 of 59 for a bare role and 55 of 59 for `pg_monitor`.
+
+  Version-gated four ways: `errors` is absent entirely on PostgreSQL 14, which
+  has no `pg_stat_subscription_stats`; `leader_pid` needs 16, `worker_type`
+  needs 17 (below it the type is inferred from whether the worker is bound to a
+  relation), and the seven `conflicts` counters need 18. An absent key means
+  the server cannot answer, which is not the same as zero.
+
+- **`listSubscriptions` returns five more of the columns it can already read.**
+  `stream`, `disable_on_error`, `origin`, `run_as_owner` and `failover` were
+  omitted; it returned 6 of the 17 publicly-readable `pg_subscription` columns.
+  `disable_on_error` in particular changes how an apply error count should be
+  read. Version-gated the same way, and `subconninfo` remains excluded — the
+  catalog revokes that one column from `public` and grants the other
+  seventeen, so selecting it would fail for any non-superuser as well as
+  exposing a password.
 
 ### Fixed
 
@@ -47,8 +99,9 @@ given a ceiling.
 
 ### Compatibility
 
-Additive. No tool's name, input schema or output payload changes, and no
-response is a byte different from 4.1.1's. The three changes are timing and
+Additive. No tool's name or input schema changes, and no existing response
+field changes type or meaning: `listSubscriptions` gains keys, and every other
+payload is a byte identical to 4.1.1's. The performance work is timing and
 resource behaviour only.
 
 

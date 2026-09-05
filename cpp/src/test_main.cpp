@@ -1761,8 +1761,34 @@ TEST_F(PostgresMCPServerTest, LocksShowsHeldLockFromAnotherConnection) {
 // --- replicationSlots ---
 
 TEST_F(PostgresMCPServerTest, ReplicationSlotsReturnsEmptyWhenNoneConfigured) {
+  // The rig's primary publishes to the logical subscriber, so it legitimately
+  // carries a slot there. The empty case is still worth pinning -- "no slots"
+  // must be {} rather than null or an error -- so it is asserted wherever the
+  // subscriber rig is not in play, and the populated case gets its own test.
+  if (std::getenv("SUBSCRIBER_URL"))
+    GTEST_SKIP() << "this server publishes to the rig's logical subscriber; "
+                    "see ReplicationSlotsReportsTheLogicalSlotOfASubscriber";
   json result = srv->call_replication_slots();
   EXPECT_TRUE(result.empty());
+}
+
+TEST_F(PostgresMCPServerTest, ReplicationSlotsReportsTheLogicalSlotOfASubscriber) {
+  // Before the rig grew a logical subscriber there was no slot anywhere in it,
+  // so replicationSlots was only ever tested returning nothing. This is the
+  // populated half, and it is also where the byte lag that subscriptionStats
+  // deliberately does not report actually lives.
+  if (!std::getenv("SUBSCRIBER_URL"))
+    GTEST_SKIP() << "no SUBSCRIBER_URL; run cpp/test/run-pooled-tests.sh";
+
+  json slots = srv->call_replication_slots();
+  ASSERT_TRUE(slots.contains("lr_sub")) << slots.dump(2);
+  const auto& s = slots["lr_sub"];
+  EXPECT_EQ(s["slot_type"], "logical");
+  EXPECT_EQ(s["plugin"], "pgoutput");
+  // A logical slot names the database it decodes; a physical one does not.
+  EXPECT_EQ(s["database"], "pglicht");
+  EXPECT_TRUE(s.contains("retained_wal_bytes"))
+      << "the publisher-side lag figure is the one a subscriber cannot compute";
 }
 
 // --- databaseStats ---
@@ -6080,6 +6106,129 @@ TEST_F(PostgresMCPServerTest, ListConnectionsReportsDefaultWithoutSecrets) {
   EXPECT_EQ(result[0]["name"].get<std::string>(), "default");
   EXPECT_TRUE(result[0]["default"].get<bool>());
   EXPECT_FALSE(result[0].contains("password"));
+}
+
+// --- subscriptionStats -----------------------------------------------------
+//
+// These need a server that actually subscribes to something. The rig builds a
+// separate cluster for it, and it has to be separate: logical replication
+// between two databases of one cluster deadlocks, because CREATE SUBSCRIPTION
+// waits for the slot it is creating, and slot creation waits for every
+// transaction older than itself -- including the CREATE SUBSCRIPTION.
+
+namespace {
+std::string subscriber_url_or_empty() {
+  const char* u = std::getenv("SUBSCRIBER_URL");
+  return u ? std::string(u) : std::string();
+}
+}  // namespace
+
+TEST_F(TopologyFixture, SubscriptionStatsReportsAWorkerAndItsSyncedTables) {
+  const std::string sub = subscriber_url_or_empty();
+  if (sub.empty()) GTEST_SKIP() << "no SUBSCRIBER_URL; run cpp/test/run-pooled-tests.sh";
+
+  auto s = server_from(section("default", sub, ""));
+  json r = s->call_subscription_stats();
+
+  ASSERT_TRUE(r.contains("lr_sub")) << r.dump(2);
+  const auto& sb = r["lr_sub"];
+
+  // At least the apply worker. A parallel apply worker may or may not be up,
+  // which is why this asserts a floor rather than a count.
+  ASSERT_TRUE(sb["workers"].is_array());
+  ASSERT_GE(sb["workers"].size(), 1u) << sb.dump(2);
+  bool saw_apply = false;
+  for (const auto& w : sb["workers"]) {
+    EXPECT_TRUE(w.contains("pid"));
+    EXPECT_TRUE(w.contains("msg_age_s"));
+    // Measured, not assumed: received_lsn and latest_end_lsn track each other
+    // rather than the publisher, so no byte-lag field is derived from them.
+    EXPECT_FALSE(w.contains("apply_lag_bytes"))
+        << "a subscriber cannot measure byte lag; replicationSlots can";
+    if (w["worker_type"] == "apply") saw_apply = true;
+  }
+  EXPECT_TRUE(saw_apply) << sb.dump(2);
+
+  // The rig publishes two tables and waits for both to reach 'r'.
+  EXPECT_GE(sb["tables"]["total"].get<int>(), 2);
+  EXPECT_EQ(sb["tables"]["total"], sb["tables"]["ready"])
+      << "the rig waits for the initial sync before running the suite";
+  EXPECT_TRUE(sb["tables"]["not_ready"].is_array());
+  EXPECT_TRUE(sb["tables"]["not_ready"].empty())
+      << "every table is ready, so the exceptional set must be empty";
+}
+
+TEST_F(TopologyFixture, SubscriptionStatsCarriesTheErrorCountersWhereTheyExist) {
+  const std::string sub = subscriber_url_or_empty();
+  if (sub.empty()) GTEST_SKIP() << "no SUBSCRIBER_URL; run cpp/test/run-pooled-tests.sh";
+
+  auto s = server_from(section("default", sub, ""));
+  json r = s->call_subscription_stats();
+  ASSERT_TRUE(r.contains("lr_sub"));
+  const auto& sb = r["lr_sub"];
+
+  // pg_stat_subscription_stats is PostgreSQL 15. On 14, the supported floor,
+  // the key is absent rather than null: "this server cannot answer" is not the
+  // same statement as "no errors".
+  if (pg_server_version_num(sub) < 150000) {
+    EXPECT_FALSE(sb.contains("errors"))
+        << "PG14 has no pg_stat_subscription_stats; the key must be omitted";
+    return;
+  }
+  ASSERT_TRUE(sb.contains("errors")) << sb.dump(2);
+  EXPECT_EQ(sb["errors"]["apply_error_count"], 0);
+  EXPECT_EQ(sb["errors"]["sync_error_count"], 0);
+
+  // The seven conflict counters are PostgreSQL 18.
+  if (pg_server_version_num(sub) >= 180000) {
+    ASSERT_TRUE(sb["errors"].contains("conflicts")) << sb.dump(2);
+    EXPECT_EQ(sb["errors"]["conflicts"]["insert_exists"], 0);
+    EXPECT_EQ(sb["errors"]["conflicts"]["multiple_unique_conflicts"], 0);
+  } else {
+    EXPECT_FALSE(sb["errors"].contains("conflicts"));
+  }
+}
+
+TEST_F(PostgresMCPServerTest, SubscriptionStatsIsEmptyOnAServerThatSubscribesToNothing) {
+  // The state of every developer machine, and the most likely regression: an
+  // empty result must reach the caller as {}, not null and not an error. The
+  // publisher side of the rig subscribes to nothing, and so does a plain dev
+  // database.
+  //
+  // Asserted over the wire rather than on the query method, because that is
+  // where it is true. JSONB_OBJECT_AGG over no rows is SQL NULL, every query
+  // method here returns nlohmann's null for it, and handle_tool_call() is what
+  // normalises null to {}. Testing the method directly would pin the wrong
+  // layer and pass while the caller still saw null.
+  json r = rpc_payload(rpc_call(*srv, "subscriptionStats", json::object()));
+  EXPECT_TRUE(r.is_object()) << r.dump(2);
+  EXPECT_TRUE(r.empty()) << r.dump(2);
+}
+
+TEST_F(TopologyFixture, ListSubscriptionsCarriesTheDeclaredFlagsButNeverTheConnInfo) {
+  const std::string sub = subscriber_url_or_empty();
+  if (sub.empty()) GTEST_SKIP() << "no SUBSCRIBER_URL; run cpp/test/run-pooled-tests.sh";
+
+  auto s = server_from(section("default", sub, ""));
+  json r = s->call_subscriptions();
+  ASSERT_TRUE(r.contains("lr_sub")) << r.dump(2);
+  const auto& sb = r["lr_sub"];
+
+  EXPECT_EQ(sb["enabled"], true);
+  EXPECT_EQ(sb["slot_name"], "lr_sub");
+  EXPECT_TRUE(sb.contains("stream")) << "substream is PG14, the supported floor";
+
+  const int v = pg_server_version_num(sub);
+  EXPECT_EQ(sb.contains("disable_on_error"), v >= 150000);
+  EXPECT_EQ(sb.contains("origin"),           v >= 160000);
+  EXPECT_EQ(sb.contains("run_as_owner"),     v >= 160000);
+  EXPECT_EQ(sb.contains("failover"),         v >= 170000);
+
+  // pg_subscription revokes subconninfo from public and grants every other
+  // column, so selecting it would break the tool for non-superusers as well as
+  // leaking a password.
+  for (const auto& [key, _] : sb.items())
+    EXPECT_EQ(key.find("conninfo"), std::string::npos) << "leaked: " << key;
 }
 
 int main(int argc, char **argv) {
