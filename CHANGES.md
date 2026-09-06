@@ -1,6 +1,6 @@
 # Changelog
 
-## 4.2.0 (unreleased)
+## 4.2.0 (2026-09-05)
 
 Three paths that walked the configured databases one at a time now use the
 bounded worker pool 4.1.0 built, the connection cache that release added is
