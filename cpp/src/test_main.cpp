@@ -1761,8 +1761,34 @@ TEST_F(PostgresMCPServerTest, LocksShowsHeldLockFromAnotherConnection) {
 // --- replicationSlots ---
 
 TEST_F(PostgresMCPServerTest, ReplicationSlotsReturnsEmptyWhenNoneConfigured) {
+  // The rig's primary publishes to the logical subscriber, so it legitimately
+  // carries a slot there. The empty case is still worth pinning -- "no slots"
+  // must be {} rather than null or an error -- so it is asserted wherever the
+  // subscriber rig is not in play, and the populated case gets its own test.
+  if (std::getenv("SUBSCRIBER_URL"))
+    GTEST_SKIP() << "this server publishes to the rig's logical subscriber; "
+                    "see ReplicationSlotsReportsTheLogicalSlotOfASubscriber";
   json result = srv->call_replication_slots();
   EXPECT_TRUE(result.empty());
+}
+
+TEST_F(PostgresMCPServerTest, ReplicationSlotsReportsTheLogicalSlotOfASubscriber) {
+  // Before the rig grew a logical subscriber there was no slot anywhere in it,
+  // so replicationSlots was only ever tested returning nothing. This is the
+  // populated half, and it is also where the byte lag that subscriptionStats
+  // deliberately does not report actually lives.
+  if (!std::getenv("SUBSCRIBER_URL"))
+    GTEST_SKIP() << "no SUBSCRIBER_URL; run cpp/test/run-pooled-tests.sh";
+
+  json slots = srv->call_replication_slots();
+  ASSERT_TRUE(slots.contains("lr_sub")) << slots.dump(2);
+  const auto& s = slots["lr_sub"];
+  EXPECT_EQ(s["slot_type"], "logical");
+  EXPECT_EQ(s["plugin"], "pgoutput");
+  // A logical slot names the database it decodes; a physical one does not.
+  EXPECT_EQ(s["database"], "pglicht");
+  EXPECT_TRUE(s.contains("retained_wal_bytes"))
+      << "the publisher-side lag figure is the one a subscriber cannot compute";
 }
 
 // --- databaseStats ---
@@ -4762,6 +4788,258 @@ TEST_F(PostgresMCPServerTest, TheReaperClosesAnIdleConnection) {
   EXPECT_EQ(cache.idle_count(), 0u);
 }
 
+TEST_F(PostgresMCPServerTest, CheckRoleAccessSeparatesTheGatesThatLookAlike) {
+  // The cases this tool exists for all look identical from a grants map: a
+  // grant that is real but unreachable, a table-level no that is a per-column
+  // yes, and a complete set of grants that returns no rows because RLS is on.
+  pqxx::connection c(test_url);
+  const std::string sfx = std::to_string(getpid());
+  const std::string reach = "cra_reach_" + sfx, part = "cra_part_" + sfx;
+  {
+    pqxx::nontransaction n(c);
+    n.exec("CREATE ROLE " + reach + " NOLOGIN");
+    n.exec("CREATE ROLE " + part + " NOLOGIN");
+    // Its own schema, because the fixture grants USAGE on grocery to PUBLIC and
+    // the whole point of the first case is a schema the role cannot enter.
+    n.exec("CREATE SCHEMA cra_s");
+    n.exec("CREATE TABLE cra_s.cra (id int, note text)");
+    // reach: granted the table, never granted the schema.
+    n.exec("GRANT SELECT ON cra_s.cra TO " + reach);
+    // part: no table grant at all, only two columns.
+    n.exec("GRANT USAGE ON SCHEMA cra_s TO " + part);
+    n.exec("GRANT SELECT (id, note) ON cra_s.cra TO " + part);
+    n.exec("ALTER TABLE cra_s.cra ENABLE ROW LEVEL SECURITY");
+  }
+
+  json r = srv->call_check_role_access(reach, "cra_s", "cra");
+  EXPECT_EQ(r["privileges"]["SELECT"], true);
+  EXPECT_EQ(r["schema_access"]["usage"], false)
+      << "the gate that is missed most often has to be reported on its own: "
+      << r.dump(2);
+
+  json p2 = srv->call_check_role_access(part, "cra_s", "cra");
+  EXPECT_EQ(p2["privileges"]["SELECT"], false);
+  ASSERT_TRUE(p2["columns"].contains("SELECT")) << p2.dump(2);
+  EXPECT_EQ(p2["columns"]["SELECT"].size(), 2u)
+      << "a table-level no that is a per-column yes must not read as a flat no";
+
+  // RLS is enabled with no policy at all, which denies everything -- and
+  // has_table_privilege knows nothing about it, which is exactly why the block
+  // is returned separately rather than folded into the verdict.
+  EXPECT_EQ(p2["row_level_security"]["enabled"], true);
+  EXPECT_EQ(p2["row_level_security"]["applies_to_role"], true);
+  EXPECT_TRUE(p2["row_level_security"]["policies"].empty()) << p2.dump(2);
+
+  // The owner is exempt unless FORCE, which is why testing as the owner proves
+  // nothing about anybody else.
+  json owner = srv->call_check_role_access(
+      admin_conn->username(), "cra_s", "cra");
+  EXPECT_EQ(owner["object"]["is_owner"], true) << owner.dump(2);
+  EXPECT_EQ(owner["row_level_security"]["applies_to_role"], false)
+      << "owner is exempt while forced is false: " << owner.dump(2);
+
+  // Neither a missing role nor a missing object is an error: both are answers.
+  json ghost = srv->call_check_role_access("cra_no_such_role", "cra_s", "cra");
+  EXPECT_EQ(ghost["role"]["exists"], false);
+  EXPECT_TRUE(ghost.contains("note"));
+  json nothing = srv->call_check_role_access(part, "cra_s", "cra_no_such_table");
+  EXPECT_TRUE(nothing.contains("note")) << nothing.dump(2);
+
+  {
+    pqxx::nontransaction n(c);
+    n.exec("DROP SCHEMA cra_s CASCADE");
+    n.exec("DROP ROLE " + reach);
+    n.exec("DROP ROLE " + part);
+  }
+}
+
+TEST_F(PostgresMCPServerTest, ColumnHistogramIsTheDetailTableStatsSummarises) {
+  // Two tools rather than a flag, per locked decision 3: tableStats carries
+  // three points for every column, this carries the whole distribution for one.
+  // The test that matters is that they agree -- a summary that disagrees with
+  // its detail is worse than either alone.
+  pqxx::connection c(test_url);
+  {
+    pqxx::work w(c);
+    w.exec("CREATE TABLE grocery.ch (id int, flag bool)");
+    w.exec("INSERT INTO grocery.ch SELECT g, g % 2 = 0 FROM generate_series(1, 4000) g");
+    w.commit();
+  }
+  { pqxx::nontransaction n(c); n.exec("ANALYZE grocery.ch"); }
+
+  json h;
+  for (int i = 0; i < 40; i++) {
+    h = srv->call_column_histogram("grocery", "ch", "id");
+    if (!h["histogram_bounds"].is_null()) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  ASSERT_FALSE(h["histogram_bounds"].is_null()) << h.dump(2);
+  ASSERT_TRUE(h["histogram_bounds"].is_array());
+  EXPECT_GT(h["histogram_bounds"].size(), 3u)
+      << "the point of this tool is the whole array, not the three tableStats has";
+  EXPECT_EQ(h["histogram_buckets"].get<int>(),
+            static_cast<int>(h["histogram_bounds"].size()) - 1)
+      << "n bounds delimit n-1 equal-frequency buckets";
+  EXPECT_TRUE(h["statistics_target"].contains("effective"));
+
+  // The summary must be a selection from this exact array, not a second
+  // computation that could drift from it.
+  json t = srv->call_table_stats("grocery", "ch");
+  const auto& three = t["columns"]["id"]["histogram_bounds"];
+  ASSERT_FALSE(three.is_null()) << t.dump(2);
+  const auto& full = h["histogram_bounds"];
+  EXPECT_EQ(three["low"], full.front());
+  EXPECT_EQ(three["high"], full.back());
+  EXPECT_EQ(three["count"].get<size_t>(), full.size());
+
+  // A boolean has too few distinct values to leave anything over once the
+  // common ones are taken, so it has no histogram at all -- and the tool has to
+  // say why rather than returning a bare null.
+  json flag = srv->call_column_histogram("grocery", "ch", "flag");
+  EXPECT_TRUE(flag["histogram_bounds"].is_null()) << flag.dump(2);
+  EXPECT_EQ(flag["histogram_buckets"], 0);
+  ASSERT_TRUE(flag.contains("note")) << flag.dump(2);
+  EXPECT_NE(flag["note"].get<std::string>().find("most_common_vals"), std::string::npos);
+
+  json bad = srv->call_column_histogram("grocery", "ch", "no_such_column");
+  EXPECT_TRUE(bad.contains("error")) << bad.dump(2);
+  EXPECT_TRUE(bad.contains("hint"));
+
+  { pqxx::work w(c); w.exec("DROP TABLE grocery.ch"); w.commit(); }
+}
+
+TEST_F(PostgresMCPServerTest, TableStatsOffersRealValuesToRePlanWith) {
+  // The point of histogram_bounds here is not to describe the distribution but
+  // to hand back values that actually occur in the column, so a statement can
+  // be re-planned with a real extreme instead of an invented constant that may
+  // match nothing.
+  pqxx::connection c(test_url);
+  {
+    pqxx::work w(c);
+    w.exec("CREATE TABLE grocery.hist (id int, label text)");
+    // Skewed on purpose: one value dominates, and the rest spread out, so the
+    // column gets both an MCV list and a histogram.
+    w.exec("INSERT INTO grocery.hist "
+           "SELECT CASE WHEN g % 2 = 0 THEN 7 ELSE g END, 'x' FROM generate_series(1, 4000) g");
+    w.commit();
+  }
+  { pqxx::nontransaction n(c); n.exec("ANALYZE grocery.hist"); }
+
+  json r;
+  for (int i = 0; i < 40; i++) {
+    r = srv->call_table_stats("grocery", "hist");
+    if (!r["columns"]["id"]["histogram_bounds"].is_null()) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  const auto& id = r["columns"]["id"];
+  ASSERT_TRUE(id.contains("histogram_bounds")) << r.dump(2);
+  ASSERT_FALSE(id["histogram_bounds"].is_null())
+      << "a column with 2000 distinct values must have a histogram: " << r.dump(2);
+
+  for (const char* k : {"low", "mid", "high", "count"})
+    EXPECT_TRUE(id["histogram_bounds"].contains(k)) << k;
+  EXPECT_GT(id["histogram_bounds"]["count"].get<int>(), 1);
+
+  // Bounded on purpose. The array is statistics_target wide, and inlining it
+  // per column is the unbounded-payload defect this project already has one of.
+  EXPECT_EQ(id["histogram_bounds"].size(), 4u)
+      << "three points and a count, not the whole array";
+
+  // The bounds keep the column's own JSON type -- an integer column gives
+  // numbers, not stringified numbers -- so they compare directly, and compare
+  // equal to what columnHistogram returns for the same column.
+  EXPECT_TRUE(id["histogram_bounds"]["low"].is_number()) << id.dump(2);
+  EXPECT_LE(id["histogram_bounds"]["low"].get<long long>(),
+            id["histogram_bounds"]["high"].get<long long>());
+
+  // The skewed value is the frequent one, and it is what the other half of the
+  // test matrix uses.
+  ASSERT_FALSE(id["most_common_vals"].is_null()) << r.dump(2);
+
+  // A column whose values are all common has no histogram at all, and that is
+  // a null rather than an empty object -- the caller has to be able to tell.
+  const auto& label = r["columns"]["label"];
+  EXPECT_TRUE(label["histogram_bounds"].is_null()) << r.dump(2);
+
+  { pqxx::work w(c); w.exec("DROP TABLE grocery.hist"); w.commit(); }
+}
+
+TEST_F(PostgresMCPServerTest, StatsSeparateManualVacuumFromAutovacuum) {
+  // Through 4.1.1 both statistics tools returned
+  // GREATEST(last_vacuum, last_autovacuum) under the name last_vacuum, and the
+  // same for analyze. That collapsed the one distinction the fields exist to
+  // draw: a table kept alive by a cron job and a table autovacuum is reaching
+  // both reported "vacuumed recently", and the first is a finding while the
+  // second is health. The names now mean what pg_stat_user_tables means by
+  // them.
+  pqxx::connection c(test_url);
+  {
+    pqxx::work w(c);
+    w.exec("CREATE TABLE grocery.vac_split (id int)");
+    w.exec("INSERT INTO grocery.vac_split SELECT generate_series(1, 50)");
+    w.commit();
+  }
+  { pqxx::nontransaction n(c); n.exec("ANALYZE grocery.vac_split"); }
+
+  // Statistics reporting is not synchronous on every supported major: the
+  // PostgreSQL 14 collector flushes on an interval rather than at statement
+  // end, so this polls rather than asserting on the first read.
+  json r;
+  for (int i = 0; i < 40; i++) {
+    r = srv->call_table_stats("grocery", "vac_split");
+    if (!r["last_analyze"].is_null()) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+
+  ASSERT_TRUE(r.contains("last_analyze"));
+  ASSERT_TRUE(r.contains("last_autoanalyze"));
+  ASSERT_TRUE(r.contains("last_vacuum"));
+  ASSERT_TRUE(r.contains("last_autovacuum"));
+
+  EXPECT_FALSE(r["last_analyze"].is_null())
+      << "ANALYZE was just run by hand: " << r.dump(2);
+  EXPECT_TRUE(r["last_autoanalyze"].is_null())
+      << "autovacuum has not touched a table created seconds ago; a non-null "
+         "here means the two columns are still merged: " << r.dump(2);
+
+  // estimated_from stays the GREATEST of all four: it dates relpages and
+  // reltuples, which any of them refreshes equally, so the merge is correct
+  // there and only there.
+  EXPECT_EQ(r["estimated_from"], r["last_analyze"]) << r.dump(2);
+
+  { pqxx::work w(c); w.exec("DROP TABLE grocery.vac_split"); w.commit(); }
+}
+
+TEST_F(PostgresMCPServerTest, TheCacheIsBoundedAndEvictsTheLeastRecentlyUsed) {
+  // The TTL alone does not bound the cache. A sweep releases one connection per
+  // member, so a registry of 400 databases holds 400 open sockets for the full
+  // minute after a single group sweep. macOS ships a 256 file-descriptor limit,
+  // so that does not present as "slow" -- it presents as a wall of connect
+  // failures from the members that ran after the limit was hit, which reads as
+  // an unreachable fleet rather than a local resource limit.
+  //
+  // Cap of 4 rather than the shipped kMaxIdle, so the test states its own bound
+  // instead of depending on a constant it is not testing.
+  ConnectionCache cache{std::chrono::seconds{60}, 4};
+  pglicht::ConnConfig cfg;
+  cfg.conninfo = test_url;
+
+  for (int i = 0; i < 10; i++) {
+    cfg.name = "c" + std::to_string(i);
+    Session s{cfg, std::nullopt, &cache, cfg.name};
+    s.txn().exec("SELECT 1");
+  }
+  EXPECT_EQ(cache.idle_count(), 4u) << "the cache grew past its cap";
+
+  // Which four survive is the whole point: evicting arbitrarily would throw
+  // away the connection the next call is most likely to want. The four most
+  // recently released must be the ones kept.
+  EXPECT_EQ(cache.take("c0"), nullptr) << "the least recently used entry survived";
+  EXPECT_EQ(cache.take("c5"), nullptr) << "an entry past the cap survived";
+  EXPECT_NE(cache.take("c9"), nullptr) << "the most recently released entry was evicted";
+  EXPECT_NE(cache.take("c6"), nullptr) << "the oldest of the survivors was evicted";
+}
+
 TEST_F(PostgresMCPServerTest, AConnectionKilledUnderneathIsReplaced) {
   // idle_session_timeout, a server restart, a NAT table that forgot us: a
   // cached socket can be dead by the time the next call wants it, and there is
@@ -6050,6 +6328,129 @@ TEST_F(PostgresMCPServerTest, ListConnectionsReportsDefaultWithoutSecrets) {
   EXPECT_EQ(result[0]["name"].get<std::string>(), "default");
   EXPECT_TRUE(result[0]["default"].get<bool>());
   EXPECT_FALSE(result[0].contains("password"));
+}
+
+// --- subscriptionStats -----------------------------------------------------
+//
+// These need a server that actually subscribes to something. The rig builds a
+// separate cluster for it, and it has to be separate: logical replication
+// between two databases of one cluster deadlocks, because CREATE SUBSCRIPTION
+// waits for the slot it is creating, and slot creation waits for every
+// transaction older than itself -- including the CREATE SUBSCRIPTION.
+
+namespace {
+std::string subscriber_url_or_empty() {
+  const char* u = std::getenv("SUBSCRIBER_URL");
+  return u ? std::string(u) : std::string();
+}
+}  // namespace
+
+TEST_F(TopologyFixture, SubscriptionStatsReportsAWorkerAndItsSyncedTables) {
+  const std::string sub = subscriber_url_or_empty();
+  if (sub.empty()) GTEST_SKIP() << "no SUBSCRIBER_URL; run cpp/test/run-pooled-tests.sh";
+
+  auto s = server_from(section("default", sub, ""));
+  json r = s->call_subscription_stats();
+
+  ASSERT_TRUE(r.contains("lr_sub")) << r.dump(2);
+  const auto& sb = r["lr_sub"];
+
+  // At least the apply worker. A parallel apply worker may or may not be up,
+  // which is why this asserts a floor rather than a count.
+  ASSERT_TRUE(sb["workers"].is_array());
+  ASSERT_GE(sb["workers"].size(), 1u) << sb.dump(2);
+  bool saw_apply = false;
+  for (const auto& w : sb["workers"]) {
+    EXPECT_TRUE(w.contains("pid"));
+    EXPECT_TRUE(w.contains("msg_age_s"));
+    // Measured, not assumed: received_lsn and latest_end_lsn track each other
+    // rather than the publisher, so no byte-lag field is derived from them.
+    EXPECT_FALSE(w.contains("apply_lag_bytes"))
+        << "a subscriber cannot measure byte lag; replicationSlots can";
+    if (w["worker_type"] == "apply") saw_apply = true;
+  }
+  EXPECT_TRUE(saw_apply) << sb.dump(2);
+
+  // The rig publishes two tables and waits for both to reach 'r'.
+  EXPECT_GE(sb["tables"]["total"].get<int>(), 2);
+  EXPECT_EQ(sb["tables"]["total"], sb["tables"]["ready"])
+      << "the rig waits for the initial sync before running the suite";
+  EXPECT_TRUE(sb["tables"]["not_ready"].is_array());
+  EXPECT_TRUE(sb["tables"]["not_ready"].empty())
+      << "every table is ready, so the exceptional set must be empty";
+}
+
+TEST_F(TopologyFixture, SubscriptionStatsCarriesTheErrorCountersWhereTheyExist) {
+  const std::string sub = subscriber_url_or_empty();
+  if (sub.empty()) GTEST_SKIP() << "no SUBSCRIBER_URL; run cpp/test/run-pooled-tests.sh";
+
+  auto s = server_from(section("default", sub, ""));
+  json r = s->call_subscription_stats();
+  ASSERT_TRUE(r.contains("lr_sub"));
+  const auto& sb = r["lr_sub"];
+
+  // pg_stat_subscription_stats is PostgreSQL 15. On 14, the supported floor,
+  // the key is absent rather than null: "this server cannot answer" is not the
+  // same statement as "no errors".
+  if (pg_server_version_num(sub) < 150000) {
+    EXPECT_FALSE(sb.contains("errors"))
+        << "PG14 has no pg_stat_subscription_stats; the key must be omitted";
+    return;
+  }
+  ASSERT_TRUE(sb.contains("errors")) << sb.dump(2);
+  EXPECT_EQ(sb["errors"]["apply_error_count"], 0);
+  EXPECT_EQ(sb["errors"]["sync_error_count"], 0);
+
+  // The seven conflict counters are PostgreSQL 18.
+  if (pg_server_version_num(sub) >= 180000) {
+    ASSERT_TRUE(sb["errors"].contains("conflicts")) << sb.dump(2);
+    EXPECT_EQ(sb["errors"]["conflicts"]["insert_exists"], 0);
+    EXPECT_EQ(sb["errors"]["conflicts"]["multiple_unique_conflicts"], 0);
+  } else {
+    EXPECT_FALSE(sb["errors"].contains("conflicts"));
+  }
+}
+
+TEST_F(PostgresMCPServerTest, SubscriptionStatsIsEmptyOnAServerThatSubscribesToNothing) {
+  // The state of every developer machine, and the most likely regression: an
+  // empty result must reach the caller as {}, not null and not an error. The
+  // publisher side of the rig subscribes to nothing, and so does a plain dev
+  // database.
+  //
+  // Asserted over the wire rather than on the query method, because that is
+  // where it is true. JSONB_OBJECT_AGG over no rows is SQL NULL, every query
+  // method here returns nlohmann's null for it, and handle_tool_call() is what
+  // normalises null to {}. Testing the method directly would pin the wrong
+  // layer and pass while the caller still saw null.
+  json r = rpc_payload(rpc_call(*srv, "subscriptionStats", json::object()));
+  EXPECT_TRUE(r.is_object()) << r.dump(2);
+  EXPECT_TRUE(r.empty()) << r.dump(2);
+}
+
+TEST_F(TopologyFixture, ListSubscriptionsCarriesTheDeclaredFlagsButNeverTheConnInfo) {
+  const std::string sub = subscriber_url_or_empty();
+  if (sub.empty()) GTEST_SKIP() << "no SUBSCRIBER_URL; run cpp/test/run-pooled-tests.sh";
+
+  auto s = server_from(section("default", sub, ""));
+  json r = s->call_subscriptions();
+  ASSERT_TRUE(r.contains("lr_sub")) << r.dump(2);
+  const auto& sb = r["lr_sub"];
+
+  EXPECT_EQ(sb["enabled"], true);
+  EXPECT_EQ(sb["slot_name"], "lr_sub");
+  EXPECT_TRUE(sb.contains("stream")) << "substream is PG14, the supported floor";
+
+  const int v = pg_server_version_num(sub);
+  EXPECT_EQ(sb.contains("disable_on_error"), v >= 150000);
+  EXPECT_EQ(sb.contains("origin"),           v >= 160000);
+  EXPECT_EQ(sb.contains("run_as_owner"),     v >= 160000);
+  EXPECT_EQ(sb.contains("failover"),         v >= 170000);
+
+  // pg_subscription revokes subconninfo from public and grants every other
+  // column, so selecting it would break the tool for non-superusers as well as
+  // leaking a password.
+  for (const auto& [key, _] : sb.items())
+    EXPECT_EQ(key.find("conninfo"), std::string::npos) << "leaked: " << key;
 }
 
 int main(int argc, char **argv) {

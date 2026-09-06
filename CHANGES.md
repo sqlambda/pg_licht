@@ -1,5 +1,484 @@
 # Changelog
 
+## 4.2.0 (2026-09-05)
+
+Three paths that walked the configured databases one at a time now use the
+bounded worker pool 4.1.0 built, the connection cache that release added is
+given a ceiling, and logical replication gains the runtime half it never had.
+
+### Added
+
+- **`subscriptionStats`** — the runtime state of every logical replication
+  subscription in the current database. `listSubscriptions` reads
+  `pg_subscription`, which is entirely static configuration: a subscription
+  that is `enabled: true` and eight hours behind was indistinguishable from a
+  healthy one. This reads the three sources that say otherwise —
+  `pg_stat_subscription` for each worker, `pg_subscription_rel` for per-table
+  sync state, and `pg_stat_subscription_stats` for the error and conflict
+  counters — and answers whether the subscriber is keeping up and, if not,
+  whether it is stuck copying a table or failing to apply.
+
+  Tables that are not yet ready are listed individually; the ready ones are
+  counted, because on a large subscription that list is the whole catalog and
+  says nothing.
+
+  **It reports no byte lag, deliberately.** `received_lsn` and `latest_end_lsn`
+  track each other rather than the publisher: measured against a 19 MB backlog
+  on a live subscriber, both sat at the same LSN and their difference was zero
+  in either direction, before and after catch-up. Any field derived from them
+  would read "no lag" at exactly the moment there was some. Byte lag is a
+  publisher-side quantity — the slot's `confirmed_flush_lsn` against
+  `pg_current_wal_lsn()` — and `replicationSlots` already reports it as
+  `retained_wal_bytes`. What this tool carries instead is `msg_age_s`, which
+  needs no clock agreement with the caller.
+
+  It composes with `progressStats`: a table still copying has a worker with a
+  real backend pid, and passing that pid to `progressStats` gives the byte and
+  tuple counts of that exact copy. Note that `bytes_total` is zero there — a
+  table sync streams from the publisher rather than reading a file of known
+  size — so `bytes_percent` and `elapsed_s` are null and `bytes_processed` is
+  the figure that moves.
+
+  No role grants it. The catalog is world-readable here, so this works for a
+  bare login role; `checkPrivileges` gains no entry for it and the counts move
+  to 48 of 59 for a bare role and 55 of 59 for `pg_monitor`.
+
+  Version-gated four ways: `errors` is absent entirely on PostgreSQL 14, which
+  has no `pg_stat_subscription_stats`; `leader_pid` needs 16, `worker_type`
+  needs 17 (below it the type is inferred from whether the worker is bound to a
+  relation), and the seven `conflicts` counters need 18. An absent key means
+  the server cannot answer, which is not the same as zero.
+
+- **Every prompt was audited against what its tools actually return**, and one
+  named a field that did not exist. `bloat-and-vacuum-review` said to read
+  `last_vacuum` *and* `last_autovacuum`, and no payload contained the second.
+  That turned out to be the tool's bug rather than the prompt's — see the
+  `last_vacuum` entry under Fixed — so the field now exists and the prompt
+  reads both, which is what it wanted all along.
+
+  Six prompts gained readings the tools were already returning:
+
+  | prompt | now reads | because |
+  |---|---|---|
+  | `bloat-and-vacuum-review` | `n_ins_since_vacuum`, `n_tup_newpage_upd` | ranking by dead tuples misses insert-only tables entirely, and failing HOT updates are a cause of bloat rather than a symptom of it |
+  | `triage-lock-contention` | `mode`/`lock_type`, `granted`, `wait_start`, `leader_pid`, `backend_xmin`, `application_name`/`client_addr` | it concluded "the fix is in the application that left it open" without ever saying how to name that application |
+  | `capacity-check` | `temp_files`/`temp_bytes`, the session counters | it computed worst-case memory and never checked whether anything actually spilled |
+  | `buffer-cache-review` | `usage_counts`/`usagecount_avg`, `evictions`/`reuses` | it asked in step 5 whether the cache is being churned, using a tool that answers exactly that in step 1 |
+  | `diagnose-slow-query`, `explain-and-fix` | `temp_blks_written`, `listExtendedStatistics` | the spill is already in hand from the first call, and extended statistics were recommended without checking whether any exist |
+
+- **`explain-and-fix` was rebuilt to investigate before it proposes.** It went
+  from plan to fix, and a plan is evidence rather than a verdict — a statement
+  can be slow with a perfect plan because the data is cold, the table is
+  bloated, or it waited instead of working.
+
+  It had a functional bug: it told the model to call `explainQuery` with
+  `analyze: true`, which is refused without a `timeout_ms`. That call errored.
+
+  The larger gap was `params`. Supplying them decides which plan comes back —
+  without them a statement carrying `$n` placeholders is planned `GENERIC_PLAN`,
+  which is what a prepared statement settles on — and the *difference between
+  the two plans* is the whole diagnosis for "fast when I run it by hand, slow
+  from the application". The prompt now asks for that comparison in both
+  directions and reads the `generic`/`analyzed` flags rather than assuming.
+
+  It reads what `EXPLAIN (ANALYZE, BUFFERS)` was already returning and it was
+  ignoring: `shared_read` against `shared_hit` (a cold cache or an oversized
+  working set is a capacity answer, not a query one), `Heap Fetches` on an
+  index-only scan (a stale visibility map, fixed by vacuum and not by an
+  index), and time no node accounts for (it waited). It grounds all of it in
+  `tableStats` — row count first, since a sequential scan of a few thousand rows
+  is the right plan, then the analyze timestamps, then `most_common_vals` for
+  the skew that makes one plan right for a common value and wrong for a rare
+  one.
+
+  It can now conclude that no fix is needed, which is a legitimate and often
+  correct outcome. An index proposal is shaped deliberately rather than named:
+  `duplicateIndexes` first because a prefix of an existing index buys nothing
+  and costs writes forever, then column order (equality before range), `INCLUDE`
+  for an index-only scan, a partial predicate, and the operator class where the
+  default will not be used. And the report says how anyone would confirm the fix
+  afterwards, which it never did.
+
+  `triage-lock-contention` also hands off to `bloat-and-vacuum-review` when the
+  chain root holds an old `backend_xmin`, since a backend blocking one wait
+  chain is simultaneously stopping vacuum cluster-wide.
+
+- **`replication-slot-review` reads the fields the tool was already
+  returning.** It ranked slots by `active`, `restart_lsn` and `wal_status` and
+  ignored three readings that answer questions it was otherwise estimating:
+  `inactive_since` dates the problem exactly, where a slot idle for an hour and
+  one idle since a deploy three weeks ago are different findings with identical
+  `retained_wal_bytes`; `conflicting` and `invalidation_reason` say the server
+  retired the slot rather than it merely falling behind, and `wal_removed`,
+  `rows_removed`, `wal_level_insufficient` and `idle_timeout` each need a
+  different fix; and the spill counters separate logical decoding that does not
+  fit in `logical_decoding_work_mem` from a consumer that is simply slow.
+
+  It also gains the state that looks like abandonment and is not. A
+  subscription created with `disable_on_error` switches *itself* off the first
+  time apply fails, so the symptom is an inactive slot, a disabled
+  subscription, and WAL piling up behind a consumer that is neither broken nor
+  gone. Dropping the slot there destroys a subscriber that was one
+  `ALTER SUBSCRIPTION ENABLE` from resuming — which is why the prompt now reads
+  `enabled` beside `disable_on_error` rather than treating inactive as
+  abandoned.
+
+- **`columnHistogram`**, and three points off the histogram added to
+  `tableStats`. Both exist to answer one question: which real values to re-plan
+  a statement with.
+
+  `tableStats` claimed to return "the per-column `pg_stats` histograms" and
+  returned everything except the histogram. It now carries `histogram_bounds`
+  as `low`, `mid`, `high` and `count` — the observed minimum, median and maximum
+  of the distribution. These are values that **actually occur in the column**,
+  so they can be passed straight back to `explainQuery` as parameters: a plan
+  built for them is a plan for real data rather than for an invented constant
+  that may match nothing. Paired with `most_common_vals`, which is the other end
+  of the same question, they make a test matrix — the plan for a frequent value
+  against the plan for a rare one is where parameter sensitivity shows itself.
+
+  Three points rather than the array, because the array is `statistics_target`
+  wide — 101 entries by default, up to 10001 — and inlining that for every
+  column of a wide table is the unbounded-payload defect this project already
+  has one of.
+
+  `columnHistogram` is the detail half, for one named column: the full bounds
+  array, the MCV list with frequencies, and `statistics_target`, which says why
+  the histogram is the width it is and is the knob that changes it. Two tools
+  rather than a flag, on the reasoning locked for `bufferCacheSummary` and
+  `bufferCacheContents` — a summary asked of every column and a detail asked
+  about one have different call frequencies and different shapes.
+
+  The two halves of a distribution are complements, not alternatives, and the
+  descriptions say so: `ANALYZE` puts the most frequent values in
+  `most_common_vals` and builds the histogram from **what is left**, so a value
+  in the MCV list never appears in the bounds however common it is. A column
+  with too few distinct values has no histogram at all, and that comes back as
+  a null with the reason rather than as an empty array.
+
+  Writing the test caught the summary and the detail disagreeing about types —
+  `"1"` against `1`, because the summary reached the array through a `text[]`
+  cast. Both now go through `to_jsonb`, so an integer column gives numbers in
+  both and the summary compares equal to the detail it summarises.
+
+  These return more literal column values than anything else here. `pg_stats`
+  filters on `has_column_privilege`, so a role without `SELECT` on the column
+  gets nulls rather than data.
+
+  Three prompts reach for them. `explain-and-fix` uses the three points to
+  decide whether the plan is stable and escalates to `columnHistogram` when it
+  needs to find *where* the plan turns rather than merely that it does.
+  `diagnose-slow-query` uses them to separate skew from staleness — statistics
+  that are current with an estimate still wrong is a different fix from
+  statistics nobody has refreshed. And `plan-schema-change` uses the full array
+  for partition boundaries: choosing them without the distribution is guessing,
+  the guess is usually uniform when the data is not, and a table partitioned by
+  month is a table with one enormous partition wherever the traffic actually
+  was. The bounds are equal-frequency, so every Nth one divides the existing
+  rows evenly.
+
+- **`checkRoleAccess`** — whether one role holds privileges on one table, view,
+  sequence, function or procedure, answered by `has_table_privilege` and its
+  relatives rather than reconstructed from ACLs. Role inheritance, grants to
+  `PUBLIC`, ownership and superuser fold in the way the server folds them, which
+  is laborious and easy to get subtly wrong by hand.
+
+  It needs no grant of its own — those functions and the catalog are
+  world-readable, so any role that can connect may ask about any other. The
+  argument is `grantee` rather than `role`, because `role` is reserved
+  server-wide for narrowing a sweep to a primary or a replica.
+
+  Three things it reports rather than folds in, because folding them in would
+  produce a confident wrong answer:
+
+  - **Schema `USAGE` and database `CONNECT` come back beside the object
+    privileges.** `SELECT` on a table is inert without `USAGE` on its schema,
+    and the error names the *table*, which sends people to the wrong object.
+  - **Column-level grants are listed when the table-level answer is no**, so a
+    partial yes does not read as a flat no.
+  - **Row-level security is not considered by `has_table_privilege` at all.** A
+    true can still return zero rows. The `row_level_security` block carries
+    whether RLS is on, whether it is *forced*, whether this particular role is
+    subject to it, and every policy with whether it applies — because the owner
+    is exempt unless forced, which is why checking as the owner proves nothing
+    about anyone else.
+
+  A routine name reports every overload with its signature and
+  `security_definer`. A missing role and a missing object are both answers
+  rather than errors.
+
+  Measured against a purpose-built rig while writing it, and one result
+  corrected the design: `has_table_privilege` **does** honour `rolinherit`, so a
+  `NOINHERIT` member of a granted group gets `false` even though the privilege
+  is one `SET ROLE` away. A false is therefore "not right now" rather than
+  "never", and `role.inherits` and `role.member_of` are returned so the two can
+  be told apart.
+
+- **`diskUsage`, and `triage-disk-space` to go with it.** "The disk is filling"
+  is the classic night page and was the one alert with no prompt — but a prompt
+  alone would have been unexecutable, because answering it normally means `df`
+  and this server speaks only SQL.
+
+  It turns out almost all of it *is* reachable: `pg_ls_waldir()`,
+  `pg_ls_archive_statusdir()`, `pg_ls_tmpdir()` and `pg_ls_logdir()` return
+  names and sizes, and `pg_tablespace_size()` and `pg_database_size()` cover the
+  data. So `diskUsage` reports WAL size and file count, the archive backlog,
+  temp files on disk right now, the log directory, and sizes per tablespace and
+  per database across the whole cluster — with no shell on the server.
+
+  **What is genuinely unreachable is the headroom.** PostgreSQL exposes no
+  function for total or free space, so the tool says what is consuming space and
+  how it divides, never how much is left, and says so in its own payload rather
+  than letting a caller assume otherwise.
+
+  Two findings it makes available that were previously invisible here. A
+  climbing `.ready` count in the archive status is a failing `archive_command`
+  retaining every segment it has not archived — **indistinguishable from an
+  abandoned replication slot by WAL size alone**, and a completely different
+  fix. And a tablespace carries its location, so the database that is growing
+  and the volume that is full need not be the same device; on a real server this
+  showed a tablespace and the log directory on two volumes neither of which was
+  `pg_default`.
+
+  Each section runs on its own savepoint, because they fail independently and
+  for ordinary reasons: `pg_ls_logdir()` *raises* rather than returning empty
+  when `logging_collector` is off, and a role short of `pg_monitor` is refused
+  the `pg_ls_*` family outright. One refusal returns an error in that key and
+  leaves the rest answered.
+
+  What it costs, measured: the four directory sections are 0.7 ms together, and
+  the tablespace and database sizes are the whole cost — 314 ms for the complete
+  call against a cluster of roughly a terabyte, where a bare `databaseSize` is
+  already 163 ms. They walk the tree and `stat()` every segment, so they scale
+  with **file count rather than bytes**, and the two overlap:
+  `pg_tablespace_size(pg_default)` covers the same subtree the per-database
+  sizes do. They are kept separate anyway because they answer different
+  questions — which *volume* is full against which *database* grew — and
+  deriving one from the other is wrong wherever a relation lives in a
+  non-default tablespace. Nothing is read, no relation is opened and no lock is
+  taken; it is metadata, not I/O. But those figures were measured with directory
+  entries warm in the page cache, and a filling disk is exactly when they are
+  not, so `statement_timeout` bounding the call matters — the failure mode is a
+  timeout that names itself rather than a hang.
+
+  The prompt ranks what can be freed by reversibility and leads with what makes
+  the obvious response wrong: `VACUUM FULL` needs free space equal to the table
+  and its indexes *before* it releases any, and holds an `AccessExclusiveLock`
+  throughout — so it is not a disk-full action, and saying that is more useful
+  than proposing it.
+
+- **`wraparoundStatus` carries the runbook that would otherwise have been a
+  prompt.** Wraparound is a single tool call, so the reasoning belongs in the
+  description where it is read at the moment of the call rather than in a
+  thirteenth prompt. It now separates the two alarms — past
+  `autovacuum_freeze_max_age` is loud maintenance working as designed, while
+  approaching the wraparound limit ends in a server refusing writes — and states
+  the fact that makes most responses to that alert fail: **nothing can be frozen
+  past the oldest transaction still visible to something**, so more workers and
+  a manual `VACUUM FREEZE` achieve nothing while the horizon is held. It names
+  the four holders, including the one this server cannot see —
+  `pg_prepared_xacts`, invisible in `pg_stat_activity` and the answer whenever
+  nothing else explains it.
+
+- **`triage-active-sessions`, for a server running more sessions at once than
+  it has cores.** Two things it establishes before anything else, because both
+  are routinely assumed instead.
+
+  **`active` does not mean on-CPU.** `pg_stat_activity` calls a backend active
+  while it is executing a statement, and a backend waiting on a lock, on a disk
+  read or on a parallel sibling is executing a statement. Fifty active sessions
+  of which forty-five are lock waits is one blocker and a queue, not a shortage
+  of cores. Only backends with no wait event compete for CPU, and that is the
+  number compared against the core count — after parallel workers are collapsed
+  into their leaders via `leader_pid`, since one query with four workers is five
+  rows and one unit of user concurrency.
+
+  The split by `wait_event_type` then decides which investigation this actually
+  is, and hands off: locks to `triage-lock-contention`, I/O to
+  `buffer-cache-review`, IPC back to the parallelism settings, LWLock to the
+  write path.
+
+  **High concurrency is usually a symptom.** Sessions in flight is arrival rate
+  multiplied by duration, so it rises when statements get slower even though
+  nothing about the load changed. Where the server really is CPU-bound,
+  `statementStats` says which term moved: more calls is growth and a capacity
+  answer, the same calls taking longer is a regression that belongs to
+  `diagnose-slow-query`. A plan that flipped, statistics gone stale, a table
+  that bloated or a working set that outgrew the cache all present as a load
+  problem and none of them is one — and the prompt says plainly that a
+  connection pooler bounds the damage without making any statement faster.
+
+  `capacity-check` flags `max_parallel_workers_per_gather` as the setting that
+  lets one query oversubscribe a machine; this is where that consequence is
+  observed, and the two now name each other.
+
+- **`check-role-access`, a tenth prompt.** Whether a role can use a table,
+  view, function or procedure — and, separately, which rows it then sees.
+
+  Access is a chain of gates and the first failure is the whole answer, so the
+  prompt walks them in order rather than reporting an object ACL and stopping.
+  The gate people miss is `USAGE` on the schema, because `SELECT` on the table
+  is inert without it and the resulting error names the *table*, sending
+  everyone to the wrong object. It also covers the cases where a grant map
+  answers a different question than it appears to: `PUBLIC` is a grantee like
+  any other, `EXECUTE` is granted to `PUBLIC` by default on every new function,
+  an owner holds everything implicitly and need not appear at all, and a
+  `NOINHERIT` member holds a role's privileges only after `SET ROLE` — which
+  application code almost never issues, so a grant that looks present is absent
+  in practice.
+
+  **Row-level security is treated as a second gate, opening only after the
+  grants have already said yes.** That ordering is the point: RLS enabled with
+  no applicable permissive policy is deny-all, so every grant checks out,
+  `has_table_privilege` says yes, and the table returns nothing — the state
+  nobody can explain. The owner bypasses RLS unless `FORCE ROW LEVEL SECURITY`
+  is set, which is why checking as the owner proves nothing about anyone else;
+  permissive policies OR together while restrictive ones AND, so one
+  restrictive policy vetoes everything; and `USING` gates reads while
+  `WITH CHECK` gates writes, so reading a row you cannot write back is normal
+  rather than broken.
+
+  Views and functions each redirect whose privileges apply: a view's base
+  tables are read as the *view owner*, unless `security_invoker` (PostgreSQL 15
+  and later) flips it to the caller and brings base-table grants and policies
+  back into play; a `SECURITY DEFINER` function runs its body as the owner, so
+  `EXECUTE` on it is effectively a grant of whatever the body can do.
+
+  The prompt leads with `checkRoleAccess` rather than reconstructing the answer,
+  and the manual walk below it is how a verdict becomes something an operator
+  can act on: which gate said no, or what a yes does not cover.
+
+  `checkPrivileges` is unrelated despite the name and now says so: that tool
+  reports which of *this server's operations* the *connecting* role can run.
+
+- **`diagnose-deadlock`, a ninth prompt.** A deadlock is over before anyone
+  reads about it: PostgreSQL detects the cycle, kills a transaction and
+  releases the other, so the pids in the log no longer exist and the live lock
+  views describe a server that has moved on. `triage-lock-contention` follows a
+  wait chain you can still see and is the wrong tool for it, which is why this
+  is a separate prompt rather than a branch of that one.
+
+  It reconstructs the deadlock from the log entry plus the schema. The lock
+  kind in the report already names the shape — `ShareLock on transaction N` is
+  a row-ordering problem, `ExclusiveLock on tuple` is a queue for one row, a
+  relation lock means DDL was in the cycle — and the statements alone do not
+  show the lock footprint: a foreign key locks the parent row the statement
+  never names, a trigger runs statements the log never shows, and the plan
+  decides the order rows are locked, so an index scan against a sequential scan
+  is enough to start a deadlock that was not happening last week.
+
+  It ranks fixes as consistent acquisition order, then a smaller lock
+  footprint, then a shorter transaction, and says plainly that
+  `deadlock_timeout` is not a fix — it changes when the cycle is detected,
+  never whether it forms — and that a retry loop is a mitigation that hides an
+  ordering bug rather than fixing one.
+
+  Recurrence escalates in three stages, and in each of them the statement
+  merely *appearing* in a view is the finding, before any counter is read.
+  Still in `statementStats` on a cluster that is evicting means it runs often
+  enough to survive eviction, which is exactly what a deadlock needs — so
+  `info.dealloc` has to be read first, because it decides what presence means.
+  Absence settles nothing: evicted, reset, or never tracked are three different
+  things and the prompt asks which were ruled out. Present in
+  `currentActivity` means it is running now, so the next occurrence can be
+  watched rather than the last one inferred. Live and slow earns
+  `currentLocks`, because a deadlock is a wait chain that closed into a loop
+  and the chains forming now are the same edges caught before the last one
+  joined up — at which point `triage-lock-contention` takes over.
+
+- **`listSubscriptions` returns five more of the columns it can already read.**
+  `stream`, `disable_on_error`, `origin`, `run_as_owner` and `failover` were
+  omitted; it returned 6 of the 17 publicly-readable `pg_subscription` columns.
+  `disable_on_error` in particular changes how an apply error count should be
+  read. Version-gated the same way, and `subconninfo` remains excluded — the
+  catalog revokes that one column from `public` and grants the other
+  seventeen, so selecting it would fail for any non-superuser as well as
+  exposing a password.
+
+### Fixed
+
+- **`last_vacuum` did not mean `last_vacuum`.** `tableStats` and
+  `listTableStats` returned `GREATEST(last_vacuum, last_autovacuum)` under the
+  name `last_vacuum`, and the same for analyze. The four
+  `pg_stat_user_tables` timestamps are now four fields with the catalog's own
+  names and meanings.
+
+  The merge collapsed the one distinction those columns exist to draw. A recent
+  `last_autovacuum` says autovacuum is reaching the table; a recent
+  `last_vacuum` beside a null `last_autovacuum` says the opposite — somebody is
+  keeping the table alive by hand and the cron job is hiding the finding rather
+  than being it. Merged, both read as "vacuumed recently", and *"is autovacuum
+  keeping up"* is the question these tools exist to answer.
+
+  Measured on a real database while fixing it: a table reporting
+  `last_analyze: 2026-09-04T03:30:30` under 4.1.1 reports
+  `last_analyze: null, last_autoanalyze: 2026-09-04T03:30:30` now. Nobody had
+  ever run `ANALYZE` on it; the old shape said otherwise.
+
+  `estimated_from` stays the latest of all four. That merge is correct and
+  unchanged: it dates `relpages` and `reltuples`, which any of the four
+  refreshes equally.
+
+- **`verifyTopology` no longer walks the registry one server at a time.** It
+  opened one connection per configured database sequentially, which made the
+  one tool whose entire job is to touch every server the slowest thing in the
+  server. Measured against twelve unreachable hosts at the five-second sweep
+  connect timeout: **60.1s before, 5.0s after** — one timeout rather than
+  twelve. The cost scaled with the registry, so a 400-database configuration
+  spent roughly half an hour on a call that reads as cheap.
+
+  Only the observing is parallel. Every conclusion the tool draws comes from
+  comparing members against each other, so the comparison passes still run
+  sequentially over results held in configuration order, and the payload is
+  byte-identical to 4.1.1's.
+
+- **`role:` is no longer a serial pre-pass in front of a parallel sweep.**
+  Filtering a sweep by observed role costs one connect per member before the
+  tool's own, and that loop sat directly in front of the worker pool without
+  using it. On twelve members with no topology labels to collapse, adding
+  `role: "primary"` took the same call from **5.0s to 60.1s**; it is now 5.0s
+  either way.
+
+  This is the call an operator makes during a failover, when they can least
+  afford to wait. Every member is still probed even when only the primary is
+  wanted — stopping at the first would hide split brain — and the ordering of
+  `matched`, of the skip reasons and of the split-brain note is unchanged.
+
+- **The connection cache is bounded.** It held one idle connection per database
+  touched, evicted only by the sixty-second idle timer, so a single sweep of a
+  large registry left one open socket per member for a full minute. macOS ships
+  a 256 file-descriptor limit, so this did not present as slowness: the members
+  that ran after the limit was reached reported connect failures, which read as
+  an unreachable fleet rather than a local resource limit.
+
+  At most 32 idle connections are now held, the least recently released being
+  dropped first. An ordinary registry never reaches the cap and nothing about
+  its behaviour changes; past it the cache reconnects, which is what every
+  release before 4.1.0 did.
+
+### Compatibility
+
+Additive except for one corrected field, and that exception is stated here
+rather than buried, because it is observable.
+
+`tableStats` and `listTableStats` change what `last_vacuum` and `last_analyze`
+contain. Both previously carried the later of the manual and automatic
+timestamp; each now carries the manual one, with `last_autovacuum` and
+`last_autoanalyze` added beside them. A caller reading `last_vacuum` will start
+seeing null for any table only autovacuum has touched.
+
+This is shipped as a fix rather than held for a major version because the field
+was not doing what its name says: it is named for a `pg_stat_user_tables`
+column and returned something else, in the direction that reads as healthy. No
+other tool ever merged them — `wraparoundStatus` has always reported both — so
+the change also removes a disagreement between two tools about the same two
+catalog columns.
+
+Everything else is additive. No tool's name or input schema changes,
+`listSubscriptions` gains keys, and every other payload is byte-identical to
+4.1.1's. The performance work is timing and resource behaviour only.
+
+
 ## 4.1.1 (2026-09-04)
 
 A compatibility fix for the output format 4.0.0 introduced, and the escape

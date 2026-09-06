@@ -460,7 +460,7 @@ Most of this server works for any role that can connect, because the catalog is
 world-readable.
 Measured on PostgreSQL 18: a bare
 .Ic LOGIN
-role with no grants runs 47 of the 58 operations at full fidelity, the
+role with no grants runs 50 of the 62 operations at full fidelity, the
 monitoring role takes that to 54, and the three that remain are exactly the
 three that read row data \(em the
 .Ic tableStats
@@ -512,6 +512,46 @@ escalate privilege, which is not this server's to make.
 .El
 .Ss Schema exploration
 .Bl -tag -width Ds
+.It Ic checkRoleAccess Ar grantee Ar schema Ar object
+Whether one role holds privileges on one table, view, sequence, function or
+procedure, answered by
+.Fn has_table_privilege
+and its relatives rather than reconstructed from ACLs, so inheritance, grants to
+.Va PUBLIC ,
+ownership and superuser fold in the way the server folds them.
+Needs no grant of its own: these functions and the catalog are world-readable,
+so any role that can connect may ask about any other.
+The argument is
+.Ar grantee
+because
+.Va role
+is reserved server-wide for narrowing a sweep to a primary or a replica.
+.Pp
+Schema
+.Ic USAGE
+and database
+.Ic CONNECT
+come back beside the object privileges, since a grant on the table is inert
+without them and the resulting error names the table.
+Where a table-level privilege is absent but individual columns carry it, those
+columns are listed.
+A routine name reports every overload with its signature and
+.Va security_definer .
+.Pp
+.Sy Row-level security is not folded in ,
+because
+.Fn has_table_privilege
+does not consider it: a true here can still return no rows.
+The
+.Va row_level_security
+block carries whether RLS is enabled, whether it is forced, whether this
+particular role is subject to it \(em the owner is exempt unless forced \(em and
+every policy with whether it applies to the role.
+Enabled with no applicable permissive policy denies everything.
+.Pp
+Not to be confused with
+.Ic checkPrivileges ,
+which reports which of this server's own operations the connecting role can run.
 .It Ic listSchemas
 All schemas with their table and view names and role grants.
 .It Ic listTables Ar schema
@@ -553,8 +593,11 @@ Statistics PostgreSQL already keeps for one table: estimated row count,
 .Va seq_scan
 and
 .Va idx_scan ,
-live and dead tuples, mods-since-analyze, inserts-since-vacuum, last vacuum and
-analyze, per-index scan counts, and the per-column
+live and dead tuples, mods-since-analyze, inserts-since-vacuum, the four
+.Li pg_stat_user_tables
+timestamps
+.Pq Va last_vacuum , Va last_autovacuum , Va last_analyze , Va last_autoanalyze ,
+per-index scan counts, and the per-column
 .Li pg_stats
 histograms
 .Pq Va null_frac , Va avg_width , Va n_distinct , physical order correlation , Va most_common_vals No and their frequencies .
@@ -566,6 +609,55 @@ is literal values sampled from the column, up to
 .Va default_statistics_target
 of them.
 This is the only operation that returns them.
+.Pp
+The manual and automatic timestamps are separate, and mean what the catalog
+means by them.
+A recent
+.Va last_autovacuum
+says autovacuum is reaching the table; a recent
+.Va last_vacuum
+beside a null
+.Va last_autovacuum
+says the opposite \(em somebody is keeping the table alive by hand and the cron
+job is hiding the finding rather than being it.
+Through 4.1.1 both were returned merged under
+.Va last_vacuum ,
+which made those two indistinguishable.
+.Va estimated_from
+remains the latest of all four, since any of them refreshes
+.Li relpages
+and
+.Li reltuples .
+.It Ic columnHistogram Ar schema Ar table Ar column
+The whole value distribution of one column: the most common values with their
+frequencies, and the full histogram of everything else.
+.Ic tableStats
+carries three points off that histogram \(em low, mid and high \(em which is
+enough to pick parameters to re-plan a statement with; this is for when the
+shape of the distribution is itself the question.
+.Pp
+The two halves are complements, not alternatives.
+.Ic ANALYZE
+puts the most frequent values in
+.Va most_common_vals
+and builds the histogram only from what is left, so a value in the MCV list
+never appears in the bounds however common it is, and reading either alone
+misdescribes the column.
+The bounds are equal-frequency: consecutive entries delimit buckets holding
+roughly the same number of rows, so bounds bunched together are a dense region
+and a wide gap a sparse one.
+.Va statistics_target
+says why the histogram is the width it is, and is the knob that changes it.
+.Pp
+Costs nothing to read, and returns more literal column values than any other
+operation here: the bounds and the most common values are rows sampled out of
+the table.
+.Li pg_stats
+filters on
+.Fn has_column_privilege ,
+so a role without
+.Ic SELECT
+on the column gets nulls rather than data.
 .It Ic listTableStats Ar schema
 The same statistics for every table in
 .Ar schema ,
@@ -740,7 +832,57 @@ flags, and member tables.
 .It Ic listSubscriptions
 Logical replication subscriptions for the current database with owner, enabled
 status, publications, slot name, and sync settings.
+Structure only: what
+.Ic CREATE SUBSCRIPTION
+declared, changing on DDL and not otherwise.
+For whether the subscriber is keeping up, call
+.Ic subscriptionStats .
+.Pp
 The connection string is never exposed, as it may contain credentials.
+PostgreSQL agrees: the catalog revokes
+.Va subconninfo
+from
+.Va public
+and grants every one of its other seventeen columns, so selecting it would
+fail for any non-superuser as well as leaking a password.
+.It Ic subscriptionStats
+Runtime state of every logical replication subscription in this database: each
+worker with its type, pid, the relation it is syncing, and how long since it
+last heard from the publisher; per-table sync state, with the tables not yet
+ready listed individually against counts for the rest; and the apply and sync
+error counters with the per-conflict-type counters beside them.
+.Pp
+Answers whether a subscriber is keeping up and, if not, whether it is stuck
+copying a table or failing to apply.
+Reports no byte lag, because a subscriber cannot measure it:
+.Va received_lsn
+and
+.Va latest_end_lsn
+track each other rather than the publisher, so their difference is zero even
+when the subscriber is far behind.
+For lag in bytes call
+.Ic replicationSlots
+on the
+.Em publisher
+and read
+.Va retained_wal_bytes .
+.Pp
+When a table is still copying, the worker pid is a real backend pid: pass it to
+.Ic progressStats
+for the byte and tuple counts of that exact copy.
+.Va bytes_total
+is zero there, and so
+.Va bytes_percent
+is null: a table sync streams from the publisher rather than reading a file of
+known size.
+.Pp
+.Va errors
+is absent entirely on PostgreSQL 14, which has no
+.Va pg_stat_subscription_stats ,
+and its
+.Va conflicts
+are PostgreSQL 18.
+An absent key means the server cannot answer, which is not the same as no errors.
 .It Ic replicationSlots
 Replication slots with retained WAL bytes.
 A lagging or unused slot holds back WAL indefinitely and is a common cause of
@@ -1044,6 +1186,52 @@ actually measured over.
 Maximum number of tables to return, oldest first.
 Defaults to 20.
 .El
+.It Ic diskUsage
+What PostgreSQL is holding on disk, without a shell on the server: WAL size and
+file count, the archive status backlog, temporary files currently on disk, the
+log directory, and sizes per tablespace and per database across the cluster.
+.Pp
+.Sy How much room is left is not knowable from SQL .
+PostgreSQL exposes no function for total or free space, so this reports what is
+consuming space and how it divides, never the headroom.
+A tablespace also carries its location, which matters because the database that
+is growing and the volume that is full need not be the same device.
+.Pp
+A climbing
+.Pa .ready
+count in the archive status is a failing
+.Va archive_command
+retaining every segment it has not archived \(em indistinguishable from an
+abandoned replication slot by WAL size alone, and a different fix.
+.Pp
+The
+.Fn pg_ls_ *
+sections need
+.Va pg_monitor .
+Each section is guarded on its own savepoint, so one refusal returns an error
+in that key and leaves the rest answered:
+.Fn pg_ls_logdir
+raises rather than returning empty when
+.Va logging_collector
+is off.
+.Pp
+The four directory sections are trivial.
+The tablespace and database sizes are the whole cost: they walk the tree and
+stat every segment file, so they scale with file count rather than with bytes,
+and the two overlap because
+.Fn pg_tablespace_size
+on
+.Va pg_default
+covers the same subtree the per-database sizes do.
+Measured at 314 ms for the whole call against a cluster of roughly a terabyte,
+where a bare
+.Ic databaseSize
+is already 163 ms.
+Nothing is read, no relation is opened and no lock is taken \(em this is
+metadata rather than I/O \(em but that was measured with directory entries warm
+in the page cache, and a filling disk is when they are not.
+.Va statement_timeout
+bounds it, so the failure mode is a timeout that names itself.
 .It Ic checkpointStats
 Checkpoint, write-ahead log, and background writer activity: timed against
 requested checkpoint counts and the ratio between them, write and sync time,
@@ -1563,7 +1751,7 @@ capability is declared, so there is no mechanism by which it could.
 Anything read from a live catalog is hinted at one minute.
 This matters most for
 .Ic tools/list ,
-which is roughly 93 kB once 58 operations carry descriptions, annotations,
+which is roughly 93 kB once 62 operations carry descriptions, annotations,
 titles and output schemas, and which a client would otherwise re-fetch whenever
 it needed the list.
 .Pp
@@ -1710,6 +1898,96 @@ to a plan to a fix, reading
 first so a truncated list is not mistaken for the whole picture.
 .It Ic triage-lock-contention Op Va connection
 Follow the wait chain to its root before proposing to terminate anything.
+For a wait that is still happening; a deadlock the server already logged needs
+.Ic diagnose-deadlock .
+.It Ic diagnose-deadlock Va deadlock_log Op Va connection
+Reconstruct a logged deadlock from the log entry and the schema.
+The deadlock is over before anyone reads about it, so the live lock views
+describe a server that has moved on; what settles it is the acquisition order
+each transaction took, which the statements alone do not show.
+A foreign key locks the parent row a statement never names, a trigger runs
+statements the log never shows, and the plan decides the order rows are locked
+\(em so an index scan against a sequential scan is enough to start a deadlock
+that was not happening last week.
+Ranks the fixes and says plainly that
+.Va deadlock_timeout
+is not one of them: it changes when the cycle is detected, never whether it
+forms.
+.Pp
+Recurrence is established in three stages, where the statement merely appearing
+in a view is the finding.
+Still present in
+.Ic statementStats
+on a cluster that is evicting means it runs often enough to survive eviction,
+which is what a deadlock needs; absent settles nothing, since it may have been
+evicted, reset, or never tracked.
+Present in
+.Ic currentActivity
+means it is running now, so the next occurrence can be watched rather than the
+last one inferred.
+Live and slow earns
+.Ic currentLocks ,
+because the chains forming now are the near-miss version of the one that closed
+\(em at which point
+.Ic triage-lock-contention
+takes over.
+.It Ic triage-active-sessions Op Va connection
+Why a server is running more sessions at once than it has CPUs.
+.Pp
+Begins by distrusting the word
+.Dq active :
+.Li pg_stat_activity
+calls a backend active while it executes a statement, and one waiting on a
+lock, on a disk read or on a parallel sibling is executing a statement.
+Only backends with no wait event compete for CPU, and that is the count
+compared against the core count \(em a server with fifty active sessions of
+which forty-five are lock waits has one blocker and a queue, not a shortage of
+cores.
+Parallel workers are collapsed into their leaders first, since one query with
+four workers is five rows and one unit of user concurrency.
+.Pp
+The split by
+.Va wait_event_type
+then decides which investigation this is:
+.Ic triage-lock-contention
+for locks,
+.Ic buffer-cache-review
+for I/O, the parallelism settings for IPC, the write path for LWLock.
+.Pp
+Where the server really is CPU-bound, concurrency is arrival rate multiplied by
+duration, so it rises when statements get slower even though nothing about the
+load changed.
+.Ic statementStats
+says which term moved: more calls is growth and a capacity answer, the same
+calls taking longer is a regression and belongs to
+.Ic diagnose-slow-query .
+A connection pooler bounds the damage and makes no statement faster.
+.It Ic triage-disk-space Op Va connection
+What is filling the disk, and what can safely be freed now.
+Opens by stating its own limit: this server reads PostgreSQL's accounting and
+cannot see the filesystem, so logs, core dumps and base backups are invisible
+here and are regularly the answer.
+.Pp
+Four consumers in order of how fast each can be undone: WAL pinned by a slot
+.Pq the usual answer, and the only one that frees a lot at once ,
+temporary files
+.Pq the fastest, and the space returns the moment the statement ends ,
+bloat, and genuine growth.
+Notes the cause it cannot see \(em a failing
+.Va archive_command
+retains WAL and
+.Li pg_stat_archiver
+is not read here \(em and that a stuck archiver and an abandoned slot look
+identical from the size alone.
+.Pp
+Says plainly that
+.Ic VACUUM FULL
+is not a disk-full action: it needs free space equal to the table and its
+indexes before it releases any, and holds an
+.Ic AccessExclusiveLock
+throughout.
+Ranks what can be freed by reversibility, with dropping a slot marked
+irreversible for its consumer.
 .It Ic bloat-and-vacuum-review Op Va schema
 Check
 .Ic replicationSlots
@@ -1722,6 +2000,21 @@ Worst-case committed memory against host RAM; stops with a partial answer
 rather than guessing an undeclared host.
 .It Ic replication-slot-review Op Va connection
 The runbook for the failure mode that presents as something else.
+Reads
+.Va inactive_since
+to date the problem rather than infer it from WAL volume,
+.Va invalidation_reason
+to tell a slot the server retired from one merely falling behind, and the spill
+counters to tell logical decoding that does not fit in memory from a slow
+consumer.
+For a logical slot it goes on to the subscriber:
+.Ic subscriptionStats
+separates one that is stuck from one that is gone, and
+.Va disable_on_error
+in
+.Ic listSubscriptions
+identifies the third case, a subscriber that switched itself off on an apply
+error and is one command from resuming.
 An unconsumed slot holds back the xmin horizon, so vacuum cannot remove dead
 tuples anywhere in the cluster, and pins WAL until the disk fills; both get
 diagnosed as bloat or as a disk problem.
@@ -1757,10 +2050,80 @@ full rewrite, and for the size at which the answer would flip.
 Lock level alone settles nothing: a strong lock held for a millisecond is safe
 and a weak one held for an hour may not be, and duration comes from the
 measurements.
-.It Ic explain-and-fix Ar sql Op Va params
-Plan without
-.Va analyze
-first, then with it if needed, and check existing indexes before proposing one.
+.It Ic check-role-access Ar role Ar object Op Va privilege , connection
+Whether a role can use a table, view, function or procedure, and which rows it
+then sees.
+Access is a chain of gates and the first failure is the answer; the one most
+often missed is
+.Ic USAGE
+on the schema, whose error names the table and sends people to the wrong object.
+.Pp
+Row-level security is a second gate, opening only after the grants have already
+said yes.
+Enabled with no applicable permissive policy it is deny-all \(em every grant
+checks out,
+.Fn has_table_privilege
+would say yes, and the table returns nothing.
+The owner bypasses it unless
+.Ic FORCE ROW LEVEL SECURITY
+is set, which is why checking as the owner proves nothing about anybody else.
+.Pp
+Distinct from
+.Ic checkPrivileges ,
+which reports which of this server's own operations the connecting role can
+run.
+This prompt is about another role's access to a database object.
+.It Ic explain-and-fix Ar sql Op Va params , schema
+Establish why a statement is slow, then propose a fix that is verified rather
+than guessed.
+A plan is evidence, not a verdict: a statement can be slow with a perfect plan
+because the data is cold, the table is bloated, or it waited rather than worked.
+.Pp
+Whether
+.Va params
+is supplied decides which plan comes back, and the difference between the two is
+itself a diagnosis.
+Without them a statement carrying
+.Li $n
+placeholders is planned with
+.Ic GENERIC_PLAN ,
+which is what a prepared statement settles on \(em frequently the whole answer to
+\(lqfast by hand, slow from the application\(rq.
+The prompt asks for the comparison in both directions.
+.Pp
+Reads estimates against actuals, then buffers
+.Pq Va shared_read No is a cold cache or an oversized working set, not a bad plan ,
+then
+.Va Heap Fetches
+on an index-only scan
+.Pq a stale visibility map, fixed by vacuum and not by an index ,
+then time no node accounts for
+.Pq it waited .
+Grounds all of it in
+.Ic tableStats :
+row count first, since a sequential scan of a few thousand rows needs no fix at
+all, then the analyze timestamps, then
+.Va most_common_vals
+for the skew that makes one plan right for a common value and wrong for a rare
+one.
+.Pp
+Ranks fixes by what they cost \(em analyze, rewrite, configuration, DDL \(em and
+treats \(lqalready as fast as it can be\(rq as a legitimate outcome.
+An index proposal is shaped deliberately: existing coverage checked with
+.Ic duplicateIndexes ,
+equality columns before range,
+.Ic INCLUDE
+for an index-only scan, a partial predicate where the constant is always the
+same, and the operator class where the default will not be used.
+.Pp
+Verifies before recommending: a rewrite is re-planned and compared, an index is
+put to
+.Ic evaluateIndex
+so the planner says whether it would take it.
+Creation is handed to
+.Ic plan-schema-change ,
+since whether an index is correct and whether it is safe to build are different
+questions.
 .Pp
 Both this and
 .Ic diagnose-slow-query

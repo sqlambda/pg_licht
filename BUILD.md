@@ -71,18 +71,29 @@ order to issue `CREATE DATABASE`. Installing the `pg_stat_statements`, `postgres
 
 Because the read-only guard is transaction-scoped specifically so it survives a
 transaction-mode pooler, there is a script that verifies exactly that. It stands up a
-throwaway PostgreSQL cluster and a companion PgBouncer (`pool_mode=transaction`,
-`server_reset_query=DISCARD ALL`) in a temp directory, runs the full suite both directly
-and through the pooler, and tears everything down — touching nothing else on the machine:
+whole rig in a temp directory, runs the full suite both directly and through the pooler,
+and tears everything down — touching nothing else on the machine:
+
+| | why it exists |
+|---|---|
+| primary, `pg_stat_statements` preloaded, `wal_level = logical` | the suite's own database, and the publisher |
+| a `pg_basebackup` streaming standby | shares the primary's system identifier, which is the only way to check that the topology tools tell a replica from a second instance rather than trusting the config |
+| a separately `initdb`-ed logical subscriber | `subscriptionStats` has nothing to report on a server that subscribes to nothing. It has to be a third cluster: logical replication between two databases of one cluster deadlocks, because `CREATE SUBSCRIPTION` waits for the slot it is creating and slot creation waits for every transaction older than itself — including that one |
+| PgBouncer, `pool_mode=transaction`, `server_reset_query=DISCARD ALL` | the deployment a session-scoped guard fails on silently |
+
+Tests that need a server other than the primary are skipped when it is absent, so the
+binary still runs against a plain `DATABASE_URL`; the rig exports `STANDBY_URL` and
+`SUBSCRIBER_URL` to switch them on.
 
 ```bash
 cmake --build cpp/build          # the script needs the test binary built
 cpp/test/run-pooled-tests.sh
 ```
 
-Requires `initdb`/`pg_ctl` (PostgreSQL 14+) and `pgbouncer`. It picks the newest installed
-PostgreSQL and free default ports, all overridable via the environment: `PG_BINDIR`,
-`PGBOUNCER`, `TEST_BIN`, `PG_PORT`, `BOUNCER_PORT`. To pin a specific major:
+Requires `initdb`, `pg_ctl`, `createdb`, `pg_basebackup` and `psql` (PostgreSQL 14+) plus
+`pgbouncer`. It picks the newest installed PostgreSQL and free default ports, all
+overridable via the environment: `PG_BINDIR`, `PGBOUNCER`, `TEST_BIN`, `PG_PORT`,
+`BOUNCER_PORT`, `STANDBY_PORT`, `SUBSCRIBER_PORT`. To pin a specific major:
 
 ```bash
 PG_BINDIR=/usr/lib/postgresql/16/bin cpp/test/run-pooled-tests.sh

@@ -57,9 +57,10 @@ TEST_BIN="${TEST_BIN:-$cpp_dir/build/pg_licht_mcp_test}"
 PG_PORT="${PG_PORT:-55432}"
 BOUNCER_PORT="${BOUNCER_PORT:-56432}"
 STANDBY_PORT="${STANDBY_PORT:-57432}"
+SUBSCRIBER_PORT="${SUBSCRIBER_PORT:-58432}"
 
 for req in "$PG_BINDIR/initdb" "$PG_BINDIR/pg_ctl" "$PG_BINDIR/createdb" \
-           "$PG_BINDIR/pg_basebackup" "$PGBOUNCER" "$TEST_BIN"; do
+           "$PG_BINDIR/pg_basebackup" "$PG_BINDIR/psql" "$PGBOUNCER" "$TEST_BIN"; do
   [ -x "$req" ] || { echo "ERROR: missing or not executable: $req" >&2
                      [ "$req" = "$TEST_BIN" ] && echo "  build it: cmake --build $cpp_dir/build" >&2
                      exit 1; }
@@ -70,11 +71,13 @@ done
 work="$(mktemp -d "${TMPDIR:-/tmp}/pglicht-rig.XXXXXX")"
 PGDATA="$work/pg"
 SBDATA="$work/standby"
+SUBDATA="$work/subscriber"
 BDIR="$work/bouncer"
 mkdir -p "$PGDATA" "$BDIR"
 
 cleanup() {
   [ -f "$BDIR/pgbouncer.pid" ] && kill "$(cat "$BDIR/pgbouncer.pid")" 2>/dev/null || true
+  "$PG_BINDIR/pg_ctl" -D "$SUBDATA" -m immediate stop >/dev/null 2>&1 || true
   "$PG_BINDIR/pg_ctl" -D "$SBDATA" -m immediate stop >/dev/null 2>&1 || true
   "$PG_BINDIR/pg_ctl" -D "$PGDATA" -m immediate stop >/dev/null 2>&1 || true
   rm -rf "$work"
@@ -90,6 +93,9 @@ port = $PG_PORT
 listen_addresses = '127.0.0.1'
 unix_socket_directories = '$work'
 shared_preload_libraries = 'pg_stat_statements'
+# For the logical subscriber below. Set before pg_basebackup so the standby
+# inherits it and the two clusters stay byte-comparable.
+wal_level = logical
 fsync = off
 full_page_writes = off
 CONF
@@ -119,6 +125,61 @@ CONF
 "$PG_BINDIR/pg_ctl" -D "$SBDATA" -l "$SBDATA/pg.log" -w start >/dev/null
 STANDBY_URL="host=127.0.0.1 port=$STANDBY_PORT dbname=pglicht user=pglicht"
 export STANDBY_URL
+
+# --- logical subscriber ----------------------------------------------------
+# A separate cluster, and it has to be: logical replication between two
+# databases of one cluster deadlocks on itself. CREATE SUBSCRIPTION creates the
+# slot on the publisher, slot creation waits for every transaction older than
+# itself to finish, and the CREATE SUBSCRIPTION transaction is one of them --
+# it waits forever, logging "Waiting for transactions (approximately 1) older
+# than N to end". initdb rather than pg_basebackup, since a physical copy would
+# share the publisher's system identifier and cannot subscribe to it.
+#
+# This exists for subscriptionStats: pg_stat_subscription, its stats view and
+# pg_subscription_rel are all empty on a server that subscribes to nothing, so
+# the tool cannot be tested against the primary at all.
+echo "--- initdb a logical subscriber on $SUBSCRIBER_PORT"
+"$PG_BINDIR/initdb" -D "$SUBDATA" -U pglicht --auth=trust -E UTF8 >/dev/null
+
+cat >> "$SUBDATA/postgresql.conf" <<CONF
+port = $SUBSCRIBER_PORT
+listen_addresses = '127.0.0.1'
+unix_socket_directories = '$work'
+fsync = off
+full_page_writes = off
+CONF
+
+"$PG_BINDIR/pg_ctl" -D "$SUBDATA" -l "$SUBDATA/pg.log" -w start >/dev/null
+"$PG_BINDIR/createdb" -h 127.0.0.1 -p "$SUBSCRIBER_PORT" -U pglicht pglicht
+
+# The publication lives in the primary's own pglicht database, not in the
+# throwaway database each test run creates for itself, so it is invisible to
+# every other test.
+psql_pub() { "$PG_BINDIR/psql" -X -q -h 127.0.0.1 -p "$PG_PORT" -U pglicht -d pglicht "$@"; }
+psql_sub() { "$PG_BINDIR/psql" -X -q -h 127.0.0.1 -p "$SUBSCRIBER_PORT" -U pglicht -d pglicht "$@"; }
+
+psql_pub -c "CREATE TABLE lr_synced (id int PRIMARY KEY, v text);
+             INSERT INTO lr_synced SELECT g, 'v'||g FROM generate_series(1,200) g;
+             CREATE TABLE lr_second (id int PRIMARY KEY);
+             CREATE PUBLICATION lr_pub FOR TABLE lr_synced, lr_second;"
+psql_sub -c "CREATE TABLE lr_synced (id int PRIMARY KEY, v text);
+             CREATE TABLE lr_second (id int PRIMARY KEY);"
+psql_sub -c "CREATE SUBSCRIPTION lr_sub
+             CONNECTION 'host=127.0.0.1 port=$PG_PORT dbname=pglicht user=pglicht'
+             PUBLICATION lr_pub;"
+
+# Wait for the initial table sync to reach 'r' (ready) for both tables, so the
+# tests see a settled subscriber rather than one mid-copy. Bounded: a subscriber
+# that never syncs is a failure worth seeing, not a reason to hang the suite.
+for _ in $(seq 1 50); do
+  ready=$(psql_sub -Atc "SELECT count(*) FROM pg_subscription_rel WHERE srsubstate = 'r'")
+  [ "$ready" = "2" ] && break
+  sleep 0.2
+done
+echo "--- logical subscriber ready ($ready of 2 tables synced)"
+
+SUBSCRIBER_URL="host=127.0.0.1 port=$SUBSCRIBER_PORT dbname=pglicht user=pglicht"
+export SUBSCRIBER_URL
 
 # --- companion pooler (transaction mode) -----------------------------------
 # auth_type=any + a forced user: this is a local throwaway, so the point is not

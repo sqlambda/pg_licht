@@ -53,9 +53,14 @@ Other install channels — deb, rpm, tarball, source — are in [INSTALL.md](INS
 
 A tool call opens no connection of its own beyond the first: connections are
 held between calls and closed after 60 seconds idle, one per configured
-connection. Startup opens none at all — the registry is validated without
-touching the network, so one unreachable database no longer prevents the server
-from starting.
+connection and at most 32 at a time. Startup opens none at all — the registry is
+validated without touching the network, so one unreachable database no longer
+prevents the server from starting.
+
+The ceiling matters only above 32 configured databases, where the least recently
+used connection is dropped to make room and the next call to that database
+reconnects. It exists so a single wide sweep cannot hold one socket per member
+for a minute and exhaust a file-descriptor limit — macOS defaults to 256.
 
 Fan-out sweeps visit up to 16 members concurrently, one connection per server.
 A thirteen-member replication group that took 449 ms sequentially takes 91 ms.
@@ -114,12 +119,41 @@ Readings stay tools, because the model has to decide *when* to take them.
 a template, so a 10 000-table database does not produce a 10 000-entry
 response.
 
-Eight **prompts** encode an order of investigation that is easy to get wrong:
-`diagnose-slow-query`, `triage-lock-contention`, `bloat-and-vacuum-review`,
+Twelve **prompts** encode an order of investigation that is easy to get wrong:
+`diagnose-slow-query`, `triage-lock-contention`, `diagnose-deadlock`,
+`triage-active-sessions`, `triage-disk-space`, `bloat-and-vacuum-review`,
 `buffer-cache-review`, `capacity-check`, `replication-slot-review`,
-`plan-schema-change` and `explain-and-fix`. They are static text and touch no
+`plan-schema-change`, `check-role-access` and `explain-and-fix`. The `triage-`
+ones are written for a page rather than an investigation: they establish how
+long there is before they propose anything. They are static text and touch no
 database until the model acts on them, and each one whose tools are
 privilege-gated opens by calling `checkPrivileges`.
+
+`triage-disk-space` is the one that arrives at night, and `diskUsage` is what
+makes it answerable without a shell on the server: WAL size, the archive
+backlog, temp files on disk now, the log directory, and sizes per tablespace and
+per database. Only the headroom is unreachable — PostgreSQL exposes no function
+for free space. The prompt leads with what makes the obvious response wrong:
+`VACUUM FULL` needs free space equal to the table and its indexes *before* it
+releases any, so it is not a disk-full action.
+
+Counts: 50 of 62 operations for a bare login role, 58 with `pg_monitor` — the
+`pg_ls_*` directory reads `diskUsage` uses are part of what that role grants.
+
+`triage-active-sessions` is for a server running more sessions at once than it
+has cores. Its first move is to stop trusting the word *active*: a backend
+waiting on a lock or a disk read is executing a statement, so only the ones with
+no wait event are competing for CPU, and parallel workers collapse into their
+leaders before anything is counted. Its second is that concurrency is arrival
+rate times duration — so it rises when statements get slower even though the
+load did not change, and more cores treat the symptom.
+
+`check-role-access` answers whether a role can use a table, view, function or
+procedure — walking the gates in order, since the one people forget is `USAGE`
+on the schema and the resulting error names the table. It treats row-level
+security as a second gate that opens after the grants already said yes: RLS
+enabled with no applicable permissive policy is deny-all, so every grant checks
+out and the table returns nothing.
 
 `diagnose-slow-query` is the hub — a slow statement can end in a plan fix, a
 vacuum change, an index, or a schema change, and it routes to the others
@@ -132,7 +166,7 @@ indexes and current lock waits can tell the two apart. **Completions** are offer
 
 ## Tools
 
-58 read-only operations, grouped as schema exploration, catalog search, cluster-wide
+62 read-only operations, grouped as schema exploration, catalog search, cluster-wide
 objects, extensibility and text search, foreign data and replication, monitoring and
 statistics, diagnostics and query planning, topology, and connections. Highlights include
 `tableDetails` (columns, indexes, constraints, foreign keys in both directions, triggers,
@@ -142,8 +176,8 @@ its `EXPLAIN` plan).
 
 `checkPrivileges` reports which of them the current role can actually use on a given
 connection. Most work for any role that can connect, since the catalog is world-readable:
-measured on PostgreSQL 18, a bare login role runs 47 of 58 at full fidelity, the monitoring
-role 54, and the ones that remain are those that read row data. Worth calling first
+measured on PostgreSQL 18, a bare login role runs 50 of 62 at full fidelity, the monitoring
+role 58, and the ones that remain are those that read row data. Worth calling first
 against an unfamiliar connection — a privilege-filtered answer is easy to mistake for an
 empty one, since `tableStats` on a role without `SELECT` returns columns with null
 statistics, exactly like a table that was never analyzed.
@@ -262,7 +296,7 @@ tool accepts depends on where its answer actually varies, and its input schema s
 | | varies across the databases of one instance | varies across members of a replication group |
 |---|---|---|
 | catalogs, `tableBloat`, the structure and size tools | yes | no — a physical replica is byte-identical |
-| `duplicateIndexes`, `indexBloat`, `tableIOStats`, `tableStats`, `listTableStats` | yes | **yes** — they carry `idx_scan` |
+| `duplicateIndexes`, `indexBloat`, `tableIOStats`, `tableStats`, `listTableStats`, `subscriptionStats` | yes | **yes** — they carry `idx_scan`, or a worker of their own |
 | `currentActivity`, `currentLocks`, `statementStats`, buffer cache | no — instance-wide | yes |
 
 That middle row is the one worth knowing: an index that reads as unused on the primary may
@@ -308,7 +342,7 @@ the tool, which takes precedence over both.
 
 | | |
 |---|---|
-| `man pg_licht_mcp` | configuration, connection strings, all 52 operations, MCP client setup |
+| `man pg_licht_mcp` | configuration, connection strings, all 62 operations, MCP client setup |
 | [INSTALL.md](INSTALL.md) | Homebrew, deb, rpm, tarball, verifying, uninstalling |
 | [BUILD.md](BUILD.md) | building from source, tests, sanitizers, CI, release process |
 | [CHANGES.md](CHANGES.md) | changelog |
