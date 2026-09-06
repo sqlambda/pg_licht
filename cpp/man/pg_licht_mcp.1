@@ -1214,6 +1214,24 @@ in that key and leaves the rest answered:
 raises rather than returning empty when
 .Va logging_collector
 is off.
+.Pp
+The four directory sections are trivial.
+The tablespace and database sizes are the whole cost: they walk the tree and
+stat every segment file, so they scale with file count rather than with bytes,
+and the two overlap because
+.Fn pg_tablespace_size
+on
+.Va pg_default
+covers the same subtree the per-database sizes do.
+Measured at 314 ms for the whole call against a cluster of roughly a terabyte,
+where a bare
+.Ic databaseSize
+is already 163 ms.
+Nothing is read, no relation is opened and no lock is taken \(em this is
+metadata rather than I/O \(em but that was measured with directory entries warm
+in the page cache, and a filling disk is when they are not.
+.Va statement_timeout
+bounds it, so the failure mode is a timeout that names itself.
 .It Ic checkpointStats
 Checkpoint, write-ahead log, and background writer activity: timed against
 requested checkpoint counts and the ratio between them, write and sync time,

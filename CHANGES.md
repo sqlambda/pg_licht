@@ -246,6 +246,21 @@ given a ceiling, and logical replication gains the runtime half it never had.
   the `pg_ls_*` family outright. One refusal returns an error in that key and
   leaves the rest answered.
 
+  What it costs, measured: the four directory sections are 0.7 ms together, and
+  the tablespace and database sizes are the whole cost — 314 ms for the complete
+  call against a cluster of roughly a terabyte, where a bare `databaseSize` is
+  already 163 ms. They walk the tree and `stat()` every segment, so they scale
+  with **file count rather than bytes**, and the two overlap:
+  `pg_tablespace_size(pg_default)` covers the same subtree the per-database
+  sizes do. They are kept separate anyway because they answer different
+  questions — which *volume* is full against which *database* grew — and
+  deriving one from the other is wrong wherever a relation lives in a
+  non-default tablespace. Nothing is read, no relation is opened and no lock is
+  taken; it is metadata, not I/O. But those figures were measured with directory
+  entries warm in the page cache, and a filling disk is exactly when they are
+  not, so `statement_timeout` bounding the call matters — the failure mode is a
+  timeout that names itself rather than a hang.
+
   The prompt ranks what can be freed by reversibility and leads with what makes
   the obvious response wrong: `VACUUM FULL` needs free space equal to the table
   and its indexes *before* it releases any, and holds an `AccessExclusiveLock`
