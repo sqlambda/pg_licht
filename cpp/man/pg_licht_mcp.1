@@ -460,7 +460,7 @@ Most of this server works for any role that can connect, because the catalog is
 world-readable.
 Measured on PostgreSQL 18: a bare
 .Ic LOGIN
-role with no grants runs 50 of the 61 operations at full fidelity, the
+role with no grants runs 50 of the 62 operations at full fidelity, the
 monitoring role takes that to 54, and the three that remain are exactly the
 three that read row data \(em the
 .Ic tableStats
@@ -1186,6 +1186,34 @@ actually measured over.
 Maximum number of tables to return, oldest first.
 Defaults to 20.
 .El
+.It Ic diskUsage
+What PostgreSQL is holding on disk, without a shell on the server: WAL size and
+file count, the archive status backlog, temporary files currently on disk, the
+log directory, and sizes per tablespace and per database across the cluster.
+.Pp
+.Sy How much room is left is not knowable from SQL .
+PostgreSQL exposes no function for total or free space, so this reports what is
+consuming space and how it divides, never the headroom.
+A tablespace also carries its location, which matters because the database that
+is growing and the volume that is full need not be the same device.
+.Pp
+A climbing
+.Pa .ready
+count in the archive status is a failing
+.Va archive_command
+retaining every segment it has not archived \(em indistinguishable from an
+abandoned replication slot by WAL size alone, and a different fix.
+.Pp
+The
+.Fn pg_ls_ *
+sections need
+.Va pg_monitor .
+Each section is guarded on its own savepoint, so one refusal returns an error
+in that key and leaves the rest answered:
+.Fn pg_ls_logdir
+raises rather than returning empty when
+.Va logging_collector
+is off.
 .It Ic checkpointStats
 Checkpoint, write-ahead log, and background writer activity: timed against
 requested checkpoint counts and the ratio between them, write and sync time,
@@ -1705,7 +1733,7 @@ capability is declared, so there is no mechanism by which it could.
 Anything read from a live catalog is hinted at one minute.
 This matters most for
 .Ic tools/list ,
-which is roughly 93 kB once 61 operations carry descriptions, annotations,
+which is roughly 93 kB once 62 operations carry descriptions, annotations,
 titles and output schemas, and which a client would otherwise re-fetch whenever
 it needed the list.
 .Pp
@@ -1916,6 +1944,32 @@ says which term moved: more calls is growth and a capacity answer, the same
 calls taking longer is a regression and belongs to
 .Ic diagnose-slow-query .
 A connection pooler bounds the damage and makes no statement faster.
+.It Ic triage-disk-space Op Va connection
+What is filling the disk, and what can safely be freed now.
+Opens by stating its own limit: this server reads PostgreSQL's accounting and
+cannot see the filesystem, so logs, core dumps and base backups are invisible
+here and are regularly the answer.
+.Pp
+Four consumers in order of how fast each can be undone: WAL pinned by a slot
+.Pq the usual answer, and the only one that frees a lot at once ,
+temporary files
+.Pq the fastest, and the space returns the moment the statement ends ,
+bloat, and genuine growth.
+Notes the cause it cannot see \(em a failing
+.Va archive_command
+retains WAL and
+.Li pg_stat_archiver
+is not read here \(em and that a stuck archiver and an abandoned slot look
+identical from the size alone.
+.Pp
+Says plainly that
+.Ic VACUUM FULL
+is not a disk-full action: it needs free space equal to the table and its
+indexes before it releases any, and holds an
+.Ic AccessExclusiveLock
+throughout.
+Ranks what can be freed by reversibility, with dropping a slot marked
+irreversible for its consumer.
 .It Ic bloat-and-vacuum-review Op Va schema
 Check
 .Ic replicationSlots

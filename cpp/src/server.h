@@ -445,6 +445,7 @@ public:
   const json call_publications() { return publications(); }
   const json call_subscriptions() { return subscriptions(); }
   const json call_subscription_stats() { return subscription_stats(); }
+  const json call_disk_usage() { return disk_usage(); }
   const json call_column_histogram(const std::string& sc, const std::string& t,
                                    const std::string& c) { return column_histogram(sc, t, c); }
   const json call_check_role_access(const std::string& r, const std::string& sc,
@@ -1130,6 +1131,8 @@ private:
       {"bufferCacheContents",   {false, true,  false, false}},
       {"bufferCacheSummary",    {false, true,  false, false}},
       {"checkpointStats",       {false, true,  false, false}},
+      // The directories belong to the postmaster, not to a database.
+      {"diskUsage",             {false, true,  false, false}},
       {"currentActivity",       {false, true,  false, false}},
       {"currentLocks",          {false, true,  false, false}},
       {"databaseStats",         {false, true,  false, false}},
@@ -1897,6 +1900,108 @@ private:
            "treats the cause rather than the residue.";
        }},
 
+      {"triage-disk-space",
+       "Find what is filling the disk, and what can safely be freed right now.",
+       {{"connection", "connection to investigate; defaults to the configured default", false}},
+       [](const json& a) -> std::string {
+         const std::string c = arg_or(a, "connection", "");
+         const std::string on = c.empty() ? std::string() : " on connection " + c;
+         return
+           "Find what is consuming disk" + on + " and what can be freed.\n\n"
+           "Call diskUsage first. It answers this from SQL alone -- WAL size and "
+           "file count, the archive status backlog, temporary files on disk now, "
+           "the log directory, and sizes per tablespace and per database across "
+           "the whole cluster -- so no shell on the server is needed for any of "
+           "what follows.\n"
+           "   One thing it cannot report, because PostgreSQL exposes no "
+           "function for it: how much room is left. Sizes here are what "
+           "PostgreSQL accounts for, not the volume, and anything outside "
+           "PostgreSQL on the same device is invisible. Ask the operator for df "
+           "if the headroom matters to the decision; everything else below is "
+           "answerable without it.\n"
+           "   Read tablespaces before anything else. A tablespace sits on "
+           "whatever volume it was created on and carries its location, so the "
+           "database that is growing and the disk that is full need not be the "
+           "same device -- and the log directory is frequently a third one. "
+           "Establish which volume the alert is about before ranking anything on "
+           "it.\n\n"
+           "Four things consume space and they need different fixes, so identify "
+           "which before proposing anything. They are in this order because it "
+           "is the order of how fast each can be undone, which is what matters "
+           "at three in the morning.\n\n"
+           "0. Call checkPrivileges. Without stats access replicationSlots and "
+           "currentActivity are degraded, and those are the first two steps.\n"
+           "1. WAL, which is the most common answer and the most recoverable. "
+           "diskUsage.wal is what is actually on disk; replicationSlots says "
+           "who is pinning it. Read retained_wal_bytes and wal_status per "
+           "slot. An inactive slot pins WAL indefinitely and nothing reclaims it "
+           "while the slot exists. wal_status says how far gone it is: reserved "
+           "is healthy, extended is past max_wal_size, unreserved means the slot "
+           "is the only thing keeping that WAL, and lost means it is already "
+           "unusable and its consumer cannot resume whatever you do next.\n"
+           "   Then get the rate, because a size without a rate does not say how "
+           "long you have. checkpointStats reports WAL volume, and "
+           "serverSettings carries max_slot_wal_keep_size -- if it is set, "
+           "PostgreSQL will invalidate the slot rather than fill the disk, which "
+           "trades a broken replica for a live primary; if it is unset, nothing "
+           "bounds this.\n"
+           "   Before concluding it is a slot, read diskUsage.archive_status. A "
+           "failing archive_command retains every segment it has not archived, "
+           "and a climbing .ready count is exactly that -- indistinguishable "
+           "from an abandoned slot by the WAL size alone, and a completely "
+           "different fix. pg_stat_archiver carries failed_count and "
+           "last_failed_time if you need the reason; this server does not read "
+           "it, but the backlog is enough to tell which of the two you have.\n"
+           "2. Temporary files, which are the fastest to free and the easiest to "
+           "miss. diskUsage.temp_files is what is on disk at this moment, while "
+           "databaseStats temp_files and temp_bytes are the running totals since "
+           "the counters were reset -- the first says whether it is happening "
+           "now, the second whether it is habitual. Both are sorts and hashes "
+           "that exceeded work_mem. A single runaway "
+           "statement can fill a volume in minutes, and every byte returns the "
+           "moment it ends -- so currentActivity for what is running now is both "
+           "the diagnosis and the fix. If this is the cause, the incident is "
+           "over as soon as that statement is, and the follow-up is work_mem "
+           "rather than storage.\n"
+           "3. Bloat: space the tables hold and are not using. "
+           "bloat-and-vacuum-review is the full investigation and tableBloat "
+           "measures one table.\n"
+           "   THE TRAP HERE IS THE OBVIOUS FIX. VACUUM FULL rewrites the table "
+           "and needs free space equal to the table plus its indexes before it "
+           "releases any -- on a disk that is already full it fails, and it "
+           "holds an AccessExclusiveLock for the whole attempt. Ordinary VACUUM "
+           "frees nothing back to the filesystem either; it makes space reusable "
+           "inside the file. So bloat is rarely the thing to act on during the "
+           "incident, and saying that plainly is more useful than proposing it.\n"
+           "4. Genuine growth. diskUsage.databases already ranked every database "
+           "in the cluster, which matters because the one filling the disk is "
+           "frequently not the one anybody is connected to. Within the database "
+           "that stands out, listTableSizes ranks a schema. Do not forget the "
+           "log directory, which diskUsage also sized: a stuck rotation fills a "
+           "volume with nobody looking at it.\n"
+           "5. Rank what can be freed by how reversible it is, and say the cost "
+           "of each rather than only the size.\n"
+           "   - Ending a statement that is spilling temp files: immediate, and "
+           "costs that one statement.\n"
+           "   - Raising or setting max_slot_wal_keep_size: bounds future growth, "
+           "frees nothing now.\n"
+           "   - Dropping a replication slot: frees the most, immediately, and is "
+           "IRREVERSIBLE for its consumer -- a replica or subscriber behind that "
+           "slot must be rebuilt from scratch. Say exactly what would have to be "
+           "rebuilt, and prefer fixing or decommissioning the consumer. "
+           "replication-slot-review establishes whether the consumer is stuck "
+           "but alive or actually gone, and those two deserve opposite "
+           "decisions.\n"
+           "   - VACUUM FULL or a table rewrite: needs space you do not have, "
+           "and locks. Not an incident action.\n"
+           "   - More storage: buys time and fixes nothing, which is sometimes "
+           "exactly the right call at three in the morning. Say so when it is.\n"
+           "6. Report what is consuming the space, how fast it is growing, how "
+           "long there is at that rate, and the one action that buys the most "
+           "time for the least damage. Then say what the permanent fix is, "
+           "because it is usually not the same thing.";
+       }},
+
       {"buffer-cache-review",
        "See what is occupying shared buffers and whether it is the right thing.",
        {{"connection", "connection to review; defaults to the configured default", false}},
@@ -2568,7 +2673,7 @@ private:
   //   1. Payloads are version-conditional. tableStats gains
   //      n_tup_newpage_upd and last_seq_scan on PostgreSQL 16, checkpointStats
   //      is normalised across three different sets of underlying views, and a
-  //      schema would have to be re-proved on five majors for 61 tools.
+  //      schema would have to be re-proved on five majors for 62 tools.
   //   2. Every tool carries the same escape hatch: when an extension is absent
   //      or a grant is missing, the payload is {error, hint} instead of the
   //      documented shape. A schema that enumerated the documented shape would
@@ -2637,6 +2742,12 @@ private:
       {"listForeignServers",     schema_map("server name", "its wrapper, options and user mappings")},
       {"listForeignTables",      schema_map("foreign table name", "its server and column list")},
       {"listPublications",       schema_map("publication name", "its tables and replicated operations")},
+      {"diskUsage",              schema_fixed("What PostgreSQL is holding on disk, by directory and by "
+                                              "tablespace. Never how much room is left.",
+                                              {{"wal", "object"}, {"archive_status", "object"},
+                                               {"temp_files", "object"}, {"log_files", "object"},
+                                               {"tablespaces", "object"}, {"databases", "object"},
+                                               {"note", "string"}})},
       {"columnHistogram",        schema_fixed("The full value distribution of one column: the "
                                               "most common values and the histogram of what is left.",
                                               {{"schema", "string"}, {"table", "string"}, {"column", "string"},
@@ -3011,6 +3122,14 @@ private:
 	      }}
 	  },
 	  {
+	    {"name", "diskUsage"},
+	    {"description", "report what PostgreSQL is holding on disk without needing a shell on the server: WAL directory size and file count, the archive status backlog, temporary files currently on disk, log directory size, per-tablespace sizes and per-database sizes across the whole cluster. Answers \"what is filling the disk\" from SQL alone, which otherwise needs df. IT CANNOT SAY HOW MUCH ROOM IS LEFT: PostgreSQL exposes no function for total or free space, so this reports what is consuming space and how it divides, never the headroom. A climbing .ready count in archive_status is a failing archive_command retaining every segment it has not archived -- indistinguishable from an abandoned replication slot by size alone, and this is what tells them apart. The pg_ls_* sections need pg_monitor; each section is guarded independently, so one refusal returns an error in that key and leaves the rest answered rather than failing the call"},
+	    {"inputSchema", {
+		{"type", "object"},
+		{"properties", json::object()}
+	      }}
+	  },
+	  {
 	    {"name", "columnHistogram"},
 	    {"description", "return the whole value distribution of one column: the most common values with their frequencies, and the full histogram of everything else. tableStats carries three points off that histogram -- low, mid and high -- which is enough to pick parameters to re-plan with; this is the tool for when the shape of the distribution itself is the question. The two are complements rather than alternatives: ANALYZE puts the most frequent values in most_common_vals and builds the histogram only from what is LEFT, so a value in the MCV list never appears in the bounds however common it is, and reading either alone misdescribes the column. The bounds are equal-frequency, so consecutive entries delimit buckets holding roughly the same number of rows -- bounds bunched together are a dense region and a wide gap is a sparse one, which is what makes them usable as sample points across the distribution rather than one corner of it. statistics_target says why the histogram is the width it is and is the knob that changes it. COSTS NOTHING TO READ but RETURNS LITERAL COLUMN VALUES, more of them than any other operation here: the bounds and the MCVs are rows sampled out of the table. pg_stats filters on has_column_privilege, so a role without SELECT on the column gets nulls rather than data"},
 	    {"inputSchema", {
@@ -3225,7 +3344,7 @@ private:
 	  },
 	  {
 	    {"name", "wraparoundStatus"},
-	    {"description", "return transaction id and multixact wraparound headroom: age(datfrozenxid) and age(datminmxid) for every database, the oldest tables by age(relfrozenxid) including TOAST tables (often the relation actually holding the horizon back), each age as a percentage of the effective autovacuum_freeze_max_age and of the 2^31 hard limit at which the cluster stops accepting write transactions, plus the per-table freeze storage parameters and last vacuum times"},
+	    {"description", "return transaction id and multixact wraparound headroom: age(datfrozenxid) and age(datminmxid) for every database, the oldest tables by age(relfrozenxid) including TOAST tables (often the relation actually holding the horizon back), each age as a percentage of the effective autovacuum_freeze_max_age and of the 2^31 hard limit at which the cluster stops accepting write transactions, plus the per-table freeze storage parameters and last vacuum times. Two alarms live in these numbers and only one is an emergency: past autovacuum_freeze_max_age PostgreSQL forces an anti-wraparound vacuum, which is loud maintenance working as designed, while approaching the wraparound limit ends in the server refusing writes and a recovery through single-user mode -- xid_percent_of_freeze_max_age against xid_percent_of_wraparound_limit tells them apart and xids_until_wraparound_limit is the budget. Past vacuum_failsafe_age autovacuum stops yielding and skips index cleanup, which is the server saying it is already serious. Rank tables by relfrozenxid age rather than size, since the oldest object sets the horizon however small it is, and read toast_for -- a TOAST table is frequently the offender and carries nobody's name. If the age will not fall, vacuum is not the problem: nothing can be frozen past the oldest transaction still visible to something, so more workers and a manual VACUUM FREEZE achieve nothing while the horizon is held. Four things hold it -- a replication slot (replicationSlots), a long-running transaction (currentActivity.backend_xmin), a standby with hot_standby_feedback, and a prepared transaction, which is invisible in pg_stat_activity and not read by this server: query pg_prepared_xacts directly when nothing else explains it"},
 	    {"inputSchema", {
 		{"type", "object"},
 		{"properties", {
@@ -7173,7 +7292,97 @@ private:
     return out;
   }
 
+  // What PostgreSQL is holding on disk, without a shell on the box.
+  //
+  // This exists because triage-disk-space is otherwise unexecutable: pg_licht
+  // speaks SQL and nothing else, and "the disk is filling" is answered by
+  // looking at directories. It turns out almost all of it is reachable --
+  // pg_ls_waldir, pg_ls_archive_statusdir, pg_ls_tmpdir and pg_ls_logdir each
+  // return names and sizes, and pg_tablespace_size and pg_database_size cover
+  // the data. What is NOT reachable is the volume itself: PostgreSQL has no
+  // function for total or free space, so this says what PostgreSQL is
+  // responsible for and never what is left.
+  //
+  // Every section is its own savepoint. They fail independently and for
+  // ordinary reasons -- pg_ls_logdir RAISES rather than returning empty when
+  // logging_collector is off, a role short of pg_monitor is refused the
+  // pg_ls_* family outright, pg_tablespace_size needs privileges of its own --
+  // and one refusal must not cost the caller the sections that would have
+  // answered. An aborted transaction would do exactly that.
+  const json disk_usage() {
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+    json out;
+
+    auto section = [&](const char* key, const std::string& sql) {
+      try {
+        pqxx::subtransaction sub{txn};
+        pqxx::result r = sub.exec(sql);
+        sub.commit();
+        if (!r.empty() && !r[0][0].is_null())
+          out[key] = json::parse(r[0][0].as<std::string>());
+      } catch (const std::exception& e) {
+        // The reason is the finding often enough to be worth keeping: "not a
+        // member of pg_monitor" and "logging_collector is off" are different
+        // answers and both are useful.
+        out[key] = {{"error", std::string(e.what()).substr(0, 300)}};
+      }
+    };
+
+    // WAL is the most common answer to a filling disk, and the one a slot pins.
+    section("wal",
+      "SELECT JSONB_BUILD_OBJECT('files', COUNT(*), 'bytes', COALESCE(SUM(size), 0))"
+      "  FROM pg_ls_waldir()");
+
+    // A .ready backlog is a failing archive_command, which retains every
+    // segment it has not archived. Indistinguishable from an abandoned slot by
+    // size alone, and this is what tells them apart.
+    section("archive_status",
+      "SELECT JSONB_BUILD_OBJECT("
+      "  'ready', COUNT(*) FILTER (WHERE name LIKE '%.ready')"
+      ", 'done',  COUNT(*) FILTER (WHERE name LIKE '%.done')"
+      ", 'archive_mode', current_setting('archive_mode'))"
+      "  FROM pg_ls_archive_statusdir()");
+
+    // Temp files are the fastest thing to free: every byte returns when the
+    // statement that spilled them ends.
+    section("temp_files",
+      "SELECT JSONB_BUILD_OBJECT('files', COUNT(*), 'bytes', COALESCE(SUM(size), 0))"
+      "  FROM pg_ls_tmpdir()");
+
+    // Logs are inside the data directory by default, so they compete for the
+    // same volume, and a stuck log rotation fills it with nobody looking.
+    section("log_files",
+      "SELECT JSONB_BUILD_OBJECT('files', COUNT(*), 'bytes', COALESCE(SUM(size), 0)"
+      ", 'logging_collector', current_setting('logging_collector')"
+      ", 'directory', current_setting('log_directory'))"
+      "  FROM pg_ls_logdir()");
+
+    // A tablespace sits on whatever volume it was created on, so the database
+    // that is growing and the disk that is full need not be the same device.
+    section("tablespaces",
+      "SELECT JSONB_OBJECT_AGG(spcname, JSONB_BUILD_OBJECT("
+      "  'bytes', pg_tablespace_size(oid)"
+      ", 'location', NULLIF(pg_tablespace_location(oid), '')))"
+      "  FROM pg_tablespace");
+
+    // Cluster-wide, not just the connected database: the one filling the disk
+    // is frequently not the one anybody is looking at.
+    section("databases",
+      "SELECT JSONB_OBJECT_AGG(datname, pg_database_size(oid))"
+      "  FROM pg_database WHERE datallowconn");
+
+    out["note"] =
+      "Sizes are what PostgreSQL accounts for, not the volume. Total and free "
+      "space are not exposed to SQL by any PostgreSQL function, so this cannot "
+      "say how much room is left -- only what is consuming it and how that is "
+      "divided. The pg_ls_* sections need pg_monitor; a section that reports an "
+      "error rather than a size is usually that.";
+    return out;
+  }
+
   const json languages() {
+
 
 
     Session sess = open_session();
@@ -7780,7 +7989,7 @@ private:
   // that can connect. What varies is a small, knowable set: the predefined
   // roles that gate the monitoring extras, and whether the role can read table
   // data at all. Measured against PostgreSQL 18: a bare login role runs 50 of
-  // the 61 tools at full fidelity, pg_monitor takes that to 57, and the ones
+  // the 62 tools at full fidelity, pg_monitor takes that to 58, and the ones
   // that remain are exactly the three that touch row data.
   //
   // The point of asking once, up front, is that the alternative is discovering
@@ -8663,6 +8872,9 @@ private:
     else if (tool_name == "subscriptionStats") {
       result_content = subscription_stats();
     }
+    else if (tool_name == "diskUsage") {
+      result_content = disk_usage();
+    }
     else if (tool_name == "columnHistogram") {
       result_content = column_histogram(
         arguments.value("schema", std::string()),
@@ -9121,7 +9333,7 @@ private:
   // the same revision, and a legacy result must not grow fields its era never
   // had.
   //
-  // This matters more here than it looks. tools/list is ~93 kB once 61 tools
+  // This matters more here than it looks. tools/list is ~93 kB once 62 tools
   // carry descriptions, annotations, titles and outputSchemas, and without a
   // freshness hint a client SHOULD treat it as immediately stale and re-fetch
   // it whenever it needs the list. That is the largest single payload the
@@ -9141,7 +9353,7 @@ private:
 
   // Page size for every paginated list. Deliberately larger than any list this
   // server currently produces, so nothing is truncated for a client that
-  // ignores nextCursor: 61 tools, 11 prompts and 5 templates are each one page.
+  // ignores nextCursor: 62 tools, 12 prompts and 5 templates are each one page.
   // The list that can genuinely outgrow it is resources/list, which is
   // connections x schemas -- and that is the case pagination exists for.
   static constexpr size_t kListPageSize = 100;

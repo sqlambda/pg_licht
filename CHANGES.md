@@ -214,6 +214,57 @@ given a ceiling, and logical replication gains the runtime half it never had.
   "never", and `role.inherits` and `role.member_of` are returned so the two can
   be told apart.
 
+- **`diskUsage`, and `triage-disk-space` to go with it.** "The disk is filling"
+  is the classic night page and was the one alert with no prompt — but a prompt
+  alone would have been unexecutable, because answering it normally means `df`
+  and this server speaks only SQL.
+
+  It turns out almost all of it *is* reachable: `pg_ls_waldir()`,
+  `pg_ls_archive_statusdir()`, `pg_ls_tmpdir()` and `pg_ls_logdir()` return
+  names and sizes, and `pg_tablespace_size()` and `pg_database_size()` cover the
+  data. So `diskUsage` reports WAL size and file count, the archive backlog,
+  temp files on disk right now, the log directory, and sizes per tablespace and
+  per database across the whole cluster — with no shell on the server.
+
+  **What is genuinely unreachable is the headroom.** PostgreSQL exposes no
+  function for total or free space, so the tool says what is consuming space and
+  how it divides, never how much is left, and says so in its own payload rather
+  than letting a caller assume otherwise.
+
+  Two findings it makes available that were previously invisible here. A
+  climbing `.ready` count in the archive status is a failing `archive_command`
+  retaining every segment it has not archived — **indistinguishable from an
+  abandoned replication slot by WAL size alone**, and a completely different
+  fix. And a tablespace carries its location, so the database that is growing
+  and the volume that is full need not be the same device; on a real server this
+  showed a tablespace and the log directory on two volumes neither of which was
+  `pg_default`.
+
+  Each section runs on its own savepoint, because they fail independently and
+  for ordinary reasons: `pg_ls_logdir()` *raises* rather than returning empty
+  when `logging_collector` is off, and a role short of `pg_monitor` is refused
+  the `pg_ls_*` family outright. One refusal returns an error in that key and
+  leaves the rest answered.
+
+  The prompt ranks what can be freed by reversibility and leads with what makes
+  the obvious response wrong: `VACUUM FULL` needs free space equal to the table
+  and its indexes *before* it releases any, and holds an `AccessExclusiveLock`
+  throughout — so it is not a disk-full action, and saying that is more useful
+  than proposing it.
+
+- **`wraparoundStatus` carries the runbook that would otherwise have been a
+  prompt.** Wraparound is a single tool call, so the reasoning belongs in the
+  description where it is read at the moment of the call rather than in a
+  thirteenth prompt. It now separates the two alarms — past
+  `autovacuum_freeze_max_age` is loud maintenance working as designed, while
+  approaching the wraparound limit ends in a server refusing writes — and states
+  the fact that makes most responses to that alert fail: **nothing can be frozen
+  past the oldest transaction still visible to something**, so more workers and
+  a manual `VACUUM FREEZE` achieve nothing while the horizon is held. It names
+  the four holders, including the one this server cannot see —
+  `pg_prepared_xacts`, invisible in `pg_stat_activity` and the answer whenever
+  nothing else explains it.
+
 - **`triage-active-sessions`, for a server running more sessions at once than
   it has cores.** Two things it establishes before anything else, because both
   are routinely assumed instead.
