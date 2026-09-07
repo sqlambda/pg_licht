@@ -1153,10 +1153,13 @@ Transaction id and multixact wraparound headroom.
 For every database:
 .Li age(datfrozenxid) ,
 .Li age(datminmxid) ,
-and each as a percentage of
-.Va autovacuum_freeze_max_age
-and of the limit of 2144483647 transactions, at which the cluster stops
-accepting commands that assign a new transaction id.
+and each as a percentage of its own
+.Va freeze_max_age
+and of the limit of 2144483647, at which the cluster stops
+accepting commands that assign a new transaction id or multixact.
+Both axes carry both budgets: multixacts have the same three-million stop
+limit and the same forty-million warning as transaction ids, and members-space
+exhaustion is its own incident.
 That figure is
 .Sy not
 2\(ha31: PostgreSQL refuses new transaction ids three million short of

@@ -2595,6 +2595,12 @@ TEST_F(PostgresMCPServerTest, WraparoundStatusReportsLimitsAndDatabases) {
   EXPECT_GT(db["xids_until_warn_limit"].get<long long>(), 0);
   EXPECT_LT(db["xids_until_warn_limit"].get<long long>(),
             db["xids_until_wraparound_limit"].get<long long>());
+  // Multixacts have the same two thresholds, and both documents claimed both
+  // axes carried them while only the xid half did.
+  EXPECT_LT(db["mxid_percent_of_wraparound_limit"].get<double>(), 100.0);
+  EXPECT_GT(db["mxids_until_wraparound_limit"].get<long long>(), 0);
+  EXPECT_LT(db["mxids_until_warn_limit"].get<long long>(),
+            db["mxids_until_wraparound_limit"].get<long long>());
 }
 
 TEST_F(PostgresMCPServerTest, WraparoundStatusReportsPerTableFreezeOverride) {

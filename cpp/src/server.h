@@ -3156,6 +3156,15 @@ private:
                     'mxid_percent_of_freeze_max_age',
                       round(100.0 * mxid_age(d.datminmxid)
                             / NULLIF(current_setting('autovacuum_multixact_freeze_max_age')::bigint, 0), 1),
+                    -- Multixacts have the same 3,000,000 stop limit as xids and
+                    -- the same 40,000,000 warning, and members-space exhaustion
+                    -- is its own incident with its own ceiling. Both documents
+                    -- said "each age as a percentage of ... the hard limit"
+                    -- while only the xid half was reported.
+                    'mxid_percent_of_wraparound_limit',
+                      round(100.0 * mxid_age(d.datminmxid) / 2144483647, 3),
+                    'mxids_until_wraparound_limit', 2144483647 - mxid_age(d.datminmxid),
+                    'mxids_until_warn_limit', 2107483647 - mxid_age(d.datminmxid),
                     'datfrozenxid', d.datfrozenxid::text,
                     'datminmxid', d.datminmxid::text))
              FROM pg_database AS d
