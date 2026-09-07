@@ -3269,7 +3269,7 @@ private:
     // what the INCLUDE coverage test compares against: an included column is
     // covered by a key column of the wider index regardless of how that key is
     // sorted or compared.
-    std::string query = R"(
+    std::string query = std::string(R"(
       WITH idx AS (
         SELECT i.indexrelid,
                i.indrelid,
@@ -3310,7 +3310,7 @@ private:
         WHERE n.nspname = $1
           AND ($2 = '' OR tc.relname = $2)
       )
-      SELECT JSONB_BUILD_OBJECT(
+      SELECT JSONB_BUILD_OBJECT()" + std::string(kCountersSince) + R"(,
         'identical', COALESCE((
           SELECT JSONB_AGG(g ORDER BY g->>'table')
           FROM (
@@ -3378,7 +3378,7 @@ private:
             ORDER BY a.indexrelid, b.size
           ) AS red), '[]'::jsonb)
       );
-    )";
+    )");
 
     pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, table_name});
 
@@ -6699,6 +6699,24 @@ private:
   //
   // estimated_from stays a GREATEST of all four, and that merge is correct:
   // it dates relpages and reltuples, which any of the four refreshes equally.
+  // A scan counter is meaningless without the window it covers, and
+  // pg_stat_reset() zeroes idx_scan and seq_scan along with everything else.
+  // An index reported with idx_scan = 0 four days after a reset is an index
+  // nothing has used FOR FOUR DAYS -- which for a month-end report, a
+  // quarterly job or a failover path is indistinguishable from one nothing has
+  // ever used, and the difference decides whether dropping it is safe. This
+  // has already produced a wrong recommendation on a real database: a 1.9 GB
+  // index proposed for dropping on the strength of a zero that was four days
+  // old.
+  //
+  // Reported as a lower bound rather than a guarantee:
+  // pg_stat_reset_single_table_counters() zeroes one relation without touching
+  // pg_stat_database.stats_reset, so a null or old value here does not prove
+  // the counters beside it are that old. It does prove they are no older.
+  static constexpr const char* kCountersSince =
+    "'counters_since', (SELECT stats_reset FROM pg_stat_database"
+    "                    WHERE datname = current_database())";
+
   static constexpr const char* kTableStatsCommon = R"(
                'rows', c.reltuples,
                'size_estimate', c.relpages::bigint * current_setting('block_size')::bigint,
@@ -6728,7 +6746,7 @@ private:
 
     std::string query = std::string(R"(
       SELECT JSONB_BUILD_OBJECT(
-               'table', c.relname,)") + kTableStatsCommon + pg16 + R"(,
+               'table', c.relname,)") + kCountersSince + "," + kTableStatsCommon + pg16 + R"(,
                'columns', COALESCE(columns, '{}'::jsonb),
                -- pg_stats returns NO ROW for a table whose RLS is active for
                -- this role, so every per-column statistic below comes back null

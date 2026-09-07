@@ -1647,6 +1647,41 @@ TEST_F(PostgresMCPServerTest, ExtendedStatisticsSayWhetherTheyHaveBeenBuilt) {
   { pqxx::nontransaction n(owner); n.exec("DROP SCHEMA " + sch + " CASCADE"); }
 }
 
+// idx_scan = 0 is not "nothing uses this index" -- it is "nothing has used it
+// since the counters were reset", and pg_stat_reset() zeroes it along with
+// everything else. On a database whose stats were reset four days ago that
+// difference decides whether dropping a 1.9 GB index is safe, and it has
+// already produced a wrong recommendation on a real one.
+TEST_F(PostgresMCPServerTest, ScanCountersCarryTheWindowTheyCover) {
+  pqxx::connection c(test_url);
+  pqxx::nontransaction n(c);
+  const std::string expected = n.query_value<std::string>(
+      "SELECT COALESCE(stats_reset::text, '') FROM pg_stat_database "
+      "WHERE datname = current_database()");
+
+  // Both tools that drive an irreversible decision from a scan counter.
+  json dup = srv->call_duplicate_indexes("grocery", "");
+  ASSERT_TRUE(dup.contains("counters_since")) << dup.dump(2);
+
+  json ts = srv->call_table_stats("grocery", "users");
+  ASSERT_TRUE(ts.contains("counters_since")) << ts.dump(2);
+
+  // Wired to pg_stat_database rather than to something that merely looks like
+  // a timestamp: the two must be the same reading.
+  if (expected.empty()) {
+    EXPECT_TRUE(dup["counters_since"].is_null());
+    EXPECT_TRUE(ts["counters_since"].is_null());
+  } else {
+    ASSERT_TRUE(dup["counters_since"].is_string()) << dup["counters_since"].dump();
+    EXPECT_EQ(dup["counters_since"], ts["counters_since"]);
+    // Same instant, whatever the two renderings look like textually.
+    const std::string got = dup["counters_since"].get<std::string>();
+    EXPECT_TRUE(n.query_value<bool>(
+        "SELECT " + n.quote(got) + "::timestamptz = " + n.quote(expected) + "::timestamptz"))
+        << "tool: " << got << "  catalog: " << expected;
+  }
+}
+
 // --- listOperators ---
 
 TEST_F(PostgresMCPServerTest, ListOperatorsReturnsCustomOperator) {
