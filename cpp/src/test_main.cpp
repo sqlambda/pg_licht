@@ -2862,6 +2862,70 @@ TEST_F(PostgresMCPServerTest, TableIOStatsRatioIsNullNotZeroWithoutTraffic) {
 // configured with a larger one made the figure understated, in the direction
 // that reads as safe. The override has to move the worst case, not merely
 // appear beside it.
+// 4.2.1 returned one overrides row per role. On a multi-tenant cluster that is
+// one row per tenant: measured on a real 723-role database it was 701 rows,
+// 698 of them the same search_path, 105 kB -- past the client's payload limit,
+// so the tool returned nothing and took capacity-check and
+// triage-active-sessions with it. The three overrides that mattered were in
+// the other three rows.
+//
+// Collapsing by (scope, name, value) loses nothing that answers the question:
+// two roles with DIFFERENT values stay separate, which is the whole point of
+// reading this at all.
+TEST_F(PostgresMCPServerTest, IdenticalOverridesCollapseAndDistinctOnesDoNot) {
+  const std::string pre = "licht_ov_" + std::to_string(getpid()) + "_";
+  const int kRoles = 12;
+  {
+    pqxx::nontransaction n(*admin_conn);
+    for (int i = 0; i < kRoles; i++) {
+      const std::string r = pre + std::to_string(i);
+      n.exec("DROP ROLE IF EXISTS \"" + r + "\"");
+      n.exec("CREATE ROLE \"" + r + "\"");
+      // Every tenant gets the same search_path: the repetition this fixes.
+      // Unquoted list form. Quoting the whole string would store it as a
+      // single schema NAMED "tenant, public", which is not what any real
+      // configuration means and stores a quoted value.
+      n.exec("ALTER ROLE \"" + r + "\" SET search_path = tenant, public");
+    }
+    // ...and one that differs, which must survive as its own row.
+    n.exec("ALTER ROLE \"" + pre + "0\" SET statement_timeout = '10s'");
+  }
+
+  json r = srv->call_host_capacity(0, 0, "");
+  ASSERT_TRUE(r.contains("overrides")) << r.dump(2);
+
+  int search_path_groups = 0, timeout_groups = 0;
+  for (const auto& o : r["overrides"]) {
+    if (o["name"] == "search_path" && o["value"].get<std::string>().find("tenant") == 0) {
+      search_path_groups++;
+      // One row for all twelve, carrying the count rather than the names.
+      EXPECT_GE(o["count"].get<int>(), kRoles) << o.dump(2);
+      EXPECT_LE(o["roles"].size(), 5u) << o.dump(2);
+      EXPECT_TRUE(o["names_truncated"].get<bool>()) << o.dump(2);
+    }
+    if (o["name"] == "statement_timeout" && o["value"] == "10s") {
+      timeout_groups++;
+      // A distinct value is not collapsed into the crowd.
+      EXPECT_EQ(o["count"].get<int>(), 1) << o.dump(2);
+      EXPECT_EQ(o["roles"].size(), 1u) << o.dump(2);
+      EXPECT_EQ(o["roles"][0].get<std::string>(), pre + "0");
+      EXPECT_FALSE(o["names_truncated"].get<bool>());
+    }
+  }
+  EXPECT_EQ(search_path_groups, 1) << "identical overrides must collapse to one row: "
+                                   << r["overrides"].dump(2);
+  EXPECT_EQ(timeout_groups, 1) << "a distinct override must survive collapsing";
+
+  // The payload has to stay small, which is the entire point.
+  EXPECT_LT(r["overrides"].dump().size(), 4096u) << r["overrides"].dump(2);
+
+  {
+    pqxx::nontransaction n(*admin_conn);
+    for (int i = 0; i < kRoles; i++)
+      n.exec("DROP ROLE IF EXISTS \"" + pre + std::to_string(i) + "\"");
+  }
+}
+
 TEST_F(PostgresMCPServerTest, HostCapacityCountsPerRoleOverridesInTheWorstCase) {
   const std::string role = "licht_hc_" + std::to_string(getpid());
   json before = srv->call_host_capacity(0, 0, "");
@@ -2882,11 +2946,13 @@ TEST_F(PostgresMCPServerTest, HostCapacityCountsPerRoleOverridesInTheWorstCase) 
   json after = srv->call_host_capacity(0, 0, "");
   bool found = false;
   for (const auto& o : after["overrides"])
-    if (o["role"].is_string() && o["role"].get<std::string>() == role
-        && o["name"].get<std::string>() == "work_mem") {
+    if (o["name"].get<std::string>() == "work_mem"
+        && std::find(o["roles"].begin(), o["roles"].end(), json(role)) != o["roles"].end()) {
       found = true;
       EXPECT_EQ(o["scope"].get<std::string>(), "role");
       EXPECT_EQ(o["value"].get<std::string>(), "512MB");
+      // A value nothing else shares is its own group, never folded into a count.
+      EXPECT_EQ(o["count"].get<int>(), 1) << o.dump(2);
     }
   EXPECT_TRUE(found) << after["overrides"].dump(2);
 

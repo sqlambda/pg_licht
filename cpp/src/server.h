@@ -719,6 +719,12 @@ private:
   // Bounded connect for the tools that sweep every configured connection.
   static constexpr int kSweepConnectTimeoutSeconds = 5;
 
+  // How many role or database names travel with a collapsed override group
+  // before the count stands in for them. Small on purpose: the names are
+  // useful for the handful of roles that differ, and the reason this exists at
+  // all is that an unbounded list of them exceeded the client's payload limit.
+  static constexpr int kOverrideNames = 5;
+
   // The current sweep member's config, carrying the bounded connect.
   //
   // Set only while fan_out is running a member, so every query method goes on
@@ -3627,7 +3633,7 @@ private:
     // rather than leaving every caller to rediscover it. A negative setting
     // means "derive from another GUC" (autovacuum_work_mem = -1) and yields a
     // null byte count rather than a negative one.
-    std::string query = R"(
+    std::string query = std::string(R"(
       WITH host AS (
         SELECT NULLIF($1, '')::bigint AS ram_bytes,
                NULLIF($2, '')::int    AS vcpus
@@ -3699,16 +3705,47 @@ private:
         -- Every per-role and per-database override, not only work_mem: a
         -- statement_timeout of 0 on one role explains as much as a memory
         -- setting does, and none of it is visible in `settings` above.
-        'overrides', COALESCE((SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
-                        'scope', CASE WHEN database = '' AND role = '' THEN 'cluster'
-                                      WHEN database = '' THEN 'role'
-                                      WHEN role = ''     THEN 'database'
-                                      ELSE 'role_in_database' END,
-                        'database', NULLIF(database, ''),
-                        'role',     NULLIF(role, ''),
-                        'name',     name,
-                        'value',    value) ORDER BY name, database, role)
-                      FROM ovr), '[]'::jsonb),
+        --
+        -- Collapsed by (scope, name, value), which is the only grouping that
+        -- loses nothing: two roles with DIFFERENT values stay separate rows,
+        -- and the whole reason to read this is to find a value that differs
+        -- from the global one. What collapses is repetition -- 4.2.1 returned
+        -- one row per role and on a multi-tenant cluster that is one row per
+        -- tenant. Measured on a real 723-role database: 701 rows, 698 of them
+        -- the same search_path, 105 kB, over the client's payload limit, so
+        -- the tool returned nothing at all and took capacity-check and
+        -- triage-active-sessions down with it. The three overrides that
+        -- mattered were in the other 3 rows.
+        --
+        -- roles/databases carry the names up to kOverrideNames, then the count
+        -- stands in for them. A count is what the question actually needs
+        -- ("does anything override work_mem, and how much of the fleet"), and
+        -- an unbounded name list is how this broke in the first place.
+        'overrides', COALESCE((
+          SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                   'scope',     g.scope,
+                   'name',      g.name,
+                   'value',     g.value,
+                   'count',     g.n,
+                   'roles',     g.roles,
+                   'databases', g.databases,
+                   'names_truncated', g.n > )" + std::to_string(kOverrideNames) + R"()
+                 ORDER BY g.name, g.value)
+            FROM (
+              SELECT CASE WHEN database = '' AND role = '' THEN 'cluster'
+                          WHEN database = '' THEN 'role'
+                          WHEN role = ''     THEN 'database'
+                          ELSE 'role_in_database' END               AS scope,
+                     name,
+                     value,
+                     count(*)                                       AS n,
+                     to_jsonb((array_remove(array_agg(NULLIF(role, '')
+                                            ORDER BY role), NULL)
+                              )[1:)" + std::to_string(kOverrideNames) + R"(])     AS roles,
+                     to_jsonb((array_remove(array_agg(DISTINCT NULLIF(database, '')), NULL)
+                              )[1:)" + std::to_string(kOverrideNames) + R"(])     AS databases
+                FROM ovr
+               GROUP BY 1, 2, 3) AS g), '[]'::jsonb),
         'settings', (SELECT JSONB_OBJECT_AGG(name, JSONB_BUILD_OBJECT(
                         'setting', setting, 'unit', unit, 'bytes', bytes)) FROM g),
         'derived', (SELECT JSONB_BUILD_OBJECT(
@@ -3758,7 +3795,7 @@ private:
           'application". committed_worst_case uses the largest work_mem any role is '
           'configured with, not this session''s.')
       );
-    )";
+    )");
 
     pqxx::result res = pqxx_exec(
       txn, query,
