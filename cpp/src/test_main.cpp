@@ -5311,6 +5311,85 @@ TEST_F(PostgresMCPServerTest, CheckPrivilegesSeparatesNotInstalledFromNotPermitt
   }
 }
 
+// pg_stats is defined WITH (security_barrier) and carries
+//   AND (c.relrowsecurity = false OR NOT row_security_active(c.oid))
+// so a role that RLS applies to gets NO ROW back, not a filtered one. Every
+// statistic then reads null, which is indistinguishable from a table nobody
+// has analyzed -- and on a schema where RLS is the convention that is the
+// normal case rather than the exceptional one. grocery.orders is analyzed in
+// the fixture, so the statistics provably exist while this role cannot see
+// them, which is exactly the pair the flag has to tell apart.
+TEST_F(PostgresMCPServerTest, StatisticsHiddenByRlsAreNotMistakenForAbsentOnes) {
+  const std::string role = "licht_rls_" + std::to_string(getpid());
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+    n.exec("CREATE ROLE \"" + role + "\" LOGIN");
+  }
+  {
+    // Roles are cluster-wide, so admin_conn (which is on the base database)
+    // can create one -- but a grant on a schema or a table is database-scoped
+    // and has to be issued where those objects live.
+    pqxx::connection owner(test_url);
+    pqxx::nontransaction n(owner);
+    n.exec("GRANT USAGE ON SCHEMA grocery TO \"" + role + "\"");
+    n.exec("GRANT SELECT ON grocery.orders TO \"" + role + "\"");
+  }
+  const std::string url = std::regex_replace(
+      test_url, std::regex(R"(\buser\s*=\s*\S+)"), "") + " user=" + role;
+
+  bool usable = false;
+  try {
+    pqxx::connection probe(url);
+    pqxx::work t(probe);
+    usable = (t.exec("SELECT current_user")[0][0].as<std::string>() == role);
+  } catch (const std::exception&) {
+  }
+  if (!usable) GTEST_SKIP() << "cannot log in as a non-superuser role here";
+
+  PostgresMCPServer rls{url};
+
+  json ts = rls.call_table_stats("grocery", "orders");
+  ASSERT_TRUE(ts.contains("stats_hidden_by_rls")) << ts.dump(2);
+  EXPECT_TRUE(ts["stats_hidden_by_rls"].get<bool>());
+  // The proof that the nulls are a visibility answer and not an absence one:
+  // the fixture ran ANALYZE, and the timestamp survives because it comes from
+  // pg_stat_user_tables rather than from pg_stats.
+  EXPECT_FALSE(ts["last_analyze"].is_null() && ts["last_autoanalyze"].is_null())
+      << "fixture analyzed this table; the timestamp is what proves the "
+         "statistics exist while pg_stats hides them";
+
+  json ch = rls.call_column_histogram("grocery", "orders", "amount");
+  ASSERT_TRUE(ch.contains("stats_hidden_by_rls")) << ch.dump(2);
+  EXPECT_TRUE(ch["stats_hidden_by_rls"].get<bool>());
+  EXPECT_TRUE(ch["n_distinct"].is_null());
+  ASSERT_TRUE(ch.contains("note"));
+  EXPECT_NE(ch["note"].get<std::string>().find("row-level security"), std::string::npos)
+      << ch["note"];
+
+  {
+    pqxx::connection owner(test_url);
+    pqxx::nontransaction n(owner);
+    n.exec("REVOKE ALL ON grocery.orders FROM \"" + role + "\"");
+    n.exec("REVOKE ALL ON SCHEMA grocery FROM \"" + role + "\"");
+  }
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+  }
+}
+
+// The owner is exempt from RLS unless FORCE ROW LEVEL SECURITY is set, so the
+// flag must be false here even though the table has RLS enabled -- otherwise it
+// would report a problem to precisely the role that does not have one.
+TEST_F(PostgresMCPServerTest, TheOwnerSeesStatisticsOnAnRlsTable) {
+  json ts = srv->call_table_stats("grocery", "orders");
+  ASSERT_TRUE(ts.contains("stats_hidden_by_rls")) << ts.dump(2);
+  EXPECT_FALSE(ts["stats_hidden_by_rls"].get<bool>());
+  ASSERT_TRUE(ts.contains("columns"));
+  EXPECT_FALSE(ts["columns"].empty());
+}
+
 TEST_F(PostgresMCPServerTest, CheckPrivilegesReportsARestrictedRoleAccurately) {
   const std::string role = "licht_cp_" + std::to_string(getpid());
   {

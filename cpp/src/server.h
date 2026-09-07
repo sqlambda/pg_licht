@@ -5565,7 +5565,17 @@ private:
       "    , 'default', current_setting('default_statistics_target')::int"
       "    , 'effective', COALESCE(NULLIF(a.attstattarget, -1),"
       "                            current_setting('default_statistics_target')::int))"
-      ", 'inherited', ps.inherited)"
+      ", 'inherited', ps.inherited"
+      // pg_stats is defined WITH (security_barrier) and carries
+      //   AND (c.relrowsecurity = false OR NOT row_security_active(c.oid))
+      // so on a table with RLS active for this role the view returns no row at
+      // all -- not a filtered row, no row. Every statistic then reads as null,
+      // which is indistinguishable from a table nobody has analyzed. This is
+      // the common case rather than the corner one wherever RLS is the norm,
+      // so the condition is detected and reported instead of being left for
+      // the caller to deduce.
+      ", 'stats_hidden_by_rls',"
+      "    (c.relrowsecurity AND row_security_active(c.oid)))"
       "  FROM pg_attribute AS a"
       "  JOIN pg_class AS c ON c.oid = a.attrelid"
       "  JOIN pg_namespace AS n ON n.oid = c.relnamespace"
@@ -5586,13 +5596,25 @@ private:
     json out = json::parse(res[0][0].as<std::string>());
     // A column with no row in pg_stats at all is a different statement from one
     // whose values are all common, and both come back as nulls otherwise.
-    if (out["n_distinct"].is_null())
-      out["note"] = "no pg_stats row for this column: either nothing has "
-                    "analyzed the table, or the current role cannot read its "
-                    "statistics -- pg_stats filters on has_column_privilege. "
-                    "tableStats carries the analyze timestamps that tell those "
-                    "apart, and checkRoleAccess says whether the role can read "
-                    "the column.";
+    if (out["n_distinct"].is_null()) {
+      if (out.value("stats_hidden_by_rls", false))
+        out["note"] = "row-level security is enabled on this table and active "
+                      "for the current role, and pg_stats returns no row at all "
+                      "in that case -- so these nulls say nothing about whether "
+                      "the table has been analyzed. The statistics exist and the "
+                      "planner uses them; this view cannot show them to this "
+                      "role. Ask as the table owner (who is exempt unless FORCE "
+                      "ROW LEVEL SECURITY is set) or as a role RLS does not "
+                      "apply to. checkRoleAccess reports which of those this "
+                      "role is.";
+      else
+        out["note"] = "no pg_stats row for this column: either nothing has "
+                      "analyzed the table, or the current role cannot read its "
+                      "statistics -- pg_stats filters on has_column_privilege. "
+                      "tableStats carries the analyze timestamps that tell those "
+                      "apart, and checkRoleAccess says whether the role can read "
+                      "the column.";
+    }
     else if (out["histogram_bounds"].is_null())
       out["note"] = "no histogram for this column. ANALYZE builds one only from "
                     "the values left after the most common ones are taken into "
@@ -6533,6 +6555,14 @@ private:
       SELECT JSONB_BUILD_OBJECT(
                'table', c.relname,)") + kTableStatsCommon + pg16 + R"(,
                'columns', COALESCE(columns, '{}'::jsonb),
+               -- pg_stats returns NO ROW for a table whose RLS is active for
+               -- this role, so every per-column statistic below comes back null
+               -- and reads exactly like a table nobody has analyzed. Reported
+               -- rather than left to be deduced: the analyze timestamps beside
+               -- it prove the statistics exist, and the two together are the
+               -- only way to tell "not collected" from "not visible to you".
+               'stats_hidden_by_rls',
+                 (c.relrowsecurity AND row_security_active(c.oid)),
                'indexes', COALESCE(indexes, '{}'::jsonb))
       FROM pg_class AS c
       LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
