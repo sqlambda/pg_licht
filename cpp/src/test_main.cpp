@@ -1602,6 +1602,51 @@ TEST_F(PostgresMCPServerTest, ListExtendedStatisticsReturnsStatsObject) {
   EXPECT_NE(std::find(kinds.begin(), kinds.end(), "dependencies"), kinds.end());
 }
 
+// A CREATE STATISTICS that has never been ANALYZEd has a catalog row, no data,
+// and no effect on any plan. Through 4.2.0 listExtendedStatistics reported it
+// identically to a working one -- and two prompts check whether extended
+// statistics "exist" before recommending any, so that difference decides
+// whether the advice is right. Built on its own schema rather than the
+// fixture's so the ANALYZE here cannot perturb another test's timestamps.
+TEST_F(PostgresMCPServerTest, ExtendedStatisticsSayWhetherTheyHaveBeenBuilt) {
+  const std::string sch = "xs_" + std::to_string(getpid());
+  pqxx::connection owner(test_url);
+  {
+    pqxx::nontransaction n(owner);
+    n.exec("CREATE SCHEMA " + sch);
+    n.exec("CREATE TABLE " + sch + ".t (a int, b int)");
+    n.exec("INSERT INTO " + sch + ".t SELECT i, i % 7 FROM generate_series(1, 500) AS i");
+    n.exec("CREATE STATISTICS " + sch + ".t_stats (dependencies, ndistinct) ON a, b FROM " + sch + ".t");
+  }
+
+  json before = srv->call_extended_statistics(sch);
+  ASSERT_TRUE(before.contains("t_stats")) << before.dump(2);
+  // Defined, and inert. The kinds it was declared with are present; the kinds
+  // actually computed are not, because none have been.
+  EXPECT_FALSE(before["t_stats"]["built"].get<bool>()) << before.dump(2);
+  EXPECT_TRUE(before["t_stats"]["built_kinds"].empty());
+  EXPECT_FALSE(before["t_stats"]["kinds"].empty());
+
+  { pqxx::nontransaction n(owner); n.exec("ANALYZE " + sch + ".t"); }
+
+  json after = srv->call_extended_statistics(sch);
+  ASSERT_TRUE(after.contains("t_stats"));
+  EXPECT_TRUE(after["t_stats"]["built"].get<bool>()) << after.dump(2);
+  std::vector<std::string> bk(after["t_stats"]["built_kinds"].begin(),
+                              after["t_stats"]["built_kinds"].end());
+  EXPECT_NE(std::find(bk.begin(), bk.end(), "dependencies"), bk.end());
+  EXPECT_NE(std::find(bk.begin(), bk.end(), "ndistinct"), bk.end());
+
+  // stxdinherit became part of the key in PostgreSQL 15; below that the
+  // question does not exist and the key is null rather than an invented value.
+  if (owner.server_version() >= 150000)
+    EXPECT_TRUE(after["t_stats"]["built_for_inherited"].is_array()) << after.dump(2);
+  else
+    EXPECT_TRUE(after["t_stats"]["built_for_inherited"].is_null());
+
+  { pqxx::nontransaction n(owner); n.exec("DROP SCHEMA " + sch + " CASCADE"); }
+}
+
 // --- listOperators ---
 
 TEST_F(PostgresMCPServerTest, ListOperatorsReturnsCustomOperator) {

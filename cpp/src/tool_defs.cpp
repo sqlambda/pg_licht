@@ -334,7 +334,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args&) -> json {
          return s.languages(); }},
       {"listExtendedStatistics",
-       "return extended statistics objects (CREATE STATISTICS) for a schema with target table, columns, statistics kinds (ndistinct, dependencies, mcv), and description",
+       "return extended statistics objects (CREATE STATISTICS) for a schema with target table, columns, the statistics kinds declared (ndistinct, dependencies, mcv, expressions), and description -- plus whether they have actually been BUILT. pg_statistic_ext holds the definition and pg_statistic_ext_data holds the data, and an object that has never been ANALYZEd has the first and not the second: a catalog row, no statistics, and no effect on any plan. 'built' is false there and 'built_kinds' is empty, which is the difference between a fix that is in place and one that was declared and never finished -- the answer to the second is ANALYZE, not another CREATE STATISTICS. built_for_inherited says whether the data covers the parent alone, the whole inheritance tree, or both (PostgreSQL 15+, where stxdinherit became part of the key; null on 14, where the question cannot arise)",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {

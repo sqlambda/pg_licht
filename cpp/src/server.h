@@ -215,6 +215,7 @@ enum class Feature {
   // 15
   SubTwoPhase,              // pg_subscription.subtwophasestate
   SubscriptionStatsView,    // pg_stat_subscription_stats
+  ExtendedStatsInherit,     // pg_statistic_ext_data.stxdinherit
   // 16
   PgStatIo,                 // the pg_stat_io view
   GenericPlan,              // EXPLAIN (GENERIC_PLAN)
@@ -247,7 +248,8 @@ enum class Feature {
 constexpr int feature_since(Feature f) {
   switch (f) {
     case Feature::SubTwoPhase:
-    case Feature::SubscriptionStatsView:    return 150000;
+    case Feature::SubscriptionStatsView:
+    case Feature::ExtendedStatsInherit:     return 150000;
 
     case Feature::PgStatIo:
     case Feature::GenericPlan:
@@ -5770,30 +5772,66 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
-      SELECT JSONB_OBJECT_AGG(
-               s.stxname,
-               JSONB_BUILD_OBJECT(
-                 'table',       s.stxrelid::regclass::text,
-                 'columns',     COALESCE(cols, '[]'::jsonb),
-                 'kinds',       COALESCE(kinds, '[]'::jsonb),
-                 'description', COALESCE(obj_description(s.oid, 'pg_statistic_ext'), '')
-               )
-             )
-      FROM pg_statistic_ext AS s
-      LEFT JOIN LATERAL (
-          SELECT JSONB_AGG(attname ORDER BY attnum) AS cols
-          FROM pg_attribute
-          WHERE attrelid = s.stxrelid
-            AND attnum = ANY(s.stxkeys)
-      ) _lat27 ON true
-      LEFT JOIN LATERAL (
-          SELECT JSONB_AGG(CASE k WHEN 'd' THEN 'ndistinct' WHEN 'f' THEN 'dependencies'
-                                   WHEN 'm' THEN 'mcv' WHEN 'e' THEN 'expressions' END) AS kinds
-          FROM unnest(s.stxkind) AS k
-      ) _lat28 ON true
-      WHERE s.stxnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1);
-    )";
+    // pg_statistic_ext is the DEFINITION. A CREATE STATISTICS that has never
+    // been ANALYZEd has a row there, no data anywhere, and changes no plan --
+    // and through 4.2.0 this tool reported it identically to a working one.
+    // The built data lives in pg_statistic_ext_data. 4.2.0's prompt audit
+    // added "check whether extended statistics exist" to explain-and-fix and
+    // diagnose-slow-query precisely so neither would recommend creating what
+    // was already there, so existence had to stop meaning the catalog row and
+    // start meaning the statistics.
+    //
+    // stxdinherit is PostgreSQL 15 and later, where it also became part of the
+    // key: an object on a partitioned parent can carry separate data for the
+    // parent alone and for the whole inheritance tree. Aggregated rather than
+    // picked, so `built` is true if either exists and built_for_inherited says
+    // which. On 14 there is one row per object and the question cannot arise,
+    // so the key is null there rather than a guess.
+    const std::string inherit_sel = sess.has(Feature::ExtendedStatsInherit)
+      ? ", COALESCE(JSONB_AGG(DISTINCT d.stxdinherit), '[]'::jsonb) AS built_for"
+      : ", NULL::jsonb AS built_for";
+
+    const std::string query =
+      "SELECT JSONB_OBJECT_AGG("
+      "         s.stxname,"
+      "         JSONB_BUILD_OBJECT("
+      "           'table',       s.stxrelid::regclass::text,"
+      "           'columns',     COALESCE(_cols.cols, '[]'::jsonb),"
+      "           'kinds',       COALESCE(_kinds.kinds, '[]'::jsonb),"
+      "           'built',       COALESCE(built.any_data, false),"
+      "           'built_kinds', COALESCE(built.kinds, '[]'::jsonb),"
+      "           'built_for_inherited', built.built_for,"
+      "           'description', COALESCE(obj_description(s.oid, 'pg_statistic_ext'), '')"
+      "         ))"
+      "  FROM pg_statistic_ext AS s"
+      "  LEFT JOIN LATERAL ("
+      "      SELECT JSONB_AGG(attname ORDER BY attnum) AS cols"
+      "        FROM pg_attribute"
+      "       WHERE attrelid = s.stxrelid AND attnum = ANY(s.stxkeys)"
+      "  ) _cols ON true"
+      "  LEFT JOIN LATERAL ("
+      "      SELECT JSONB_AGG(CASE k WHEN 'd' THEN 'ndistinct' WHEN 'f' THEN 'dependencies'"
+      "                              WHEN 'm' THEN 'mcv' WHEN 'e' THEN 'expressions' END) AS kinds"
+      "        FROM unnest(s.stxkind) AS k"
+      "  ) _kinds ON true"
+      "  LEFT JOIN LATERAL ("
+      "      SELECT bool_or(d.stxdndistinct IS NOT NULL"
+      "                  OR d.stxddependencies IS NOT NULL"
+      "                  OR d.stxdmcv IS NOT NULL"
+      "                  OR d.stxdexpr IS NOT NULL) AS any_data"
+      "           , COALESCE(JSONB_AGG(DISTINCT bk) FILTER (WHERE bk IS NOT NULL),"
+      "                      '[]'::jsonb) AS kinds"
+      + inherit_sel +
+      "        FROM pg_statistic_ext_data AS d"
+      "        LEFT JOIN LATERAL unnest(ARRAY["
+      "               CASE WHEN d.stxdndistinct    IS NOT NULL THEN 'ndistinct'    END,"
+      "               CASE WHEN d.stxddependencies IS NOT NULL THEN 'dependencies' END,"
+      "               CASE WHEN d.stxdmcv          IS NOT NULL THEN 'mcv'          END,"
+      "               CASE WHEN d.stxdexpr         IS NOT NULL THEN 'expressions'  END])"
+      "             AS bk ON true"
+      "       WHERE d.stxoid = s.oid"
+      "  ) built ON true"
+      " WHERE s.stxnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1);";
 
     pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
 
