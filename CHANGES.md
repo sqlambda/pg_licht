@@ -1,5 +1,347 @@
 # Changelog
 
+## 4.2.1 (2026-09-07)
+
+Every PostgreSQL-factual claim in the tool descriptions, the twelve prompts and
+the man page, checked against `postgresql.org/docs/18` and — where the
+documentation is silent — against the PostgreSQL source. Thirteen findings.
+Eight were behaviour rather than prose, and six of those change a value a
+caller reads.
+
+The organising fact is that most of these were not documentation errors sitting
+on top of a correct implementation. They were wrong answers with confident
+names, and prose was simply the surface they were visible on. 4.2.0's audit
+asked *"does every prompt read what its tools return"*; this one asks the
+question underneath it — *"does every tool return what PostgreSQL says it
+does"* — and the answer was no thirteen times.
+
+**Three of the six failed in the same direction as 4.2.0's `last_vacuum`:
+wrong in the way that reads as healthy.** Two million transactions of
+wraparound headroom that did not exist, a memory worst case computed from
+settings a role can override, and a replication slot losing its WAL described
+as one holding it. That is now four occurrences across two releases, and the
+common cause is not carelessness about PostgreSQL — it is that each was written
+from a plausible mental model and never checked against the sentence that
+defines the field. They survived review because they read correctly.
+
+The check that catches this class is mechanical, and is now the rule for new
+work: **for every field named after a catalog column, view column or GUC, quote
+the documented definition beside it.**
+
+### Fixed
+
+- **The wraparound stop limit was off by 2,000,000 transactions, overstating
+  the budget.** `varsup.c`'s `SetTransactionIdLimit()` computes
+
+  ```c
+  xidWrapLimit = oldest_datfrozenxid + (MaxTransactionId >> 1)
+  xidStopLimit = xidWrapLimit - 3000000
+  xidWarnLimit = xidWrapLimit - 40000000
+  ```
+
+  so the age at which a server refuses to assign new transaction ids is
+  **2144483647**. `wraparoundStatus` used 2146483647 — a 1,000,000 delta
+  PostgreSQL has not used for many releases — and reported two million
+  transactions of headroom that do not exist.
+
+  The warning threshold was not reported at all. It fires first, and it is what
+  produces `WARNING: database "..." must be vacuumed within N transactions` in
+  the log, so the one threshold an operator has usually already seen was the one
+  this tool could not show them.
+
+- **`wraparoundStatus` prescribed single-user mode. The documentation
+  prescribes against it**, in as many words:
+
+  > "contrary to what was sometimes recommended in earlier releases, it is not
+  > necessary or desirable to stop the postmaster or enter single user-mode in
+  > order to restore normal operation."
+
+  A plain database-wide `VACUUM` in normal multi-user mode is the documented
+  recovery, and the description now carries the two traps the docs name and it
+  did not: `VACUUM FULL` requires an xid of its own and will fail, and
+  `VACUUM FREEZE` does more than the minimum needed to restore service. This is
+  the one finding here whose cost was an unnecessary outage rather than a wrong
+  number, in the text a model reads at the moment it is deciding what to tell
+  somebody at three in the morning.
+
+- **`wal_status: unreserved` meant the opposite of what both prompts said.**
+  `triage-disk-space` and `replication-slot-review` glossed it as "the slot is
+  the only thing keeping that WAL". The documentation:
+
+  > "`unreserved` means that the slot **no longer retains** the required WAL
+  > files and some of them are to be removed at the next checkpoint. […] This
+  > state can return to `reserved` or `extended`."
+
+  It is the server having *stopped* retaining, one step short of `lost`. The
+  direction matters most in the prompt that could least afford it: on a
+  disk-space page it means the space is about to come back on its own and the
+  consumer is about to break. Both prompts now also carry that the state is
+  reversible, which is what decides between waiting and dropping the slot.
+
+  `extended` was incomplete the same way — the WAL is retained "either by the
+  replication slot **or by `wal_keep_size`**", so the old gloss could send
+  someone hunting a slot when a GUC was the retainer.
+
+  Both passages also replaced a derived budget with the reported one:
+  `safe_wal_size` is documented as the bytes that can still be written before a
+  slot is in danger of becoming `lost`, and both prompts were reconstructing it
+  from WAL volume and `max_slot_wal_keep_size`. Its null is its own finding —
+  `max_slot_wal_keep_size` is `-1` and nothing bounds the retention, which is
+  worse than a large number rather than better.
+
+- **"Ordinary VACUUM frees nothing back to the filesystem" was too absolute.**
+  The documentation says space is not returned "(in most cases)", and `VACUUM`'s
+  truncation does return empty pages at the end of a table. On a full disk that
+  exception is the case worth knowing, so `triage-disk-space` now names it, and
+  names `vacuum_truncate` as the reloption that disables it.
+
+- **Statistics hidden by row-level security were indistinguishable from
+  statistics never collected.** `pg_stats` is defined `WITH (security_barrier)`
+  and its `WHERE` clause ends
+
+  ```sql
+  AND (c.relrowsecurity = false OR NOT row_security_active(c.oid))
+  ```
+
+  so for a role that RLS applies to the view returns **no row at all** — not a
+  filtered row. Every per-column statistic in `tableStats` and the whole of
+  `columnHistogram` then came back null, reading exactly like a table nobody
+  has analyzed.
+
+  This is not a corner case where RLS is the convention: on a multi-tenant
+  schema it is the normal path, and three prompts now reach for these values.
+  `explain-and-fix` and `diagnose-slow-query` separate skew from staleness with
+  them and `plan-schema-change` picks partition boundaries off the bounds — all
+  three would have concluded "never analyzed" about a table whose statistics
+  the planner is actively using.
+
+  Both tools now report `stats_hidden_by_rls`, and `columnHistogram`'s note
+  says which of the three causes applies rather than listing two of them. The
+  owner is exempt unless `FORCE ROW LEVEL SECURITY`, so the flag is false for
+  exactly the role that does not have the problem.
+
+- **`size_estimate` assumed an 8kB page.** It computed `relpages * 8192`.
+  `pg_class.relpages` is documented as a count of pages "of size `BLCKSZ`", and
+  `BLCKSZ` is a compile-time option between 1kB and 32kB. On a cluster built
+  with any other page size every estimate was wrong by the ratio, silently.
+  Now `relpages * current_setting('block_size')`.
+
+- **`hostCapacity`'s worst case ignored every per-role and per-database
+  override.** It multiplied `work_mem` by `max_connections`, reading `work_mem`
+  from `pg_settings` — which reports the value for *this* session. An
+  `ALTER ROLE app SET work_mem = '512MB'` is invisible to anyone connected as
+  somebody else, so wherever the application role carries a larger `work_mem`
+  the committed worst case was understated.
+
+  `pg_db_role_setting` is that layer and nothing here read it. `overrides` now
+  carries every entry with its scope — cluster, role, database or
+  role-in-database — and `committed_worst_case_bytes` is computed from
+  `GREATEST(global, any override)`, with `work_mem_is_overridden` saying when
+  those differ. The two `work_mem_times_max_connections` fields keep the global
+  value: they are named after the setting and are literally what their names
+  say; `committed_worst_case` is the field that promises a worst case, so it is
+  the one that had to change.
+
+  All overrides are reported rather than only the memory ones. A
+  `statement_timeout` of 0 or a `search_path` set on one role explains as much
+  as a memory setting does, and none of it is visible in `pg_settings`.
+
+- **`listExtendedStatistics` could not tell a defined statistics object from a
+  built one.** `pg_statistic_ext` is the definition; `pg_statistic_ext_data` is
+  the data. A `CREATE STATISTICS` that has never been `ANALYZE`d has the first
+  and not the second — a catalog row, no statistics, no effect on any plan —
+  and this reported it identically to a working one.
+
+  That became load-bearing in 4.2.0, whose prompt audit added "check whether
+  extended statistics exist" to `explain-and-fix` and `diagnose-slow-query`
+  precisely so neither would recommend creating what was already there. Both
+  then read existence as usability, and the advice came out as "statistics are
+  already in place" when the correct advice was `ANALYZE`.
+
+  Now reports `built` and `built_kinds` — which of the declared kinds were
+  actually computed, since `ANALYZE` can build some and not others — and
+  `built_for_inherited`, which carries `stxdinherit` on PostgreSQL 15 and later
+  and is null on 14, where the question cannot arise.
+
+- **A plan was reported without saying what environment produced it.**
+  `explainQuery` plans in *this* server's session, not the one the statement
+  runs in, and said nothing about the difference. `work_mem` alone changes the
+  algorithm rather than the cost. Measured on PostgreSQL 18, 400,000 rows,
+  identical statistics, one statement:
+
+  ```
+  work_mem = 64kB              work_mem = 512MB
+    GroupAggregate               HashAggregate
+      -> Sort                      -> Seq Scan on t
+           -> Seq Scan on t
+  ```
+
+  Everything `explain-and-fix` reads off node types, `Sort Method` or whether a
+  node spilled is then read off a plan production never runs — and the report
+  gave a reader nothing to notice.
+
+  Every `EXPLAIN` now carries `SETTINGS` — on all six paths: bare, generic,
+  prepared, analyzed, and both of `evaluateIndex`'s — which names the settings
+  differing from the built-in default and so names the environment the plan was
+  built in. PostgreSQL 12 and later, so no gate on any supported major.
+
+  **That half only became useful because of the fix above it.** `SETTINGS` says
+  what planned the statement; `hostCapacity.overrides` says what production runs
+  it with. Neither answers the question alone, which is exactly why this was
+  invisible until the other existed. `explain-and-fix` and `diagnose-slow-query`
+  both make the comparison a step, and both say plainly that where the executing
+  role has its own `work_mem`, this plan is not the plan production gets —
+  before anything else is drawn from it.
+
+  This release reports the mismatch; it does not remove it. Planning under
+  another role's settings needs a new argument and a new input schema, so it is
+  the next minor release rather than a patch.
+
+- **Multixacts had no wraparound budget, though both documents promised one.**
+  The tool description and the man page both said "each age as a percentage of
+  … the hard limit" while only the xid half was reported. Multixacts have the
+  same three-million stop limit and the same forty-million warning, and
+  members-space exhaustion is its own incident with its own ceiling.
+
+- **`vacuum_failsafe_age` was described short, and with the wrong subject.** It
+  said "autovacuum stops yielding and skips index cleanup". It is *any*
+  `VACUUM`, not only autovacuum — and there is a third effect that was missing:
+  the Buffer Access Strategy is disabled, so the vacuum is free to use all of
+  `shared_buffers`. That is why the cache looks wrecked during a failsafe
+  vacuum, a reading `bufferCacheSummary` will show and nothing else here
+  explained. The default of 1.6 billion and the silent floor at 105% of
+  `autovacuum_freeze_max_age` are stated too, since the effective value is not
+  the configured one.
+
+- **Five smaller claims narrowed to what the documentation supports.**
+  `inactive_since` "dates the problem exactly" — except that once a slot becomes
+  invalid the value is never updated again, so on an invalidated slot it dates
+  the invalidation, which is precisely the slot the prompt exists for.
+  `conflicting` is always null for a physical slot while `invalidation_reason` is
+  set for both kinds, so the pair does not cover the same slots.
+  `diskUsage` named one privilege gate and has two — `pg_ls_*` needs
+  `pg_monitor`, while the tablespace and database sizes need `CREATE` on the
+  tablespace or `pg_read_all_stats`, so a bare role gets the four cheap sections
+  and is refused the two expensive ones, which is a partial answer that arrives
+  fast and reads like a complete one. The histogram array is
+  `statistics_target`**+1** entries wide. And `pgstattuple` ships no
+  `pgstat*index` function for gist, spgist or brin, which is narrower and truer
+  than "no function".
+
+- **`subscriptionStats`' "no byte lag" rationale is now definitional.** It
+  argued observationally that `received_lsn` and `latest_end_lsn` "track each
+  other". The documented reason settles the question instead: one is the last
+  WAL location **received** and the other the last one **reported back** to the
+  publisher's WAL sender, so neither references the publisher's position and no
+  difference between them *can* express backlog. What it expresses is feedback
+  latency, bounded by the status-report interval. Stated the other way round it
+  read as an empirical accident a later release might revisit. Also notes that
+  both LSNs and both `last_msg_*` timestamps are null for a parallel apply
+  worker, so such a row is not broken.
+
+- **`progressStats`' description undersold its own implementation.** It has
+  returned `num_dead_item_ids`, `indexes_total` and `indexes_processed` on
+  PostgreSQL 17 since 4.2.0, and mentioned only blocks, tuples and
+  `dead_tuple_unit` — omitting index vacuuming, which is the phase a long
+  `VACUUM` usually sits in and where block counts look stalled throughout.
+
+### Added
+
+- **`wraparound_warn_limit`, and `xids_until_warn_limit` per database.** The
+  log warning fires forty million transactions before wraparound, thirty-seven
+  million before the stop, and nothing here reported it.
+
+- **`mxid_percent_of_wraparound_limit`, `mxids_until_wraparound_limit` and
+  `mxids_until_warn_limit`**, so both axes carry both budgets.
+
+- **`hostCapacity.overrides`**, with `work_mem_effective_max_bytes` and
+  `work_mem_is_overridden` beside it.
+
+- **`stats_hidden_by_rls`** on `tableStats` and `columnHistogram`.
+
+- **`built`, `built_kinds` and `built_for_inherited`** on
+  `listExtendedStatistics`.
+
+- **A `Settings` block on every plan**, from `EXPLAIN (SETTINGS)`.
+
+- **`delay_time_ms` and `delay_percent`** on a running vacuum, from
+  `pg_stat_progress_vacuum.delay_time` (PostgreSQL 18). The total time a vacuum
+  has spent *asleep* on the cost-based delay. A throttled vacuum and a vacuum on
+  a slow disk look identical in blocks scanned per second and have opposite
+  fixes — raise `vacuum_cost_limit`, or buy I/O — and nothing else here told
+  them apart. `bloat-and-vacuum-review` reads it before concluding autovacuum is
+  too slow.
+
+### Changed
+
+Nothing observable, and it is recorded here because it is the reason several of
+the fixes above were cheap.
+
+- **One tool registry replacing two tables five thousand lines apart.** A tool's
+  name, description, input schema and implementation lived in a JSON literal in
+  `get_tools_list` and an if/else chain of 61 branches in `dispatch_tool`, with
+  nothing making them agree. They did agree — verified 62/62 with no orphan on
+  either side while the new table was generated from them — but a tool
+  advertised and not dispatchable would have built cleanly and failed at runtime.
+
+  They are now one table; `get_tools_list` projects over it and `dispatch_tool`
+  is a map lookup. Twenty-four tools had re-typed the schema default longhand,
+  where one copy differing from the rest would have been invisible; 52 of the 62
+  handlers are now a single line.
+
+- **The version gates are named.** Twenty-nine bare comparisons against
+  `150000`, `160000`, `170000` and `180000`, scattered through five thousand
+  lines, are one enum and one switch. `sess.has(Feature::PgStatIo)` says why the
+  branch exists. Adding a new major is reading one table — and the two
+  version-gated additions in this release each cost one line there rather than
+  another magic number.
+
+  This is the part of "compile a separate binary per PostgreSQL version" that is
+  worth having. The rest is not: the version is a per-connection runtime fact,
+  and `verifyTopology` deliberately talks to servers of several majors in one
+  sweep and reports each one's version.
+
+- **The two registries compile as their own translation units.** `server.h` was
+  the whole program, so every edit recompiled everything. Measured, Release:
+
+  | | before | after |
+  |---|---|---|
+  | full clean, `-j4` | 49.9s | **39.4s** |
+  | touch `server.h`, `-j4` | 49.2s | **39.4s** |
+  | touch `tool_defs.cpp` | — | **12.7s** |
+  | touch `prompt_defs.cpp` | — | **4.4s** |
+
+  The honest cost: a serial `-j1` clean build goes 72.3s → 78.8s, because the
+  header is now parsed by four translation units instead of two. More total
+  work, far less of it on the critical path.
+
+  Verified rather than assumed: `tools/list`, `prompts/list` and
+  `resources/list` are byte-identical across all three negotiated protocol
+  revisions before and after each of the three refactor commits.
+
+### Compatibility
+
+Additive except for six corrected values, stated here rather than buried
+because they are observable.
+
+| field | before | after | who sees a change |
+|---|---|---|---|
+| `wraparoundStatus` `limits.wraparound_limit` | `2146483647` | `2144483647` | everyone |
+| `wraparoundStatus` `xids_until_wraparound_limit` | 2,000,000 too high | correct | everyone |
+| `wraparoundStatus` `xid_percent_of_wraparound_limit` | reads low | correct | everyone |
+| `hostCapacity` `derived.committed_worst_case_bytes` | global `work_mem` only | largest applicable | anyone using `ALTER ROLE … SET work_mem` |
+| `hostCapacity` `derived.committed_worst_case_percent_of_ram` | as above | as above | as above |
+| `tableStats` / `listTableStats` `size_estimate` | `relpages * 8192` | `relpages * block_size` | non-default `BLCKSZ` builds only |
+
+Each is a fix rather than a redefinition, on the bar §7 sets and the reasoning
+4.2.0 used for `last_vacuum`: **the field is named for a documented PostgreSQL
+quantity and returned a different one.** No key is removed, no type changes, and
+every one of them moves a number toward what its name already claims.
+
+Everything else is additive. No tool's name or input schema changes, and the
+`Settings` block arrives inside the plan payload `explainQuery` already returned
+verbatim.
+
 ## 4.2.0 (2026-09-05)
 
 Three paths that walked the configured databases one at a time now use the
