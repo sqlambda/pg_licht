@@ -6460,7 +6460,14 @@ private:
   // not in tableDetails, but they are cheap, which is why they are not behind
   // the gate that tableSize is.
   //
-  // size_estimate is relpages * 8192 and is deliberately not called `size`.
+  // size_estimate is relpages * block_size and is deliberately not called
+  // `size`. It multiplied by a literal 8192 through 4.2.0, which is only the
+  // default: pg_class.relpages is documented as a count of pages "of size
+  // BLCKSZ", and BLCKSZ is a compile-time option between 1kB and 32kB. On a
+  // server built with anything else every estimate was wrong by the ratio, and
+  // silently. current_setting('block_size') is a preset GUC, readable by any
+  // role and constant for the life of the server, so this costs nothing.
+  //
   // relpages is set by VACUUM and ANALYZE, so between runs it can be arbitrarily
   // stale -- on a table that has doubled since the last analyze it is half the
   // truth. estimated_from carries the timestamp that produced it so a caller can
@@ -6497,7 +6504,7 @@ private:
   // it dates relpages and reltuples, which any of the four refreshes equally.
   static constexpr const char* kTableStatsCommon = R"(
                'rows', c.reltuples,
-               'size_estimate', c.relpages::bigint * 8192,
+               'size_estimate', c.relpages::bigint * current_setting('block_size')::bigint,
                'estimated_from', GREATEST(s.last_vacuum, s.last_autovacuum,
                                           s.last_analyze, s.last_autoanalyze),
                'seq_scan', s.seq_scan, 'idx_scan', s.idx_scan,

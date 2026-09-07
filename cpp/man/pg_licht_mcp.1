@@ -589,7 +589,11 @@ for measured sizes see
 .It Ic tableStats Ar schema Ar table
 Statistics PostgreSQL already keeps for one table: estimated row count,
 .Va size_estimate
-.Pq Li relpages No * 8192 No with the Va estimated_from No timestamp that produced it ,
+.Pq Li relpages No * Li block_size No with the Va estimated_from No timestamp that produced it ,
+.Li block_size
+is the server's compile-time
+.Li BLCKSZ ,
+8192 unless it was built otherwise.
 .Va seq_scan
 and
 .Va idx_scan ,

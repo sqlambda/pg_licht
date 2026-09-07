@@ -2226,6 +2226,18 @@ TEST_F(PostgresMCPServerTest, SizeEstimateIsNamedAsAnEstimateAndDatedByIt) {
   // confused for one another.
   EXPECT_TRUE(measured.contains("size"));
   EXPECT_FALSE(measured.contains("size_estimate"));
+
+  // The estimate is relpages * BLCKSZ, and BLCKSZ is a compile-time option --
+  // through 4.2.0 this multiplied by a literal 8192, which is only the default.
+  // Asserting against the server's own block_size rather than against 8192 is
+  // the point: on a cluster built with another page size the old arithmetic was
+  // wrong by the ratio and nothing here would have noticed.
+  pqxx::connection c(test_url);
+  pqxx::nontransaction n(c);
+  const long long blocksz = n.query_value<long long>("SELECT current_setting('block_size')::bigint");
+  const long long relpages = n.query_value<long long>(
+      "SELECT relpages::bigint FROM pg_class WHERE oid = 'grocery.users'::regclass");
+  EXPECT_EQ(stats["size_estimate"].get<long long>(), relpages * blocksz);
 }
 
 TEST_F(PostgresMCPServerTest, TableSizeMeasuresEveryFork) {
