@@ -2835,6 +2835,52 @@ TEST_F(PostgresMCPServerTest, TableIOStatsRatioIsNullNotZeroWithoutTraffic) {
 
 // --- hostCapacity ---
 
+// pg_settings reports the value for THIS session, so an ALTER ROLE ... SET is
+// invisible to a DBA connected as anyone else -- and through 4.2.0 the
+// committed worst case was computed from the global work_mem alone, so a role
+// configured with a larger one made the figure understated, in the direction
+// that reads as safe. The override has to move the worst case, not merely
+// appear beside it.
+TEST_F(PostgresMCPServerTest, HostCapacityCountsPerRoleOverridesInTheWorstCase) {
+  const std::string role = "licht_hc_" + std::to_string(getpid());
+  json before = srv->call_host_capacity(0, 0, "");
+  ASSERT_TRUE(before.contains("overrides")) << before.dump(2);
+  const long long base_worst =
+      before["derived"]["committed_worst_case_bytes"].get<long long>();
+  EXPECT_FALSE(before["derived"]["work_mem_is_overridden"].get<bool>());
+
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+    n.exec("CREATE ROLE \"" + role + "\"");
+    // Far above any plausible global default, so the GREATEST cannot be a
+    // coincidence of the fixture's settings.
+    n.exec("ALTER ROLE \"" + role + "\" SET work_mem = '512MB'");
+  }
+
+  json after = srv->call_host_capacity(0, 0, "");
+  bool found = false;
+  for (const auto& o : after["overrides"])
+    if (o["role"].is_string() && o["role"].get<std::string>() == role
+        && o["name"].get<std::string>() == "work_mem") {
+      found = true;
+      EXPECT_EQ(o["scope"].get<std::string>(), "role");
+      EXPECT_EQ(o["value"].get<std::string>(), "512MB");
+    }
+  EXPECT_TRUE(found) << after["overrides"].dump(2);
+
+  EXPECT_TRUE(after["derived"]["work_mem_is_overridden"].get<bool>());
+  EXPECT_EQ(after["derived"]["work_mem_effective_max_bytes"].get<long long>(),
+            512LL * 1024 * 1024);
+  // The point of the whole fix: the worst case moved.
+  EXPECT_GT(after["derived"]["committed_worst_case_bytes"].get<long long>(), base_worst);
+
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+  }
+}
+
 TEST_F(PostgresMCPServerTest, HostCapacitySaysSoWhenNoHardwareWasInjected) {
   json r = srv->call_host_capacity(0, 0, "");
   ASSERT_TRUE(r.contains("host")) << r.dump(2);

@@ -3636,11 +3636,53 @@ private:
                (SELECT bytes   FROM g WHERE name = 'effective_cache_size') AS effective_cache_size,
                (SELECT setting::bigint FROM g WHERE name = 'max_connections')        AS max_connections,
                (SELECT setting::bigint FROM g WHERE name = 'autovacuum_max_workers') AS av_workers
+      ),
+      -- pg_db_role_setting is a whole configuration layer pg_settings cannot
+      -- show: pg_settings reports the value for THIS session, so an
+      -- `ALTER ROLE app SET work_mem` or `ALTER DATABASE reporting SET ...` is
+      -- invisible to anyone connected as someone else. Through 4.2.0 the
+      -- worst case below was computed from the global work_mem alone, so on
+      -- any server where the application role carries a larger one the figure
+      -- was understated -- wrong in the direction that reads as safe.
+      --
+      -- setdatabase = 0 means "all databases", setrole = 0 means "all roles",
+      -- so the four combinations are the four scopes.
+      ovr AS (
+        SELECT COALESCE(d.datname, '')                       AS database,
+               COALESCE(r.rolname, '')                       AS role,
+               split_part(cfg, '=', 1)                       AS name,
+               substr(cfg, strpos(cfg, '=') + 1)             AS value
+          FROM pg_db_role_setting AS s
+          LEFT JOIN pg_database AS d ON d.oid = s.setdatabase
+          LEFT JOIN pg_roles    AS r ON r.oid = s.setrole
+          CROSS JOIN LATERAL unnest(s.setconfig) AS cfg
+      ),
+      -- work_mem's unit is kB, so a bare number is kilobytes; anything with a
+      -- suffix is what pg_size_bytes understands. An unparseable value is
+      -- skipped rather than guessed at.
+      wm AS (
+        SELECT max(CASE WHEN value ~ '^[0-9]+$' THEN value::bigint * 1024
+                        WHEN value ~ '^[0-9]+\s*[kMGT]B$' THEN pg_size_bytes(value)
+                   END) AS max_bytes
+          FROM ovr WHERE name = 'work_mem'
       )
       SELECT JSONB_BUILD_OBJECT(
         'server', JSONB_BUILD_OBJECT(
           'version', current_setting('server_version'),
           'database', current_database()),
+        -- Every per-role and per-database override, not only work_mem: a
+        -- statement_timeout of 0 on one role explains as much as a memory
+        -- setting does, and none of it is visible in `settings` above.
+        'overrides', COALESCE((SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                        'scope', CASE WHEN database = '' AND role = '' THEN 'cluster'
+                                      WHEN database = '' THEN 'role'
+                                      WHEN role = ''     THEN 'database'
+                                      ELSE 'role_in_database' END,
+                        'database', NULLIF(database, ''),
+                        'role',     NULLIF(role, ''),
+                        'name',     name,
+                        'value',    value) ORDER BY name, database, role)
+                      FROM ovr), '[]'::jsonb),
         'settings', (SELECT JSONB_OBJECT_AGG(name, JSONB_BUILD_OBJECT(
                         'setting', setting, 'unit', unit, 'bytes', bytes)) FROM g),
         'derived', (SELECT JSONB_BUILD_OBJECT(
@@ -3656,11 +3698,18 @@ private:
             v.maint_work_mem * v.av_workers,
           'maintenance_work_mem_times_autovacuum_workers_percent_of_ram',
             round(100.0 * v.maint_work_mem * v.av_workers / NULLIF(host.ram_bytes, 0), 1),
+          -- GREATEST of the global work_mem and any override, because the
+          -- worst case is what the largest-configured role can do, not what
+          -- the current session happens to be set to.
+          'work_mem_effective_max_bytes', GREATEST(v.work_mem, wm.max_bytes),
+          'work_mem_is_overridden', wm.max_bytes IS NOT NULL
+                                    AND wm.max_bytes > v.work_mem,
           'committed_worst_case_bytes',
-            v.shared_buffers + v.work_mem * v.max_connections
+            v.shared_buffers + GREATEST(v.work_mem, wm.max_bytes) * v.max_connections
               + v.maint_work_mem * v.av_workers,
           'committed_worst_case_percent_of_ram',
-            round(100.0 * (v.shared_buffers + v.work_mem * v.max_connections
+            round(100.0 * (v.shared_buffers
+                           + GREATEST(v.work_mem, wm.max_bytes) * v.max_connections
                            + v.maint_work_mem * v.av_workers)
                   / NULLIF(host.ram_bytes, 0), 1),
           'max_parallel_workers_per_vcpu',
@@ -3669,14 +3718,19 @@ private:
           'max_worker_processes_per_vcpu',
             round((SELECT setting::numeric FROM g WHERE name = 'max_worker_processes')
                   / NULLIF(host.vcpus, 0), 2))
-          FROM v, host),
+          FROM v, host, wm),
         'notes', JSONB_BUILD_ARRAY(
           'work_mem is a per-node limit, not a per-connection one: a single query '
           'with several sorts or hash joins can use a multiple of it, and parallel '
           'workers each get their own. work_mem_times_max_connections is therefore a '
           'floor on the worst case, not a ceiling.',
           'shared_buffers is counted once here; the operating system page cache is '
-          'not, which is what effective_cache_size is meant to describe.')
+          'not, which is what effective_cache_size is meant to describe.',
+          'settings shows this session''s values. overrides carries what '
+          'pg_db_role_setting holds for other roles and databases, which pg_settings '
+          'cannot show and which is the usual answer to "slow only from the '
+          'application". committed_worst_case uses the largest work_mem any role is '
+          'configured with, not this session''s.')
       );
     )";
 
