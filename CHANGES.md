@@ -1,5 +1,137 @@
 # Changelog
 
+## 4.2.2 (2026-09-07)
+
+4.2.1 was exercised against a real 617 GB cluster — 24 schemas, 3,165 tables,
+723 roles — by running all twelve prompts end to end. Four tools returned
+**nothing at all**, and one of them was a regression 4.2.1 had introduced hours
+earlier.
+
+The failure mode is the point. A tool whose payload exceeds the client's limit
+does not return a truncated answer; it returns an empty one. So an oversized
+reply is indistinguishable from an empty database, and a caller reads "no
+roles", "no publications", "no schemas" and moves on. Every fix here is the
+same shape: report the count, name a bounded sample, and say when the rest were
+dropped.
+
+### Fixed
+
+- **`hostCapacity` returned nothing on a multi-tenant cluster — a 4.2.1
+  regression.** That release added `overrides` from `pg_db_role_setting` and
+  emitted one row per role. On a database with one login role per tenant that is
+  one row per tenant: 701 rows, 105 kB, over the limit. The tool returned
+  nothing and took `capacity-check` step 2 and `triage-active-sessions` step 1
+  with it — both had a working answer before 4.2.1 and none after.
+
+  It is now collapsed by `(scope, name, value)`, the only grouping that loses
+  nothing: two roles with **different** values stay separate rows, and a value
+  that differs from the global one is the entire reason to read this. What
+  collapses is repetition. Each group carries `count`, up to five example names
+  and `names_truncated`.
+
+  Verified against the cluster that broke it: **701 rows became 9 groups**, the
+  largest collapsing 688 roles into one, and all three overrides that mattered
+  survived as their own rows.
+
+  Worth recording plainly: this walked into a hazard already written down. The
+  roadmap lists two unbounded payloads as known defects, and `tableStats`' own
+  comment calls inlining a full histogram "the unbounded-payload mistake this
+  project has already made once elsewhere". Same day, same mistake, in the
+  commit that was fixing the tool.
+
+- **`listSchemas` named every relation in every schema.** One schema held 1,816
+  tables; the payload was 89 kB. Now `table_count` with up to 25 names and
+  `tables_truncated`. The count is what a summary needs; `listTables` names them
+  and takes one schema at a time precisely so the caller bounds its size.
+
+- **`listPublications` inlined every member table.** A publication
+  `FOR ALL TABLES` resolves through `pg_publication_tables` to every table in
+  the database, so one line of DDL produces an unbounded list and nothing in the
+  declaration hints at the size. Now `table_count`, up to 50 names, and
+  `tables_truncated`.
+
+- **`listRoles` returned every role.** 723 of them, 689 `client_*` with default
+  attributes and no memberships, at 165 kB. Capped at 200 and **ordered so every
+  role carrying a non-default attribute or a group membership comes first**, so
+  the cap drops the identical crowd rather than the superusers. A new `pattern`
+  argument searches by name when the role wanted falls outside the cap.
+
+- **`serverSettings` dumped all 456 settings**, 99 kB, of which one category
+  alone held 95. It now defaults to the settings that differ from their built-in
+  default — the set that describes *this server* rather than PostgreSQL, which
+  is the same set `EXPLAIN (SETTINGS)` reports and for the same reason.
+  `all:true` restores the full dump, and `pattern` searches by name or category.
+
+- **`idx_scan` was reported without the window it covers.** `pg_stat_reset()`
+  zeroes `idx_scan` and `seq_scan` with everything else, so `idx_scan = 0` means
+  "not since the reset", never "never". `stats_reset` was reported by six tools
+  and by none of the six sites emitting a scan counter — the one place its
+  absence changes a decision.
+
+  This had already cost a wrong recommendation. On a database whose statistics
+  were reset four days earlier the review produced *"1.91 GB reclaimable
+  immediately — 0 scans, a drop candidate"*. Four days of evidence. A month-end
+  report, a quarterly job and a failover path all read as zero over that window,
+  and dropping a 1.9 GB index is not reversible in an afternoon.
+
+  `duplicateIndexes` and `tableStats` now carry `counters_since`, and
+  `bloat-and-vacuum-review` step 5 reads it **before** `idx_scan`, saying plainly
+  that where the window is short `idx_scan = 0` is not evidence and waiting
+  beats dropping. It is documented as a lower bound:
+  `pg_stat_reset_single_table_counters()` zeroes one relation without moving
+  `pg_stat_database.stats_reset`.
+
+- **A missing schema read as a clean one.** An empty result from a schema-scoped
+  tool had two causes that look identical and mean opposite things.
+  `bloat-and-vacuum-review` defaults to `public`, and on a database that has no
+  `public` schema a caller following that default got `{}` and would reasonably
+  conclude the schema was clean. `listTables`, `listTableStats` and
+  `listTableSizes` now check `pg_namespace` and name the missing schema, while a
+  schema that exists and is empty still returns an empty answer rather than an
+  error.
+
+  One existing test asserted the old silence — `TablesUnknownSchemaReturnsEmpty`
+  was pinning the defect — and is renamed and inverted.
+
+- **An unplannable statement now says why, and whether params were applied.**
+  `explainQuery` met SQLSTATE 42883 on a statement recovered from
+  `pg_stat_statements`, fell through to a bare "explain failed", and gave the
+  caller nothing. Supplying `params` produced the identical error with no
+  indication they had been applied, so the natural next step was to retry with
+  more params forever.
+
+  The cause is the normalization rather than the statement: replacing a literal
+  with `$n` strips its type, and a placeholder nothing constrains — 
+  `CASE WHEN … THEN $6 ELSE $7` is the usual one — is assigned `text` when the
+  statement is **parsed**, before any value is bound. No `params` argument can
+  change that. The error now carries `params_supplied` and says that params
+  cannot help here, along with the two things that do: inline the literals, or
+  add explicit casts.
+
+### Compatibility
+
+Three tools change what a **default** call returns. Each previously returned
+nothing on the databases affected, so every one of these is strictly more
+information than before, not less.
+
+| tool | before | after | who sees a change |
+|---|---|---|---|
+| `listSchemas` | every relation name per schema | `table_count` + 25 names + `tables_truncated` | any schema with more than 25 relations |
+| `listPublications` | every member table | `table_count` + 50 names + `tables_truncated` | any publication with more than 50 tables |
+| `listRoles` | every role | 200, attribute- and membership-carrying first | clusters with more than 200 roles |
+| `serverSettings` | all settings | only those differing from the built-in default | **everyone**; `all:true` restores it |
+| `hostCapacity` `overrides` | one row per role | collapsed by (scope, name, value) | anyone with per-role settings |
+
+`serverSettings` is the one that changes on every server rather than only large
+ones, which is why it takes an explicit `all` flag rather than a silent cap.
+
+Additive alongside them: `counters_since` on `duplicateIndexes` and
+`tableStats`; `pattern` on `listRoles`; `pattern` and `all` on `serverSettings`;
+`params_supplied` on the 42883 error. `listTables`, `listTableStats` and
+`listTableSizes` return an error object where they previously returned `{}` for
+a schema that does not exist — a shape change only on an input that was already
+a mistake.
+
 ## 4.2.1 (2026-09-07)
 
 Every PostgreSQL-factual claim in the tool descriptions, the twelve prompts and
