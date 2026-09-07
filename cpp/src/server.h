@@ -3088,10 +3088,24 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    // 2^31 - 1000000: the point at which PostgreSQL stops accepting commands
-    // that assign new transaction ids. It is the outage threshold, and is
-    // distinct from autovacuum_freeze_max_age, which is merely where an
-    // anti-wraparound autovacuum is forced.
+    // The two thresholds PostgreSQL itself uses, from varsup.c's
+    // SetTransactionIdLimit():
+    //
+    //   xidWrapLimit = oldest_datfrozenxid + (MaxTransactionId >> 1)  // 2^31-1
+    //   xidStopLimit = xidWrapLimit - 3000000
+    //   xidWarnLimit = xidWrapLimit - 40000000
+    //
+    // so the age at which the server refuses to assign new transaction ids is
+    // 2147483647 - 3000000 = 2144483647, and the age at which it starts
+    // warning in the log is 2147483647 - 40000000 = 2107483647. Both are
+    // outage thresholds and both are distinct from autovacuum_freeze_max_age,
+    // which is merely where an anti-wraparound autovacuum is forced.
+    //
+    // Through 4.2.0 this used 2146483647 -- a 1,000,000 delta PostgreSQL has
+    // not used for many releases -- which reported two million transactions of
+    // headroom that did not exist, in the direction that reads as safe. The
+    // warn limit was not reported at all, so the one threshold an operator has
+    // already seen fire in the log was the one this tool could not show them.
     //
     // TOAST tables are included deliberately. They carry their own
     // relfrozenxid, are invisible in pg_stat_user_tables, and a TOAST or
@@ -3124,7 +3138,8 @@ private:
                            'vacuum_freeze_min_age', 'vacuum_freeze_table_age',
                            'vacuum_multixact_freeze_min_age', 'vacuum_multixact_freeze_table_age',
                            'vacuum_failsafe_age', 'vacuum_multixact_failsafe_age'))
-          || JSONB_BUILD_OBJECT('wraparound_limit', 2146483647::bigint),
+          || JSONB_BUILD_OBJECT('wraparound_limit', 2144483647::bigint,
+                                'wraparound_warn_limit', 2107483647::bigint),
         'databases',
           (SELECT JSONB_OBJECT_AGG(d.datname, JSONB_BUILD_OBJECT(
                     'xid_age', age(d.datfrozenxid),
@@ -3132,8 +3147,9 @@ private:
                       round(100.0 * age(d.datfrozenxid)
                             / NULLIF(current_setting('autovacuum_freeze_max_age')::bigint, 0), 1),
                     'xid_percent_of_wraparound_limit',
-                      round(100.0 * age(d.datfrozenxid) / 2146483647, 3),
-                    'xids_until_wraparound_limit', 2146483647 - age(d.datfrozenxid),
+                      round(100.0 * age(d.datfrozenxid) / 2144483647, 3),
+                    'xids_until_wraparound_limit', 2144483647 - age(d.datfrozenxid),
+                    'xids_until_warn_limit', 2107483647 - age(d.datfrozenxid),
                     'mxid_age', mxid_age(d.datminmxid),
                     'mxid_percent_of_freeze_max_age',
                       round(100.0 * mxid_age(d.datminmxid)
@@ -3152,7 +3168,7 @@ private:
                    'xid_percent_of_freeze_max_age',
                      round(100.0 * r.xid_age / NULLIF(r.freeze_max_age, 0), 1),
                    'xid_percent_of_wraparound_limit',
-                     round(100.0 * r.xid_age / 2146483647, 3),
+                     round(100.0 * r.xid_age / 2144483647, 3),
                    'mxid_age', r.mxid_age,
                    'relfrozenxid', r.relfrozenxid::text,
                    'freeze_max_age', r.freeze_max_age,

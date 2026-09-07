@@ -2514,9 +2514,18 @@ TEST_F(PostgresMCPServerTest, WraparoundStatusReportsLimitsAndDatabases) {
   EXPECT_TRUE(r["limits"].contains("autovacuum_freeze_max_age"));
   EXPECT_TRUE(r["limits"].contains("autovacuum_multixact_freeze_max_age"));
   EXPECT_TRUE(r["limits"].contains("vacuum_failsafe_age"));
-  // The hard limit is the outage threshold, and is what the percentages that
-  // actually matter are taken against.
-  EXPECT_EQ(r["limits"]["wraparound_limit"].get<long long>(), 2146483647LL);
+  // The two thresholds PostgreSQL itself uses, spelled out as varsup.c derives
+  // them rather than as bare constants -- through 4.2.0 this asserted
+  // 2146483647, a 1,000,000 delta PostgreSQL has not used for many releases,
+  // which reported two million transactions of headroom that did not exist.
+  constexpr long long kWrap = 2147483647LL;         // MaxTransactionId >> 1
+  EXPECT_EQ(r["limits"]["wraparound_limit"].get<long long>(),
+            kWrap - 3000000LL);                     // xidStopLimit
+  EXPECT_EQ(r["limits"]["wraparound_warn_limit"].get<long long>(),
+            kWrap - 40000000LL);                    // xidWarnLimit
+  // The warning fires first, so its budget is always the smaller of the two.
+  EXPECT_LT(r["limits"]["wraparound_warn_limit"].get<long long>(),
+            r["limits"]["wraparound_limit"].get<long long>());
 
   ASSERT_TRUE(r.contains("databases"));
   ASSERT_TRUE(r["databases"].contains(test_dbname));
@@ -2525,6 +2534,10 @@ TEST_F(PostgresMCPServerTest, WraparoundStatusReportsLimitsAndDatabases) {
   EXPECT_GE(db["mxid_age"].get<long long>(), 0);
   EXPECT_LT(db["xid_percent_of_wraparound_limit"].get<double>(), 100.0);
   EXPECT_GT(db["xids_until_wraparound_limit"].get<long long>(), 0);
+  // Both budgets are reported, and the warning one is always reached first.
+  EXPECT_GT(db["xids_until_warn_limit"].get<long long>(), 0);
+  EXPECT_LT(db["xids_until_warn_limit"].get<long long>(),
+            db["xids_until_wraparound_limit"].get<long long>());
 }
 
 TEST_F(PostgresMCPServerTest, WraparoundStatusReportsPerTableFreezeOverride) {
