@@ -6,7 +6,7 @@
 auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
     static const std::vector<ToolDef> defs = {
       {"listSchemas",
-       "return schema list with basic summaries",
+       "return schema list with basic summaries: table_count, up to 25 table names, and role grants per schema. tables_truncated says when a schema holds more than the names shown -- listTables is the tool that names every relation in one schema, and it takes one schema at a time so its size stays bounded by the caller",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", json::object()}
@@ -208,13 +208,15 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args& a) -> json {
          return s.type_detail(a.str("schema", "public"), a.str("type", "")); }},
       {"listRoles",
-       "return cluster-wide roles with kind (login/group), attributes (superuser, create_role, create_db, replication, bypass_rls, connection_limit, valid_until), and group memberships",
+       "return cluster-wide roles with kind (login/group), attributes (superuser, create_role, create_db, replication, bypass_rls, connection_limit, valid_until), and group memberships. Without 'pattern' the list is capped at 200, ordered so every role carrying a non-default attribute or a group membership comes first -- on a multi-tenant cluster with one login role per tenant the crowd is identical and the cap drops it rather than the superusers. Pass 'pattern' to search by name (case-insensitive substring) when the role you want is outside the cap",
        []() -> json { return {
    		{"type", "object"},
-   		{"properties", json::object()}
+   		{"properties", {
+   		    {"pattern", {{"type", "string"}, {"description", "case-insensitive substring of the role name"}}}
+   		  }}
    	      }; },
-       [](PostgresMCPServer& s, const Args&) -> json {
-         return s.roles(); }},
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.roles(a.str("pattern")); }},
       {"listForeignTables",
        "return foreign tables in a schema with their foreign server, FDW, options, and columns (does not expose user mapping credentials)",
        []() -> json { return {
@@ -421,13 +423,16 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args&) -> json {
          return s.database_size(); }},
       {"serverSettings",
-       "return all PostgreSQL server settings (pg_settings) grouped by category, each with current value, unit, description, context, type, source, and pending_restart flag",
+       "return PostgreSQL server settings (pg_settings) grouped by category, each with current value, unit, description, context, type, source, and pending_restart flag. By DEFAULT only settings that differ from their built-in default -- the set that describes THIS server rather than PostgreSQL, which is the same set EXPLAIN (SETTINGS) reports and for the same reason. A full dump is hundreds of settings and on a cluster with extensions it exceeds the client's payload limit, at which point the tool returns nothing and the forty settings that describe the machine are lost with the four hundred that describe the software. Pass all:true for everything, or 'pattern' to search by setting name or category (case-insensitive substring)",
        []() -> json { return {
    		{"type", "object"},
-   		{"properties", json::object()}
+   		{"properties", {
+   		    {"pattern", {{"type", "string"}, {"description", "case-insensitive substring of the setting name or category"}}},
+   		    {"all", {{"type", "boolean"}, {"description", "include settings still at their built-in default; defaults to false"}}}
+   		  }}
    	      }; },
-       [](PostgresMCPServer& s, const Args&) -> json {
-         return s.server_settings(); }},
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.server_settings(a.str("pattern"), a.flag("all", false)); }},
       {"currentActivity",
        "return current server connections and running queries (pg_stat_activity) across all databases: pid, database, user, application_name, backend_type, state, wait event, query text, transaction and query duration, leader_pid for parallel workers, and the backend's xid and xmin. query_id is returned as a decimal string and is the join key to statementStats and explainQuery, so a statement seen running here can be looked up and planned. All filters are optional and combine; with none the whole view is returned, which on a busy server is mostly idle connections and internal processes",
        []() -> json { return {

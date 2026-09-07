@@ -569,7 +569,8 @@ public:
   const json call_type_detail(const std::string& schema, const std::string& type_name) {
     return type_detail(schema, type_name);
   }
-  const json call_roles() { return roles(); }
+  const json call_roles() { return roles(""); }
+  const json call_roles(const std::string& pattern) { return roles(pattern); }
   const json call_foreign_tables(const std::string& schema) { return foreign_tables(schema); }
   const json call_foreign_servers() { return foreign_servers(); }
   const json call_tablespaces() { return tablespaces(); }
@@ -593,7 +594,8 @@ public:
   const json call_sequences(const std::string& schema) { return sequences(schema); }
   const json call_extensions() { return extensions(); }
   const json call_database_size() { return database_size(); }
-  const json call_server_settings() { return server_settings(); }
+  const json call_server_settings() { return server_settings("", false); }
+  const json call_server_settings(const std::string& p, bool all) { return server_settings(p, all); }
   const json call_activity() { return activity(0, "", 0, ""); }
   const json call_activity(int pid, const std::string& query_id,
                            double min_duration_s, const std::string& state) {
@@ -724,6 +726,17 @@ private:
   // useful for the handful of roles that differ, and the reason this exists at
   // all is that an unbounded list of them exceeded the client's payload limit.
   static constexpr int kOverrideNames = 5;
+
+  // How many relation names listSchemas carries per schema before table_count
+  // stands in for them. listTables is the tool that names every table in one
+  // schema; this one summarises every schema, and a full name list per schema
+  // is quadratic in exactly the direction that breaks.
+  static constexpr int kSchemaTableNames = 25;
+
+  // How many roles listRoles returns without a pattern. Ordered so the ones
+  // carrying an attribute or a membership come first, because those are the
+  // ones a cap must not drop.
+  static constexpr int kRoleLimit = 200;
 
   // The current sweep member's config, carrying the bounded connect.
   //
@@ -1533,9 +1546,9 @@ private:
 
     if (seg.size() == 2 && seg[1] == "schemas")               return schemas();
     if (seg.size() == 3 && seg[1] == "server") {
-      if (seg[2] == "roles")      return roles();
+      if (seg[2] == "roles")      return roles("");
       if (seg[2] == "extensions") return extensions();
-      if (seg[2] == "settings")   return server_settings();
+      if (seg[2] == "settings")   return server_settings("", false);
     }
     if (seg[1] == "schema" && seg.size() >= 3) {
       const std::string& sch = seg[2];
@@ -2003,17 +2016,48 @@ private:
     return out;
   }
 
+  // An empty result from a schema-scoped tool has two causes that look
+  // identical and mean opposite things: the schema is empty, or it does not
+  // exist. bloat-and-vacuum-review defaults to "public", and on a database
+  // that has no public schema a caller following that default got {} and would
+  // reasonably conclude the schema is clean. Silence that reads as a healthy
+  // answer is the defect this release keeps finding, so it is named instead.
+  json no_such_schema(pqxx::work& txn, const std::string& schema) {
+    pqxx::result r = pqxx_exec(
+      txn, "SELECT 1 FROM pg_namespace WHERE nspname = $1", pqxx::params{schema});
+    if (!r.empty()) return {};
+    return {
+      {"error", "no such schema: \"" + schema + "\""},
+      {"hint", "listSchemas names every schema in this database. Names are case "
+               "sensitive here exactly as they are in the catalog, and a "
+               "database need not have a schema called \"public\" -- several "
+               "tools default to it, so an unexpected empty answer is worth "
+               "checking against listSchemas first."}
+    };
+  }
+
   const json schemas() {
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    // `tables` was every relation name in every schema. On a 24-schema
+    // database where one schema holds 1,816 tables that is an 89 kB payload
+    // over the client's limit, and the tool returns nothing -- which is the
+    // unbounded-payload defect §12 already had recorded against this exact
+    // tool. The count is what the summary question needs ("how big is this
+    // schema"); listTables is the tool that names them, and it takes one
+    // schema at a time precisely so its size is bounded by the caller.
+    std::string query = std::string(R"(
       SELECT JSONB_OBJECT_AGG(nspname,
               JSONB_BUILD_OBJECT(
+               'table_count', table_count,
                'tables', relnames,
+               'tables_truncated', table_count > )") + std::to_string(kSchemaTableNames) + R"(,
                'roles', COALESCE(roles, '{}'::jsonb)))
       FROM pg_namespace
-      LEFT JOIN LATERAL (SELECT JSONB_AGG(relname ORDER BY relname) AS relnames
+      LEFT JOIN LATERAL (SELECT count(*) AS table_count,
+                                to_jsonb((array_agg(relname ORDER BY relname))[1:)"
+                              + std::to_string(kSchemaTableNames) + R"(]) AS relnames
                          FROM pg_class
                          WHERE relnamespace = pg_namespace.oid
                            AND relkind IN ('r','m','f','p','v')) _lat1 ON true
@@ -2025,7 +2069,7 @@ private:
                                GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) _lat2 ON true
       WHERE nspname NOT LIKE 'pg_%'
         AND nspname <> 'information_schema'
-        AND relnames IS NOT NULL;
+        AND table_count > 0;
     )";
 
     pqxx::result res = txn.exec(query);
@@ -2084,7 +2128,8 @@ private:
       std::string pgsql_tables = res[0][0].as<std::string>();
       return json::parse(pgsql_tables);
     } else {
-      return {};
+      json missing = no_such_schema(txn, schema);
+      return missing.is_null() ? json::object() : missing;
     }
   }
 
@@ -2317,7 +2362,15 @@ private:
     }
   }
 
-  const json server_settings() {
+  // By default only settings that differ from their built-in default, which is
+  // the set that describes THIS server rather than PostgreSQL. all=true
+  // restores the full dump.
+  //
+  // Measured on a real cluster: 456 settings, 99 kB, past the client's payload
+  // limit -- so the tool returned nothing, and the ~40 settings that actually
+  // describe the machine went with the 400 that describe the software. This is
+  // the same set EXPLAIN (SETTINGS) reports, and for the same reason.
+  const json server_settings(const std::string& pattern, bool all) {
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
@@ -2337,11 +2390,13 @@ private:
                  ) ORDER BY name
                ) AS settings
         FROM pg_settings
+        WHERE ($1 = '' OR name ILIKE '%' || $1 || '%' OR category ILIKE '%' || $1 || '%')
+          AND ($2 OR source <> 'default' OR setting IS DISTINCT FROM boot_val)
         GROUP BY category
       ) s;
     )";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{pattern, all});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -5086,11 +5141,20 @@ private:
     }
   }
 
-  const json roles() {
+  // `pattern` narrows by name; without it the list is capped, ordered so the
+  // roles worth reading survive the cap.
+  //
+  // A multi-tenant cluster has one login role per tenant. Measured on a real
+  // one: 723 roles, 689 of them client_* with default attributes and no
+  // memberships, 165 kB -- past the client's payload limit, so the tool
+  // returned nothing and the interesting 34 went with it. Ordering by
+  // "carries a non-default attribute or a membership" first means the cap
+  // drops the identical crowd rather than the superusers.
+  const json roles(const std::string& pattern) {
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string query = std::string(R"(
       SELECT JSONB_OBJECT_AGG(
                r.rolname,
                JSONB_BUILD_OBJECT(
@@ -5107,7 +5171,17 @@ private:
                  'member_of',        COALESCE(member_of, '[]'::jsonb)
                )
              )
-      FROM pg_roles AS r
+      FROM (SELECT * FROM pg_roles AS r0
+             LEFT JOIN LATERAL (
+                 SELECT count(*) AS n_memberships
+                   FROM pg_auth_members AS m0 WHERE m0.member = r0.oid) _m ON true
+             WHERE ($1 = '' OR r0.rolname ILIKE '%' || $1 || '%')
+             ORDER BY (r0.rolsuper OR r0.rolcreaterole OR r0.rolcreatedb
+                       OR r0.rolreplication OR r0.rolbypassrls
+                       OR NOT r0.rolinherit OR r0.rolconnlimit <> -1
+                       OR r0.rolvaliduntil IS NOT NULL
+                       OR _m.n_memberships > 0) DESC, r0.rolname
+             LIMIT )") + std::to_string(kRoleLimit) + R"() AS r
       LEFT JOIN LATERAL (
           SELECT JSONB_AGG(g.rolname ORDER BY g.rolname) AS member_of
           FROM pg_auth_members AS m
@@ -5116,7 +5190,7 @@ private:
       ) _lat24 ON true;
     )";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{pattern});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -6850,7 +6924,8 @@ private:
 
     if (!res.empty() && !res[0][0].is_null())
       return json::parse(res[0][0].as<std::string>());
-    return {};
+    json missing = no_such_schema(txn, schema);
+    return missing.is_null() ? json::object() : missing;
   }
 
   // --- Measured size: the gated tier --------------------------------------
@@ -6928,7 +7003,8 @@ private:
 
     if (!res.empty() && !res[0][0].is_null())
       return json::parse(res[0][0].as<std::string>());
-    return {};
+    json missing = no_such_schema(txn, schema);
+    return missing.is_null() ? json::object() : missing;
   }
 
   // The three _meta keys the stateless revision defines, and the revision
