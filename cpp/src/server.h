@@ -199,6 +199,86 @@ private:
   std::thread reaper_;
 };
 
+// Every PostgreSQL feature this server's SQL depends on, named, with the
+// release that introduced it.
+//
+// Before 4.3.0 these were twenty-nine bare comparisons against 150000,
+// 160000, 170000 and 180000, scattered through five thousand lines of query
+// methods. Supporting a new major meant grepping for magic numbers and
+// trusting that the grep was complete; and the numbers said which release
+// without ever saying which *feature*, so a reader had to reconstruct the
+// reason from the SQL beside them.
+//
+// Adding PostgreSQL 19 is now reading one table. So is answering "what does
+// this server lack", which nothing could previously ask.
+enum class Feature {
+  // 15
+  SubTwoPhase,              // pg_subscription.subtwophasestate
+  SubscriptionStatsView,    // pg_stat_subscription_stats
+  // 16
+  PgStatIo,                 // the pg_stat_io view
+  GenericPlan,              // EXPLAIN (GENERIC_PLAN)
+  BufferCacheSummary,       // pg_buffercache 1.4's summary functions
+  SlotConflicting,          // pg_replication_slots.conflicting
+  SubOrigin,                // pg_subscription.suborigin
+  SubLeaderPid,             // pg_stat_subscription.leader_pid
+  TableStatsSeqScanDetail,  // n_tup_newpage_upd, last_seq_scan
+  IndexLastScan,            // pg_stat_all_indexes.last_idx_scan
+  // 17
+  WaitEventDescriptions,    // pg_wait_events
+  SlotInvalidationReason,   // pg_replication_slots.invalidation_reason
+  StatementStatsSince,      // pg_stat_statements.stats_since
+  VacuumProgressBytes,      // dead tuple counts became byte counts
+  Checkpointer,             // pg_stat_checkpointer split from pg_stat_bgwriter
+  SubFailover,              // pg_subscription.subfailover
+  SubWorkerType,            // pg_stat_subscription.worker_type
+  MaintainPrivilege,        // the MAINTAIN table privilege
+  // 18
+  ActivityParallelWorkers,  // parallel_workers_to_launch / _launched
+  StatementStatsWalBuffers, // wal_buffers_full and the parallel columns
+  BackendIo,                // pg_stat_get_backend_io
+  IoByteCounters,           // read_bytes / write_bytes / extend_bytes
+  RelAllFrozen,             // pg_class.relallfrozen, total_vacuum_time
+  WalIoMovedToPgStatIo,     // pg_stat_wal lost wal_write/wal_sync here
+  CheckpointerNumDone,      // pg_stat_checkpointer.num_done, slru_written
+  SubConflictCounters,      // the seven confl_* counters
+};
+
+constexpr int feature_since(Feature f) {
+  switch (f) {
+    case Feature::SubTwoPhase:
+    case Feature::SubscriptionStatsView:    return 150000;
+
+    case Feature::PgStatIo:
+    case Feature::GenericPlan:
+    case Feature::BufferCacheSummary:
+    case Feature::SlotConflicting:
+    case Feature::SubOrigin:
+    case Feature::SubLeaderPid:
+    case Feature::TableStatsSeqScanDetail:
+    case Feature::IndexLastScan:            return 160000;
+
+    case Feature::WaitEventDescriptions:
+    case Feature::SlotInvalidationReason:
+    case Feature::StatementStatsSince:
+    case Feature::VacuumProgressBytes:
+    case Feature::Checkpointer:
+    case Feature::SubFailover:
+    case Feature::SubWorkerType:
+    case Feature::MaintainPrivilege:        return 170000;
+
+    case Feature::ActivityParallelWorkers:
+    case Feature::StatementStatsWalBuffers:
+    case Feature::BackendIo:
+    case Feature::IoByteCounters:
+    case Feature::RelAllFrozen:
+    case Feature::WalIoMovedToPgStatIo:
+    case Feature::CheckpointerNumDone:
+    case Feature::SubConflictCounters:      return 180000;
+  }
+  return 0;  // unreachable; every enumerator is listed above
+}
+
 class Session {
 public:
   // timeout_ms overrides the connection's configured statement ceiling; omit it
@@ -327,6 +407,10 @@ public:
   // that don't exist on older majors; correct per connection, which matters
   // when different configured connections point at different-version servers.
   int server_version() const { return conn_->server_version(); }
+
+  // Does this server have the feature, rather than "is this server new
+  // enough" -- the call site then says why it is branching.
+  bool has(Feature f) const { return server_version() >= feature_since(f); }
 
   // txn_ is destroyed before conn_, rolling back; conn_ then disconnects.
   // Every session ends in ROLLBACK, explicitly. pqxx::work already aborts an
@@ -4232,9 +4316,9 @@ private:
     // pg_wait_events (PostgreSQL 17+) carries a prose description of every
     // wait event, which is what turns an opaque name like "BufFileRead" into
     // something actionable without leaving the tool output.
-    const std::string wait_desc = sess.server_version() >= 170000
+    const std::string wait_desc = sess.has(Feature::WaitEventDescriptions)
       ? ", 'wait_event_description', we.description" : "";
-    const std::string wait_join = sess.server_version() >= 170000
+    const std::string wait_join = sess.has(Feature::WaitEventDescriptions)
       ? R"(LEFT JOIN pg_wait_events AS we
              ON we.type = a.wait_event_type AND we.name = a.wait_event)"
       : "";
@@ -4402,9 +4486,9 @@ private:
     // (PostgreSQL 14+), a different view from pg_replication_slots: they show
     // logical decoding spilling large transactions to disk, which is invisible
     // in the slot's own row and is a common, silent throughput cliff.
-    const std::string conflicting = sess.server_version() >= 160000
+    const std::string conflicting = sess.has(Feature::SlotConflicting)
       ? ", 'conflicting', s.conflicting" : "";
-    const std::string invalidation = sess.server_version() >= 170000
+    const std::string invalidation = sess.has(Feature::SlotInvalidationReason)
       ? ", 'invalidation_reason', s.invalidation_reason, 'inactive_since', s.inactive_since"
       : "";
 
@@ -4460,7 +4544,7 @@ private:
     // parallel_workers_launched falling short of parallel_workers_to_launch
     // (PostgreSQL 18+) means queries planned for parallelism ran without it,
     // because max_parallel_workers was exhausted.
-    const std::string parallel = sess.server_version() >= 180000
+    const std::string parallel = sess.has(Feature::ActivityParallelWorkers)
       ? R"(, 'parallel_workers_to_launch', parallel_workers_to_launch,
             'parallel_workers_launched',  parallel_workers_launched)"
       : "";
@@ -4557,10 +4641,10 @@ private:
     // in the cluster but the slowest of those that survived eviction -- a
     // difference that cannot be inferred from the rows themselves, which is
     // why it is returned alongside them.
-    const std::string since = sess.server_version() >= 170000
+    const std::string since = sess.has(Feature::StatementStatsSince)
       ? ", 'stats_since', pss.stats_since, 'minmax_stats_since', pss.minmax_stats_since"
       : "";
-    const std::string pg18 = sess.server_version() >= 180000
+    const std::string pg18 = sess.has(Feature::StatementStatsWalBuffers)
       ? R"(, 'wal_buffers_full', pss.wal_buffers_full,
             'parallel_workers_to_launch', pss.parallel_workers_to_launch,
             'parallel_workers_launched', pss.parallel_workers_launched)"
@@ -4679,7 +4763,7 @@ private:
     // measure different things (tuple counts against bytes), so they are
     // reported under their own names rather than pretended to be one field,
     // with 'dead_tuple_unit' saying which the server produced.
-    const bool v17 = sess.server_version() >= 170000;
+    const bool v17 = sess.has(Feature::VacuumProgressBytes);
     const std::string vacuum_dead = v17
       ? R"('dead_tuple_unit',     'bytes',
            'max_dead_tuple_bytes', v.max_dead_tuple_bytes,
@@ -4822,7 +4906,7 @@ private:
 
     // pg_stat_io arrived in PostgreSQL 16. Saying so plainly beats an
     // undefined-table error, and matches how a missing extension is reported.
-    if (sess.server_version() < 160000) {
+    if (!sess.has(Feature::PgStatIo)) {
       return {
         {"error", "pg_stat_io requires PostgreSQL 16 or newer"},
         {"hint", "this server is older; use checkpointStats for the "
@@ -4833,7 +4917,7 @@ private:
     }
     // Per-backend I/O is not a filter over pg_stat_io -- the view has no pid
     // column at all. It is a separate function, added in PostgreSQL 18.
-    if (pid > 0 && sess.server_version() < 180000) {
+    if (pid > 0 && !sess.has(Feature::BackendIo)) {
       return {
         {"error", "per-backend I/O statistics require PostgreSQL 18 or newer"},
         {"hint", "pg_stat_io is aggregated across backends and has no pid "
@@ -4850,7 +4934,7 @@ private:
     // before that, a block count times op_bytes was the only way to get bytes,
     // and op_bytes itself is gone in 18. Reporting the byte columns only where
     // they exist avoids inventing a number on older servers.
-    const std::string bytes = sess.server_version() >= 180000
+    const std::string bytes = sess.has(Feature::IoByteCounters)
       ? R"(, 'read_bytes', read_bytes, 'write_bytes', write_bytes,
             'extend_bytes', extend_bytes)"
       : "";
@@ -4956,14 +5040,14 @@ private:
     // a very different problem from the same age with nothing frozen.
     // total_autovacuum_time answers the next question -- whether autovacuum
     // has been trying and failing to keep up, or has simply never run.
-    const std::string pg18_cols = sess.server_version() >= 180000
+    const std::string pg18_cols = sess.has(Feature::RelAllFrozen)
       ? R"(, 'frozen_percent',
               round(100.0 * r.relallfrozen / NULLIF(r.relpages, 0), 1),
             'relallfrozen', r.relallfrozen,
             'total_vacuum_time_ms', r.total_vacuum_time,
             'total_autovacuum_time_ms', r.total_autovacuum_time)"
       : "";
-    const std::string pg18_sel = sess.server_version() >= 180000
+    const std::string pg18_sel = sess.has(Feature::RelAllFrozen)
       ? R"(, c.relallfrozen, c.relpages,
             s.total_vacuum_time, s.total_autovacuum_time)"
       : "";
@@ -5201,12 +5285,12 @@ private:
     // buffer counts to pg_stat_io. Field names are normalized across both
     // shapes so a caller never has to branch on the server version; 'source'
     // says which views produced the numbers.
-    const bool split = sess.server_version() >= 170000;
+    const bool split = sess.has(Feature::Checkpointer);
 
     // pg_stat_wal lost wal_write/wal_sync and their timings in PostgreSQL 18,
     // where they moved to pg_stat_io. The remaining four columns exist on
     // every supported major.
-    const std::string wal_timing = sess.server_version() < 180000
+    const std::string wal_timing = !sess.has(Feature::WalIoMovedToPgStatIo)
       ? R"(, 'wal_write', w.wal_write,
             'wal_sync', w.wal_sync,
             'wal_write_time_ms', w.wal_write_time,
@@ -5215,7 +5299,7 @@ private:
 
     // num_done and slru_written are PostgreSQL 18 additions to
     // pg_stat_checkpointer; the rest of the view is unchanged since 17.
-    const std::string ckpt_pg18 = sess.server_version() >= 180000
+    const std::string ckpt_pg18 = sess.has(Feature::CheckpointerNumDone)
       ? "'checkpoints_done', c.num_done, 'slru_written', c.slru_written,"
       : "";
 
@@ -5810,7 +5894,7 @@ private:
           // GENERIC_PLAN is PostgreSQL 16+. On older servers attempting it
           // yields a confusing "unrecognized EXPLAIN option" rather than the
           // real problem, so short-circuit with the actionable hint instead.
-          if (sess.server_version() < 160000) {
+          if (!sess.has(Feature::GenericPlan)) {
             json out = {
               {"error", "the statement has $n placeholders and no params were supplied"},
               {"hint", "supply values via the params argument so the statement can be "
@@ -6254,7 +6338,7 @@ private:
       // Two different problems that look alike. pg_buffercache 1.4 shipped with
       // PostgreSQL 16, so on 14 and 15 there is no 1.4 to update to and
       // "ALTER EXTENSION ... UPDATE" would send the operator in a circle.
-      if (sess.server_version() < 160000) {
+      if (!sess.has(Feature::BufferCacheSummary)) {
         return {
           {"error", "pg_buffercache_summary() was added in pg_buffercache 1.4, "
                     "which ships with PostgreSQL 16. This server has "
@@ -7033,13 +7117,12 @@ private:
     // server that has no such column: absent means "this server cannot answer",
     // which is not what a null would say. subbinary and substream are PG14, the
     // supported floor.
-    const int v = sess.server_version();
     const std::string opt =
-      std::string(v >= 150000 ? ", 'two_phase', subtwophasestate"
+      std::string(sess.has(Feature::SubTwoPhase) ? ", 'two_phase', subtwophasestate"
                                 ", 'disable_on_error', subdisableonerr" : "") +
-                 (v >= 160000 ? ", 'origin', suborigin"
+                 (sess.has(Feature::SubOrigin) ? ", 'origin', suborigin"
                                 ", 'run_as_owner', subrunasowner" : "") +
-                 (v >= 170000 ? ", 'failover', subfailover" : "");
+                 (sess.has(Feature::SubFailover) ? ", 'failover', subfailover" : "");
     std::string query =
       "SELECT JSONB_OBJECT_AGG(subname, JSONB_BUILD_OBJECT("
       "  'owner',              subowner::regrole::text"
@@ -7086,25 +7169,24 @@ private:
   const json subscription_stats() {
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
-    const int v = sess.server_version();
 
     // worker_type is PG17. Below it the type is inferred from whether the
     // worker is bound to a relation, which is what the pre-17 idiom was. That
     // collapses 'parallel apply' into 'apply' -- both are apply workers with a
     // null relid -- and leader_pid still tells them apart on 16.
     const std::string worker_type =
-      v >= 170000 ? "st.worker_type"
+      sess.has(Feature::SubWorkerType) ? "st.worker_type"
                   : "CASE WHEN st.relid IS NOT NULL THEN 'table synchronization' "
                     "ELSE 'apply' END";
-    const std::string leader_pid = v >= 160000 ? "st.leader_pid" : "NULL::int";
+    const std::string leader_pid = sess.has(Feature::SubLeaderPid) ? "st.leader_pid" : "NULL::int";
 
     // pg_stat_subscription_stats is PG15. On 14, the supported floor, the view
     // does not exist at all, so the whole errors key is omitted rather than
     // returned as nulls: absent means "this server cannot answer", which is
     // not the same as zero errors.
-    const bool has_stats = v >= 150000;
+    const bool has_stats = sess.has(Feature::SubscriptionStatsView);
     // The seven conflict counters are PG18.
-    const std::string conflicts = v >= 180000 ?
+    const std::string conflicts = sess.has(Feature::SubConflictCounters) ?
       ", 'conflicts', JSONB_BUILD_OBJECT("
       "   'insert_exists',             ss.confl_insert_exists"
       " , 'update_origin_differs',     ss.confl_update_origin_differs"
@@ -7223,7 +7305,6 @@ private:
                                const std::string& object) {
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
-    const int v = sess.server_version();
 
     // A role that does not exist makes every has_*_privilege call raise, so it
     // is established first and reported as a fact rather than an error: "no
@@ -7249,7 +7330,7 @@ private:
     // MAINTAIN is PostgreSQL 17. Asking for it on an older server raises
     // rather than returning false, so it is gated rather than probed.
     const std::string maintain =
-      v >= 170000 ? ", 'MAINTAIN', has_table_privilege($1, c.oid, 'MAINTAIN')" : "";
+      sess.has(Feature::MaintainPrivilege) ? ", 'MAINTAIN', has_table_privilege($1, c.oid, 'MAINTAIN')" : "";
 
     pqxx::result rel = pqxx_exec(txn,
       "SELECT JSONB_BUILD_OBJECT("
@@ -8052,7 +8133,7 @@ private:
 
     // Each EXPLAIN runs inside a savepoint so that a failing statement leaves
     // the transaction usable -- the reset on the way out needs it alive.
-    const bool pg16 = sess.server_version() >= 160000;
+    const bool pg16 = sess.has(Feature::GenericPlan);
     auto plan_of = [&]() -> json {
       try {
         pqxx::subtransaction sub{txn};
@@ -8314,7 +8395,7 @@ private:
   // the last sequential scan, which turns a large seq_scan count into something
   // actionable.
   static std::string stats_pg16_fragment(int server_version) {
-    return server_version >= 160000
+    return server_version >= feature_since(Feature::TableStatsSeqScanDetail)
       ? R"(, 'n_tup_newpage_upd', s.n_tup_newpage_upd,
             'last_seq_scan', s.last_seq_scan)"
       : "";
@@ -8359,7 +8440,7 @@ private:
     // finished query, which is what the pre-4.0.0 tableDetails did: if the two
     // ever drifted the erase silently did nothing and the pg14/pg15 jobs failed
     // on an undefined column.
-    const std::string idx_pg16 = sess.server_version() >= 160000
+    const std::string idx_pg16 = sess.has(Feature::IndexLastScan)
       ? R"(, 'last_use', si.last_idx_scan)" : "";
 
     std::string query = std::string(R"(
