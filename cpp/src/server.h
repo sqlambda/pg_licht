@@ -569,7 +569,8 @@ public:
   const json call_type_detail(const std::string& schema, const std::string& type_name) {
     return type_detail(schema, type_name);
   }
-  const json call_roles() { return roles(); }
+  const json call_roles() { return roles(""); }
+  const json call_roles(const std::string& pattern) { return roles(pattern); }
   const json call_foreign_tables(const std::string& schema) { return foreign_tables(schema); }
   const json call_foreign_servers() { return foreign_servers(); }
   const json call_tablespaces() { return tablespaces(); }
@@ -593,7 +594,8 @@ public:
   const json call_sequences(const std::string& schema) { return sequences(schema); }
   const json call_extensions() { return extensions(); }
   const json call_database_size() { return database_size(); }
-  const json call_server_settings() { return server_settings(); }
+  const json call_server_settings() { return server_settings("", false); }
+  const json call_server_settings(const std::string& p, bool all) { return server_settings(p, all); }
   const json call_activity() { return activity(0, "", 0, ""); }
   const json call_activity(int pid, const std::string& query_id,
                            double min_duration_s, const std::string& state) {
@@ -718,6 +720,28 @@ private:
 
   // Bounded connect for the tools that sweep every configured connection.
   static constexpr int kSweepConnectTimeoutSeconds = 5;
+
+  // How many role or database names travel with a collapsed override group
+  // before the count stands in for them. Small on purpose: the names are
+  // useful for the handful of roles that differ, and the reason this exists at
+  // all is that an unbounded list of them exceeded the client's payload limit.
+  static constexpr int kOverrideNames = 5;
+
+  // How many relation names listSchemas carries per schema before table_count
+  // stands in for them. listTables is the tool that names every table in one
+  // schema; this one summarises every schema, and a full name list per schema
+  // is quadratic in exactly the direction that breaks.
+  static constexpr int kSchemaTableNames = 25;
+
+  // How many roles listRoles returns without a pattern. Ordered so the ones
+  // carrying an attribute or a membership come first, because those are the
+  // ones a cap must not drop.
+  static constexpr int kRoleLimit = 200;
+
+  // How many member tables listPublications names per publication. A
+  // publication FOR ALL TABLES expands to the whole database, so the list is
+  // unbounded by construction and the count is the answer that scales.
+  static constexpr int kPublicationTableNames = 50;
 
   // The current sweep member's config, carrying the bounded connect.
   //
@@ -1527,9 +1551,9 @@ private:
 
     if (seg.size() == 2 && seg[1] == "schemas")               return schemas();
     if (seg.size() == 3 && seg[1] == "server") {
-      if (seg[2] == "roles")      return roles();
+      if (seg[2] == "roles")      return roles("");
       if (seg[2] == "extensions") return extensions();
-      if (seg[2] == "settings")   return server_settings();
+      if (seg[2] == "settings")   return server_settings("", false);
     }
     if (seg[1] == "schema" && seg.size() >= 3) {
       const std::string& sch = seg[2];
@@ -1997,17 +2021,48 @@ private:
     return out;
   }
 
+  // An empty result from a schema-scoped tool has two causes that look
+  // identical and mean opposite things: the schema is empty, or it does not
+  // exist. bloat-and-vacuum-review defaults to "public", and on a database
+  // that has no public schema a caller following that default got {} and would
+  // reasonably conclude the schema is clean. Silence that reads as a healthy
+  // answer is the defect this release keeps finding, so it is named instead.
+  json no_such_schema(pqxx::work& txn, const std::string& schema) {
+    pqxx::result r = pqxx_exec(
+      txn, "SELECT 1 FROM pg_namespace WHERE nspname = $1", pqxx::params{schema});
+    if (!r.empty()) return {};
+    return {
+      {"error", "no such schema: \"" + schema + "\""},
+      {"hint", "listSchemas names every schema in this database. Names are case "
+               "sensitive here exactly as they are in the catalog, and a "
+               "database need not have a schema called \"public\" -- several "
+               "tools default to it, so an unexpected empty answer is worth "
+               "checking against listSchemas first."}
+    };
+  }
+
   const json schemas() {
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    // `tables` was every relation name in every schema. On a 24-schema
+    // database where one schema holds 1,816 tables that is an 89 kB payload
+    // over the client's limit, and the tool returns nothing -- which is the
+    // unbounded-payload defect §12 already had recorded against this exact
+    // tool. The count is what the summary question needs ("how big is this
+    // schema"); listTables is the tool that names them, and it takes one
+    // schema at a time precisely so its size is bounded by the caller.
+    std::string query = std::string(R"(
       SELECT JSONB_OBJECT_AGG(nspname,
               JSONB_BUILD_OBJECT(
+               'table_count', table_count,
                'tables', relnames,
+               'tables_truncated', table_count > )") + std::to_string(kSchemaTableNames) + R"(,
                'roles', COALESCE(roles, '{}'::jsonb)))
       FROM pg_namespace
-      LEFT JOIN LATERAL (SELECT JSONB_AGG(relname ORDER BY relname) AS relnames
+      LEFT JOIN LATERAL (SELECT count(*) AS table_count,
+                                to_jsonb((array_agg(relname ORDER BY relname))[1:)"
+                              + std::to_string(kSchemaTableNames) + R"(]) AS relnames
                          FROM pg_class
                          WHERE relnamespace = pg_namespace.oid
                            AND relkind IN ('r','m','f','p','v')) _lat1 ON true
@@ -2019,7 +2074,7 @@ private:
                                GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) _lat2 ON true
       WHERE nspname NOT LIKE 'pg_%'
         AND nspname <> 'information_schema'
-        AND relnames IS NOT NULL;
+        AND table_count > 0;
     )";
 
     pqxx::result res = txn.exec(query);
@@ -2078,7 +2133,8 @@ private:
       std::string pgsql_tables = res[0][0].as<std::string>();
       return json::parse(pgsql_tables);
     } else {
-      return {};
+      json missing = no_such_schema(txn, schema);
+      return missing.is_null() ? json::object() : missing;
     }
   }
 
@@ -2311,7 +2367,15 @@ private:
     }
   }
 
-  const json server_settings() {
+  // By default only settings that differ from their built-in default, which is
+  // the set that describes THIS server rather than PostgreSQL. all=true
+  // restores the full dump.
+  //
+  // Measured on a real cluster: 456 settings, 99 kB, past the client's payload
+  // limit -- so the tool returned nothing, and the ~40 settings that actually
+  // describe the machine went with the 400 that describe the software. This is
+  // the same set EXPLAIN (SETTINGS) reports, and for the same reason.
+  const json server_settings(const std::string& pattern, bool all) {
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
@@ -2331,11 +2395,13 @@ private:
                  ) ORDER BY name
                ) AS settings
         FROM pg_settings
+        WHERE ($1 = '' OR name ILIKE '%' || $1 || '%' OR category ILIKE '%' || $1 || '%')
+          AND ($2 OR source <> 'default' OR setting IS DISTINCT FROM boot_val)
         GROUP BY category
       ) s;
     )";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{pattern, all});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -3263,7 +3329,7 @@ private:
     // what the INCLUDE coverage test compares against: an included column is
     // covered by a key column of the wider index regardless of how that key is
     // sorted or compared.
-    std::string query = R"(
+    std::string query = std::string(R"(
       WITH idx AS (
         SELECT i.indexrelid,
                i.indrelid,
@@ -3304,7 +3370,7 @@ private:
         WHERE n.nspname = $1
           AND ($2 = '' OR tc.relname = $2)
       )
-      SELECT JSONB_BUILD_OBJECT(
+      SELECT JSONB_BUILD_OBJECT()" + std::string(kCountersSince) + R"(,
         'identical', COALESCE((
           SELECT JSONB_AGG(g ORDER BY g->>'table')
           FROM (
@@ -3372,7 +3438,7 @@ private:
             ORDER BY a.indexrelid, b.size
           ) AS red), '[]'::jsonb)
       );
-    )";
+    )");
 
     pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, table_name});
 
@@ -3627,7 +3693,7 @@ private:
     // rather than leaving every caller to rediscover it. A negative setting
     // means "derive from another GUC" (autovacuum_work_mem = -1) and yields a
     // null byte count rather than a negative one.
-    std::string query = R"(
+    std::string query = std::string(R"(
       WITH host AS (
         SELECT NULLIF($1, '')::bigint AS ram_bytes,
                NULLIF($2, '')::int    AS vcpus
@@ -3699,16 +3765,47 @@ private:
         -- Every per-role and per-database override, not only work_mem: a
         -- statement_timeout of 0 on one role explains as much as a memory
         -- setting does, and none of it is visible in `settings` above.
-        'overrides', COALESCE((SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
-                        'scope', CASE WHEN database = '' AND role = '' THEN 'cluster'
-                                      WHEN database = '' THEN 'role'
-                                      WHEN role = ''     THEN 'database'
-                                      ELSE 'role_in_database' END,
-                        'database', NULLIF(database, ''),
-                        'role',     NULLIF(role, ''),
-                        'name',     name,
-                        'value',    value) ORDER BY name, database, role)
-                      FROM ovr), '[]'::jsonb),
+        --
+        -- Collapsed by (scope, name, value), which is the only grouping that
+        -- loses nothing: two roles with DIFFERENT values stay separate rows,
+        -- and the whole reason to read this is to find a value that differs
+        -- from the global one. What collapses is repetition -- 4.2.1 returned
+        -- one row per role and on a multi-tenant cluster that is one row per
+        -- tenant. Measured on a real 723-role database: 701 rows, 698 of them
+        -- the same search_path, 105 kB, over the client's payload limit, so
+        -- the tool returned nothing at all and took capacity-check and
+        -- triage-active-sessions down with it. The three overrides that
+        -- mattered were in the other 3 rows.
+        --
+        -- roles/databases carry the names up to kOverrideNames, then the count
+        -- stands in for them. A count is what the question actually needs
+        -- ("does anything override work_mem, and how much of the fleet"), and
+        -- an unbounded name list is how this broke in the first place.
+        'overrides', COALESCE((
+          SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                   'scope',     g.scope,
+                   'name',      g.name,
+                   'value',     g.value,
+                   'count',     g.n,
+                   'roles',     g.roles,
+                   'databases', g.databases,
+                   'names_truncated', g.n > )" + std::to_string(kOverrideNames) + R"()
+                 ORDER BY g.name, g.value)
+            FROM (
+              SELECT CASE WHEN database = '' AND role = '' THEN 'cluster'
+                          WHEN database = '' THEN 'role'
+                          WHEN role = ''     THEN 'database'
+                          ELSE 'role_in_database' END               AS scope,
+                     name,
+                     value,
+                     count(*)                                       AS n,
+                     to_jsonb((array_remove(array_agg(NULLIF(role, '')
+                                            ORDER BY role), NULL)
+                              )[1:)" + std::to_string(kOverrideNames) + R"(])     AS roles,
+                     to_jsonb((array_remove(array_agg(DISTINCT NULLIF(database, '')), NULL)
+                              )[1:)" + std::to_string(kOverrideNames) + R"(])     AS databases
+                FROM ovr
+               GROUP BY 1, 2, 3) AS g), '[]'::jsonb),
         'settings', (SELECT JSONB_OBJECT_AGG(name, JSONB_BUILD_OBJECT(
                         'setting', setting, 'unit', unit, 'bytes', bytes)) FROM g),
         'derived', (SELECT JSONB_BUILD_OBJECT(
@@ -3758,7 +3855,7 @@ private:
           'application". committed_worst_case uses the largest work_mem any role is '
           'configured with, not this session''s.')
       );
-    )";
+    )");
 
     pqxx::result res = pqxx_exec(
       txn, query,
@@ -4190,6 +4287,34 @@ private:
       if (ss == "42P02")
         return {{"error", "the statement has parameters that could not be planned generically"},
                 {"hint", "supply values via the params argument"},
+                {"detail", e.what()}};
+      // 42883 on a statement recovered from pg_stat_statements is almost always
+      // the normalization, not the statement. Normalizing replaces every
+      // literal with $n and strips its type, so a placeholder in a position
+      // where nothing constrains it -- CASE WHEN ... THEN $6 ELSE $7 is the
+      // usual one -- is assigned text at PARSE time and the operator lookup
+      // fails before any value is bound. Supplying params cannot fix that,
+      // which is the part worth saying: without it a caller retries with
+      // params, gets the identical error, and has no way to tell whether the
+      // params were even applied.
+      if (ss == "42883")
+        return {{"error", "the statement references an operator or function that "
+                          "does not exist for the types PostgreSQL inferred"},
+                {"params_supplied", !params.empty()},
+                {"hint", std::string(
+                   params.empty()
+                     ? "supply values via the params argument if the types are "
+                       "inferable. "
+                     : "params WERE applied and did not help, which is the "
+                       "expected outcome here. ") +
+                   "If this statement came from pg_stat_statements, the cause is "
+                   "usually normalization rather than the statement: replacing a "
+                   "literal with $n strips its type, and a placeholder nothing "
+                   "constrains (typically CASE WHEN ... THEN $n ELSE $n) is "
+                   "assigned text when the statement is parsed -- before any "
+                   "value is bound, so no params argument can change it. Pass the "
+                   "statement to 'sql' with the literals written back in, or add "
+                   "explicit casts such as $1::numeric, and it will plan."},
                 {"detail", e.what()}};
       if (ss == "42P01")
         return {{"error", "a relation referenced by the statement does not exist"},
@@ -5049,11 +5174,20 @@ private:
     }
   }
 
-  const json roles() {
+  // `pattern` narrows by name; without it the list is capped, ordered so the
+  // roles worth reading survive the cap.
+  //
+  // A multi-tenant cluster has one login role per tenant. Measured on a real
+  // one: 723 roles, 689 of them client_* with default attributes and no
+  // memberships, 165 kB -- past the client's payload limit, so the tool
+  // returned nothing and the interesting 34 went with it. Ordering by
+  // "carries a non-default attribute or a membership" first means the cap
+  // drops the identical crowd rather than the superusers.
+  const json roles(const std::string& pattern) {
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string query = std::string(R"(
       SELECT JSONB_OBJECT_AGG(
                r.rolname,
                JSONB_BUILD_OBJECT(
@@ -5070,7 +5204,17 @@ private:
                  'member_of',        COALESCE(member_of, '[]'::jsonb)
                )
              )
-      FROM pg_roles AS r
+      FROM (SELECT * FROM pg_roles AS r0
+             LEFT JOIN LATERAL (
+                 SELECT count(*) AS n_memberships
+                   FROM pg_auth_members AS m0 WHERE m0.member = r0.oid) _m ON true
+             WHERE ($1 = '' OR r0.rolname ILIKE '%' || $1 || '%')
+             ORDER BY (r0.rolsuper OR r0.rolcreaterole OR r0.rolcreatedb
+                       OR r0.rolreplication OR r0.rolbypassrls
+                       OR NOT r0.rolinherit OR r0.rolconnlimit <> -1
+                       OR r0.rolvaliduntil IS NOT NULL
+                       OR _m.n_memberships > 0) DESC, r0.rolname
+             LIMIT )") + std::to_string(kRoleLimit) + R"() AS r
       LEFT JOIN LATERAL (
           SELECT JSONB_AGG(g.rolname ORDER BY g.rolname) AS member_of
           FROM pg_auth_members AS m
@@ -5079,7 +5223,7 @@ private:
       ) _lat24 ON true;
     )";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{pattern});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -5249,7 +5393,15 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    // The same unbounded expansion listSchemas had, and it is worse here:
+    // FOR ALL TABLES resolves through pg_publication_tables to every table in
+    // the database, so a publication declared in one line expands to thousands
+    // of names. Past the client's payload limit the tool returns nothing, so a
+    // cluster with one big publication reports no publications at all.
+    //
+    // table_count is what the question needs -- "is this publication carrying
+    // what I think" -- and all_tables already says the list is the catalog.
+    std::string query = std::string(R"(
       SELECT JSONB_OBJECT_AGG(
                p.pubname,
                JSONB_BUILD_OBJECT(
@@ -5259,12 +5411,17 @@ private:
                  'update',     p.pubupdate,
                  'delete',     p.pubdelete,
                  'truncate',   p.pubtruncate,
-                 'tables',     COALESCE(tables, '[]'::jsonb)
+                 'table_count', COALESCE(table_count, 0),
+                 'tables',     COALESCE(tables, '[]'::jsonb),
+                 'tables_truncated', COALESCE(table_count, 0) > )") + std::to_string(kPublicationTableNames) + R"(
                )
              )
       FROM pg_publication AS p
       LEFT JOIN LATERAL (
-          SELECT JSONB_AGG(pt.schemaname || '.' || pt.tablename) AS tables
+          SELECT count(*) AS table_count,
+                 to_jsonb((array_agg(pt.schemaname || '.' || pt.tablename
+                                     ORDER BY pt.schemaname, pt.tablename)
+                          )[1:)" + std::to_string(kPublicationTableNames) + R"(]) AS tables
           FROM pg_publication_tables AS pt
           WHERE pt.pubname = p.pubname
       ) _lat26 ON true;
@@ -6662,6 +6819,24 @@ private:
   //
   // estimated_from stays a GREATEST of all four, and that merge is correct:
   // it dates relpages and reltuples, which any of the four refreshes equally.
+  // A scan counter is meaningless without the window it covers, and
+  // pg_stat_reset() zeroes idx_scan and seq_scan along with everything else.
+  // An index reported with idx_scan = 0 four days after a reset is an index
+  // nothing has used FOR FOUR DAYS -- which for a month-end report, a
+  // quarterly job or a failover path is indistinguishable from one nothing has
+  // ever used, and the difference decides whether dropping it is safe. This
+  // has already produced a wrong recommendation on a real database: a 1.9 GB
+  // index proposed for dropping on the strength of a zero that was four days
+  // old.
+  //
+  // Reported as a lower bound rather than a guarantee:
+  // pg_stat_reset_single_table_counters() zeroes one relation without touching
+  // pg_stat_database.stats_reset, so a null or old value here does not prove
+  // the counters beside it are that old. It does prove they are no older.
+  static constexpr const char* kCountersSince =
+    "'counters_since', (SELECT stats_reset FROM pg_stat_database"
+    "                    WHERE datname = current_database())";
+
   static constexpr const char* kTableStatsCommon = R"(
                'rows', c.reltuples,
                'size_estimate', c.relpages::bigint * current_setting('block_size')::bigint,
@@ -6691,7 +6866,7 @@ private:
 
     std::string query = std::string(R"(
       SELECT JSONB_BUILD_OBJECT(
-               'table', c.relname,)") + kTableStatsCommon + pg16 + R"(,
+               'table', c.relname,)") + kCountersSince + "," + kTableStatsCommon + pg16 + R"(,
                'columns', COALESCE(columns, '{}'::jsonb),
                -- pg_stats returns NO ROW for a table whose RLS is active for
                -- this role, so every per-column statistic below comes back null
@@ -6795,7 +6970,8 @@ private:
 
     if (!res.empty() && !res[0][0].is_null())
       return json::parse(res[0][0].as<std::string>());
-    return {};
+    json missing = no_such_schema(txn, schema);
+    return missing.is_null() ? json::object() : missing;
   }
 
   // --- Measured size: the gated tier --------------------------------------
@@ -6873,7 +7049,8 @@ private:
 
     if (!res.empty() && !res[0][0].is_null())
       return json::parse(res[0][0].as<std::string>());
-    return {};
+    json missing = no_such_schema(txn, schema);
+    return missing.is_null() ? json::object() : missing;
   }
 
   // The three _meta keys the stateless revision defines, and the revision

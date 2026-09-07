@@ -493,9 +493,17 @@ TEST_F(PostgresMCPServerTest, TableWithNoIndexesIsIncluded) {
   EXPECT_EQ(result["bare_notes"]["index_count"].get<int>(), 0);
 }
 
-TEST_F(PostgresMCPServerTest, TablesUnknownSchemaReturnsEmpty) {
+// Renamed from TablesUnknownSchemaReturnsEmpty in 4.2.2, because returning
+// empty was the defect. A missing schema and an empty one produced the same
+// {}, and bloat-and-vacuum-review defaults to "public" -- which several
+// databases do not have, so a caller following the default read silence as a
+// clean schema.
+TEST_F(PostgresMCPServerTest, TablesUnknownSchemaIsNamedNotEmpty) {
   json result = srv->call_tables("does_not_exist_schema");
-  EXPECT_TRUE(result.empty() || result.is_null());
+  ASSERT_TRUE(result.contains("error")) << result.dump(2);
+  EXPECT_NE(result["error"].get<std::string>().find("does_not_exist_schema"),
+            std::string::npos);
+  EXPECT_TRUE(result.contains("hint"));
 }
 
 TEST_F(PostgresMCPServerTest, SearchByTableName) {
@@ -1645,6 +1653,164 @@ TEST_F(PostgresMCPServerTest, ExtendedStatisticsSayWhetherTheyHaveBeenBuilt) {
     EXPECT_TRUE(after["t_stats"]["built_for_inherited"].is_null());
 
   { pqxx::nontransaction n(owner); n.exec("DROP SCHEMA " + sch + " CASCADE"); }
+}
+
+// idx_scan = 0 is not "nothing uses this index" -- it is "nothing has used it
+// since the counters were reset", and pg_stat_reset() zeroes it along with
+// everything else. On a database whose stats were reset four days ago that
+// difference decides whether dropping a 1.9 GB index is safe, and it has
+// already produced a wrong recommendation on a real one.
+TEST_F(PostgresMCPServerTest, ScanCountersCarryTheWindowTheyCover) {
+  pqxx::connection c(test_url);
+  pqxx::nontransaction n(c);
+  const std::string expected = n.query_value<std::string>(
+      "SELECT COALESCE(stats_reset::text, '') FROM pg_stat_database "
+      "WHERE datname = current_database()");
+
+  // Both tools that drive an irreversible decision from a scan counter.
+  json dup = srv->call_duplicate_indexes("grocery", "");
+  ASSERT_TRUE(dup.contains("counters_since")) << dup.dump(2);
+
+  json ts = srv->call_table_stats("grocery", "users");
+  ASSERT_TRUE(ts.contains("counters_since")) << ts.dump(2);
+
+  // Wired to pg_stat_database rather than to something that merely looks like
+  // a timestamp: the two must be the same reading.
+  if (expected.empty()) {
+    EXPECT_TRUE(dup["counters_since"].is_null());
+    EXPECT_TRUE(ts["counters_since"].is_null());
+  } else {
+    ASSERT_TRUE(dup["counters_since"].is_string()) << dup["counters_since"].dump();
+    EXPECT_EQ(dup["counters_since"], ts["counters_since"]);
+    // Same instant, whatever the two renderings look like textually.
+    const std::string got = dup["counters_since"].get<std::string>();
+    EXPECT_TRUE(n.query_value<bool>(
+        "SELECT " + n.quote(got) + "::timestamptz = " + n.quote(expected) + "::timestamptz"))
+        << "tool: " << got << "  catalog: " << expected;
+  }
+}
+
+// listSchemas dumped every relation name in every schema. On a database where
+// one schema holds 1,816 tables that is an 89 kB payload past the client's
+// limit, and the tool returns nothing at all.
+TEST_F(PostgresMCPServerTest, ListSchemasCountsTablesRatherThanNamingThemAll) {
+  json r = srv->call_schemas();
+  ASSERT_TRUE(r.contains("grocery")) << r.dump(2);
+  auto& g = r["grocery"];
+  ASSERT_TRUE(g.contains("table_count")) << g.dump(2);
+  EXPECT_GT(g["table_count"].get<int>(), 0);
+  EXPECT_LE(g["tables"].size(), 25u) << "names must be capped";
+  EXPECT_EQ(g["tables_truncated"].get<bool>(), g["table_count"].get<int>() > 25);
+  // The count and the names agree when nothing was dropped.
+  if (!g["tables_truncated"].get<bool>()) {
+    EXPECT_EQ(g["tables"].size(), (size_t)g["table_count"].get<int>());
+  }
+}
+
+// 723 roles, 689 of them identical tenants, is 165 kB and returns nothing.
+// The cap must drop the crowd rather than the superusers.
+TEST_F(PostgresMCPServerTest, ListRolesFiltersByPatternAndKeepsTheInterestingOnes) {
+  json all = srv->call_roles();
+  ASSERT_FALSE(all.empty()) << all.dump(2);
+  EXPECT_LE(all.size(), 200u) << "the unfiltered list is capped";
+  // The fixture's group role has a membership, so it survives any ordering
+  // that puts attribute- and membership-carrying roles first.
+  EXPECT_TRUE(all.contains("carrot") || all.contains("tomato")) << all.dump(2);
+
+  json one = srv->call_roles("carro");
+  ASSERT_TRUE(one.contains("carrot")) << one.dump(2);
+  EXPECT_FALSE(one.contains("tomato")) << "pattern must actually filter";
+}
+
+// A full pg_settings dump is hundreds of rows; the default is now the set that
+// describes THIS server rather than PostgreSQL.
+TEST_F(PostgresMCPServerTest, ServerSettingsDefaultsToWhatDiffersFromTheBuiltInDefault) {
+  json def = srv->call_server_settings();
+  json all = srv->call_server_settings("", true);
+
+  size_t n_def = 0, n_all = 0;
+  for (auto& [cat, settings] : def.items())  { (void)cat; n_def += settings.size(); }
+  for (auto& [cat, settings] : all.items())  { (void)cat; n_all += settings.size(); }
+  EXPECT_GT(n_all, n_def) << "all:true must be a superset";
+  EXPECT_GT(n_def, 0u) << "the harness sets several settings explicitly";
+
+  // A pattern narrows to one setting rather than a category's worth.
+  json one = srv->call_server_settings("statement_timeout", true);
+  size_t n_one = 0;
+  for (auto& [cat, settings] : one.items()) { (void)cat; n_one += settings.size(); }
+  EXPECT_GE(n_one, 1u) << one.dump(2);
+  EXPECT_LT(n_one, n_all);
+}
+
+// {} from a schema-scoped tool meant either "empty" or "does not exist", and
+// bloat-and-vacuum-review defaults to public -- which several databases do not
+// have. A caller following that default got silence and would conclude the
+// schema was clean.
+TEST_F(PostgresMCPServerTest, AMissingSchemaIsNamedRatherThanReturnedAsEmpty) {
+  const std::string absent = "no_such_schema_" + std::to_string(getpid());
+  for (json r : {srv->call_list_table_stats(absent),
+                 srv->call_tables(absent),
+                 srv->call_list_table_sizes(absent)}) {
+    ASSERT_TRUE(r.contains("error")) << r.dump(2);
+    EXPECT_NE(r["error"].get<std::string>().find(absent), std::string::npos);
+    EXPECT_TRUE(r.contains("hint"));
+  }
+  // A schema that exists and is empty is still an empty answer, not an error.
+  {
+    pqxx::connection c(test_url);
+    pqxx::nontransaction n(c);
+    n.exec("DROP SCHEMA IF EXISTS empty_sch CASCADE");
+    n.exec("CREATE SCHEMA empty_sch");
+  }
+  json e = srv->call_list_table_stats("empty_sch");
+  EXPECT_FALSE(e.contains("error")) << e.dump(2);
+  EXPECT_TRUE(e.empty()) << e.dump(2);
+  {
+    pqxx::connection c(test_url);
+    pqxx::nontransaction n(c);
+    n.exec("DROP SCHEMA empty_sch");
+  }
+}
+
+// A publication FOR ALL TABLES resolves through pg_publication_tables to every
+// table in the database, so the member list is unbounded by construction --
+// the same defect listSchemas had, and worse, because one line of DDL produces
+// it. Past the payload limit the tool returns nothing, so a cluster with one
+// big publication reports no publications at all.
+TEST_F(PostgresMCPServerTest, PublicationsCountMembersRatherThanNamingThemAll) {
+  json r = srv->call_publications();
+  ASSERT_FALSE(r.empty()) << r.dump(2);
+  for (auto& [name, p] : r.items()) {
+    ASSERT_TRUE(p.contains("table_count")) << name << ": " << p.dump(2);
+    EXPECT_LE(p["tables"].size(), 50u) << name << " must cap its member names";
+    EXPECT_EQ(p["tables_truncated"].get<bool>(), p["table_count"].get<int>() > 50);
+    if (!p["tables_truncated"].get<bool>()) {
+      EXPECT_EQ(p["tables"].size(), (size_t)p["table_count"].get<int>()) << name;
+    }
+  }
+}
+
+// A statement recovered from pg_stat_statements can be unplannable because of
+// the normalization rather than the statement: replacing a literal with $n
+// strips its type, and a placeholder nothing constrains is assigned text at
+// parse time -- before any value is bound, so params cannot fix it. Retrying
+// with params and getting the identical error, with no indication the params
+// were applied, is what this message exists to prevent.
+TEST_F(PostgresMCPServerTest, AnUninferableParameterTypeExplainsItselfAndSaysParamsCannotHelp) {
+  // CASE ... THEN $1 ELSE $2 constrains neither branch, so both become text and
+  // the numeric addition has no operator.
+  const std::string sql =
+      "SELECT id + (CASE WHEN id > 0 THEN $1 ELSE $2 END) FROM grocery.users";
+  json r = srv->call_explain_query("", sql, json::array({1, 2}), false, 0);
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  ASSERT_TRUE(r.contains("hint")) << r.dump(2);
+  EXPECT_TRUE(r.contains("params_supplied")) << r.dump(2);
+  EXPECT_TRUE(r["params_supplied"].get<bool>());
+  // The two things a caller cannot otherwise learn: params were applied, and
+  // no params argument will help.
+  const std::string hint = r["hint"].get<std::string>();
+  EXPECT_NE(hint.find("WERE applied"), std::string::npos) << hint;
+  EXPECT_NE(hint.find("normalization"), std::string::npos) << hint;
 }
 
 // --- listOperators ---
@@ -2862,6 +3028,70 @@ TEST_F(PostgresMCPServerTest, TableIOStatsRatioIsNullNotZeroWithoutTraffic) {
 // configured with a larger one made the figure understated, in the direction
 // that reads as safe. The override has to move the worst case, not merely
 // appear beside it.
+// 4.2.1 returned one overrides row per role. On a multi-tenant cluster that is
+// one row per tenant: measured on a real 723-role database it was 701 rows,
+// 698 of them the same search_path, 105 kB -- past the client's payload limit,
+// so the tool returned nothing and took capacity-check and
+// triage-active-sessions with it. The three overrides that mattered were in
+// the other three rows.
+//
+// Collapsing by (scope, name, value) loses nothing that answers the question:
+// two roles with DIFFERENT values stay separate, which is the whole point of
+// reading this at all.
+TEST_F(PostgresMCPServerTest, IdenticalOverridesCollapseAndDistinctOnesDoNot) {
+  const std::string pre = "licht_ov_" + std::to_string(getpid()) + "_";
+  const int kRoles = 12;
+  {
+    pqxx::nontransaction n(*admin_conn);
+    for (int i = 0; i < kRoles; i++) {
+      const std::string r = pre + std::to_string(i);
+      n.exec("DROP ROLE IF EXISTS \"" + r + "\"");
+      n.exec("CREATE ROLE \"" + r + "\"");
+      // Every tenant gets the same search_path: the repetition this fixes.
+      // Unquoted list form. Quoting the whole string would store it as a
+      // single schema NAMED "tenant, public", which is not what any real
+      // configuration means and stores a quoted value.
+      n.exec("ALTER ROLE \"" + r + "\" SET search_path = tenant, public");
+    }
+    // ...and one that differs, which must survive as its own row.
+    n.exec("ALTER ROLE \"" + pre + "0\" SET statement_timeout = '10s'");
+  }
+
+  json r = srv->call_host_capacity(0, 0, "");
+  ASSERT_TRUE(r.contains("overrides")) << r.dump(2);
+
+  int search_path_groups = 0, timeout_groups = 0;
+  for (const auto& o : r["overrides"]) {
+    if (o["name"] == "search_path" && o["value"].get<std::string>().find("tenant") == 0) {
+      search_path_groups++;
+      // One row for all twelve, carrying the count rather than the names.
+      EXPECT_GE(o["count"].get<int>(), kRoles) << o.dump(2);
+      EXPECT_LE(o["roles"].size(), 5u) << o.dump(2);
+      EXPECT_TRUE(o["names_truncated"].get<bool>()) << o.dump(2);
+    }
+    if (o["name"] == "statement_timeout" && o["value"] == "10s") {
+      timeout_groups++;
+      // A distinct value is not collapsed into the crowd.
+      EXPECT_EQ(o["count"].get<int>(), 1) << o.dump(2);
+      EXPECT_EQ(o["roles"].size(), 1u) << o.dump(2);
+      EXPECT_EQ(o["roles"][0].get<std::string>(), pre + "0");
+      EXPECT_FALSE(o["names_truncated"].get<bool>());
+    }
+  }
+  EXPECT_EQ(search_path_groups, 1) << "identical overrides must collapse to one row: "
+                                   << r["overrides"].dump(2);
+  EXPECT_EQ(timeout_groups, 1) << "a distinct override must survive collapsing";
+
+  // The payload has to stay small, which is the entire point.
+  EXPECT_LT(r["overrides"].dump().size(), 4096u) << r["overrides"].dump(2);
+
+  {
+    pqxx::nontransaction n(*admin_conn);
+    for (int i = 0; i < kRoles; i++)
+      n.exec("DROP ROLE IF EXISTS \"" + pre + std::to_string(i) + "\"");
+  }
+}
+
 TEST_F(PostgresMCPServerTest, HostCapacityCountsPerRoleOverridesInTheWorstCase) {
   const std::string role = "licht_hc_" + std::to_string(getpid());
   json before = srv->call_host_capacity(0, 0, "");
@@ -2882,11 +3112,13 @@ TEST_F(PostgresMCPServerTest, HostCapacityCountsPerRoleOverridesInTheWorstCase) 
   json after = srv->call_host_capacity(0, 0, "");
   bool found = false;
   for (const auto& o : after["overrides"])
-    if (o["role"].is_string() && o["role"].get<std::string>() == role
-        && o["name"].get<std::string>() == "work_mem") {
+    if (o["name"].get<std::string>() == "work_mem"
+        && std::find(o["roles"].begin(), o["roles"].end(), json(role)) != o["roles"].end()) {
       found = true;
       EXPECT_EQ(o["scope"].get<std::string>(), "role");
       EXPECT_EQ(o["value"].get<std::string>(), "512MB");
+      // A value nothing else shares is its own group, never folded into a count.
+      EXPECT_EQ(o["count"].get<int>(), 1) << o.dump(2);
     }
   EXPECT_TRUE(found) << after["overrides"].dump(2);
 

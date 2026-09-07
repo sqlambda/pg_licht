@@ -6,7 +6,7 @@
 auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
     static const std::vector<ToolDef> defs = {
       {"listSchemas",
-       "return schema list with basic summaries",
+       "return schema list with basic summaries: table_count, up to 25 table names, and role grants per schema. tables_truncated says when a schema holds more than the names shown -- listTables is the tool that names every relation in one schema, and it takes one schema at a time so its size stays bounded by the caller",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", json::object()}
@@ -71,7 +71,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args&) -> json {
          return s.check_privileges(); }},
       {"tableStats",
-       "return the statistics PostgreSQL keeps for one table: estimated row count, seq_scan and idx_scan counts, live and dead tuples, rows modified since the last analyze, rows inserted since the last vacuum, the manual and automatic vacuum and analyze times as four separate fields (last_vacuum and last_analyze are the manual ones, exactly as in pg_stat_user_tables -- a recent last_vacuum beside a null last_autovacuum means the table is being kept alive by hand and autovacuum is not reaching it), per-index scan counts, and the per-column pg_stats histograms (null_frac, avg_width, n_distinct, physical order correlation, most_common_vals and their frequencies, and three points off the histogram -- histogram_bounds gives low, mid and high, the observed extremes and median of the distribution, which are real values that occur in the column and so are usable directly as parameters to re-plan a statement with. It is three points rather than the whole array because the array is statistics_target+1 entries wide, 101 by default; for the whole distribution of one column call columnHistogram. Null when the column has no histogram, meaning every value is in the MCV list or the column was never analyzed). IMPORTANT: pg_stats returns no row at all for a table whose row-level security is active for the connecting role, so on such a table every per-column statistic here is null and looks exactly like a table nobody has analyzed -- stats_hidden_by_rls says which it is, and the analyze timestamps beside it prove the statistics exist. Reads the catalog and the statistics collector only -- no relation is opened and no file is measured. size_estimate is relpages*block_size (the server's BLCKSZ, 8192 unless it was built otherwise) and is only as fresh as estimated_from says: for a measured size call tableSize. Note that most_common_vals and histogram_bounds both contain literal values sampled from the column. Not to be confused with tableIOStats, which reports pg_statio_all_tables -- whether reads came from the buffer cache or the disk",
+       "return the statistics PostgreSQL keeps for one table: estimated row count, seq_scan and idx_scan counts, live and dead tuples, rows modified since the last analyze, rows inserted since the last vacuum, the manual and automatic vacuum and analyze times as four separate fields (last_vacuum and last_analyze are the manual ones, exactly as in pg_stat_user_tables -- a recent last_vacuum beside a null last_autovacuum means the table is being kept alive by hand and autovacuum is not reaching it), per-index scan counts, and the per-column pg_stats histograms (null_frac, avg_width, n_distinct, physical order correlation, most_common_vals and their frequencies, and three points off the histogram -- histogram_bounds gives low, mid and high, the observed extremes and median of the distribution, which are real values that occur in the column and so are usable directly as parameters to re-plan a statement with. It is three points rather than the whole array because the array is statistics_target+1 entries wide, 101 by default; for the whole distribution of one column call columnHistogram. Null when the column has no histogram, meaning every value is in the MCV list or the column was never analyzed). IMPORTANT: pg_stats returns no row at all for a table whose row-level security is active for the connecting role, so on such a table every per-column statistic here is null and looks exactly like a table nobody has analyzed -- stats_hidden_by_rls says which it is, and the analyze timestamps beside it prove the statistics exist. Reads the catalog and the statistics collector only -- no relation is opened and no file is measured. counters_since is when this database's statistics were last reset; seq_scan, idx_scan and the tuple counters cover only the period since, so a zero means 'not since then' rather than 'never'. size_estimate is relpages*block_size (the server's BLCKSZ, 8192 unless it was built otherwise) and is only as fresh as estimated_from says: for a measured size call tableSize. Note that most_common_vals and histogram_bounds both contain literal values sampled from the column. Not to be confused with tableIOStats, which reports pg_statio_all_tables -- whether reads came from the buffer cache or the disk",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
@@ -208,13 +208,15 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args& a) -> json {
          return s.type_detail(a.str("schema", "public"), a.str("type", "")); }},
       {"listRoles",
-       "return cluster-wide roles with kind (login/group), attributes (superuser, create_role, create_db, replication, bypass_rls, connection_limit, valid_until), and group memberships",
+       "return cluster-wide roles with kind (login/group), attributes (superuser, create_role, create_db, replication, bypass_rls, connection_limit, valid_until), and group memberships. Without 'pattern' the list is capped at 200, ordered so every role carrying a non-default attribute or a group membership comes first -- on a multi-tenant cluster with one login role per tenant the crowd is identical and the cap drops it rather than the superusers. Pass 'pattern' to search by name (case-insensitive substring) when the role you want is outside the cap",
        []() -> json { return {
    		{"type", "object"},
-   		{"properties", json::object()}
+   		{"properties", {
+   		    {"pattern", {{"type", "string"}, {"description", "case-insensitive substring of the role name"}}}
+   		  }}
    	      }; },
-       [](PostgresMCPServer& s, const Args&) -> json {
-         return s.roles(); }},
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.roles(a.str("pattern")); }},
       {"listForeignTables",
        "return foreign tables in a schema with their foreign server, FDW, options, and columns (does not expose user mapping credentials)",
        []() -> json { return {
@@ -262,7 +264,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args&) -> json {
          return s.event_triggers(); }},
       {"listPublications",
-       "return logical replication publications with owner, all-tables flag, per-operation flags (insert/update/delete/truncate), and member tables",
+       "return logical replication publications with owner, all-tables flag, per-operation flags (insert/update/delete/truncate), table_count, and up to 50 member table names. tables_truncated says when a publication carries more than the names shown -- a publication FOR ALL TABLES resolves to every table in the database, so the member list is unbounded by construction and the count is the figure that scales",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", json::object()}
@@ -421,13 +423,16 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args&) -> json {
          return s.database_size(); }},
       {"serverSettings",
-       "return all PostgreSQL server settings (pg_settings) grouped by category, each with current value, unit, description, context, type, source, and pending_restart flag",
+       "return PostgreSQL server settings (pg_settings) grouped by category, each with current value, unit, description, context, type, source, and pending_restart flag. By DEFAULT only settings that differ from their built-in default -- the set that describes THIS server rather than PostgreSQL, which is the same set EXPLAIN (SETTINGS) reports and for the same reason. A full dump is hundreds of settings and on a cluster with extensions it exceeds the client's payload limit, at which point the tool returns nothing and the forty settings that describe the machine are lost with the four hundred that describe the software. Pass all:true for everything, or 'pattern' to search by setting name or category (case-insensitive substring)",
        []() -> json { return {
    		{"type", "object"},
-   		{"properties", json::object()}
+   		{"properties", {
+   		    {"pattern", {{"type", "string"}, {"description", "case-insensitive substring of the setting name or category"}}},
+   		    {"all", {{"type", "boolean"}, {"description", "include settings still at their built-in default; defaults to false"}}}
+   		  }}
    	      }; },
-       [](PostgresMCPServer& s, const Args&) -> json {
-         return s.server_settings(); }},
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.server_settings(a.str("pattern"), a.flag("all", false)); }},
       {"currentActivity",
        "return current server connections and running queries (pg_stat_activity) across all databases: pid, database, user, application_name, backend_type, state, wait event, query text, transaction and query duration, leader_pid for parallel workers, and the backend's xid and xmin. query_id is returned as a decimal string and is the join key to statementStats and explainQuery, so a statement seen running here can be looked up and planned. All filters are optional and combine; with none the whole view is returned, which on a busy server is mostly idle connections and internal processes",
        []() -> json { return {
@@ -626,7 +631,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args& a) -> json {
          return s.table_io_stats(a.str("schema", "public"), a.str("table", ""), a.num("limit", 20)); }},
       {"hostCapacity",
-       "correlate memory and parallelism settings with the capacity of the machine PostgreSQL runs on. Host RAM and vCPU count exist outside the catalog, so they must be injected: pass them as arguments, set host_ram_mb/host_vcpus in the connection's section of the connections file, or export PG_LICHT_HOST_RAM_MB/PG_LICHT_HOST_VCPUS. Returns the host facts with the source they came from, every memory-related setting resolved to bytes, and derived ratios (shared_buffers and effective_cache_size as a percentage of RAM, work_mem times max_connections, maintenance_work_mem times autovacuum_max_workers, parallel workers per vCPU). Ratios are null when no RAM figure was supplied; nothing is ever guessed. IMPORTANT: 'settings' is what pg_settings reports for THIS session, so an ALTER ROLE ... SET or ALTER DATABASE ... SET made for another role is not in it. 'overrides' carries those from pg_db_role_setting with their scope, and committed_worst_case uses the largest work_mem any role is configured with rather than this session's -- work_mem_is_overridden says when the two differ. That layer is invisible to pg_settings and is the usual explanation for a statement that is slow only from the application",
+       "correlate memory and parallelism settings with the capacity of the machine PostgreSQL runs on. Host RAM and vCPU count exist outside the catalog, so they must be injected: pass them as arguments, set host_ram_mb/host_vcpus in the connection's section of the connections file, or export PG_LICHT_HOST_RAM_MB/PG_LICHT_HOST_VCPUS. Returns the host facts with the source they came from, every memory-related setting resolved to bytes, and derived ratios (shared_buffers and effective_cache_size as a percentage of RAM, work_mem times max_connections, maintenance_work_mem times autovacuum_max_workers, parallel workers per vCPU). Ratios are null when no RAM figure was supplied; nothing is ever guessed. IMPORTANT: 'settings' is what pg_settings reports for THIS session, so an ALTER ROLE ... SET or ALTER DATABASE ... SET made for another role is not in it. 'overrides' carries those from pg_db_role_setting, collapsed by (scope, name, value): two roles with different values stay separate rows, while N roles sharing one value become a single row with 'count' and up to five example names ('names_truncated' says when the rest were dropped). On a multi-tenant cluster the same search_path on every tenant is otherwise one row per tenant and swamps the three overrides that matter. committed_worst_case uses the largest work_mem any role is configured with rather than this session's -- work_mem_is_overridden says when the two differ. That layer is invisible to pg_settings and is the usual explanation for a statement that is slow only from the application",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
@@ -653,7 +658,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
            ? a["storage"].get<std::string>() : "";
          return s.host_capacity(ram_mb, vcpus, storage); }},
       {"duplicateIndexes",
-       "return indexes that duplicate or are covered by another index on the same table. 'identical' groups indexes whose key columns, operator classes, collations, sort order, INCLUDE columns and partial predicate all match; 'redundant' reports an index whose key columns are a leading prefix of a wider index that also covers its INCLUDE columns. Comparison is by column expression rather than attribute number, so expression indexes and differing sort orders are handled correctly, and a unique index is never called redundant for being a prefix. Each entry carries size, idx_scan, the backing constraint name, and the replica identity and validity flags, since those decide whether it can be dropped at all",
+       "return indexes that duplicate or are covered by another index on the same table. 'identical' groups indexes whose key columns, operator classes, collations, sort order, INCLUDE columns and partial predicate all match; 'redundant' reports an index whose key columns are a leading prefix of a wider index that also covers its INCLUDE columns. Comparison is by column expression rather than attribute number, so expression indexes and differing sort orders are handled correctly, and a unique index is never called redundant for being a prefix. Each entry carries size, idx_scan, the backing constraint name, and the replica identity and validity flags, since those decide whether it can be dropped at all. READ counters_since BEFORE idx_scan: it is when this database's statistics were last reset, and idx_scan counts only since then. A zero on a recently reset database says nothing about a monthly or quarterly index. It is a lower bound -- pg_stat_reset_single_table_counters() zeroes one relation without moving it",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
