@@ -242,6 +242,7 @@ enum class Feature {
   RelAllFrozen,             // pg_class.relallfrozen, total_vacuum_time
   WalIoMovedToPgStatIo,     // pg_stat_wal lost wal_write/wal_sync here
   CheckpointerNumDone,      // pg_stat_checkpointer.num_done, slru_written
+  VacuumDelayTime,          // pg_stat_progress_vacuum.delay_time
   SubConflictCounters,      // the seven confl_* counters
 };
 
@@ -276,6 +277,7 @@ constexpr int feature_since(Feature f) {
     case Feature::RelAllFrozen:
     case Feature::WalIoMovedToPgStatIo:
     case Feature::CheckpointerNumDone:
+    case Feature::VacuumDelayTime:
     case Feature::SubConflictCounters:      return 180000;
   }
   return 0;  // unreachable; every enumerator is listed above
@@ -2840,6 +2842,21 @@ private:
            'max_dead_tuples',  v.max_dead_tuples,
            'num_dead_tuples',  v.num_dead_tuples)";
 
+    // delay_time (PostgreSQL 18) is the total time this vacuum has spent
+    // sleeping on the cost-based delay. It answers "is autovacuum being
+    // throttled" directly, where bloat-and-vacuum-review previously had to
+    // infer it from timestamps and total_autovacuum_time -- and a vacuum that
+    // is 90% asleep looks identical, in blocks scanned per second, to one on a
+    // slow disk. Reported beside elapsed_s so the ratio is available without a
+    // second call; the two together are what separate a throttle from a
+    // bottleneck.
+    const std::string vacuum_delay = sess.has(Feature::VacuumDelayTime)
+      ? R"(, 'delay_time_ms', round(v.delay_time::numeric, 1),
+            'delay_percent',
+              round((100.0 * v.delay_time
+                     / NULLIF(EXTRACT(EPOCH FROM now() - a.query_start) * 1000, 0))::numeric, 1))"
+      : "";
+
     // Percentages are the point of a progress view: "1.2 million of 4 million
     // blocks" is only useful once it is 30%.
     std::string query = R"(
@@ -2861,7 +2878,7 @@ private:
                    'query',             a.query,
                    'started',           a.query_start,
                    'elapsed_s',         round(EXTRACT(EPOCH FROM now() - a.query_start)::numeric, 1),
-                   )" + vacuum_dead + R"())
+                   )" + vacuum_dead + vacuum_delay + R"())
           FROM pg_stat_progress_vacuum AS v
           LEFT JOIN pg_stat_activity AS a ON a.pid = v.pid
           WHERE true)" + pid_v + rel_filter("v") + R"(), '[]'::jsonb),

@@ -2456,7 +2456,22 @@ TEST_F(PostgresMCPServerTest, ProgressStatsReportsARunningVacuum) {
     EXPECT_TRUE(found.contains("max_dead_tuple_bytes"));
     EXPECT_TRUE(found.contains("num_dead_item_ids"));
     EXPECT_TRUE(found.contains("indexes_total"));
+  }
+  // delay_time is PostgreSQL 18, and the version gate is what is asserted here.
+  // Not the magnitude: the poll above catches the vacuum on its first
+  // iteration, which can be before it has slept at all, so a zero is a correct
+  // reading of a vacuum that has not yet been throttled rather than a broken
+  // field. Asserting a positive value would be asserting a race.
+  if (pg_server_version_num(test_url) >= 180000) {
+    ASSERT_TRUE(found.contains("delay_time_ms")) << found.dump(2);
+    EXPECT_TRUE(found["delay_time_ms"].is_number()) << found.dump(2);
+    EXPECT_GE(found["delay_time_ms"].get<double>(), 0.0);
+    ASSERT_TRUE(found.contains("delay_percent"));
   } else {
+    EXPECT_FALSE(found.contains("delay_time_ms"));
+    EXPECT_FALSE(found.contains("delay_percent"));
+  }
+  if (pg_server_version_num(test_url) < 170000) {
     EXPECT_EQ(found["dead_tuple_unit"].get<std::string>(), "tuples");
     EXPECT_TRUE(found.contains("max_dead_tuples"));
     EXPECT_TRUE(found.contains("num_dead_tuples"));
