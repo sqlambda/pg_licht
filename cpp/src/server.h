@@ -4011,13 +4011,33 @@ private:
     bool generic = false;
 
     try {
+      // Every EXPLAIN here carries SETTINGS, which reports the settings that
+      // differ from the built-in default -- and so names the environment this
+      // plan was built in.
+      //
+      // That environment is this server's connection, not the one the
+      // statement runs in. work_mem alone is enough to change the algorithm
+      // rather than the cost: measured on PostgreSQL 18 over 400k rows with
+      // identical statistics, one statement planned as GroupAggregate over a
+      // Sort at work_mem 64kB and as HashAggregate at 512MB. Anything read off
+      // node types, Sort Method, or whether a node spilled is then read off a
+      // plan production never runs.
+      //
+      // pg_db_role_setting is where a per-role work_mem lives, hostCapacity
+      // reports it under `overrides`, and the two together let a caller see
+      // the mismatch. SETTINGS is the half that says what planned it; without
+      // it there is nothing to compare against and nothing to notice.
+      //
+      // SETTINGS is PostgreSQL 12 and later, so it needs no gate on any
+      // supported major.
+      //
       // --- Phase A: produce a plan without executing anything ---
       if (params.empty()) {
         try {
           // A savepoint, so that the expected failure below leaves the
           // transaction usable rather than aborted.
           pqxx::subtransaction sub{txn};
-          pqxx::result r = sub.exec("EXPLAIN (FORMAT JSON) " + sql);
+          pqxx::result r = sub.exec("EXPLAIN (SETTINGS, FORMAT JSON) " + sql);
           plan = json::parse(r[0][0].as<std::string>());
           sub.commit();
         } catch (const pqxx::sql_error& e) {
@@ -4041,7 +4061,7 @@ private:
             if (!stats.is_null()) out["statement"] = stats;
             return out;
           }
-          pqxx::result r = txn.exec("EXPLAIN (GENERIC_PLAN, FORMAT JSON) " + sql);
+          pqxx::result r = txn.exec("EXPLAIN (SETTINGS, GENERIC_PLAN, FORMAT JSON) " + sql);
           plan = json::parse(r[0][0].as<std::string>());
           generic = true;
         }
@@ -4063,7 +4083,7 @@ private:
 
         lits = build_execute_literals(txn, params);
         pqxx::result r = txn.exec(
-          "EXPLAIN (FORMAT JSON) EXECUTE " + prepared + "(" + lits + ")");
+          "EXPLAIN (SETTINGS, FORMAT JSON) EXECUTE " + prepared + "(" + lits + ")");
         plan = json::parse(r[0][0].as<std::string>());
       }
 
@@ -4085,7 +4105,7 @@ private:
           std::string target = prepared.empty()
             ? sql : ("EXECUTE " + prepared + "(" + lits + ")");
           pqxx::result r = txn.exec(
-            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + target);
+            "EXPLAIN (SETTINGS, ANALYZE, BUFFERS, FORMAT JSON) " + target);
           plan = json::parse(r[0][0].as<std::string>());
           analyzed = true;
         }
@@ -6330,7 +6350,7 @@ private:
     auto plan_of = [&]() -> json {
       try {
         pqxx::subtransaction sub{txn};
-        pqxx::result r = sub.exec("EXPLAIN (FORMAT JSON) " + sql);
+        pqxx::result r = sub.exec("EXPLAIN (SETTINGS, FORMAT JSON) " + sql);
         json p = json::parse(r[0][0].as<std::string>());
         sub.commit();
         return p;
@@ -6339,7 +6359,7 @@ private:
         // same fallback explainQuery uses, and it is PostgreSQL 16+.
         if (e.sqlstate() != "42P02" || !pg16) throw;
         pqxx::subtransaction sub{txn};
-        pqxx::result r = sub.exec("EXPLAIN (FORMAT JSON, GENERIC_PLAN) " + sql);
+        pqxx::result r = sub.exec("EXPLAIN (SETTINGS, FORMAT JSON, GENERIC_PLAN) " + sql);
         json p = json::parse(r[0][0].as<std::string>());
         sub.commit();
         return p;

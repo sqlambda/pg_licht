@@ -3222,6 +3222,36 @@ std::string PgssMCPServerTest::dbname;
 std::string PgssMCPServerTest::url;
 bool PgssMCPServerTest::available = false;
 
+// The plan is built in THIS server's session, not in the one the statement
+// runs in, and work_mem alone can change the algorithm rather than the cost.
+// SETTINGS is what names the environment that produced the plan; without it
+// there is nothing for a reader to compare against hostCapacity.overrides and
+// nothing to notice.
+TEST_F(PostgresMCPServerTest, ExplainNamesTheSettingsThePlanWasBuiltUnder) {
+  json r = srv->call_explain_query("", "SELECT count(*) FROM grocery.users", json::array(),
+                                   false, 0);
+  ASSERT_TRUE(r.contains("plan")) << r.dump(2);
+  ASSERT_TRUE(r["plan"].is_array() && !r["plan"].empty()) << r["plan"].dump(2);
+  // EXPLAIN (SETTINGS) emits the block only when something differs from the
+  // built-in default. This server always sets one such thing itself -- the
+  // per-transaction statement_timeout -- but that is not a planner GUC and
+  // need not appear, so the assertion is on the option being accepted and the
+  // plan surviving it rather than on a particular key being present.
+  EXPECT_TRUE(r["plan"][0].contains("Plan")) << r["plan"][0].dump(2);
+}
+
+// The same option has to survive every path that produces a plan, including
+// the prepared one -- a caller comparing a generic plan against an analyzed
+// one needs both halves labelled with the environment that built them.
+TEST_F(PostgresMCPServerTest, ExplainKeepsSettingsOnThePreparedPath) {
+  json r = srv->call_explain_query("", "SELECT * FROM grocery.users WHERE id = $1",
+                                   json::array({1}), false, 0);
+  ASSERT_TRUE(r.contains("plan")) << r.dump(2);
+  EXPECT_FALSE(r["generic"].get<bool>()) << r.dump(2);
+  ASSERT_TRUE(r["plan"].is_array() && !r["plan"].empty());
+  EXPECT_TRUE(r["plan"][0].contains("Plan"));
+}
+
 TEST_F(PgssMCPServerTest, RecoversStatementByQueryIdAndPlansItGenerically) {
   std::string qid = seeded_queryid();
   ASSERT_FALSE(qid.empty());
