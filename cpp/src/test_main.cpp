@@ -1602,6 +1602,51 @@ TEST_F(PostgresMCPServerTest, ListExtendedStatisticsReturnsStatsObject) {
   EXPECT_NE(std::find(kinds.begin(), kinds.end(), "dependencies"), kinds.end());
 }
 
+// A CREATE STATISTICS that has never been ANALYZEd has a catalog row, no data,
+// and no effect on any plan. Through 4.2.0 listExtendedStatistics reported it
+// identically to a working one -- and two prompts check whether extended
+// statistics "exist" before recommending any, so that difference decides
+// whether the advice is right. Built on its own schema rather than the
+// fixture's so the ANALYZE here cannot perturb another test's timestamps.
+TEST_F(PostgresMCPServerTest, ExtendedStatisticsSayWhetherTheyHaveBeenBuilt) {
+  const std::string sch = "xs_" + std::to_string(getpid());
+  pqxx::connection owner(test_url);
+  {
+    pqxx::nontransaction n(owner);
+    n.exec("CREATE SCHEMA " + sch);
+    n.exec("CREATE TABLE " + sch + ".t (a int, b int)");
+    n.exec("INSERT INTO " + sch + ".t SELECT i, i % 7 FROM generate_series(1, 500) AS i");
+    n.exec("CREATE STATISTICS " + sch + ".t_stats (dependencies, ndistinct) ON a, b FROM " + sch + ".t");
+  }
+
+  json before = srv->call_extended_statistics(sch);
+  ASSERT_TRUE(before.contains("t_stats")) << before.dump(2);
+  // Defined, and inert. The kinds it was declared with are present; the kinds
+  // actually computed are not, because none have been.
+  EXPECT_FALSE(before["t_stats"]["built"].get<bool>()) << before.dump(2);
+  EXPECT_TRUE(before["t_stats"]["built_kinds"].empty());
+  EXPECT_FALSE(before["t_stats"]["kinds"].empty());
+
+  { pqxx::nontransaction n(owner); n.exec("ANALYZE " + sch + ".t"); }
+
+  json after = srv->call_extended_statistics(sch);
+  ASSERT_TRUE(after.contains("t_stats"));
+  EXPECT_TRUE(after["t_stats"]["built"].get<bool>()) << after.dump(2);
+  std::vector<std::string> bk(after["t_stats"]["built_kinds"].begin(),
+                              after["t_stats"]["built_kinds"].end());
+  EXPECT_NE(std::find(bk.begin(), bk.end(), "dependencies"), bk.end());
+  EXPECT_NE(std::find(bk.begin(), bk.end(), "ndistinct"), bk.end());
+
+  // stxdinherit became part of the key in PostgreSQL 15; below that the
+  // question does not exist and the key is null rather than an invented value.
+  if (owner.server_version() >= 150000)
+    EXPECT_TRUE(after["t_stats"]["built_for_inherited"].is_array()) << after.dump(2);
+  else
+    EXPECT_TRUE(after["t_stats"]["built_for_inherited"].is_null());
+
+  { pqxx::nontransaction n(owner); n.exec("DROP SCHEMA " + sch + " CASCADE"); }
+}
+
 // --- listOperators ---
 
 TEST_F(PostgresMCPServerTest, ListOperatorsReturnsCustomOperator) {
@@ -2226,6 +2271,18 @@ TEST_F(PostgresMCPServerTest, SizeEstimateIsNamedAsAnEstimateAndDatedByIt) {
   // confused for one another.
   EXPECT_TRUE(measured.contains("size"));
   EXPECT_FALSE(measured.contains("size_estimate"));
+
+  // The estimate is relpages * BLCKSZ, and BLCKSZ is a compile-time option --
+  // through 4.2.0 this multiplied by a literal 8192, which is only the default.
+  // Asserting against the server's own block_size rather than against 8192 is
+  // the point: on a cluster built with another page size the old arithmetic was
+  // wrong by the ratio and nothing here would have noticed.
+  pqxx::connection c(test_url);
+  pqxx::nontransaction n(c);
+  const long long blocksz = n.query_value<long long>("SELECT current_setting('block_size')::bigint");
+  const long long relpages = n.query_value<long long>(
+      "SELECT relpages::bigint FROM pg_class WHERE oid = 'grocery.users'::regclass");
+  EXPECT_EQ(stats["size_estimate"].get<long long>(), relpages * blocksz);
 }
 
 TEST_F(PostgresMCPServerTest, TableSizeMeasuresEveryFork) {
@@ -2399,7 +2456,22 @@ TEST_F(PostgresMCPServerTest, ProgressStatsReportsARunningVacuum) {
     EXPECT_TRUE(found.contains("max_dead_tuple_bytes"));
     EXPECT_TRUE(found.contains("num_dead_item_ids"));
     EXPECT_TRUE(found.contains("indexes_total"));
+  }
+  // delay_time is PostgreSQL 18, and the version gate is what is asserted here.
+  // Not the magnitude: the poll above catches the vacuum on its first
+  // iteration, which can be before it has slept at all, so a zero is a correct
+  // reading of a vacuum that has not yet been throttled rather than a broken
+  // field. Asserting a positive value would be asserting a race.
+  if (pg_server_version_num(test_url) >= 180000) {
+    ASSERT_TRUE(found.contains("delay_time_ms")) << found.dump(2);
+    EXPECT_TRUE(found["delay_time_ms"].is_number()) << found.dump(2);
+    EXPECT_GE(found["delay_time_ms"].get<double>(), 0.0);
+    ASSERT_TRUE(found.contains("delay_percent"));
   } else {
+    EXPECT_FALSE(found.contains("delay_time_ms"));
+    EXPECT_FALSE(found.contains("delay_percent"));
+  }
+  if (pg_server_version_num(test_url) < 170000) {
     EXPECT_EQ(found["dead_tuple_unit"].get<std::string>(), "tuples");
     EXPECT_TRUE(found.contains("max_dead_tuples"));
     EXPECT_TRUE(found.contains("num_dead_tuples"));
@@ -2514,9 +2586,18 @@ TEST_F(PostgresMCPServerTest, WraparoundStatusReportsLimitsAndDatabases) {
   EXPECT_TRUE(r["limits"].contains("autovacuum_freeze_max_age"));
   EXPECT_TRUE(r["limits"].contains("autovacuum_multixact_freeze_max_age"));
   EXPECT_TRUE(r["limits"].contains("vacuum_failsafe_age"));
-  // The hard limit is the outage threshold, and is what the percentages that
-  // actually matter are taken against.
-  EXPECT_EQ(r["limits"]["wraparound_limit"].get<long long>(), 2146483647LL);
+  // The two thresholds PostgreSQL itself uses, spelled out as varsup.c derives
+  // them rather than as bare constants -- through 4.2.0 this asserted
+  // 2146483647, a 1,000,000 delta PostgreSQL has not used for many releases,
+  // which reported two million transactions of headroom that did not exist.
+  constexpr long long kWrap = 2147483647LL;         // MaxTransactionId >> 1
+  EXPECT_EQ(r["limits"]["wraparound_limit"].get<long long>(),
+            kWrap - 3000000LL);                     // xidStopLimit
+  EXPECT_EQ(r["limits"]["wraparound_warn_limit"].get<long long>(),
+            kWrap - 40000000LL);                    // xidWarnLimit
+  // The warning fires first, so its budget is always the smaller of the two.
+  EXPECT_LT(r["limits"]["wraparound_warn_limit"].get<long long>(),
+            r["limits"]["wraparound_limit"].get<long long>());
 
   ASSERT_TRUE(r.contains("databases"));
   ASSERT_TRUE(r["databases"].contains(test_dbname));
@@ -2525,6 +2606,16 @@ TEST_F(PostgresMCPServerTest, WraparoundStatusReportsLimitsAndDatabases) {
   EXPECT_GE(db["mxid_age"].get<long long>(), 0);
   EXPECT_LT(db["xid_percent_of_wraparound_limit"].get<double>(), 100.0);
   EXPECT_GT(db["xids_until_wraparound_limit"].get<long long>(), 0);
+  // Both budgets are reported, and the warning one is always reached first.
+  EXPECT_GT(db["xids_until_warn_limit"].get<long long>(), 0);
+  EXPECT_LT(db["xids_until_warn_limit"].get<long long>(),
+            db["xids_until_wraparound_limit"].get<long long>());
+  // Multixacts have the same two thresholds, and both documents claimed both
+  // axes carried them while only the xid half did.
+  EXPECT_LT(db["mxid_percent_of_wraparound_limit"].get<double>(), 100.0);
+  EXPECT_GT(db["mxids_until_wraparound_limit"].get<long long>(), 0);
+  EXPECT_LT(db["mxids_until_warn_limit"].get<long long>(),
+            db["mxids_until_wraparound_limit"].get<long long>());
 }
 
 TEST_F(PostgresMCPServerTest, WraparoundStatusReportsPerTableFreezeOverride) {
@@ -2764,6 +2855,52 @@ TEST_F(PostgresMCPServerTest, TableIOStatsRatioIsNullNotZeroWithoutTraffic) {
 }
 
 // --- hostCapacity ---
+
+// pg_settings reports the value for THIS session, so an ALTER ROLE ... SET is
+// invisible to a DBA connected as anyone else -- and through 4.2.0 the
+// committed worst case was computed from the global work_mem alone, so a role
+// configured with a larger one made the figure understated, in the direction
+// that reads as safe. The override has to move the worst case, not merely
+// appear beside it.
+TEST_F(PostgresMCPServerTest, HostCapacityCountsPerRoleOverridesInTheWorstCase) {
+  const std::string role = "licht_hc_" + std::to_string(getpid());
+  json before = srv->call_host_capacity(0, 0, "");
+  ASSERT_TRUE(before.contains("overrides")) << before.dump(2);
+  const long long base_worst =
+      before["derived"]["committed_worst_case_bytes"].get<long long>();
+  EXPECT_FALSE(before["derived"]["work_mem_is_overridden"].get<bool>());
+
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+    n.exec("CREATE ROLE \"" + role + "\"");
+    // Far above any plausible global default, so the GREATEST cannot be a
+    // coincidence of the fixture's settings.
+    n.exec("ALTER ROLE \"" + role + "\" SET work_mem = '512MB'");
+  }
+
+  json after = srv->call_host_capacity(0, 0, "");
+  bool found = false;
+  for (const auto& o : after["overrides"])
+    if (o["role"].is_string() && o["role"].get<std::string>() == role
+        && o["name"].get<std::string>() == "work_mem") {
+      found = true;
+      EXPECT_EQ(o["scope"].get<std::string>(), "role");
+      EXPECT_EQ(o["value"].get<std::string>(), "512MB");
+    }
+  EXPECT_TRUE(found) << after["overrides"].dump(2);
+
+  EXPECT_TRUE(after["derived"]["work_mem_is_overridden"].get<bool>());
+  EXPECT_EQ(after["derived"]["work_mem_effective_max_bytes"].get<long long>(),
+            512LL * 1024 * 1024);
+  // The point of the whole fix: the worst case moved.
+  EXPECT_GT(after["derived"]["committed_worst_case_bytes"].get<long long>(), base_worst);
+
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+  }
+}
 
 TEST_F(PostgresMCPServerTest, HostCapacitySaysSoWhenNoHardwareWasInjected) {
   json r = srv->call_host_capacity(0, 0, "");
@@ -3105,6 +3242,36 @@ PostgresMCPServer* PgssMCPServerTest::srv = nullptr;
 std::string PgssMCPServerTest::dbname;
 std::string PgssMCPServerTest::url;
 bool PgssMCPServerTest::available = false;
+
+// The plan is built in THIS server's session, not in the one the statement
+// runs in, and work_mem alone can change the algorithm rather than the cost.
+// SETTINGS is what names the environment that produced the plan; without it
+// there is nothing for a reader to compare against hostCapacity.overrides and
+// nothing to notice.
+TEST_F(PostgresMCPServerTest, ExplainNamesTheSettingsThePlanWasBuiltUnder) {
+  json r = srv->call_explain_query("", "SELECT count(*) FROM grocery.users", json::array(),
+                                   false, 0);
+  ASSERT_TRUE(r.contains("plan")) << r.dump(2);
+  ASSERT_TRUE(r["plan"].is_array() && !r["plan"].empty()) << r["plan"].dump(2);
+  // EXPLAIN (SETTINGS) emits the block only when something differs from the
+  // built-in default. This server always sets one such thing itself -- the
+  // per-transaction statement_timeout -- but that is not a planner GUC and
+  // need not appear, so the assertion is on the option being accepted and the
+  // plan surviving it rather than on a particular key being present.
+  EXPECT_TRUE(r["plan"][0].contains("Plan")) << r["plan"][0].dump(2);
+}
+
+// The same option has to survive every path that produces a plan, including
+// the prepared one -- a caller comparing a generic plan against an analyzed
+// one needs both halves labelled with the environment that built them.
+TEST_F(PostgresMCPServerTest, ExplainKeepsSettingsOnThePreparedPath) {
+  json r = srv->call_explain_query("", "SELECT * FROM grocery.users WHERE id = $1",
+                                   json::array({1}), false, 0);
+  ASSERT_TRUE(r.contains("plan")) << r.dump(2);
+  EXPECT_FALSE(r["generic"].get<bool>()) << r.dump(2);
+  ASSERT_TRUE(r["plan"].is_array() && !r["plan"].empty());
+  EXPECT_TRUE(r["plan"][0].contains("Plan"));
+}
 
 TEST_F(PgssMCPServerTest, RecoversStatementByQueryIdAndPlansItGenerically) {
   std::string qid = seeded_queryid();
@@ -5284,6 +5451,85 @@ TEST_F(PostgresMCPServerTest, CheckPrivilegesSeparatesNotInstalledFromNotPermitt
                             reason.find("readable only by") != std::string::npos;
     EXPECT_TRUE(classified) << d["tool"] << ": " << reason;
   }
+}
+
+// pg_stats is defined WITH (security_barrier) and carries
+//   AND (c.relrowsecurity = false OR NOT row_security_active(c.oid))
+// so a role that RLS applies to gets NO ROW back, not a filtered one. Every
+// statistic then reads null, which is indistinguishable from a table nobody
+// has analyzed -- and on a schema where RLS is the convention that is the
+// normal case rather than the exceptional one. grocery.orders is analyzed in
+// the fixture, so the statistics provably exist while this role cannot see
+// them, which is exactly the pair the flag has to tell apart.
+TEST_F(PostgresMCPServerTest, StatisticsHiddenByRlsAreNotMistakenForAbsentOnes) {
+  const std::string role = "licht_rls_" + std::to_string(getpid());
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+    n.exec("CREATE ROLE \"" + role + "\" LOGIN");
+  }
+  {
+    // Roles are cluster-wide, so admin_conn (which is on the base database)
+    // can create one -- but a grant on a schema or a table is database-scoped
+    // and has to be issued where those objects live.
+    pqxx::connection owner(test_url);
+    pqxx::nontransaction n(owner);
+    n.exec("GRANT USAGE ON SCHEMA grocery TO \"" + role + "\"");
+    n.exec("GRANT SELECT ON grocery.orders TO \"" + role + "\"");
+  }
+  const std::string url = std::regex_replace(
+      test_url, std::regex(R"(\buser\s*=\s*\S+)"), "") + " user=" + role;
+
+  bool usable = false;
+  try {
+    pqxx::connection probe(url);
+    pqxx::work t(probe);
+    usable = (t.exec("SELECT current_user")[0][0].as<std::string>() == role);
+  } catch (const std::exception&) {
+  }
+  if (!usable) GTEST_SKIP() << "cannot log in as a non-superuser role here";
+
+  PostgresMCPServer rls{url};
+
+  json ts = rls.call_table_stats("grocery", "orders");
+  ASSERT_TRUE(ts.contains("stats_hidden_by_rls")) << ts.dump(2);
+  EXPECT_TRUE(ts["stats_hidden_by_rls"].get<bool>());
+  // The proof that the nulls are a visibility answer and not an absence one:
+  // the fixture ran ANALYZE, and the timestamp survives because it comes from
+  // pg_stat_user_tables rather than from pg_stats.
+  EXPECT_FALSE(ts["last_analyze"].is_null() && ts["last_autoanalyze"].is_null())
+      << "fixture analyzed this table; the timestamp is what proves the "
+         "statistics exist while pg_stats hides them";
+
+  json ch = rls.call_column_histogram("grocery", "orders", "amount");
+  ASSERT_TRUE(ch.contains("stats_hidden_by_rls")) << ch.dump(2);
+  EXPECT_TRUE(ch["stats_hidden_by_rls"].get<bool>());
+  EXPECT_TRUE(ch["n_distinct"].is_null());
+  ASSERT_TRUE(ch.contains("note"));
+  EXPECT_NE(ch["note"].get<std::string>().find("row-level security"), std::string::npos)
+      << ch["note"];
+
+  {
+    pqxx::connection owner(test_url);
+    pqxx::nontransaction n(owner);
+    n.exec("REVOKE ALL ON grocery.orders FROM \"" + role + "\"");
+    n.exec("REVOKE ALL ON SCHEMA grocery FROM \"" + role + "\"");
+  }
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+  }
+}
+
+// The owner is exempt from RLS unless FORCE ROW LEVEL SECURITY is set, so the
+// flag must be false here even though the table has RLS enabled -- otherwise it
+// would report a problem to precisely the role that does not have one.
+TEST_F(PostgresMCPServerTest, TheOwnerSeesStatisticsOnAnRlsTable) {
+  json ts = srv->call_table_stats("grocery", "orders");
+  ASSERT_TRUE(ts.contains("stats_hidden_by_rls")) << ts.dump(2);
+  EXPECT_FALSE(ts["stats_hidden_by_rls"].get<bool>());
+  ASSERT_TRUE(ts.contains("columns"));
+  EXPECT_FALSE(ts["columns"].empty());
 }
 
 TEST_F(PostgresMCPServerTest, CheckPrivilegesReportsARestrictedRoleAccurately) {

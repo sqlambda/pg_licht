@@ -199,6 +199,90 @@ private:
   std::thread reaper_;
 };
 
+// Every PostgreSQL feature this server's SQL depends on, named, with the
+// release that introduced it.
+//
+// Before 4.3.0 these were twenty-nine bare comparisons against 150000,
+// 160000, 170000 and 180000, scattered through five thousand lines of query
+// methods. Supporting a new major meant grepping for magic numbers and
+// trusting that the grep was complete; and the numbers said which release
+// without ever saying which *feature*, so a reader had to reconstruct the
+// reason from the SQL beside them.
+//
+// Adding PostgreSQL 19 is now reading one table. So is answering "what does
+// this server lack", which nothing could previously ask.
+enum class Feature {
+  // 15
+  SubTwoPhase,              // pg_subscription.subtwophasestate
+  SubscriptionStatsView,    // pg_stat_subscription_stats
+  ExtendedStatsInherit,     // pg_statistic_ext_data.stxdinherit
+  // 16
+  PgStatIo,                 // the pg_stat_io view
+  GenericPlan,              // EXPLAIN (GENERIC_PLAN)
+  BufferCacheSummary,       // pg_buffercache 1.4's summary functions
+  SlotConflicting,          // pg_replication_slots.conflicting
+  SubOrigin,                // pg_subscription.suborigin
+  SubLeaderPid,             // pg_stat_subscription.leader_pid
+  TableStatsSeqScanDetail,  // n_tup_newpage_upd, last_seq_scan
+  IndexLastScan,            // pg_stat_all_indexes.last_idx_scan
+  // 17
+  WaitEventDescriptions,    // pg_wait_events
+  SlotInvalidationReason,   // pg_replication_slots.invalidation_reason
+  StatementStatsSince,      // pg_stat_statements.stats_since
+  VacuumProgressBytes,      // dead tuple counts became byte counts
+  Checkpointer,             // pg_stat_checkpointer split from pg_stat_bgwriter
+  SubFailover,              // pg_subscription.subfailover
+  SubWorkerType,            // pg_stat_subscription.worker_type
+  MaintainPrivilege,        // the MAINTAIN table privilege
+  // 18
+  ActivityParallelWorkers,  // parallel_workers_to_launch / _launched
+  StatementStatsWalBuffers, // wal_buffers_full and the parallel columns
+  BackendIo,                // pg_stat_get_backend_io
+  IoByteCounters,           // read_bytes / write_bytes / extend_bytes
+  RelAllFrozen,             // pg_class.relallfrozen, total_vacuum_time
+  WalIoMovedToPgStatIo,     // pg_stat_wal lost wal_write/wal_sync here
+  CheckpointerNumDone,      // pg_stat_checkpointer.num_done, slru_written
+  VacuumDelayTime,          // pg_stat_progress_vacuum.delay_time
+  SubConflictCounters,      // the seven confl_* counters
+};
+
+constexpr int feature_since(Feature f) {
+  switch (f) {
+    case Feature::SubTwoPhase:
+    case Feature::SubscriptionStatsView:
+    case Feature::ExtendedStatsInherit:     return 150000;
+
+    case Feature::PgStatIo:
+    case Feature::GenericPlan:
+    case Feature::BufferCacheSummary:
+    case Feature::SlotConflicting:
+    case Feature::SubOrigin:
+    case Feature::SubLeaderPid:
+    case Feature::TableStatsSeqScanDetail:
+    case Feature::IndexLastScan:            return 160000;
+
+    case Feature::WaitEventDescriptions:
+    case Feature::SlotInvalidationReason:
+    case Feature::StatementStatsSince:
+    case Feature::VacuumProgressBytes:
+    case Feature::Checkpointer:
+    case Feature::SubFailover:
+    case Feature::SubWorkerType:
+    case Feature::MaintainPrivilege:        return 170000;
+
+    case Feature::ActivityParallelWorkers:
+    case Feature::StatementStatsWalBuffers:
+    case Feature::BackendIo:
+    case Feature::IoByteCounters:
+    case Feature::RelAllFrozen:
+    case Feature::WalIoMovedToPgStatIo:
+    case Feature::CheckpointerNumDone:
+    case Feature::VacuumDelayTime:
+    case Feature::SubConflictCounters:      return 180000;
+  }
+  return 0;  // unreachable; every enumerator is listed above
+}
+
 class Session {
 public:
   // timeout_ms overrides the connection's configured statement ceiling; omit it
@@ -328,6 +412,10 @@ public:
   // when different configured connections point at different-version servers.
   int server_version() const { return conn_->server_version(); }
 
+  // Does this server have the feature, rather than "is this server new
+  // enough" -- the call site then says why it is branching.
+  bool has(Feature f) const { return server_version() >= feature_since(f); }
+
   // txn_ is destroyed before conn_, rolling back; conn_ then disconnects.
   // Every session ends in ROLLBACK, explicitly. pqxx::work already aborts an
   // uncommitted transaction on destruction, so this changes no behaviour -- it
@@ -363,6 +451,51 @@ private:
   std::optional<pqxx::work> txn_;
   std::optional<bool> in_recovery_;
   int statement_timeout_ms_ = 0;
+};
+
+// Typed access to a `tools/call` arguments object.
+//
+// Before 4.3.0 every tool re-typed its own extraction, and the schema default
+// was written out longhand once per tool -- twenty-four identical copies of
+// `arguments.contains("schema") ? arguments["schema"].get<std::string>() :
+// "public"`. One of them differing from the others would have been invisible.
+//
+// The semantics are deliberately the ones that were already there rather than
+// stricter ones: a missing key yields the default, and a key of the wrong type
+// still throws, because handle_request already turns that into -32602 and
+// silently substituting a default would hide a caller's bug.
+class Args {
+public:
+  explicit Args(const json& a) : a_(a) {}
+
+  bool contains(const char* k) const { return a_.contains(k); }
+  const json& operator[](const char* k) const { return a_[k]; }
+  const json& raw() const { return a_; }
+
+  std::string str(const char* k, const char* d = "") const {
+    return a_.contains(k) ? a_[k].get<std::string>() : std::string(d);
+  }
+  // Integers check their type rather than throwing: `limit` is the argument a
+  // model is most likely to send as a string, and a default is a better answer
+  // there than an error about JSON types.
+  int num(const char* k, int d) const {
+    return a_.contains(k) && a_[k].is_number_integer() ? a_[k].get<int>() : d;
+  }
+  long long bignum(const char* k, long long d) const {
+    return a_.contains(k) && a_[k].is_number_integer() ? a_[k].get<long long>() : d;
+  }
+  bool flag(const char* k, bool d) const {
+    return a_.contains(k) ? a_[k].get<bool>() : d;
+  }
+  json arr(const char* k) const {
+    return a_.contains(k) ? a_[k] : json::array();
+  }
+  json obj(const char* k) const {
+    return a_.contains(k) ? a_[k] : json::object();
+  }
+
+private:
+  const json& a_;
 };
 
 class PostgresMCPServer {
@@ -1431,1152 +1564,7 @@ private:
     return a[key].dump();
   }
 
-  static const std::vector<PromptDef>& prompt_defs() {
-    static const std::vector<PromptDef> v = {
-      {"diagnose-slow-query",
-       "Trace a slow statement from pg_stat_statements to a plan and a fix.",
-       {{"query_id", "queryid from statementStats; omit to start from the worst offender", false},
-        {"min_duration_s", "ignore statements faster than this mean duration", false}},
-       [](const json& a) -> std::string {
-         const std::string qid = arg_or(a, "query_id", "");
-         const std::string mind = arg_or(a, "min_duration_s", "");
-         std::string s =
-           "Diagnose a slow statement on this PostgreSQL server.\n\n"
-           "0. Call checkPrivileges first. statementStats hides the query text "
-           "of other roles without stats access, explainQuery needs SELECT on "
-           "the tables referenced, and tableBloat needs a grant of its own -- "
-           "a plan built on tools that will not answer wastes the incident.\n"
-           "1. Call statementStats to rank statements by total execution time. "
-           "Read info.dealloc first: if it is non-zero the extension has been "
-           "evicting entries, so the list is the slowest of what survived, not "
-           "the slowest overall -- say so before drawing conclusions.\n";
-         if (!qid.empty())
-           s += "2. The statement of interest is query_id " + qid +
-                ". Call explainQuery with that queryid.\n";
-         else
-           s += "2. Pick the statement with the largest total_exec_time"
-                + (mind.empty() ? std::string()
-                                : " whose mean duration is at least " + mind + "s")
-                + " and call explainQuery with its query_id.\n";
-         s +=
-           "3. Read the plan for the usual causes in this order: a sequential "
-           "scan on a large table, an estimate that is orders of magnitude off "
-           "the actual row count, a sort or hash that spilled to disk, and a "
-           "nested loop driven by a bad estimate.\n"
-           "   The spill you can confirm without the plan: statementStats already "
-           "returned temp_blks_read and temp_blks_written for this statement in "
-           "step 1, and a non-zero write count is the sort or hash going to disk, "
-           "every time it ran rather than the once EXPLAIN ANALYZE watched. Use "
-           "the plan to find which node, and the counter to know it is typical.\n"
-           "4. If the estimates are wrong, call tableStats on the tables "
-           "involved and compare n_mod_since_analyze against last_analyze and "
-           "last_autoanalyze -- stale statistics explain more bad plans than "
-           "missing indexes do, and those two timestamps also say whether "
-           "anything is analyzing the table at all or somebody is doing it by "
-           "hand.\n"
-           "   If the statistics are current and the estimate is still wrong, the "
-           "column is probably skewed rather than stale, and that is a different "
-           "fix. most_common_vals and histogram_bounds in the same payload are "
-           "the evidence: a predicate on a value in the MCV list is estimated "
-           "from its recorded frequency, while one outside it is estimated from "
-           "the histogram, and a planner that is right for the first and wrong "
-           "for the second is describing skew rather than staleness. Call "
-           "columnHistogram on that column when the shape of the distribution is "
-           "what you need, and consider a higher statistics target -- it reports "
-           "the one in effect -- or extended statistics where two columns are "
-           "correlated.\n"
-           "5. If the plan shows a sequential scan where a usable index exists, "
-           "or an index scan fetching far more heap pages than it returns rows, "
-           "suspect bloat rather than the plan. tableBloat measures dead space "
-           "in the table, indexBloat in one index; both cost a scan, so name "
-           "the object rather than sweeping the schema.\n"
-           "6. If bloat is confirmed, the fix is usually vacuum reaching the "
-           "table more often rather than a REINDEX. Read n_dead_tup and the "
-           "last vacuum times from tableStats and the per-table autovacuum "
-           "settings from tableDetails.reloptions, and follow "
-           "bloat-and-vacuum-review before changing anything cluster-wide -- "
-           "an unconsumed replication slot makes every autovacuum setting "
-           "irrelevant, and that prompt checks for one.\n"
-           "7. Before proposing an index, call duplicateIndexes to check that "
-           "one does not already exist, and tableDetails to see what is there. "
-           "If the change is DDL, follow plan-schema-change: an index that is "
-           "correct and an index that is safe to create on a live server are "
-           "different questions.\n"
-           "8. Decide what kind of fix this is before writing one, and say "
-           "which. Either the statement asks for something the planner cannot "
-           "use -- a predicate that is not sargable, a function or a cast over "
-           "an indexed column, NOT IN against a nullable subquery, OFFSET deep "
-           "into a large result -- and the fix is a rewrite. Or the planner was "
-           "misinformed, and the fix is statistics: an ANALYZE, a higher "
-           "statistics target, or extended statistics for correlated columns -- "
-           "and before proposing those, call listExtendedStatistics, because a "
-           "statistics object that already exists and is not being used is a "
-           "different problem from one that was never created. "
-           "Or the plan is right but under-resourced, and the fix is "
-           "configuration, such as work_mem for a node that spilled. Or the "
-           "statement is already well formed and nothing supports the access "
-           "path it needs -- and only then is the fix DDL.\n"
-           "   Prefer them in that order, because that is the order of what "
-           "they cost. An ANALYZE is free and instant. A rewrite costs a deploy "
-           "and nothing in the database. Configuration changes the behaviour of "
-           "every other query too. An index is a write cost paid by every "
-           "INSERT and UPDATE for as long as it exists, to buy speed for one "
-           "read pattern. Say why the cheaper options were rejected rather than "
-           "passing over them.\n"           "9. Verify what can be verified. A rewrite can be checked here and "
-           "now: call explainQuery on the rewritten statement and show that the "
-           "plan actually changed, and how. An index is checkable too "
-           "wherever hypopg is installed: call evaluateIndex with the CREATE "
-           "INDEX statement and report whether the planner actually took it, "
-           "because a proposed index the planner ignores is the common case "
-           "and a cost figure alone hides it. checkPrivileges says whether "
-           "hypopg is there; where it is not, an index is a prediction and has "
-           "to be presented as one rather than as a result. Either way hand "
-           "the creation to plan-schema-change: whether an index is correct "
-           "and whether it is safe to build on this server are different "
-           "questions, and evaluateIndex answers only the first.";
-         return s;
-       }},
-
-      {"triage-lock-contention",
-       "Find what is blocking what, and who to look at first.",
-       {{"connection", "connection to investigate; defaults to the configured default", false}},
-       [](const json& a) -> std::string {
-         const std::string c = arg_or(a, "connection", "");
-         const std::string on = c.empty() ? std::string() : " on connection " + c;
-         return
-           "Triage lock contention" + on + ".\n\n"
-           "0. Call checkPrivileges. Without stats access, currentActivity hides "
-           "the query text of backends belonging to other roles, which is most "
-           "of what this investigation reads.\n\n"
-           "Read before you write. Do not kill anything, and do not recommend "
-           "killing anything until the last step.\n\n"
-           "This is for a wait that is still happening. If what you have is a "
-           "deadlock the server already detected and logged, the sessions in it "
-           "are gone and nothing below will find them -- use diagnose-deadlock, "
-           "which reconstructs it from the log and the schema instead.\n\n"
-           "1. Call currentLocks. The rows carry a chain_depth: 0 is the "
-           "backend asked about, and the largest depth is the backend at the "
-           "root of the wait chain. That is the one to look at first.\n"
-           "   Read mode and lock_type on the same rows before going further, "
-           "because they decide what kind of problem this is. An "
-           "AccessExclusiveLock at the root is DDL or a VACUUM FULL and everything "
-           "behind it is stopped dead; a RowExclusiveLock is ordinary DML and the "
-           "queue is moving, just slowly. granted separates what is held from what "
-           "is being waited on, and wait_start says how long the queue has been "
-           "stuck -- which is not the same number as how long the blocker has been "
-           "running, and is the one that says how much damage is already done.\n"
-           "2. Call currentActivity for the pids in the chain. For each, read "
-           "state, wait_event_type, query and how long the transaction has "
-           "been open.\n"
-           "   Check leader_pid before deciding what any pid is. A parallel worker "
-           "carries its leader's pid there, and it is the leader that holds the "
-           "transaction -- terminating a worker achieves nothing and the leader "
-           "simply starts another.\n"
-           "   Read backend_xmin on the root as well. A backend holding an xmin "
-           "horizon is not only blocking this chain: it stops vacuum removing dead "
-           "tuples anywhere in the cluster, so a long idle transaction here is "
-           "also the bloat somebody else is investigating. If it is set and old, "
-           "say so, and hand the second half to bloat-and-vacuum-review.\n"
-           "3. An idle in transaction backend at the root is the usual answer, "
-           "and the fix is in the application that left it open, not in the "
-           "database -- so name the application rather than the pid. "
-           "currentActivity carries application_name, user and client_addr for "
-           "exactly this: a pid is gone by the time anyone acts on the report, "
-           "while a connection pool, a deploy or a host is something an operator "
-           "can go and fix. query_id links the statement to statementStats, which "
-           "says whether this is a recurring pattern or one bad session.\n"
-           "4. Report the chain root, what it is doing, how long it has held "
-           "the lock, and what is queued behind it. Only then discuss whether "
-           "terminating it is safe, and say what would be lost.";
-       }},
-
-      {"diagnose-deadlock",
-       "Work out why a logged deadlock happened, from the log entry plus the schema.",
-       {{"deadlock_log", "the deadlock report from the server log: the ERROR line, "
-                         "the DETAIL block naming each process, and the statements", true},
-        {"connection", "connection the deadlock happened on; defaults to the configured default", false}},
-       [](const json& a) -> std::string {
-         const std::string log = arg_or(a, "deadlock_log", "");
-         const std::string c = arg_or(a, "connection", "");
-         const std::string on = c.empty() ? std::string() : " on connection " + c;
-         return
-           "Investigate this deadlock" + on + ".\n\n"
-           "The log:\n" + log + "\n\n"
-           "Start from what is no longer true. The deadlock is over: PostgreSQL "
-           "detected the cycle, killed one transaction and released the other. "
-           "The pids in that log do not exist any more, so currentActivity and "
-           "currentLocks describe a server that has already moved on, and "
-           "triage-lock-contention -- which is about a wait chain you can still "
-           "see -- does not apply. Everything below reconstructs the deadlock "
-           "from the log and the schema. Reach for the live tools only in step "
-           "6, and only if it is still recurring.\n\n"
-           "0. Call checkPrivileges. explainQuery and statementStats are the two "
-           "this needs and the two a restricted role loses; without them say so "
-           "rather than guessing at plans.\n"
-           "1. Read the log before touching the database, because it already "
-           "settles more than it is usually given credit for. For each process "
-           "extract three things: the statement it was running, the lock it "
-           "waited for, and the lock it held. The kind of lock names the shape "
-           "before you look at anything:\n"
-           "   - 'ShareLock on transaction N' means it was waiting for a row "
-           "another transaction had written and not yet committed. This is the "
-           "common case and it is a row-ordering problem.\n"
-           "   - 'ExclusiveLock on tuple (x,y)' is the queue for one specific "
-           "row: several transactions want the same row and are lined up.\n"
-           "   - a relation-level lock, especially AccessExclusiveLock, means "
-           "DDL or an explicit LOCK TABLE was in the cycle, not ordinary DML.\n"
-           "2. The statement text is not the lock footprint, and assuming it is "
-           "is why deadlocks between statements that name different tables look "
-           "impossible. For every table named, call tableDetails and read:\n"
-           "   - foreign keys in BOTH directions. Writing a row that references "
-           "a parent takes a lock on the parent row too, so a statement that "
-           "names only the child touches the parent, and two children pointing "
-           "at two parents in opposite orders deadlock without ever naming the "
-           "same table.\n"
-           "   - triggers. A trigger runs statements the log never shows, "
-           "against tables the statement never names.\n"
-           "   - unique indexes. Two inserts of the same key do not conflict on "
-           "a row that exists; the second waits on the first transaction to end.\n"
-           "   If a statement calls a function or procedure, call "
-           "functionDetails and read the body: the transaction is the whole "
-           "body, and the ordering that matters is the order the body takes.\n"
-           "3. Now reconstruct the acquisition ORDER for each transaction, "
-           "because that is the only thing that ever causes a deadlock. Two "
-           "transactions took the same locks in different orders; nothing else "
-           "produces a cycle. Write the order out per transaction, including "
-           "the locks step 2 found that the statements do not mention, and say "
-           "where the two orders cross.\n"
-           "4. Call explainQuery for each statement. The plan decides the order "
-           "rows are locked, so two UPDATEs with identical WHERE clauses lock "
-           "in different orders when one uses an index scan and the other a "
-           "sequential scan -- and a plan flip is enough to start a deadlock "
-           "that was not happening last week. Where the statement came from "
-           "pg_stat_statements, recover it with explainQuery by queryid first. "
-           "Do not use analyze: it executes, and this is a post mortem.\n"
-           "5. Classify it, and say which reading decided it: rows taken in "
-           "different orders, a foreign key pulling in a parent, a trigger "
-           "widening the footprint, contention on one unique key, or explicit "
-           "locking in inconsistent order.\n"
-           "6. Only now ask whether it is still happening, and escalate in three "
-           "stages. Each one is licensed by the one before it, and in each the "
-           "fact that the statement APPEARS is itself the finding, before any "
-           "counter is read.\n"
-           "   a. Look for it in statementStats. pg_stat_statements evicts "
-           "under pressure, discarding the least-used entries first, so a "
-           "statement still present in a cluster that is evicting has proved it "
-           "runs often enough to survive -- and a deadlock needs concurrency, so "
-           "that is the first thing worth establishing. Read info.dealloc to "
-           "know whether eviction is happening at all, because it decides what "
-           "presence means. Then calls and mean_exec_time say how much overlap "
-           "there is between two runs.\n"
-           "      Not finding it settles nothing. It may have been evicted, the "
-           "counters may have been reset, or the extension may not be installed. "
-           "Say which of those you ruled out rather than reporting it as rare. "
-           "Match on the normalised text: the log holds one execution, "
-           "pg_stat_statements holds the shape with constants replaced.\n"
-           "   b. Look for it in currentActivity. If it is there, it is running "
-           "right now, which turns a post mortem into something observable -- "
-           "you can watch the next occurrence instead of inferring the last one. "
-           "Read state and how long each transaction has been open: a statement "
-           "that finishes in milliseconds cannot hold a lock long enough to "
-           "deadlock with anything, so an open transaction sitting on it is the "
-           "condition that makes the cycle possible.\n"
-           "   c. If it is live and slow, call currentLocks. A deadlock is a "
-           "wait chain that closed into a loop, so the chains forming now are "
-           "the near-miss version of the one that closed -- the same edges, "
-           "caught before the last one joined up. If you find a real chain, hand "
-           "off to triage-lock-contention, which is built for a wait you can "
-           "still see; come back here with what it found about the root.\n"
-           "   Whatever the stage, serverSettings gives deadlock_timeout, and "
-           "log_lock_waits being off means every long wait that did not quite "
-           "close into a cycle went unlogged -- so the log you are reading is "
-           "the only one of these events you were ever going to see.\n"
-           "7. Rank the fixes, and rank them in this order: make the "
-           "acquisition order consistent between the two paths, then shrink the "
-           "lock footprint, then shorten the transaction so the window is "
-           "smaller. Be explicit that deadlock_timeout is not a fix -- it "
-           "changes when the cycle is detected, never whether it forms -- and "
-           "that max_locks_per_transaction has nothing to do with this. "
-           "Retrying on SQLSTATE 40P01 belongs in the application and is a "
-           "mitigation, not a diagnosis: say so plainly if you recommend it, "
-           "because a retry loop over an ordering bug hides it rather than "
-           "fixing it.\n"
-           "8. If the fix is DDL -- an index to change a plan, a constraint to "
-           "drop, a trigger to rewrite -- hand it to plan-schema-change rather "
-           "than proposing the statement here. What is safe to apply depends on "
-           "the size and traffic of the table, which that prompt measures.";
-       }},
-
-      {"triage-active-sessions",
-       "Find why a server is running more sessions at once than it has CPUs to run them on.",
-       {{"connection", "connection to investigate; defaults to the configured default", false}},
-       [](const json& a) -> std::string {
-         const std::string c = arg_or(a, "connection", "");
-         const std::string on = c.empty() ? std::string() : " on connection " + c;
-         return
-           "Work out why this server has so many sessions running at once" + on +
-           ".\n\n"
-           "Two things have to be established before any of it means anything, "
-           "and both are routinely assumed instead.\n\n"
-           "First, ACTIVE IS NOT ON-CPU. pg_stat_activity calls a backend active "
-           "while it is executing a statement, and a backend waiting on a lock, "
-           "on a disk read, or on a parallel sibling is executing a statement. A "
-           "server with fifty active sessions where forty-five are waiting on "
-           "locks is not short of CPU; it has one blocker and a queue. Only "
-           "backends with no wait event are actually competing for CPU, and that "
-           "is the number to compare against the core count.\n\n"
-           "Second, HIGH CONCURRENCY IS USUALLY A SYMPTOM. The number of "
-           "sessions in flight is the arrival rate multiplied by how long each "
-           "one takes, so it rises when statements get slower even though "
-           "nothing about the load changed. Treating that as a capacity problem "
-           "-- more cores, a bigger pool -- treats the symptom and leaves the "
-           "cause. Establish which of the two moved before proposing anything.\n\n"
-           "0. Call checkPrivileges. Without stats access currentActivity hides "
-           "the query text of other roles, which is most of what this reads, and "
-           "statementStats hides most of its rows.\n"
-           "1. Call hostCapacity for the core count. If it reports host vCPUs "
-           "unknown, stop with a partial answer and say so: PostgreSQL cannot "
-           "see the machine it runs on and the number has to be declared per "
-           "connection. Everything below is a comparison against it, so guessing "
-           "it invents the conclusion.\n"
-           "2. Call currentActivity and count properly, because the raw number "
-           "of active rows is not the concurrency.\n"
-           "   - Keep only client backends. Autovacuum workers, the walsender, "
-           "the checkpointer and background workers all appear here and none of "
-           "them is user concurrency, though they do compete for the same "
-           "cores -- count them separately rather than dropping them.\n"
-           "   - Collapse parallel workers into their leaders using leader_pid. "
-           "One query with four workers is five rows and one unit of user "
-           "concurrency. Report both numbers, because the gap between them is "
-           "how much of the load is parallelism rather than clients, and "
-           "max_parallel_workers_per_gather above 1 means a single statement can "
-           "oversubscribe the machine by itself.\n"
-           "   - Split what remains by wait_event_type, and read "
-           "wait_event_description where it is unfamiliar rather than guessing "
-           "from the name.\n"
-           "3. The split is the diagnosis, and it decides which investigation "
-           "this actually is. Compare ONLY the no-wait group against the core "
-           "count from step 1.\n"
-           "   - No wait event: on CPU. If this is at or above the core count "
-           "the server is genuinely CPU-bound and step 4 is the question. If it "
-           "is well below, the server is not CPU-bound whatever the active total "
-           "says, and the dominant wait below is the real subject.\n"
-           "   - Lock: they are queued behind something, not working. Hand off "
-           "to triage-lock-contention, which follows the chain to its root. A "
-           "single blocker can make a server look saturated.\n"
-           "   - IO: reading from disk rather than from cache. That is "
-           "buffer-cache-review, and ioStats separates real pressure from a "
-           "large sequential scan recycling its own ring buffer on purpose.\n"
-           "   - LWLock: contention inside PostgreSQL rather than on user data, "
-           "commonly around WAL or buffer mapping. checkpointStats and ioStats "
-           "are where that shows, and it usually means the write path rather "
-           "than the query.\n"
-           "   - IPC: frequently parallel workers waiting on each other, which "
-           "points back at the parallelism settings rather than at the "
-           "statements.\n"
-           "   - Client: waiting on the application to send or read. The "
-           "database is not the bottleneck; something on the other side is slow, "
-           "or a transaction is being held open across application work.\n"
-           "4. Only if the no-wait group really is at the core count: find out "
-           "which of the two terms moved, because they need opposite fixes. Call "
-           "statementStats.\n"
-           "   - More statements arriving, with mean_exec_time roughly where it "
-           "was, is genuine growth. That is a capacity answer: a connection "
-           "pooler to bound the concurrency, or more cores.\n"
-           "   - The same statements taking longer than they did is a "
-           "regression, and the concurrency is its consequence rather than its "
-           "cause. Take the worst offender to diagnose-slow-query. A plan that "
-           "flipped, statistics that went stale, a table that bloated or a "
-           "working set that outgrew the cache will all show here as a load "
-           "problem and none of them is one.\n"
-           "   - Say which it is and what the reading was. If you cannot tell "
-           "because there is no earlier figure to compare against, say that too, "
-           "and note that mean_exec_time needs a before-value or a reset to mean "
-           "anything.\n"
-           "5. Read the duration spread from query_duration_s and "
-           "xact_duration_s, because an average hides the shape. Many short "
-           "statements and a few very long ones are different problems: the "
-           "second is not concurrency at all, and a long-running transaction "
-           "also holds back the xmin horizon, which makes it "
-           "bloat-and-vacuum-review's problem simultaneously. Name the "
-           "applications behind them using application_name and client_addr, "
-           "since a pid is gone by the time anyone acts on the report and a "
-           "connection pool or a deploy is something an operator can go and "
-           "change.\n"
-           "6. Check whether the pool is the problem rather than the workload. "
-           "databaseStats gives numbackends against max_connections, and the "
-           "session counters say whether connections are churning: sizing "
-           "anything against a backend count that is high because sessions keep "
-           "dying is sizing for the symptom. Without a pooler in front, every "
-           "burst opens real backends and each one is a work_mem allocation "
-           "waiting to happen -- capacity-check does that arithmetic.\n"
-           "7. Account for the work nobody asked for. progressStats shows a "
-           "VACUUM, CREATE INDEX or CLUSTER in flight, any of which takes "
-           "parallel workers and I/O from everything else; wraparoundStatus "
-           "shows an antiwraparound autovacuum, which will not yield and cannot "
-           "be postponed, and which explains a server that is busy with no "
-           "corresponding user load.\n"
-           "8. Report the count that matters -- backends genuinely on CPU "
-           "against cores -- not the active total, and say what the rest were "
-           "waiting on. Then the cause, then the fix, ranked. Be explicit that a "
-           "connection pooler bounds the damage rather than repairing it: it "
-           "stops an overloaded server from getting worse, and it makes no "
-           "statement faster.";
-       }},
-
-      {"bloat-and-vacuum-review",
-       "Decide whether bloat is real, and whether autovacuum is keeping up.",
-       {{"schema", "schema to review; defaults to public", false}},
-       [](const json& a) -> std::string {
-         const std::string sch = arg_or(a, "schema", "public");
-         return
-           "Review bloat and autovacuum health for schema " + sch + ".\n\n"
-           "0. Call checkPrivileges. tableBloat and indexBloat are denied outright "
-           "to a role without the scanning grant, and tableStats returns null "
-           "statistics rather than an error when it cannot read a column -- "
-           "which looks exactly like a table nobody has analyzed.\n"
-           "1. Call listTableStats for " + sch + ". Rank by n_dead_tup and read "
-           "last_vacuum and last_autovacuum beside it: a large dead-tuple count on "
-           "a table vacuumed minutes ago is a busy table, not a neglected one.\n"
-           "   Read those two apart, because together they answer the question "
-           "this review is actually for. A recent last_autovacuum means autovacuum "
-           "is reaching the table and the settings are working. A recent "
-           "last_vacuum beside a null or ancient last_autovacuum means the "
-           "opposite: somebody is keeping this table alive by hand, autovacuum is "
-           "not doing it, and the cron job is hiding the finding rather than being "
-           "it. Both look identical if you only ask when the table was last "
-           "vacuumed. last_analyze and last_autoanalyze divide the same way.\n"
-           "   Ranking by dead tuples alone misses the table most likely to hurt "
-           "you, because an insert-only table never accumulates any. Read "
-           "n_ins_since_vacuum as a second ranking: a large value beside an old "
-           "last_vacuum is a table autovacuum reaches only through the insert "
-           "threshold, and one that is never vacuumed is also never frozen, which "
-           "makes it step 3's problem rather than this step's.\n"
-           "   Where the server reports it (PostgreSQL 16 and later), "
-           "n_tup_newpage_upd against the update count says how often an update "
-           "could not stay on its page. That is a cause rather than a symptom: it "
-           "means HOT is failing, either because fillfactor leaves no room or "
-           "because an index covers a column the workload keeps changing, and no "
-           "amount of vacuuming fixes either.\n"
-           "2. Call replicationSlots before concluding anything. An inactive "
-           "or lagging slot holds back the xmin horizon, which stops vacuum "
-           "from removing dead tuples cluster-wide -- and no amount of "
-           "autovacuum tuning fixes it. This is the single most common wrong "
-           "diagnosis in this area.\n"
-           "   Then find out whether the slot will ever advance, because that "
-           "decides whether to wait or to drop it. For a logical slot the "
-           "consumer is a subscriber on another server: call subscriptionStats "
-           "on that connection. A subscriber with a climbing apply_error_count "
-           "or a table still copying is stuck but alive, and fixing it releases "
-           "the horizon; one that reports nothing at all is gone, and the slot "
-           "is abandoned. Those two look identical from this side.\n"
-           "   There is a third state that looks like abandonment and is not. "
-           "Call listSubscriptions there too and read enabled beside "
-           "disable_on_error. A subscription created with disable_on_error "
-           "turns ITSELF off the first time apply fails, so what you see is an "
-           "inactive slot, a disabled subscription, and WAL piling up behind a "
-           "consumer that is neither broken nor gone -- it is waiting, exactly "
-           "as configured. The fix is the apply error plus ALTER SUBSCRIPTION "
-           "ENABLE, and dropping the slot here would destroy a subscriber that "
-           "was one command from resuming. enabled false with disable_on_error "
-           "false is the opposite: somebody disabled it by hand, and the "
-           "question is who and whether they meant to leave it.\n"
-           "3. Call wraparoundStatus. If any database or table is approaching "
-           "autovacuum_freeze_max_age, that outranks ordinary bloat.\n"
-           "4. For the worst few tables, call tableBloat to measure rather than "
-           "estimate. Leave exact at its default first; the approximation is "
-           "usually enough to rank them.\n"
-           "5. For an index that looks redundant, duplicateIndexes says it is "
-           "covered and idx_scan says nobody used it on this server -- but "
-           "neither proves the planner would not miss it. Where hypopg is "
-           "installed, evaluateIndex with 'hide' plans the query without the "
-           "index and settles it. Dropping an index is easy; rebuilding one on "
-           "a large table is not.\n"
-           "6. Only where bloat is confirmed, look at per-table storage "
-           "parameters via tableDetails.reloptions and propose changes. Say which "
-           "reading justifies each one. The autovacuum thresholds are the usual "
-           "answer for a table that is vacuumed too rarely; fillfactor is the "
-           "answer for one where n_tup_newpage_upd showed HOT failing, and it "
-           "treats the cause rather than the residue.";
-       }},
-
-      {"triage-disk-space",
-       "Find what is filling the disk, and what can safely be freed right now.",
-       {{"connection", "connection to investigate; defaults to the configured default", false}},
-       [](const json& a) -> std::string {
-         const std::string c = arg_or(a, "connection", "");
-         const std::string on = c.empty() ? std::string() : " on connection " + c;
-         return
-           "Find what is consuming disk" + on + " and what can be freed.\n\n"
-           "Call diskUsage first. It answers this from SQL alone -- WAL size and "
-           "file count, the archive status backlog, temporary files on disk now, "
-           "the log directory, and sizes per tablespace and per database across "
-           "the whole cluster -- so no shell on the server is needed for any of "
-           "what follows.\n"
-           "   One thing it cannot report, because PostgreSQL exposes no "
-           "function for it: how much room is left. Sizes here are what "
-           "PostgreSQL accounts for, not the volume, and anything outside "
-           "PostgreSQL on the same device is invisible. Ask the operator for df "
-           "if the headroom matters to the decision; everything else below is "
-           "answerable without it.\n"
-           "   Read tablespaces before anything else. A tablespace sits on "
-           "whatever volume it was created on and carries its location, so the "
-           "database that is growing and the disk that is full need not be the "
-           "same device -- and the log directory is frequently a third one. "
-           "Establish which volume the alert is about before ranking anything on "
-           "it.\n\n"
-           "Four things consume space and they need different fixes, so identify "
-           "which before proposing anything. They are in this order because it "
-           "is the order of how fast each can be undone, which is what matters "
-           "at three in the morning.\n\n"
-           "0. Call checkPrivileges. Without stats access replicationSlots and "
-           "currentActivity are degraded, and those are the first two steps.\n"
-           "1. WAL, which is the most common answer and the most recoverable. "
-           "diskUsage.wal is what is actually on disk; replicationSlots says "
-           "who is pinning it. Read retained_wal_bytes and wal_status per "
-           "slot. An inactive slot pins WAL indefinitely and nothing reclaims it "
-           "while the slot exists. wal_status says how far gone it is: reserved "
-           "is healthy, extended is past max_wal_size, unreserved means the slot "
-           "is the only thing keeping that WAL, and lost means it is already "
-           "unusable and its consumer cannot resume whatever you do next.\n"
-           "   Then get the rate, because a size without a rate does not say how "
-           "long you have. checkpointStats reports WAL volume, and "
-           "serverSettings carries max_slot_wal_keep_size -- if it is set, "
-           "PostgreSQL will invalidate the slot rather than fill the disk, which "
-           "trades a broken replica for a live primary; if it is unset, nothing "
-           "bounds this.\n"
-           "   Before concluding it is a slot, read diskUsage.archive_status. A "
-           "failing archive_command retains every segment it has not archived, "
-           "and a climbing .ready count is exactly that -- indistinguishable "
-           "from an abandoned slot by the WAL size alone, and a completely "
-           "different fix. pg_stat_archiver carries failed_count and "
-           "last_failed_time if you need the reason; this server does not read "
-           "it, but the backlog is enough to tell which of the two you have.\n"
-           "2. Temporary files, which are the fastest to free and the easiest to "
-           "miss. diskUsage.temp_files is what is on disk at this moment, while "
-           "databaseStats temp_files and temp_bytes are the running totals since "
-           "the counters were reset -- the first says whether it is happening "
-           "now, the second whether it is habitual. Both are sorts and hashes "
-           "that exceeded work_mem. A single runaway "
-           "statement can fill a volume in minutes, and every byte returns the "
-           "moment it ends -- so currentActivity for what is running now is both "
-           "the diagnosis and the fix. If this is the cause, the incident is "
-           "over as soon as that statement is, and the follow-up is work_mem "
-           "rather than storage.\n"
-           "3. Bloat: space the tables hold and are not using. "
-           "bloat-and-vacuum-review is the full investigation and tableBloat "
-           "measures one table.\n"
-           "   THE TRAP HERE IS THE OBVIOUS FIX. VACUUM FULL rewrites the table "
-           "and needs free space equal to the table plus its indexes before it "
-           "releases any -- on a disk that is already full it fails, and it "
-           "holds an AccessExclusiveLock for the whole attempt. Ordinary VACUUM "
-           "frees nothing back to the filesystem either; it makes space reusable "
-           "inside the file. So bloat is rarely the thing to act on during the "
-           "incident, and saying that plainly is more useful than proposing it.\n"
-           "4. Genuine growth. diskUsage.databases already ranked every database "
-           "in the cluster, which matters because the one filling the disk is "
-           "frequently not the one anybody is connected to. Within the database "
-           "that stands out, listTableSizes ranks a schema. Do not forget the "
-           "log directory, which diskUsage also sized: a stuck rotation fills a "
-           "volume with nobody looking at it.\n"
-           "5. Rank what can be freed by how reversible it is, and say the cost "
-           "of each rather than only the size.\n"
-           "   - Ending a statement that is spilling temp files: immediate, and "
-           "costs that one statement.\n"
-           "   - Raising or setting max_slot_wal_keep_size: bounds future growth, "
-           "frees nothing now.\n"
-           "   - Dropping a replication slot: frees the most, immediately, and is "
-           "IRREVERSIBLE for its consumer -- a replica or subscriber behind that "
-           "slot must be rebuilt from scratch. Say exactly what would have to be "
-           "rebuilt, and prefer fixing or decommissioning the consumer. "
-           "replication-slot-review establishes whether the consumer is stuck "
-           "but alive or actually gone, and those two deserve opposite "
-           "decisions.\n"
-           "   - VACUUM FULL or a table rewrite: needs space you do not have, "
-           "and locks. Not an incident action.\n"
-           "   - More storage: buys time and fixes nothing, which is sometimes "
-           "exactly the right call at three in the morning. Say so when it is.\n"
-           "6. Report what is consuming the space, how fast it is growing, how "
-           "long there is at that rate, and the one action that buys the most "
-           "time for the least damage. Then say what the permanent fix is, "
-           "because it is usually not the same thing.";
-       }},
-
-      {"buffer-cache-review",
-       "See what is occupying shared buffers and whether it is the right thing.",
-       {{"connection", "connection to review; defaults to the configured default", false}},
-       [](const json& a) -> std::string {
-         const std::string c = arg_or(a, "connection", "");
-         const std::string on = c.empty() ? std::string() : " on connection " + c;
-         return
-           "Review shared buffer usage" + on + ".\n\n"
-           "0. Call checkPrivileges. Both buffer-cache tools need the monitoring "
-           "role, and they are the whole of this review.\n"
-           "1. Call bufferCacheSummary first. It is cheap; bufferCacheContents "
-           "aggregates every buffer and is not.\n"
-           "   Read the usage_counts histogram and usagecount_avg, not only the "
-           "used and dirty totals. A cache that is full but sitting at low usage "
-           "counts is being churned -- buffers are evicted before anything reads "
-           "them twice -- and a cache that is full at high usage counts is simply "
-           "working. Those two want opposite actions and buffers_used alone cannot "
-           "tell them apart, which is the question step 5 has to answer.\n"
-           "2. Call hostCapacity and compare shared_buffers against the host's "
-           "RAM, and effective_cache_size against what the OS can plausibly "
-           "cache.\n"
-           "3. Call tableIOStats. A low hit ratio on a small, frequently read "
-           "table is the actionable case; a low ratio on a large table scanned "
-           "once a day is not a problem.\n"
-           "   Then call ioStats for the same period. evictions counts buffers "
-           "thrown out to make room and reuses counts a ring buffer recycling its "
-           "own, which is what a large sequential scan does deliberately so it "
-           "cannot flush the cache. Distinguishing them is the difference between "
-           "a cache under real pressure and one doing its job: rising evictions is "
-           "the finding, rising reuses is a big scan behaving correctly.\n"
-           "4. Only if the summary suggests something is wrong, call "
-           "bufferCacheContents to see which relations hold the buffers.\n"
-           "5. Report whether the cache is undersized, mis-sized relative to "
-           "the host, or being churned by one workload, and say which reading "
-           "supports the conclusion.";
-       }},
-
-      {"capacity-check",
-       "Check memory and parallelism settings against the machine.",
-       {{"connection", "connection to check; defaults to the configured default", false}},
-       [](const json& a) -> std::string {
-         const std::string c = arg_or(a, "connection", "");
-         const std::string on = c.empty() ? std::string() : " for connection " + c;
-         return
-           "Check server capacity settings" + on + ".\n\n"
-           "1. Call hostCapacity. If it reports that host RAM and vCPU count "
-           "are unknown, say so and stop with a partial answer: PostgreSQL "
-           "cannot see the machine it runs on, and those values have to be "
-           "declared per connection in the config file. Do not guess them.\n"
-           "2. Read derived.committed_worst_case_percent_of_ram. This is "
-           "work_mem times max_connections plus maintenance_work_mem times "
-           "autovacuum_max_workers, and it is the number that decides whether "
-           "the OOM killer is a risk.\n"
-           "3. Compare shared_buffers and effective_cache_size against RAM.\n"
-           "4. Check parallelism: max_parallel_workers_per_vcpu above 1 means "
-           "a single query can oversubscribe the machine. That is the setting; "
-           "triage-active-sessions is where the consequence is observed, and it "
-           "collapses parallel workers into their leaders so the concurrency is "
-           "counted in queries rather than in backends.\n"
-           "5. Call databaseStats and read numbackends against max_connections "
-           "to see how much of the worst case is actually reached. Read "
-           "temp_files and temp_bytes on the same call: everything above is the "
-           "worst case arithmetic, and these two are the only evidence of what "
-           "actually happened. Temporary files are sorts and hashes that did not "
-           "fit in work_mem and went to disk, so a large temp_bytes is work_mem "
-           "being too small in practice however comfortable step 2 looked -- and "
-           "a temp_bytes of zero is the argument against raising it. The two "
-           "readings pull in opposite directions and the answer needs both.\n"
-           "   sessions_abandoned, sessions_fatal and sessions_killed say whether "
-           "connections are churning. Sizing max_connections against a count that "
-           "is high because sessions keep dying is sizing for the symptom.\n"
-           "6. Report each finding with the reading behind it, and name the "
-           "setting to change.";
-       }},
-
-      {"replication-slot-review",
-       "Find what a replication slot is holding back, and what it costs to release it.",
-       {{"connection", "connection to review; defaults to the configured default", false}},
-       [](const json& a) -> std::string {
-         const std::string c = arg_or(a, "connection", "");
-         const std::string on = c.empty() ? std::string() : " on connection " + c;
-         return
-           "Review replication slots" + on + " and what they are holding back.\n\n"
-           "An unconsumed slot is the failure mode that presents as something "
-           "else. It holds back the xmin horizon, so vacuum cannot remove dead "
-           "tuples anywhere in the cluster; and it pins WAL until the disk "
-           "fills. Both symptoms get diagnosed as bloat, or as a disk problem, "
-           "and neither diagnosis leads anywhere.\n\n"
-           "0. Call checkPrivileges: a role without stats access sees less of "
-           "replicationSlots and of currentActivity than this review needs.\n"
-           "1. Call replicationSlots. For each slot read whether it is active, how "
-           "far its restart_lsn trails the current WAL position, and its "
-           "wal_status. reserved is healthy. extended means it has gone past "
-           "max_wal_size. unreserved means the slot is now the only thing "
-           "keeping that WAL on disk. lost means the WAL it needs is already "
-           "gone and the consumer cannot resume -- that slot is dead, and only "
-           "rebuilding its consumer fixes it.\n"
-           "   Three more fields answer questions you would otherwise estimate. "
-           "inactive_since dates the problem exactly, which beats inferring it "
-           "from WAL volume: a slot inactive for an hour and one inactive since "
-           "a deploy three weeks ago are different findings with the same "
-           "retained_wal_bytes. conflicting and invalidation_reason say the "
-           "server retired the slot itself rather than it merely falling "
-           "behind -- wal_removed, rows_removed, wal_level_insufficient and "
-           "idle_timeout are each a different cause and a different fix, and "
-           "none of them is repaired by giving the consumer more time. And for "
-           "a logical slot the spill and stream counters say whether decoding "
-           "is fitting in memory: heavy spill_txns and spill_bytes mean large "
-           "transactions are being written to disk before they are sent, which "
-           "is a logical_decoding_work_mem finding rather than a slow "
-           "consumer.\n"
-           "2. An inactive slot with growing lag is the finding. Before "
-           "anything else, establish whose it is: listTopology and "
-           "verifyTopology for physical replicas, listSubscriptions and "
-           "listPublications for logical ones. A slot with no owner anybody "
-           "recognises is the common case and the easy one. If the owner is a "
-           "subscriber you can reach, call subscriptionStats on THAT connection "
-           "-- not this one -- to separate a subscriber that is stuck from one "
-           "that is merely gone: a stuck apply worker shows an error count or a "
-           "table still copying, while a decommissioned one shows nothing at "
-           "all and the slot is simply abandoned.\n"
-           "3. Measure how fast it grows before deciding how urgent it is. "
-           "checkpointStats reports WAL volume, and serverSettings carries "
-           "max_slot_wal_keep_size -- if that is set, PostgreSQL will "
-           "invalidate the slot rather than fill the disk, which trades a "
-           "broken replica for a live primary. If it is unset, nothing bounds "
-           "the growth.\n"
-           "4. Call wraparoundStatus. The same held xmin horizon also stops "
-           "freezing, and if wraparound headroom is shrinking that outranks the "
-           "disk: one ends in a slow server, the other in a cluster that stops "
-           "accepting writes.\n"
-           "5. Report the slot, its owner, what it is holding, and how long the "
-           "disk has at the current rate. Dropping a slot is irreversible for "
-           "its consumer: say exactly what would have to be rebuilt, and prefer "
-           "fixing or decommissioning the consumer over dropping the slot "
-           "underneath it.";
-       }},
-
-      {"plan-schema-change",
-       "Choose how to apply a DDL change by measuring the table it targets.",
-       {{"change", "the change you intend to make, in your own words", true},
-        {"schema", "schema of the table being changed", false},
-        {"table", "table being changed", false}},
-       [](const json& a) -> std::string {
-         const std::string change = arg_or(a, "change", "");
-         const std::string sch = arg_or(a, "schema", "");
-         const std::string tbl = arg_or(a, "table", "");
-         std::string target;
-         if (!tbl.empty()) target = "Target: " + (sch.empty() ? "" : sch + ".") + tbl + "\n";
-         return
-           "Plan this schema change against what this database actually is.\n\n"
-           "The change: " + change + "\n" + target + "\n"
-           "This server is read-only and will run none of it. What you produce "
-           "is a plan for an operator to apply.\n\n"
-           "Do not answer from a recipe. The safe method for a change is a "
-           "property of the table in front of you, not of the statement: the "
-           "same DDL that is instant on one table is an outage on another. A "
-           "table with no rows can be rewritten in place and nobody notices; "
-           "the same rewrite at a billion rows is hours under an exclusive "
-           "lock. Partitioning is the extreme case -- trivial before there is "
-           "data, a migration project with a cutover after it. Reaching for the "
-           "safest-at-scale approach on a small table is complexity nobody "
-           "needs, and reaching for the simple one on a large table is the "
-           "outage. Measure first, then choose, and say which reading decided "
-           "it.\n\n"
-           "1. Call checkPrivileges. tableStats and tableSize are what this "
-           "whole plan rests on; if either is degraded here, say so rather than "
-           "estimating, because they are what separates a metadata change from "
-           "a full rewrite.\n"
-           "2. Identify every object the change touches, then measure each of "
-           "them -- not only the one named as the target. A statement that "
-           "names one table routinely locks more than one: a foreign key locks "
-           "the table it references as well as the table it is added to, a "
-           "partitioned table means the parent and every partition, and a "
-           "column that other tables reference cannot be considered alone. The "
-           "object you did not name is often the busier one, and its lock is "
-           "the one that surprises people. Read the change itself for the "
-           "objects it names, and tableDetails for the ones the catalog knows "
-           "about -- foreign keys in both directions, and inheritance or "
-           "partition parents.\n"
-           "   For each of them:\n"
-           "   - tableStats: the row count, and n_distinct and most_common_vals "
-           "when the change involves a default, an index or a partition key -- "
-           "most_common_vals is the empirical answer to what value the rows "
-           "already hold, and histogram_bounds low, mid and high are the "
-           "observed extremes, which is the range a new constraint or default "
-           "has to be true across\n"
-           "   - columnHistogram on the partition key, if this is a "
-           "partitioning change. Choosing boundaries without the distribution is "
-           "guessing, and the guess is usually uniform when the data is not: a "
-           "table partitioned by month is a table with one enormous partition "
-           "wherever the traffic actually was. The bounds are equal-frequency, "
-           "so every consecutive pair delimits roughly the same number of rows, "
-           "and taking every Nth bound gives boundaries that divide the existing "
-           "data evenly. Say which bounds you used, because that is what makes "
-           "the choice checkable later against how the data has moved since\n"
-           "   - tableSize: what a rewrite would actually move. Use the "
-           "measured size, not the estimate; this is the number that turns "
-           "\"instant\" into \"an hour\"\n"
-           "   - tableDetails: the indexes, constraints, inbound foreign keys "
-           "and triggers already there, and whether it is already partitioned. "
-           "Each one multiplies the cost of a rewrite, and some rule out "
-           "approaches outright\n"
-           "   - the scan and tuple counters in tableStats: how busy it is. A "
-           "lock window costs nothing on a table nothing is touching\n"
-           "   - currentActivity and currentLocks: the oldest running "
-           "transaction, and whether anything already holds or waits for a lock "
-           "on any of these objects. A brief exclusive lock request waits "
-           "behind a long transaction, and everything arriving after it waits "
-           "behind that -- which is how a millisecond operation becomes an "
-           "outage. Check this for every object the change touches, since one "
-           "busy parent is enough to stall the whole statement\n"
-           "   - serverSettings for the server version, since what is possible "
-           "and what it costs both moved across majors\n"
-           "   - listTopology and replicationSlots if the change rewrites: the "
-           "WAL a rewrite generates has to reach every replica and pass through "
-           "every slot\n"
-           "   - listPublications, always. Logical replication does not carry "
-           "DDL: if the table is published, this statement changes the publisher "
-           "and nothing else, and the subscriber keeps the old shape until "
-           "someone changes it too. The failure is silent until the next row "
-           "arrives and apply stops. Two things decide the plan -- whether the "
-           "table is published at all, and whether the change touches the "
-           "primary key or the unique index serving as REPLICA IDENTITY, "
-           "because a published table without one cannot replicate UPDATE or "
-           "DELETE at all\n"
-           "3. From those numbers, classify the change before writing any DDL. "
-           "Say which of the three it is -- metadata only, a scan without a "
-           "rewrite, or a full rewrite of the table and its indexes -- and "
-           "separately what lock it needs and for how long. The lock level "
-           "alone settles nothing: a strong lock held for a millisecond is "
-           "safe, and a weak one held for an hour may not be. Duration is the "
-           "number that matters, and duration comes from the measurements.\n"
-           "4. Choose the method by matching that cost against what this table "
-           "can tolerate. Above some size the incremental approach is the only "
-           "one available; below it, it is machinery for nothing. State the "
-           "size or rate at which your answer would flip, so the reasoning can "
-           "be checked against a different table later.\n"
-           "5. Give the plan as ordered DDL. Against each statement say the "
-           "lock it takes, whether it rewrites, what must not be running "
-           "alongside it, and roughly how long at this table's measured size.\n"
-           "   If the table is published, the plan has two sides and the order "
-           "between them is part of it: additive changes go on the subscriber "
-           "first, so it can accept a row that already carries the new column; "
-           "destructive ones go on the publisher first, so it stops sending "
-           "what the subscriber is about to lose. Getting that backwards stops "
-           "apply rather than degrading it. Say which side each statement runs "
-           "on, and end with subscriptionStats on the subscriber as the check "
-           "that apply survived -- a zero apply_error_count after the change is "
-           "the only evidence that it did.\n"
-           "6. Say what the revert looks like, and flag anything irreversible "
-           "as irreversible whatever the size.";
-       }},
-
-      {"check-role-access",
-       "Work out whether a role can use a table, view, function or procedure, and which rows.",
-       {{"role", "the role to check; not necessarily the role this server connects as", true},
-        {"object", "schema-qualified object name, e.g. billing.invoices", true},
-        {"privilege", "SELECT, INSERT, UPDATE, DELETE or EXECUTE; omit to cover all of them", false},
-        {"connection", "connection to check; defaults to the configured default", false}},
-       [](const json& a) -> std::string {
-         const std::string role = arg_or(a, "role", "");
-         const std::string obj  = arg_or(a, "object", "");
-         const std::string priv = arg_or(a, "privilege", "");
-         const std::string c    = arg_or(a, "connection", "");
-         const std::string on = c.empty() ? std::string() : " on connection " + c;
-         return
-           "Determine whether " + role + " can use " + obj + on +
-           (priv.empty() ? ", for every privilege that applies to it"
-                         : ", specifically " + priv) + ".\n\n"
-           "Access is a chain of gates, not a grant. Every one has to pass, and "
-           "the first that fails is the whole answer -- so find that one and "
-           "name it, rather than reporting the object ACL and stopping. The "
-           "usual wrong answer comes from checking the table and forgetting the "
-           "schema.\n\n"
-           "Two questions hide inside the one being asked, and they have "
-           "different answers: whether the role may REACH the object at all, "
-           "and WHICH ROWS it then sees. Grants settle the first. Row-level "
-           "security settles the second and can reduce a complete set of grants "
-           "to nothing without touching them. Answer both explicitly.\n\n"
-           "0. Call checkRoleAccess with grantee " + role + ", the schema and "
-           "the object. It answers the grant question outright, the way "
-           "PostgreSQL answers it: has_table_privilege and its relatives fold in "
-           "inheritance, grants to PUBLIC, ownership and superuser exactly as the "
-           "server does. Everything below interprets that answer rather than "
-           "recomputing it -- do not add up ACLs by hand when the server has "
-           "already been asked.\n"
-           "   Read four parts of it before anything else. privileges is the "
-           "verdict per privilege. schema_access.usage is a separate gate and a "
-           "false there beats a true above it. columns lists a partial grant "
-           "where the table-level answer was no. row_level_security is a "
-           "different question entirely and step 4 is where it is read.\n"
-           "1. Call listRoles and establish what " + role + " IS before asking "
-           "what it has. Three attributes can end the investigation here:\n"
-           "   - superuser bypasses every check below, including row-level "
-           "security. The answer is yes to everything; say so and stop rather "
-           "than tracing grants that do not matter.\n"
-           "   - bypass_rls means step 4 does not apply to this role, however "
-           "the policies read.\n"
-           "   - inherit explains a no that step 0 already reported. The has_* "
-           "functions honour rolinherit, so a NOINHERIT member of a granted "
-           "group comes back false rather than true -- the privilege is real and "
-           "one SET ROLE away, and application code almost never issues one. "
-           "Read it together with member_of to tell \"never granted\" from "
-           "\"granted, unreachable as the application connects\", because those "
-           "look identical in the verdict and need different fixes.\n"
-           "   Then walk member_of transitively: a grant to any role in the "
-           "closure counts, subject to inherit. Say which role in the chain "
-           "actually carries the grant, because that is where an operator has "
-           "to go to change it.\n"
-           "2. Where checkRoleAccess said no, walk the gates to find WHICH one "
-           "said it -- the tool gives the verdict, and this is how you turn a "
-           "verdict into something an operator can act on. Where it said yes, "
-           "read the same list to say what the yes does not cover.\n"
-           "   a. CONNECT on the database, and whether the role can log in at "
-           "all -- a group role with every grant in the cluster still cannot "
-           "open a session.\n"
-           "   b. USAGE on the schema, which step 0 returned as "
-           "schema_access.usage. This is the gate that is missed most often: "
-           "SELECT on the table is inert without it, and the error names "
-           "permission on the TABLE, which sends people to the wrong object. Go "
-           "to listSchemas only for what the tool does not carry -- who else "
-           "holds USAGE, and whether PUBLIC does -- which is what says whether "
-           "granting it is a one-role change or a decision about the schema.\n"
-           "   c. The object\'s own privileges, from tableDetails or "
-           "functionDetails. PUBLIC is a grantee like any other and applies to "
-           "every role, so a grant to PUBLIC answers the question on its own -- "
-           "and EXECUTE is granted to PUBLIC by default on every new function, "
-           "which surprises people who never granted anything.\n"
-           "   d. Ownership. The owner holds every privilege implicitly and "
-           "need not appear in the grants map at all, so an empty map is not an "
-           "empty answer.\n"
-           "   e. Column-level grants, where the columns list carries them. "
-           "SELECT on three of ten columns is a real yes that fails the moment "
-           "a query names the fourth, so report it as the partial it is.\n"
-           "3. If the object is a VIEW, the privileges checked are the view\'s "
-           "own, and the base tables are read as the VIEW OWNER. So a role can "
-           "hold SELECT on a view while holding nothing at all on what it "
-           "selects from, and that is normal rather than a misconfiguration. "
-           "Check reloptions for security_invoker: on PostgreSQL 15 and later a "
-           "view can be defined to run as the caller instead, which flips this "
-           "entirely -- base-table grants and base-table policies both come "
-           "back into play. Say which of the two you are looking at.\n"
-           "4. Now row-level security, and only for a table or a view over one. "
-           "Step 0 returned the row_level_security block: if enabled is false, "
-           "the grants above are the complete answer and this step is over. If "
-           "it is true, everything above answers only whether the role may reach "
-           "the table.\n"
-           "   Read applies_to_role before the policies. It is the one thing no "
-           "grants map can tell you, because it folds together three exemptions "
-           "-- superuser, BYPASSRLS, and ownership without FORCE -- and a role "
-           "that is exempt makes every policy below irrelevant. Each policy "
-           "carries its own applies_to_role for the same reason: a policy that "
-           "does not name this role, directly or through a role it belongs to, "
-           "is not part of the answer however it reads.\n"
-           "   - The OWNER BYPASSES RLS unless forced is also true. This is the "
-           "single most common wrong test: someone checks as the owner, sees "
-           "every row, and concludes the policies are permissive. FORCE ROW "
-           "LEVEL SECURITY is what makes the owner subject to them, and without "
-           "it the owner\'s experience says nothing about anyone else\'s.\n"
-           "   - Read the policies map. Each policy names a command and a set of "
-           "roles, and a policy whose roles are PUBLIC applies to everybody. "
-           "Only policies matching both " + role + " and the command in question "
-           "are in play.\n"
-           "   - RLS ENABLED WITH NO APPLICABLE PERMISSIVE POLICY IS DENY ALL. "
-           "This is the state nobody can explain: every grant checks out, "
-           "has_table_privilege would say yes, and the table returns zero rows. "
-           "If you find it, that is the finding -- say it in those words.\n"
-           "   - Permissive policies OR together and restrictive ones AND, so "
-           "adding a restrictive policy can veto everything the permissive ones "
-           "allow. Report the combination, not a list.\n"
-           "   - using gates which rows can be read or affected; with_check "
-           "gates which rows may be written. They are frequently different, and "
-           "a role that can read a row it cannot write back is a normal and "
-           "confusing result worth stating outright.\n"
-           "5. For a FUNCTION or PROCEDURE the privilege is EXECUTE, and "
-           "security_definer changes who the body runs as. Under a security "
-           "definer function the caller borrows the owner\'s privileges for "
-           "everything inside, so the caller\'s own grants on the tables it "
-           "touches are irrelevant -- and EXECUTE on it is effectively a grant "
-           "of whatever the body can do. Say so plainly when you find one: it is "
-           "the intended mechanism for controlled escalation and also the way "
-           "access is given by accident.\n"
-           "6. Report the chain, not a verdict. Name the gate that decided, and "
-           "if the answer is no, name the single grant that would change it. If "
-           "the answer is yes, say what it does not include -- the columns "
-           "outside the grant, the rows outside the policy, the write that the "
-           "read does not imply.\n"
-           "7. One thing checkRoleAccess cannot fold in, so say it when it "
-           "applies: a false for a NOINHERIT member of a granted group means "
-           "\'not right now\' rather than \'never\'. The has_* functions honour "
-           "rolinherit, so the privilege is real and one SET ROLE away -- and "
-           "application code almost never issues one, which is usually what "
-           "makes the answer no in practice rather than in principle. The role "
-           "block carries inherits and member_of precisely so the two can be "
-           "told apart.";
-       }},
-
-      {"explain-and-fix",
-       "Explain one statement, establish why it is slow, and propose a fix that is verified rather than guessed.",
-       {{"sql", "the statement to explain", true},
-        {"params", "JSON array of parameter values, if the statement is parameterised", false},
-        {"schema", "schema of the main tables, if they are not on the search path", false}},
-       [](const json& a) -> std::string {
-         const std::string sql = arg_or(a, "sql", "");
-         const std::string prm = arg_or(a, "params", "");
-         return
-           "Explain this statement and propose a fix.\n\n"
-           "SQL:\n" + sql + "\n\n" +
-           (prm.empty() ? std::string()
-                        : "Parameters: " + prm + "\n\n") +
-           "Establish what is actually slow before proposing anything. A plan is "
-           "evidence, not a verdict: a statement can be slow with a perfect plan "
-           "because the data is cold, the table is bloated, or it spent its time "
-           "waiting rather than working. Say which of those it is.\n\n"
-           "0. Call checkPrivileges. EXPLAIN needs SELECT on every table the "
-           "statement touches, so a restricted role fails here rather than "
-           "returning a worse plan, and evaluateIndex in step 7 needs hypopg.\n"
-           "1. Call explainQuery with this sql" +
-           (prm.empty() ? std::string() : " and these params") +
-           ". Leave analyze false first: the plan alone usually shows the "
-           "problem, and analyze really executes the statement.\n" +
-           (prm.empty()
-             ? std::string(
-               "   This statement was given without parameters. If it carries $n "
-               "placeholders it is planned with GENERIC_PLAN -- the plan "
-               "PostgreSQL builds knowing nothing about the values, which is what "
-               "a prepared statement gets once it settles on a generic plan. That "
-               "is frequently the whole answer to \"fast when I run it by hand, "
-               "slow from the application\": ask for the concrete values and run "
-               "this again with them, then compare. A generic plan that differs "
-               "from the plan for real values is the finding, and no index fixes "
-               "it.\n")
-             : std::string(
-               "   Parameters were supplied, so this is planned with those real "
-               "values rather than generically. Run it once WITHOUT them as well "
-               "and compare: if the generic plan differs, the application may be "
-               "getting that one instead, and the statement is only slow when "
-               "prepared. Skewed columns are where the two diverge, and step 4 is "
-               "where you check for that.\n")) +
-           "   Read the generic and analyzed flags the tool returns rather than "
-           "assuming which plan you got.\n"
-           "2. If the plan alone is not conclusive and the statement only reads, "
-           "call again with analyze true AND a timeout_ms -- analyze is refused "
-           "without one. It runs EXPLAIN (ANALYZE, BUFFERS) and is honoured only "
-           "after the plan is proven free of any ModifyTable node, so a "
-           "data-modifying statement can never be executed here. Say that you are "
-           "about to run it.\n"
-           "   For an INSERT, UPDATE, DELETE or MERGE this step is unavailable by "
-           "design, so the estimates are all you get. Reason from them and say so, "
-           "rather than presenting an estimate as a measurement.\n"
-           "3. Read the numbers in this order, because they answer different "
-           "questions and the first one that answers yours ends the search.\n"
-           "   - Estimated against actual rows, per node. A ratio past roughly "
-           "100x is the planner being misinformed, and no index built on a wrong "
-           "estimate will be chosen.\n"
-           "   - Buffers, which analyze returns. shared_hit is memory and "
-           "shared_read is disk: a plan that looks fine but reads heavily from "
-           "disk is a cold cache or a working set larger than shared_buffers, and "
-           "that is a capacity answer rather than a query one. Large temp blocks "
-           "are a sort or hash that exceeded work_mem.\n"
-           "   - Heap Fetches on an Index Only Scan. Nonzero means the visibility "
-           "map is stale and the scan is going to the heap anyway; the fix is "
-           "vacuum, not an index.\n"
-           "   - Time not accounted for by any node. If the nodes are fast and "
-           "the statement is not, it waited -- for a lock, or for I/O. That is "
-           "triage-lock-contention or the buffers above, and neither is fixed by "
-           "rewriting the query.\n"
-           "4. Ground the plan in what the tables actually are, before believing "
-           "anything the plan implies. Call tableStats for each table involved.\n"
-           "   - rows first. A sequential scan of a few thousand rows is the "
-           "correct plan and needs no fix; proposing an index there is noise.\n"
-           "   - last_analyze and last_autoanalyze beside n_mod_since_analyze: "
-           "stale statistics explain more bad plans than missing indexes do, and "
-           "the two timestamps say whether anything is analyzing this table at "
-           "all.\n"
-           "   - most_common_vals, n_distinct and histogram_bounds for any "
-           "column in a predicate. This is the empirical answer to whether the "
-           "column is skewed, and skew is what makes one plan right for a common "
-           "value and wrong for a rare one -- the same thing that makes a generic "
-           "plan dangerous.\n"
-           "   Then use them, rather than only reading them. Both carry values "
-           "that actually occur in the column, so they are usable directly as "
-           "parameters: most_common_vals[0] is the most frequent value the table "
-           "holds, and histogram_bounds low, mid and high are the observed "
-           "minimum, median and maximum. Re-plan the statement with each in turn "
-           "and compare. A plan that is identical across all of them is stable "
-           "and the parameters are not the problem; a plan that flips between a "
-           "common value and an extreme one is parameter-sensitive, and that is "
-           "the finding -- an index chosen for one end of the distribution will "
-           "be wrong at the other, and the generic plan is wrong for both.\n"
-           "   This is the one test that needs no invention. A constant you made "
-           "up may match no rows and produce a plan for a case that never "
-           "happens; these values are what is actually there. Where "
-           "histogram_bounds is null the column has no histogram at all -- every "
-           "value is in the MCV list, or nothing has analyzed it -- and which of "
-           "those it is comes from the analyze timestamps above.\n"
-           "   Three points settle whether the plan is stable. When they are not "
-           "enough -- the plan flips somewhere between them and you need to know "
-           "where, or the estimate is wrong in a way the extremes do not explain "
-           "-- call columnHistogram for that one column. It returns every bound, "
-           "and they are equal-frequency, so consecutive entries bunched close "
-           "together are a dense region of the distribution and a wide gap is a "
-           "sparse one. Sampling across the buckets rather than at the ends is "
-           "how you find where the plan actually turns.\n"
-           "   If a scan reads far more heap than it returns rows and the "
-           "statistics are current, suspect bloat: tableBloat measures the table "
-           "and indexBloat one index, and bloat-and-vacuum-review is the fuller "
-           "investigation.\n"
-           "5. Classify the fix before writing one, and say which it is. Either "
-           "the statement asks for something the planner cannot use -- a "
-           "predicate that is not sargable, a function or cast over an indexed "
-           "column, NOT IN against a nullable subquery, OFFSET deep into a large "
-           "result -- and the fix is a rewrite. Or the planner was misinformed, "
-           "and the fix is statistics: an ANALYZE, a higher statistics target, or "
-           "extended statistics for correlated columns -- call "
-           "listExtendedStatistics first, because an object that exists and is "
-           "not helping is a different problem from one that was never created, "
-           "and only the second is fixed by CREATE STATISTICS. Or the plan is "
-           "right but under-resourced, and the fix is configuration such as "
-           "work_mem for a node that spilled. Or nothing supports the access path "
-           "the statement needs -- and only then is the fix DDL.\n"
-           "   A fifth outcome is legitimate and often correct: the statement is "
-           "already as fast as it can be, and the cost is inherent to the work it "
-           "does. Say so plainly when it is true. Proposing a fix for a statement "
-           "that does not need one is worse than proposing nothing.\n"
-           "   Prefer them in that order, because that is the order of what they "
-           "cost. An ANALYZE is free and instant. A rewrite costs a deploy and "
-           "nothing in the database. Configuration changes the behaviour of every "
-           "other query too. An index is a write cost paid by every INSERT and "
-           "UPDATE for as long as it exists, to buy speed for one read pattern. "
-           "Say why the cheaper options were rejected rather than passing over "
-           "them.\n"
-           "6. If the answer is an index, choose its shape deliberately and "
-           "justify each part -- an index is not a single decision.\n"
-           "   - Call duplicateIndexes first. An index that is a prefix of one "
-           "that already exists buys nothing and costs writes forever, and this "
-           "is the most common wasted proposal.\n"
-           "   - Column order: equality predicates first, then the range or "
-           "inequality, then anything used only for ordering. A composite index "
-           "is usable only up to its first range column.\n"
-           "   - INCLUDE for columns the statement returns but does not filter "
-           "on, which is what buys an index-only scan without widening the key.\n"
-           "   - A WHERE clause on the index itself when the statement always "
-           "carries the same selective constant: a partial index is smaller and "
-           "cheaper to maintain.\n"
-           "   - The operator class where it is not the default -- text pattern "
-           "matching, trigram search and jsonb containment each need one, and the "
-           "index is simply not used without it.\n"
-           "7. Verify what can be verified, here, before recommending it.\n"
-           "   - A rewrite is fully checkable: call explainQuery on the rewritten "
-           "statement and show that the plan changed, and how. Same params, so "
-           "the comparison is honest.\n"
-           "   - An index is checkable wherever hypopg is installed: call "
-           "evaluateIndex with the CREATE INDEX statement and report whether the "
-           "planner actually took it. A proposed index the planner ignores is the "
-           "common case and a cost figure alone hides it. checkPrivileges says "
-           "whether hypopg is there; where it is not, an index is a prediction "
-           "and must be presented as one rather than as a result.\n"
-           "   - Compare like with like. A lower cost estimate is not a result; "
-           "what supports the claim is the node that disappeared, the row count "
-           "that stopped being wrong, or the buffers that stopped being read.\n"
-           "8. Report the chain: what the statement does, which reading showed "
-           "the cause, the fix, and the evidence it works. State how anyone would "
-           "confirm it afterwards -- for a statement that came from "
-           "pg_stat_statements, mean_exec_time on the same queryid is the "
-           "measurement, and it needs a reset or a before-figure to mean "
-           "anything. Hand any DDL to plan-schema-change rather than giving a "
-           "CREATE INDEX to run: whether an index is correct and whether it is "
-           "safe to build on this table are different questions, and evaluateIndex "
-           "answers only the first.";
-       }},
-    };
-    return v;
-  }
+  static const std::vector<PromptDef>& prompt_defs();
 
   json get_prompts_list() {
     json out = json::array();
@@ -2846,736 +1834,48 @@ private:
     return m;
   }
 
+  // ------------------------------------------------------------------
+  // The tool registry.
+  //
+  // One row per tool, carrying the four facts that must agree: the name, the
+  // description the model reads, the schema of what it accepts, and the code
+  // that runs it. Until 4.3.0 those lived in two tables five thousand lines
+  // apart -- a JSON literal in get_tools_list and an if/else chain in
+  // dispatch_tool -- with nothing making them agree. They did agree, as it
+  // happens: the split was verified 62/62 with no orphan on either side when
+  // this table was generated from them. Nothing had guaranteed that, and a
+  // tool advertised but not dispatchable would have been a -32601 at runtime
+  // with a clean build behind it.
+  //
+  // Everything else about a tool is still derived rather than stored here:
+  // the fan-out scope from tool_scopes(), the output schema from
+  // structured_schemas(), the title from the name, and the connection and
+  // sweep arguments injected by get_tools_list. Those are computed per
+  // protocol revision, so they cannot be constants in this table.
+  struct ToolDef {
+    const char* name;
+    const char* description;
+    json (*input_schema)();
+    json (*run)(PostgresMCPServer&, const Args&);
+  };
+
+  static const std::vector<ToolDef>& tool_defs();
+
+  static const std::unordered_map<std::string, const ToolDef*>& tool_index() {
+    static const std::unordered_map<std::string, const ToolDef*> ix = [] {
+      std::unordered_map<std::string, const ToolDef*> m;
+      for (const ToolDef& d : tool_defs()) m.emplace(d.name, &d);
+      return m;
+    }();
+    return ix;
+  }
+
   const json get_tools_list(const std::string& protocol) {
-    json list = {
-      {"tools", {
-	  {
-	    {"name", "listSchemas"},
-	    {"description", "return schema list with basic summaries"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "listTables"},
-	    {"description", "return the structure of every table, view and materialised view in a schema: kind, comment, storage options, columns and their per-column index counts, index count and constraint count. Structure only -- it changes when someone issues DDL and not otherwise. For row counts, scan counters, dead tuples and vacuum times call listTableStats; for measured on-disk sizes call listTableSizes"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}}
-		  }},
-		{"required", {"schema"}}
-	      }}
-	  },
-	  {
-	    {"name", "tableDetails"},
-	    {"description", "return the structure of one table: columns with types, defaults, storage and compression, primary key, indexes, constraints, foreign keys, inbound foreign keys (referenced_by), triggers, rules, row-level security, policies and privileges. Structure only -- it changes when someone issues DDL and not otherwise, and it returns no sample column values. For row counts, scan counters, dead tuples, vacuum times and the pg_stats column histograms call tableStats; for measured on-disk sizes call tableSize"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"table", {{"type", "string"}}},
-		    {"schema", {{"type", "string"}}}
-		  }},
-		{"required", {"table", "schema"}}
-	      }}
-	  },
-	  {
-	    {"name", "searchTables"},
-	    {"description", "find tables across every non-system schema by full-text search over table names, comments, column names and comments, enum labels and grantee names, and return their structure. Structure only -- there is no statistics counterpart, because a text search is how you find a table, not how you read a counter: name a match to tableStats or tableSize for those"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"web_search", {{"type", "string"}}}
-		  }},
-		{"required", {"web_search"}}
-	      }}
-	  },
-	  {
-	    {"name", "evaluateIndex"},
-	    {"description", "plan a statement as if the indexes were different, using hypopg. 'create' takes CREATE INDEX statements to plan against without building them; 'hide' takes the names of existing indexes to plan without, which is how to ask whether an index is safe to drop. Nothing is built, no lock is taken and no catalog row is written, and the statement is never executed -- hypopg cannot serve EXPLAIN ANALYZE, so this is plan-only and safer than explainQuery with analyze. Returns the plan and total cost before and after, and for each index whether the planner actually used it, which is the answer that matters: a proposed index the planner ignores is the common case and a cost figure alone hides it. The cost is the planner's estimate, not a measurement. For a statement recovered from pg_stat_statements, call explainQuery with its queryid first and pass the sql it echoes back. Reports a clear error with setup instructions if hypopg is not installed"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"sql", {{"type", "string"}}},
-		    {"create", {{"type", "array"}, {"items", {{"type", "string"}}},
-		                {"description", "CREATE INDEX statements to plan against"}}},
-		    {"hide", {{"type", "array"}, {"items", {{"type", "string"}}},
-		              {"description", "names of existing indexes to plan without"}}}
-		  }},
-		{"required", {"sql"}}
-	      }}
-	  },
-	  {
-	    {"name", "checkPrivileges"},
-	    {"description", "report which tools the current role can actually use on this connection, and how the rest fall short. Most of this server works for any role that can connect, because the catalog is world-readable; what varies is the monitoring extras and whether the role can read table data. Call this first when working against an unfamiliar connection or a restricted role -- the alternative is discovering the limits tool by tool, and a privilege-filtered answer is easy to mistake for an empty one. Names no role memberships and no GRANT statements: what a caller needs is which tools work. This is about THIS server's operations for the CONNECTING role, and is not an object permission check -- for whether some other role may read a given table, view or function, and which rows row-level security then leaves it, use the check-role-access prompt. Tools absent from both lists are fully available"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "tableStats"},
-	    {"description", "return the statistics PostgreSQL keeps for one table: estimated row count, seq_scan and idx_scan counts, live and dead tuples, rows modified since the last analyze, rows inserted since the last vacuum, the manual and automatic vacuum and analyze times as four separate fields (last_vacuum and last_analyze are the manual ones, exactly as in pg_stat_user_tables -- a recent last_vacuum beside a null last_autovacuum means the table is being kept alive by hand and autovacuum is not reaching it), per-index scan counts, and the per-column pg_stats histograms (null_frac, avg_width, n_distinct, physical order correlation, most_common_vals and their frequencies, and three points off the histogram -- histogram_bounds gives low, mid and high, the observed extremes and median of the distribution, which are real values that occur in the column and so are usable directly as parameters to re-plan a statement with. It is three points rather than the whole array because the array is statistics_target wide, 101 entries by default; for the whole distribution of one column call columnHistogram. Null when the column has no histogram, meaning every value is in the MCV list or the column was never analyzed). Reads the catalog and the statistics collector only -- no relation is opened and no file is measured. size_estimate is relpages*8192 and is only as fresh as estimated_from says: for a measured size call tableSize. Note that most_common_vals and histogram_bounds both contain literal values sampled from the column. Not to be confused with tableIOStats, which reports pg_statio_all_tables -- whether reads came from the buffer cache or the disk"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"table", {{"type", "string"}}},
-		    {"schema", {{"type", "string"}}}
-		  }},
-		{"required", {"table", "schema"}}
-	      }}
-	  },
-	  {
-	    {"name", "listTableStats"},
-	    {"description", "return the statistics PostgreSQL keeps for every table in a schema: estimated row count, seq_scan and idx_scan counts, live and dead tuples, rows modified since the last analyze, rows inserted since the last vacuum, and the manual and automatic vacuum and analyze times as four separate fields (last_vacuum and last_analyze are the manual ones, exactly as in pg_stat_user_tables -- a recent last_vacuum beside a null last_autovacuum means the table is being kept alive by hand and autovacuum is not reaching it). Reads the catalog and the statistics collector only -- no relation is opened and no file is measured. Carries no per-column histograms; name one table to tableStats for those. size_estimate is relpages*8192 and is only as fresh as estimated_from says: for measured sizes call listTableSizes"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}}
-		  }},
-		{"required", {"schema"}}
-	      }}
-	  },
-	  {
-	    {"name", "tableSize"},
-	    {"description", "measure one table on disk: main fork, total table size including TOAST and the free space and visibility maps, index size, grand total, the TOAST relation and each index individually. COSTS MORE THAN IT LOOKS: these functions open the relation with AccessShareLock, so on a table an ALTER TABLE is rewriting the call waits behind AccessExclusiveLock until statement_timeout fires. Prefer size_estimate from tableStats, which is free, and call this when the estimate is too stale to act on. A partitioned table reports its own storage, which is zero -- measure the partitions"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"table", {{"type", "string"}}},
-		    {"schema", {{"type", "string"}}}
-		  }},
-		{"required", {"table", "schema"}}
-	      }}
-	  },
-	  {
-	    {"name", "listTableSizes"},
-	    {"description", "measure every table in a schema on disk: table size, index size and grand total per relation. COSTS MORE THAN IT LOOKS, and more here than in tableSize: one relation is opened per table, each taking AccessShareLock, so a single table held under AccessExclusiveLock by an ALTER TABLE blocks the whole call rather than one row of it, and on a large schema this is thousands of file-metadata calls. Prefer size_estimate from listTableStats, which is free, and call this when the estimates are too stale to act on. Partitioned tables report their own storage, which is zero"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}}
-		  }},
-		{"required", {"schema"}}
-	      }}
-	  },
-	  {
-	    {"name", "listFunctions"},
-	    {"description", "return function and procedure list for a schema"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}}
-		  }},
-		{"required", {"schema"}}
-	      }}
-	  },
-	  {
-	    {"name", "functionDetails"},
-	    {"description", "return detailed function or procedure info including source and trigger usage"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}},
-		    {"function", {{"type", "string"}}}
-		  }},
-		{"required", {"schema", "function"}}
-	      }}
-	  },
-	  {
-	    {"name", "searchFunctions"},
-	    {"description", "search functions and procedures by name, source, language, trigger name, or description"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"web_search", {{"type", "string"}}}
-		  }},
-		{"required", {"web_search"}}
-	      }}
-	  },
-	  {
-	    {"name", "listEnums"},
-	    {"description", "return enum type list for a schema with their values and descriptions"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}}
-		  }},
-		{"required", {"schema"}}
-	      }}
-	  },
-	  {
-	    {"name", "enumDetails"},
-	    {"description", "return enum type details including values and which columns use it"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}},
-		    {"enum", {{"type", "string"}}}
-		  }},
-		{"required", {"schema", "enum"}}
-	      }}
-	  },
-	  {
-	    {"name", "searchEnums"},
-	    {"description", "search enum types by name, values, or description"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"web_search", {{"type", "string"}}}
-		  }},
-		{"required", {"web_search"}}
-	      }}
-	  },
-	  {
-	    {"name", "listTypes"},
-	    {"description", "return composite type, domain, and range type list for a schema (excludes enums and implicit table/view row types); composites include their attribute list, domains include base type/nullability/default/constraints, ranges include subtype and the auto-generated multirange type name"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}}
-		  }},
-		{"required", {"schema"}}
-	      }}
-	  },
-	  {
-	    {"name", "typeDetails"},
-	    {"description", "return composite type, domain, or range type details including attributes/constraints/subtype and which columns use it"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}},
-		    {"type", {{"type", "string"}}}
-		  }},
-		{"required", {"schema", "type"}}
-	      }}
-	  },
-	  {
-	    {"name", "listRoles"},
-	    {"description", "return cluster-wide roles with kind (login/group), attributes (superuser, create_role, create_db, replication, bypass_rls, connection_limit, valid_until), and group memberships"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "listForeignTables"},
-	    {"description", "return foreign tables in a schema with their foreign server, FDW, options, and columns (does not expose user mapping credentials)"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}}
-		  }},
-		{"required", {"schema"}}
-	      }}
-	  },
-	  {
-	    {"name", "listForeignServers"},
-	    {"description", "return cluster-wide foreign servers with their FDW, owner, and options (host/port/dbname-style options only, never user mapping credentials)"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "listTablespaces"},
-	    {"description", "return cluster-wide tablespaces with owner, filesystem location, options, and description"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "listCollations"},
-	    {"description", "return collations usable in the current database's encoding for a schema, with provider, locale settings, and determinism flag"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}}
-		  }},
-		{"required", {"schema"}}
-	      }}
-	  },
-	  {
-	    {"name", "listEventTriggers"},
-	    {"description", "return cluster-wide event triggers with event type, tags, function, owner, enabled status, and description"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "listPublications"},
-	    {"description", "return logical replication publications with owner, all-tables flag, per-operation flags (insert/update/delete/truncate), and member tables"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "listSubscriptions"},
-	    {"description", "return logical replication subscriptions for the current database with owner, enabled status, publications, slot name, and sync settings (never exposes the connection string, which may contain credentials). Structure only -- what CREATE SUBSCRIPTION declared. For whether the subscriber is actually keeping up call subscriptionStats"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "diskUsage"},
-	    {"description", "report what PostgreSQL is holding on disk without needing a shell on the server: WAL directory size and file count, the archive status backlog, temporary files currently on disk, log directory size, per-tablespace sizes and per-database sizes across the whole cluster. Answers \"what is filling the disk\" from SQL alone, which otherwise needs df. IT CANNOT SAY HOW MUCH ROOM IS LEFT: PostgreSQL exposes no function for total or free space, so this reports what is consuming space and how it divides, never the headroom. A climbing .ready count in archive_status is a failing archive_command retaining every segment it has not archived -- indistinguishable from an abandoned replication slot by size alone, and this is what tells them apart. The pg_ls_* sections need pg_monitor; each section is guarded independently, so one refusal returns an error in that key and leaves the rest answered rather than failing the call. Costs: the four directory sections are trivial, and the tablespace and database sizes are the whole cost -- they walk the directory tree and stat every segment file, so they scale with FILE COUNT rather than with bytes. Measured at 314 ms for the whole call against a cluster of roughly a terabyte, where a bare databaseSize is already 163 ms. Nothing is read, no relation is opened and no lock is taken -- this is metadata rather than I/O -- but it was measured with directory entries warm in the page cache, and a filling disk is exactly when they are not. statement_timeout bounds it, so the failure mode is a timeout that names itself"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "columnHistogram"},
-	    {"description", "return the whole value distribution of one column: the most common values with their frequencies, and the full histogram of everything else. tableStats carries three points off that histogram -- low, mid and high -- which is enough to pick parameters to re-plan with; this is the tool for when the shape of the distribution itself is the question. The two are complements rather than alternatives: ANALYZE puts the most frequent values in most_common_vals and builds the histogram only from what is LEFT, so a value in the MCV list never appears in the bounds however common it is, and reading either alone misdescribes the column. The bounds are equal-frequency, so consecutive entries delimit buckets holding roughly the same number of rows -- bounds bunched together are a dense region and a wide gap is a sparse one, which is what makes them usable as sample points across the distribution rather than one corner of it. statistics_target says why the histogram is the width it is and is the knob that changes it. COSTS NOTHING TO READ but RETURNS LITERAL COLUMN VALUES, more of them than any other operation here: the bounds and the MCVs are rows sampled out of the table. pg_stats filters on has_column_privilege, so a role without SELECT on the column gets nulls rather than data"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}},
-		    {"table", {{"type", "string"}}},
-		    {"column", {{"type", "string"}}}
-		  }},
-		{"required", {"schema", "table", "column"}}
-	      }}
-	  },
-	  {
-	    {"name", "checkRoleAccess"},
-	    {"description", "answer whether one role holds privileges on one table, view, sequence, function or procedure -- as PostgreSQL evaluates it, via has_table_privilege and its relatives, so role inheritance, grants to PUBLIC, ownership and superuser are all folded in the way the server folds them rather than reconstructed from ACLs. Needs no grant of its own: these functions and the catalog are world-readable, so any role that can connect may ask about any other. Returns schema USAGE and database CONNECT beside the object privileges, because a grant on the table is inert without them and the resulting error names the table. Where a table-level privilege is absent but individual columns carry it, the columns are listed. IMPORTANT: has_table_privilege does not consider row-level security, so a true here can still return no rows -- row_level_security carries whether RLS is on, whether this role is subject to it (the owner is exempt unless FORCE ROW LEVEL SECURITY), and every policy with whether it applies to this role. RLS enabled with no applicable permissive policy denies everything. Not to be confused with checkPrivileges, which reports which of THIS SERVER's operations the CONNECTING role can run"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"grantee", {{"type", "string"}, {"description", "the role to ask about; need not be the role this server connects as, and need not hold an actual GRANT -- ownership and superuser answer true too. Named grantee rather than role because role is reserved server-wide for narrowing a sweep to a primary or a replica"}}},
-		    {"schema", {{"type", "string"}}},
-		    {"object", {{"type", "string"}, {"description", "table, view, sequence, function or procedure name. A routine name reports every overload"}}}
-		  }},
-		{"required", {"grantee", "schema", "object"}}
-	      }}
-	  },
-	  {
-	    {"name", "subscriptionStats"},
-	    {"description", "return the runtime state of every logical replication subscription in this database: each worker with its type, pid, the relation it is syncing and how long since it last heard from the publisher; per-table sync state, with the tables that are not yet ready listed individually; and the apply and sync error counters plus the per-conflict-type counters. Answers whether a subscriber is keeping up and, if not, whether it is stuck syncing a table or failing to apply. Reports no byte lag, because a subscriber cannot measure it -- received_lsn and latest_end_lsn track each other rather than the publisher, so their difference is zero even when the subscriber is far behind. For lag in bytes call replicationSlots on the PUBLISHER and read retained_wal_bytes. When a table is still copying, its worker pid is a real backend pid: pass it to progressStats to get the byte count of that exact copy. Complements listSubscriptions, which is the structural half"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "listLanguages"},
-	    {"description", "return procedural languages installed in the current database (e.g. plpgsql, plpython3u) with owner, trusted/procedural flags, handler function, and description"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "listExtendedStatistics"},
-	    {"description", "return extended statistics objects (CREATE STATISTICS) for a schema with target table, columns, statistics kinds (ndistinct, dependencies, mcv), and description"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}}
-		  }},
-		{"required", {"schema"}}
-	      }}
-	  },
-	  {
-	    {"name", "listOperators"},
-	    {"description", "return custom operators in a schema with left/right operand types, result type, and implementing function; mostly relevant for schemas using extensions with custom types (e.g. PostGIS)"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}}
-		  }},
-		{"required", {"schema"}}
-	      }}
-	  },
-	  {
-	    {"name", "listOperatorClasses"},
-	    {"description", "return operator classes in a schema with their index access method, input type, and default flag; describes what index types (btree/gist/gin/etc) a type supports"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}}
-		  }},
-		{"required", {"schema"}}
-	      }}
-	  },
-	  {
-	    {"name", "listAccessMethods"},
-	    {"description", "return index and table access methods available in the cluster (btree, gist, gin, heap, etc) with type and handler function"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "listCasts"},
-	    {"description", "return type casts involving at least one user-defined type (excludes built-in-to-built-in casts) with source/target types, context (implicit/assignment/explicit), and method"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "listTextSearchConfigs"},
-	    {"description", "return full-text search configurations for a schema with parser and the token-type-to-dictionary mapping"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}}
-		  }},
-		{"required", {"schema"}}
-	      }}
-	  },
-	  {
-	    {"name", "listSequences"},
-	    {"description", "return sequence list for a schema with type, range, increment, cycle, cache, current value, and owning table.column (for SERIAL/IDENTITY columns)"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}}
-		  }},
-		{"required", {"schema"}}
-	      }}
-	  },
-	  {
-	    {"name", "listExtensions"},
-	    {"description", "return installed PostgreSQL extensions with version, schema, relocatable flag, and description"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "databaseSize"},
-	    {"description", "return the current database name and its total disk size"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "serverSettings"},
-	    {"description", "return all PostgreSQL server settings (pg_settings) grouped by category, each with current value, unit, description, context, type, source, and pending_restart flag"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "currentActivity"},
-	    {"description", "return current server connections and running queries (pg_stat_activity) across all databases: pid, database, user, application_name, backend_type, state, wait event, query text, transaction and query duration, leader_pid for parallel workers, and the backend's xid and xmin. query_id is returned as a decimal string and is the join key to statementStats and explainQuery, so a statement seen running here can be looked up and planned. All filters are optional and combine; with none the whole view is returned, which on a busy server is mostly idle connections and internal processes"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"pid", {
-			{"type", "integer"},
-			{"description", "a single backend, together with its parallel workers (any backend whose leader_pid is this pid)"}
-		      }},
-		    {"query_id", {
-			{"type", "string"},
-			{"description", "only backends running this query_id, as a decimal string; use it to find who is running a statement identified by statementStats. Requires compute_query_id to be enabled (the default 'auto' enables it when pg_stat_statements is loaded)"}
-		      }},
-		    {"min_duration_s", {
-			{"type", "number"},
-			{"description", "only backends whose current query has been running at least this many seconds. Plain idle backends are excluded, since their query_start dates a statement that already finished"}
-		      }},
-		    {"state", {
-			{"type", "string"},
-			{"description", "only backends in this pg_stat_activity state, e.g. \"active\" or \"idle in transaction\""}
-		      }}
-		  }}
-	      }}
-	  },
-	  {
-	    {"name", "currentLocks"},
-	    {"description", "return current locks (pg_locks) joined with the holding backend's query and user, plus which pids are blocking each waiting lock; use to diagnose lock contention. Given a pid, returns that backend's locks together with every backend blocking it transitively, each tagged with chain_depth: 0 is the pid asked about, and the largest depth is the backend at the root of the pile-up, which is the one to look at first"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"pid", {
-			{"type", "integer"},
-			{"description", "restrict to this backend and its transitive blockers, resolved through pg_blocking_pids. Omit for every lock in the cluster"}
-		      }}
-		  }}
-	      }}
-	  },
-	  {
-	    {"name", "replicationSlots"},
-	    {"description", "return replication slots with retained WAL bytes; a lagging or unused slot holds back WAL indefinitely and is a common cause of disk bloat incidents. A logical slot's consumer is a subscriber on another server: call subscriptionStats there to see whether it is stuck, and note that retained_wal_bytes here is the byte lag that a subscriber cannot measure for itself"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "databaseStats"},
-	    {"description", "return per-database statistics (pg_stat_database) for every database in the cluster: connections, commits/rollbacks, block hit ratio inputs, tuple counts, conflicts, deadlocks, temp file usage, and checksum failures"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "statementStats"},
-	    {"description", "return tracked queries from pg_stat_statements under 'statements', with calls, timing, row counts, buffer usage, temporary block I/O and WAL volume, alongside an 'info' block from pg_stat_statements_info whose dealloc counter says whether entries are being evicted -- if it is climbing, this is not the slowest queries in the cluster but the slowest of those that survived eviction. query_id is a decimal string, ready to pass to explainQuery. Returns a clear error with setup instructions if the extension is not installed"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"limit", {{"type", "integer"}, {"description", "how many statements to return. Defaults to 20"}}},
-		    {"query_id", {
-			{"type", "string"},
-			{"description", "only statements with this queryid, as a decimal string; their query text is returned whole rather than truncated. pg_stat_statements keeps one entry per user and database, so a queryid can match more than one row"}
-		      }},
-		    {"order_by", {
-			{"type", "string"},
-			{"description", "ranking column: total_exec_time (default), mean_exec_time, max_exec_time, calls, rows, shared_blks_read, temp_blks_written, or wal_bytes. Ranking by total time buries a statement called twice at 40s under one called ten million times at 2ms; mean_exec_time is the other question"}
-		      }},
-		    {"min_calls", {
-			{"type", "integer"},
-			{"description", "ignore statements called fewer times than this, to keep one-off maintenance queries out of a mean_exec_time ranking"}
-		      }}
-		  }}
-	      }}
-	  },
-	  {
-	    {"name", "wraparoundStatus"},
-	    {"description", "return transaction id and multixact wraparound headroom: age(datfrozenxid) and age(datminmxid) for every database, the oldest tables by age(relfrozenxid) including TOAST tables (often the relation actually holding the horizon back), each age as a percentage of the effective autovacuum_freeze_max_age and of the 2^31 hard limit at which the cluster stops accepting write transactions, plus the per-table freeze storage parameters and last vacuum times. Two alarms live in these numbers and only one is an emergency: past autovacuum_freeze_max_age PostgreSQL forces an anti-wraparound vacuum, which is loud maintenance working as designed, while approaching the wraparound limit ends in the server refusing writes and a recovery through single-user mode -- xid_percent_of_freeze_max_age against xid_percent_of_wraparound_limit tells them apart and xids_until_wraparound_limit is the budget. Past vacuum_failsafe_age autovacuum stops yielding and skips index cleanup, which is the server saying it is already serious. Rank tables by relfrozenxid age rather than size, since the oldest object sets the horizon however small it is, and read toast_for -- a TOAST table is frequently the offender and carries nobody's name. If the age will not fall, vacuum is not the problem: nothing can be frozen past the oldest transaction still visible to something, so more workers and a manual VACUUM FREEZE achieve nothing while the horizon is held. Four things hold it -- a replication slot (replicationSlots), a long-running transaction (currentActivity.backend_xmin), a standby with hot_standby_feedback, and a prepared transaction, which is invisible in pg_stat_activity and not read by this server: query pg_prepared_xacts directly when nothing else explains it"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {
-			{"type", "string"},
-			{"description", "restrict the table list to one schema; omit to cover the whole database, which is what wraparound risk is actually measured over"}
-		      }},
-		    {"limit", {
-			{"type", "integer"},
-			{"description", "how many tables to return, oldest first. Defaults to 20"}
-		      }}
-		  }}
-	      }}
-	  },
-	  {
-	    {"name", "progressStats"},
-	    {"description", "return every long-running maintenance command currently reporting progress (pg_stat_progress_vacuum, _analyze, _create_index, _cluster, _copy, _basebackup), with the phase, the blocks or tuples done against the total, a completion percentage, and how long it has been running. Use it to decide whether a VACUUM will finish before wraparound, or whether a CREATE INDEX is stuck waiting on a locker. The PostgreSQL 17 rename of the vacuum dead-tuple columns is normalized, and 'dead_tuple_unit' says whether the server counts tuples or bytes. A logical replication table sync also reports here: take the worker pid from subscriptionStats and pass it as pid. Note that such a copy streams from the publisher rather than reading a file, so bytes_total is 0 and bytes_percent is null -- bytes_processed and tuples_processed are the figures that move"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"pid", {
-			{"type", "integer"},
-			{"description", "only the command running in this backend; pair with the pid from currentActivity"}
-		      }},
-		    {"relation", {
-			{"type", "string"},
-			{"description", "only commands operating on this table, named bare or schema-qualified. A base backup has no relation, so this excludes that category entirely"}
-		      }}
-		  }}
-	      }}
-	  },
-	  {
-	    {"name", "ioStats"},
-	    {"description", "return cumulative I/O statistics under 'io', per backend type, object and context (pg_stat_io, PostgreSQL 16+): reads, writes, extends, hits, evictions, reuses, fsyncs and their timings, with a hit percentage. This is where backend-written buffers, vacuum's ring-buffer reuse, and bulk read/write I/O become visible separately from the aggregate counters in checkpointStats. Rows with no activity are omitted unless a filter was given. Given a pid, reports that one backend instead, via pg_stat_get_backend_io, plus its WAL volume under 'wal' -- a backend can be quiet in I/O and still be generating WAL heavily; that requires PostgreSQL 18, since pg_stat_io itself has no pid column. Returns a clear error on PostgreSQL 15 and older, where the view does not exist"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"pid", {
-			{"type", "integer"},
-			{"description", "report this one backend's I/O and WAL instead of the cluster-wide aggregate. PostgreSQL 18 and newer only"}
-		      }},
-		    {"backend_type", {
-			{"type", "string"},
-			{"description", "only this backend type, e.g. \"client backend\", \"autovacuum worker\", \"checkpointer\""}
-		      }},
-		    {"object", {
-			{"type", "string"},
-			{"description", "only this object class, e.g. \"relation\" or \"temp relation\""}
-		      }},
-		    {"context", {
-			{"type", "string"},
-			{"description", "only this I/O context, e.g. \"normal\", \"vacuum\", \"bulkread\", \"bulkwrite\""}
-		      }}
-		  }}
-	      }}
-	  },
-	  {
-	    {"name", "checkpointStats"},
-	    {"description", "return checkpoint, WAL, and background writer activity (pg_stat_checkpointer and pg_stat_bgwriter on PostgreSQL 17+, pg_stat_bgwriter alone before that, plus pg_stat_wal) with field names normalized across both shapes: timed versus requested checkpoint counts and the ratio between them, write and sync time, buffers written by the checkpointer, by the background writer, and directly by backends, WAL record/FPI/byte counts, and the related settings (checkpoint_timeout, max_wal_size, checkpoint_completion_target, the bgwriter knobs)"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "tableIOStats"},
-	    {"description", "return per-object buffer cache hit ratios (pg_statio_all_tables): heap_blks_read versus heap_blks_hit, idx_blks_read versus idx_blks_hit, the TOAST and TOAST-index pairs, and a combined ratio, with relation size and scan counts. Naming a single table adds a per-index breakdown from pg_statio_all_indexes. Ratios are null, not zero, for an object that has seen no reads at all. Not to be confused with tableStats, which reports pg_stat_user_tables -- scans, tuples and vacuum state; this tool answers only whether those reads came from the buffer cache or the disk"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}},
-		    {"table",  {
-			{"type", "string"},
-			{"description", "a single table; omit to sweep the schema. Only a named table gets the per-index breakdown"}
-		      }},
-		    {"limit", {
-			{"type", "integer"},
-			{"description", "how many tables to return, most physical reads first. Defaults to 20"}
-		      }}
-		  }},
-		{"required", {"schema"}}
-	      }}
-	  },
-	  {
-	    {"name", "hostCapacity"},
-	    {"description", "correlate memory and parallelism settings with the capacity of the machine PostgreSQL runs on. Host RAM and vCPU count exist outside the catalog, so they must be injected: pass them as arguments, set host_ram_mb/host_vcpus in the connection's section of the connections file, or export PG_LICHT_HOST_RAM_MB/PG_LICHT_HOST_VCPUS. Returns the host facts with the source they came from, every memory-related setting resolved to bytes, and derived ratios (shared_buffers and effective_cache_size as a percentage of RAM, work_mem times max_connections, maintenance_work_mem times autovacuum_max_workers, parallel workers per vCPU). Ratios are null when no RAM figure was supplied; nothing is ever guessed"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"ram_mb", {
-			{"type", "integer"},
-			{"description", "total host memory in megabytes, overriding any configured value"}
-		      }},
-		    {"vcpus", {
-			{"type", "integer"},
-			{"description", "number of vCPUs or cores available to the host, overriding any configured value"}
-		      }},
-		    {"storage", {
-			{"type", "string"},
-			{"description", "free-text description of the storage, e.g. \"local nvme\" or \"gp3 3000 iops\"; echoed back, never interpreted"}
-		      }}
-		  }}
-	      }}
-	  },
-	  {
-	    {"name", "duplicateIndexes"},
-	    {"description", "return indexes that duplicate or are covered by another index on the same table. 'identical' groups indexes whose key columns, operator classes, collations, sort order, INCLUDE columns and partial predicate all match; 'redundant' reports an index whose key columns are a leading prefix of a wider index that also covers its INCLUDE columns. Comparison is by column expression rather than attribute number, so expression indexes and differing sort orders are handled correctly, and a unique index is never called redundant for being a prefix. Each entry carries size, idx_scan, the backing constraint name, and the replica identity and validity flags, since those decide whether it can be dropped at all"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}},
-		    {"table",  {
-			{"type", "string"},
-			{"description", "restrict to one table; omit to check every table in the schema"}
-		      }}
-		  }},
-		{"required", {"schema"}}
-	      }}
-	  },
-	  {
-	    {"name", "tableBloat"},
-	    {"description", "return physical storage bloat for a table (pgstattuple/pgstattuple_approx): table size, live/dead tuple counts and percentages, free space and percentage. Defaults to the cheap visibility-map-based approximation; set exact=true for a precise but I/O-heavy full table scan. More accurate than the ANALYZE-time estimates in listTableStats/tableStats. Returns a clear error with setup instructions if the pgstattuple extension is not installed"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}},
-		    {"table",  {{"type", "string"}}},
-		    {"exact",  {{"type", "boolean"}}}
-		  }},
-		{"required", {"schema", "table"}}
-	      }}
-	  },
-	  {
-	    {"name", "indexBloat"},
-	    {"description", "return physical statistics for one index, from whichever pgstattuple function matches its access method: pgstatindex for btree (tree level, leaf/internal/empty/deleted pages, average leaf density, leaf fragmentation), pgstatginindex for GIN (pending list pages and tuples, alongside the fastupdate setting and pending list limit that bound them), pgstathashindex for hash (bucket/overflow/bitmap/unused pages, live and dead items, free percent). The access method is resolved from the catalog, so the caller does not need to know it; gist, spgist and brin are reported as unsupported by name, since pgstattuple has no function for them. Metrics are deliberately NOT normalized across access methods -- 'access_method' says which set came back. Index size and idx_scan travel with the metrics, because a fragmented index nothing has scanned is a candidate for dropping rather than REINDEX. btree and hash read the whole index; GIN reads only the metapage and is always cheap"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}},
-		    {"index",  {{"type", "string"},
-				{"description", "the index's own name, not the name of the table it is on"}}}
-		  }},
-		{"required", {"schema", "index"}}
-	      }}
-	  },
-	  {
-	    {"name", "checkKey"},
-	    {"description", "check if a row exists by primary key; validates value types against the PK column types before querying"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"schema", {{"type", "string"}}},
-		    {"table",  {{"type", "string"}}},
-		    {"values", {{"type", "array"}}}
-		  }},
-		{"required", {"schema", "table", "values"}}
-	      }}
-	  },
-	  {
-	    {"name", "explainQuery"},
-	    {"description", "return the raw EXPLAIN (FORMAT JSON) plan for a statement, either recovered from pg_stat_statements by queryid (full untruncated text) or supplied directly as sql. Runs in a read-only transaction bounded by statement_timeout. Statements with $n placeholders are planned with GENERIC_PLAN unless concrete params are supplied, in which case the statement is PREPAREd and planned with real values. analyze:true runs EXPLAIN (ANALYZE, BUFFERS), which really executes the statement, and is honoured only after the plan is proven free of any ModifyTable node -- so data-modifying statements, including data-modifying CTEs, are never executed; it also requires an explicit timeout_ms. Returns the plan verbatim plus generic/analyzed/read_only flags and the pg_stat_statements row; no heuristics and no generated DDL, the plan is yours to interpret"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"queryid", {
-			{"type", "string"},
-			{"description", "pg_stat_statements queryid as a decimal string (it is a 64-bit value and does not survive JSON number precision). Mutually exclusive with 'sql'"}
-		      }},
-		    {"sql", {
-			{"type", "string"},
-			{"description", "a single SELECT/INSERT/UPDATE/DELETE/MERGE/WITH/TABLE/VALUES statement to explain. Utility statements (SET, CREATE, VACUUM, ...) are rejected. Mutually exclusive with 'queryid'"}
-		      }},
-		    {"params", {
-			{"type", "array"},
-			{"description", "concrete values for the statement's $1..$n placeholders, in order. Supply these for a real (non-generic) plan; required to use analyze. Values are bound as literals of unknown type and coerced by PostgreSQL to the inferred parameter types; use null for SQL NULL"}
-		      }},
-		    {"analyze", {
-			{"type", "boolean"},
-			{"description", "run EXPLAIN (ANALYZE, BUFFERS), which really executes the statement. Requires timeout_ms. Ignored with an explanatory 'note' if the statement modifies data or could only be planned generically. Default false"}
-		      }},
-		    {"timeout_ms", {
-			{"type", "integer"},
-			{"description", "statement_timeout for the explain, in milliseconds, clamped to [100, 30000]. Required when analyze is true; defaults to 5000 for plan-only calls"}
-		      }}
-		  }}
-	      }}
-	  },
-	  {
-	    {"name", "verifyTopology"},
-	    {"description", "connect to every configured connection and report what each server actually is: its role (primary or replica, from pg_is_in_recovery(), observed now rather than configured), its system identifier, database, address, port and version -- then check the declared topology against them. A physical replica carries the same system identifier as its primary forever, so the identifier alone cannot separate the two axes: same identifier with the same host and port is one instance, same identifier on different hosts is a replication group. Reports declarations the servers contradict, connections that share an identifier but are not declared together (an undeclared replica is where 'is this index used?' quietly gets the wrong answer), a replication group with no primary, and split brain. Logical replication cannot be verified this way and is reported as such rather than as a mismatch. Connects once per configured connection, sequentially, with a short connect timeout; a connection that fails is reported and does not abort the rest"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "bufferCacheSummary"},
-	    {"description", "return how much of shared_buffers is used, dirty and pinned, with the usage-count histogram from pg_buffercache. Cheap enough for a routine health sweep beside checkpointStats. tableIOStats counts only what shared_buffers served, so a miss there may still have come from the OS page cache at RAM speed; this is the only in-core view of that split. Read the histogram rather than a hit ratio: mass at usage_count 2-5 is a stable working set, everything at 0-1 with no unused buffers is clock-sweep churn, and those are the same ratio with opposite diagnoses. One sample is weak evidence -- two samples minutes apart are the method. The readings cover the whole instance, not this database alone. Requires the pg_buffercache extension at version 1.4 or later, and a role with pg_monitor"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "bufferCacheContents"},
-	    {"description", "return which relations own shared_buffers, aggregated per relation and fork and ranked by buffers held: cached bytes, percent of that fork resident, percent of shared_buffers consumed, dirty buffers, average usagecount and pins. Never raw per-buffer rows. Answers which relation is driving checkpoint writeback (pair with checkpointStats), whether the visibility-map fork is resident enough for index-only scans to pay off, and -- on a multi-tenant instance -- which database's working set is displacing the others. Only buffers belonging to this database and the shared catalogs can be resolved to names; buffers held by other databases on the same instance are visible to PostgreSQL but deliberately not reported here. Cost is O(shared_buffers) and does not vary with the limit or with anything else asked: pg_buffercache materialises one row per buffer before any filter applies, so narrowing the question does not narrow the scan. Around 0.5s per 16GB of shared_buffers, and it is subject to the connection's statement_timeout like every other call. bufferCacheSummary reads the same memory through a function that returns one row and is roughly a hundred times cheaper, so prefer it for anything routine. Requires the pg_buffercache extension and a role with pg_monitor"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", {
-		    {"limit", {{"type", "integer"}, {"description", "how many relation/fork rows to return, ranked by buffers held. Defaults to 20, capped at 200"}}}
-		  }}
-	      }}
-	  },
-	  {
-	    {"name", "listTopology"},
-	    {"description", "return the configured topology: which connections share an instance (one postmaster, so they share shared_buffers, WAL, autovacuum workers and disk), which belong to the same replication_group (a primary and its replicas, holding the same data on different servers), and which carry each operator group label. Reads the config file only and opens no database connection, so it is cheap to call before deciding how wide a sweep to run. An instance whose source is \"inferred\" was derived from an identical host and port rather than declared, and is a hint for grouping output, not evidence of shared memory. Roles are not here: primary or replica is observed per call, never configured -- use verifyTopology"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  },
-	  {
-	    {"name", "listConnections"},
-	    {"description", "return the configured database connections by name, with the libpq service name or host/port/dbname/user for each, its instance, replication_group and group labels where configured, and which is the default; passwords are never returned and a service file is never expanded. Pass a name as the 'connection' argument of any other tool to run that tool against that database. See listTopology for the same labels indexed the other way round, by topology name rather than by connection"},
-	    {"inputSchema", {
-		{"type", "object"},
-		{"properties", json::object()}
-	      }}
-	  }
-	}}
-    };
+    json list = {{"tools", json::array()}};
+    for (const ToolDef& d : tool_defs())
+      list["tools"].push_back({{"name",        d.name},
+                               {"description", d.description},
+                               {"inputSchema", d.input_schema()}});
 
     // Every tool accepts an optional `connection`. Injecting it here keeps the
     // ~40 tool definitions and their method signatures untouched; the name is
@@ -4083,9 +2383,9 @@ private:
     // pg_wait_events (PostgreSQL 17+) carries a prose description of every
     // wait event, which is what turns an opaque name like "BufFileRead" into
     // something actionable without leaving the tool output.
-    const std::string wait_desc = sess.server_version() >= 170000
+    const std::string wait_desc = sess.has(Feature::WaitEventDescriptions)
       ? ", 'wait_event_description', we.description" : "";
-    const std::string wait_join = sess.server_version() >= 170000
+    const std::string wait_join = sess.has(Feature::WaitEventDescriptions)
       ? R"(LEFT JOIN pg_wait_events AS we
              ON we.type = a.wait_event_type AND we.name = a.wait_event)"
       : "";
@@ -4253,9 +2553,9 @@ private:
     // (PostgreSQL 14+), a different view from pg_replication_slots: they show
     // logical decoding spilling large transactions to disk, which is invisible
     // in the slot's own row and is a common, silent throughput cliff.
-    const std::string conflicting = sess.server_version() >= 160000
+    const std::string conflicting = sess.has(Feature::SlotConflicting)
       ? ", 'conflicting', s.conflicting" : "";
-    const std::string invalidation = sess.server_version() >= 170000
+    const std::string invalidation = sess.has(Feature::SlotInvalidationReason)
       ? ", 'invalidation_reason', s.invalidation_reason, 'inactive_since', s.inactive_since"
       : "";
 
@@ -4311,7 +2611,7 @@ private:
     // parallel_workers_launched falling short of parallel_workers_to_launch
     // (PostgreSQL 18+) means queries planned for parallelism ran without it,
     // because max_parallel_workers was exhausted.
-    const std::string parallel = sess.server_version() >= 180000
+    const std::string parallel = sess.has(Feature::ActivityParallelWorkers)
       ? R"(, 'parallel_workers_to_launch', parallel_workers_to_launch,
             'parallel_workers_launched',  parallel_workers_launched)"
       : "";
@@ -4408,10 +2708,10 @@ private:
     // in the cluster but the slowest of those that survived eviction -- a
     // difference that cannot be inferred from the rows themselves, which is
     // why it is returned alongside them.
-    const std::string since = sess.server_version() >= 170000
+    const std::string since = sess.has(Feature::StatementStatsSince)
       ? ", 'stats_since', pss.stats_since, 'minmax_stats_since', pss.minmax_stats_since"
       : "";
-    const std::string pg18 = sess.server_version() >= 180000
+    const std::string pg18 = sess.has(Feature::StatementStatsWalBuffers)
       ? R"(, 'wal_buffers_full', pss.wal_buffers_full,
             'parallel_workers_to_launch', pss.parallel_workers_to_launch,
             'parallel_workers_launched', pss.parallel_workers_launched)"
@@ -4530,7 +2830,7 @@ private:
     // measure different things (tuple counts against bytes), so they are
     // reported under their own names rather than pretended to be one field,
     // with 'dead_tuple_unit' saying which the server produced.
-    const bool v17 = sess.server_version() >= 170000;
+    const bool v17 = sess.has(Feature::VacuumProgressBytes);
     const std::string vacuum_dead = v17
       ? R"('dead_tuple_unit',     'bytes',
            'max_dead_tuple_bytes', v.max_dead_tuple_bytes,
@@ -4541,6 +2841,21 @@ private:
       : R"('dead_tuple_unit',  'tuples',
            'max_dead_tuples',  v.max_dead_tuples,
            'num_dead_tuples',  v.num_dead_tuples)";
+
+    // delay_time (PostgreSQL 18) is the total time this vacuum has spent
+    // sleeping on the cost-based delay. It answers "is autovacuum being
+    // throttled" directly, where bloat-and-vacuum-review previously had to
+    // infer it from timestamps and total_autovacuum_time -- and a vacuum that
+    // is 90% asleep looks identical, in blocks scanned per second, to one on a
+    // slow disk. Reported beside elapsed_s so the ratio is available without a
+    // second call; the two together are what separate a throttle from a
+    // bottleneck.
+    const std::string vacuum_delay = sess.has(Feature::VacuumDelayTime)
+      ? R"(, 'delay_time_ms', round(v.delay_time::numeric, 1),
+            'delay_percent',
+              round((100.0 * v.delay_time
+                     / NULLIF(EXTRACT(EPOCH FROM now() - a.query_start) * 1000, 0))::numeric, 1))"
+      : "";
 
     // Percentages are the point of a progress view: "1.2 million of 4 million
     // blocks" is only useful once it is 30%.
@@ -4563,7 +2878,7 @@ private:
                    'query',             a.query,
                    'started',           a.query_start,
                    'elapsed_s',         round(EXTRACT(EPOCH FROM now() - a.query_start)::numeric, 1),
-                   )" + vacuum_dead + R"())
+                   )" + vacuum_dead + vacuum_delay + R"())
           FROM pg_stat_progress_vacuum AS v
           LEFT JOIN pg_stat_activity AS a ON a.pid = v.pid
           WHERE true)" + pid_v + rel_filter("v") + R"(), '[]'::jsonb),
@@ -4673,7 +2988,7 @@ private:
 
     // pg_stat_io arrived in PostgreSQL 16. Saying so plainly beats an
     // undefined-table error, and matches how a missing extension is reported.
-    if (sess.server_version() < 160000) {
+    if (!sess.has(Feature::PgStatIo)) {
       return {
         {"error", "pg_stat_io requires PostgreSQL 16 or newer"},
         {"hint", "this server is older; use checkpointStats for the "
@@ -4684,7 +2999,7 @@ private:
     }
     // Per-backend I/O is not a filter over pg_stat_io -- the view has no pid
     // column at all. It is a separate function, added in PostgreSQL 18.
-    if (pid > 0 && sess.server_version() < 180000) {
+    if (pid > 0 && !sess.has(Feature::BackendIo)) {
       return {
         {"error", "per-backend I/O statistics require PostgreSQL 18 or newer"},
         {"hint", "pg_stat_io is aggregated across backends and has no pid "
@@ -4701,7 +3016,7 @@ private:
     // before that, a block count times op_bytes was the only way to get bytes,
     // and op_bytes itself is gone in 18. Reporting the byte columns only where
     // they exist avoids inventing a number on older servers.
-    const std::string bytes = sess.server_version() >= 180000
+    const std::string bytes = sess.has(Feature::IoByteCounters)
       ? R"(, 'read_bytes', read_bytes, 'write_bytes', write_bytes,
             'extend_bytes', extend_bytes)"
       : "";
@@ -4792,10 +3107,24 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    // 2^31 - 1000000: the point at which PostgreSQL stops accepting commands
-    // that assign new transaction ids. It is the outage threshold, and is
-    // distinct from autovacuum_freeze_max_age, which is merely where an
-    // anti-wraparound autovacuum is forced.
+    // The two thresholds PostgreSQL itself uses, from varsup.c's
+    // SetTransactionIdLimit():
+    //
+    //   xidWrapLimit = oldest_datfrozenxid + (MaxTransactionId >> 1)  // 2^31-1
+    //   xidStopLimit = xidWrapLimit - 3000000
+    //   xidWarnLimit = xidWrapLimit - 40000000
+    //
+    // so the age at which the server refuses to assign new transaction ids is
+    // 2147483647 - 3000000 = 2144483647, and the age at which it starts
+    // warning in the log is 2147483647 - 40000000 = 2107483647. Both are
+    // outage thresholds and both are distinct from autovacuum_freeze_max_age,
+    // which is merely where an anti-wraparound autovacuum is forced.
+    //
+    // Through 4.2.0 this used 2146483647 -- a 1,000,000 delta PostgreSQL has
+    // not used for many releases -- which reported two million transactions of
+    // headroom that did not exist, in the direction that reads as safe. The
+    // warn limit was not reported at all, so the one threshold an operator has
+    // already seen fire in the log was the one this tool could not show them.
     //
     // TOAST tables are included deliberately. They carry their own
     // relfrozenxid, are invisible in pg_stat_user_tables, and a TOAST or
@@ -4807,14 +3136,14 @@ private:
     // a very different problem from the same age with nothing frozen.
     // total_autovacuum_time answers the next question -- whether autovacuum
     // has been trying and failing to keep up, or has simply never run.
-    const std::string pg18_cols = sess.server_version() >= 180000
+    const std::string pg18_cols = sess.has(Feature::RelAllFrozen)
       ? R"(, 'frozen_percent',
               round(100.0 * r.relallfrozen / NULLIF(r.relpages, 0), 1),
             'relallfrozen', r.relallfrozen,
             'total_vacuum_time_ms', r.total_vacuum_time,
             'total_autovacuum_time_ms', r.total_autovacuum_time)"
       : "";
-    const std::string pg18_sel = sess.server_version() >= 180000
+    const std::string pg18_sel = sess.has(Feature::RelAllFrozen)
       ? R"(, c.relallfrozen, c.relpages,
             s.total_vacuum_time, s.total_autovacuum_time)"
       : "";
@@ -4828,7 +3157,8 @@ private:
                            'vacuum_freeze_min_age', 'vacuum_freeze_table_age',
                            'vacuum_multixact_freeze_min_age', 'vacuum_multixact_freeze_table_age',
                            'vacuum_failsafe_age', 'vacuum_multixact_failsafe_age'))
-          || JSONB_BUILD_OBJECT('wraparound_limit', 2146483647::bigint),
+          || JSONB_BUILD_OBJECT('wraparound_limit', 2144483647::bigint,
+                                'wraparound_warn_limit', 2107483647::bigint),
         'databases',
           (SELECT JSONB_OBJECT_AGG(d.datname, JSONB_BUILD_OBJECT(
                     'xid_age', age(d.datfrozenxid),
@@ -4836,12 +3166,22 @@ private:
                       round(100.0 * age(d.datfrozenxid)
                             / NULLIF(current_setting('autovacuum_freeze_max_age')::bigint, 0), 1),
                     'xid_percent_of_wraparound_limit',
-                      round(100.0 * age(d.datfrozenxid) / 2146483647, 3),
-                    'xids_until_wraparound_limit', 2146483647 - age(d.datfrozenxid),
+                      round(100.0 * age(d.datfrozenxid) / 2144483647, 3),
+                    'xids_until_wraparound_limit', 2144483647 - age(d.datfrozenxid),
+                    'xids_until_warn_limit', 2107483647 - age(d.datfrozenxid),
                     'mxid_age', mxid_age(d.datminmxid),
                     'mxid_percent_of_freeze_max_age',
                       round(100.0 * mxid_age(d.datminmxid)
                             / NULLIF(current_setting('autovacuum_multixact_freeze_max_age')::bigint, 0), 1),
+                    -- Multixacts have the same 3,000,000 stop limit as xids and
+                    -- the same 40,000,000 warning, and members-space exhaustion
+                    -- is its own incident with its own ceiling. Both documents
+                    -- said "each age as a percentage of ... the hard limit"
+                    -- while only the xid half was reported.
+                    'mxid_percent_of_wraparound_limit',
+                      round(100.0 * mxid_age(d.datminmxid) / 2144483647, 3),
+                    'mxids_until_wraparound_limit', 2144483647 - mxid_age(d.datminmxid),
+                    'mxids_until_warn_limit', 2107483647 - mxid_age(d.datminmxid),
                     'datfrozenxid', d.datfrozenxid::text,
                     'datminmxid', d.datminmxid::text))
              FROM pg_database AS d
@@ -4856,7 +3196,7 @@ private:
                    'xid_percent_of_freeze_max_age',
                      round(100.0 * r.xid_age / NULLIF(r.freeze_max_age, 0), 1),
                    'xid_percent_of_wraparound_limit',
-                     round(100.0 * r.xid_age / 2146483647, 3),
+                     round(100.0 * r.xid_age / 2144483647, 3),
                    'mxid_age', r.mxid_age,
                    'relfrozenxid', r.relfrozenxid::text,
                    'freeze_max_age', r.freeze_max_age,
@@ -5052,12 +3392,12 @@ private:
     // buffer counts to pg_stat_io. Field names are normalized across both
     // shapes so a caller never has to branch on the server version; 'source'
     // says which views produced the numbers.
-    const bool split = sess.server_version() >= 170000;
+    const bool split = sess.has(Feature::Checkpointer);
 
     // pg_stat_wal lost wal_write/wal_sync and their timings in PostgreSQL 18,
     // where they moved to pg_stat_io. The remaining four columns exist on
     // every supported major.
-    const std::string wal_timing = sess.server_version() < 180000
+    const std::string wal_timing = !sess.has(Feature::WalIoMovedToPgStatIo)
       ? R"(, 'wal_write', w.wal_write,
             'wal_sync', w.wal_sync,
             'wal_write_time_ms', w.wal_write_time,
@@ -5066,7 +3406,7 @@ private:
 
     // num_done and slru_written are PostgreSQL 18 additions to
     // pg_stat_checkpointer; the rest of the view is unchanged since 17.
-    const std::string ckpt_pg18 = sess.server_version() >= 180000
+    const std::string ckpt_pg18 = sess.has(Feature::CheckpointerNumDone)
       ? "'checkpoints_done', c.num_done, 'slru_written', c.slru_written,"
       : "";
 
@@ -5322,11 +3662,53 @@ private:
                (SELECT bytes   FROM g WHERE name = 'effective_cache_size') AS effective_cache_size,
                (SELECT setting::bigint FROM g WHERE name = 'max_connections')        AS max_connections,
                (SELECT setting::bigint FROM g WHERE name = 'autovacuum_max_workers') AS av_workers
+      ),
+      -- pg_db_role_setting is a whole configuration layer pg_settings cannot
+      -- show: pg_settings reports the value for THIS session, so an
+      -- `ALTER ROLE app SET work_mem` or `ALTER DATABASE reporting SET ...` is
+      -- invisible to anyone connected as someone else. Through 4.2.0 the
+      -- worst case below was computed from the global work_mem alone, so on
+      -- any server where the application role carries a larger one the figure
+      -- was understated -- wrong in the direction that reads as safe.
+      --
+      -- setdatabase = 0 means "all databases", setrole = 0 means "all roles",
+      -- so the four combinations are the four scopes.
+      ovr AS (
+        SELECT COALESCE(d.datname, '')                       AS database,
+               COALESCE(r.rolname, '')                       AS role,
+               split_part(cfg, '=', 1)                       AS name,
+               substr(cfg, strpos(cfg, '=') + 1)             AS value
+          FROM pg_db_role_setting AS s
+          LEFT JOIN pg_database AS d ON d.oid = s.setdatabase
+          LEFT JOIN pg_roles    AS r ON r.oid = s.setrole
+          CROSS JOIN LATERAL unnest(s.setconfig) AS cfg
+      ),
+      -- work_mem's unit is kB, so a bare number is kilobytes; anything with a
+      -- suffix is what pg_size_bytes understands. An unparseable value is
+      -- skipped rather than guessed at.
+      wm AS (
+        SELECT max(CASE WHEN value ~ '^[0-9]+$' THEN value::bigint * 1024
+                        WHEN value ~ '^[0-9]+\s*[kMGT]B$' THEN pg_size_bytes(value)
+                   END) AS max_bytes
+          FROM ovr WHERE name = 'work_mem'
       )
       SELECT JSONB_BUILD_OBJECT(
         'server', JSONB_BUILD_OBJECT(
           'version', current_setting('server_version'),
           'database', current_database()),
+        -- Every per-role and per-database override, not only work_mem: a
+        -- statement_timeout of 0 on one role explains as much as a memory
+        -- setting does, and none of it is visible in `settings` above.
+        'overrides', COALESCE((SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                        'scope', CASE WHEN database = '' AND role = '' THEN 'cluster'
+                                      WHEN database = '' THEN 'role'
+                                      WHEN role = ''     THEN 'database'
+                                      ELSE 'role_in_database' END,
+                        'database', NULLIF(database, ''),
+                        'role',     NULLIF(role, ''),
+                        'name',     name,
+                        'value',    value) ORDER BY name, database, role)
+                      FROM ovr), '[]'::jsonb),
         'settings', (SELECT JSONB_OBJECT_AGG(name, JSONB_BUILD_OBJECT(
                         'setting', setting, 'unit', unit, 'bytes', bytes)) FROM g),
         'derived', (SELECT JSONB_BUILD_OBJECT(
@@ -5342,11 +3724,18 @@ private:
             v.maint_work_mem * v.av_workers,
           'maintenance_work_mem_times_autovacuum_workers_percent_of_ram',
             round(100.0 * v.maint_work_mem * v.av_workers / NULLIF(host.ram_bytes, 0), 1),
+          -- GREATEST of the global work_mem and any override, because the
+          -- worst case is what the largest-configured role can do, not what
+          -- the current session happens to be set to.
+          'work_mem_effective_max_bytes', GREATEST(v.work_mem, wm.max_bytes),
+          'work_mem_is_overridden', wm.max_bytes IS NOT NULL
+                                    AND wm.max_bytes > v.work_mem,
           'committed_worst_case_bytes',
-            v.shared_buffers + v.work_mem * v.max_connections
+            v.shared_buffers + GREATEST(v.work_mem, wm.max_bytes) * v.max_connections
               + v.maint_work_mem * v.av_workers,
           'committed_worst_case_percent_of_ram',
-            round(100.0 * (v.shared_buffers + v.work_mem * v.max_connections
+            round(100.0 * (v.shared_buffers
+                           + GREATEST(v.work_mem, wm.max_bytes) * v.max_connections
                            + v.maint_work_mem * v.av_workers)
                   / NULLIF(host.ram_bytes, 0), 1),
           'max_parallel_workers_per_vcpu',
@@ -5355,14 +3744,19 @@ private:
           'max_worker_processes_per_vcpu',
             round((SELECT setting::numeric FROM g WHERE name = 'max_worker_processes')
                   / NULLIF(host.vcpus, 0), 2))
-          FROM v, host),
+          FROM v, host, wm),
         'notes', JSONB_BUILD_ARRAY(
           'work_mem is a per-node limit, not a per-connection one: a single query '
           'with several sorts or hash joins can use a multiple of it, and parallel '
           'workers each get their own. work_mem_times_max_connections is therefore a '
           'floor on the worst case, not a ceiling.',
           'shared_buffers is counted once here; the operating system page cache is '
-          'not, which is what effective_cache_size is meant to describe.')
+          'not, which is what effective_cache_size is meant to describe.',
+          'settings shows this session''s values. overrides carries what '
+          'pg_db_role_setting holds for other roles and databases, which pg_settings '
+          'cannot show and which is the usual answer to "slow only from the '
+          'application". committed_worst_case uses the largest work_mem any role is '
+          'configured with, not this session''s.')
       );
     )";
 
@@ -5643,13 +4037,33 @@ private:
     bool generic = false;
 
     try {
+      // Every EXPLAIN here carries SETTINGS, which reports the settings that
+      // differ from the built-in default -- and so names the environment this
+      // plan was built in.
+      //
+      // That environment is this server's connection, not the one the
+      // statement runs in. work_mem alone is enough to change the algorithm
+      // rather than the cost: measured on PostgreSQL 18 over 400k rows with
+      // identical statistics, one statement planned as GroupAggregate over a
+      // Sort at work_mem 64kB and as HashAggregate at 512MB. Anything read off
+      // node types, Sort Method, or whether a node spilled is then read off a
+      // plan production never runs.
+      //
+      // pg_db_role_setting is where a per-role work_mem lives, hostCapacity
+      // reports it under `overrides`, and the two together let a caller see
+      // the mismatch. SETTINGS is the half that says what planned it; without
+      // it there is nothing to compare against and nothing to notice.
+      //
+      // SETTINGS is PostgreSQL 12 and later, so it needs no gate on any
+      // supported major.
+      //
       // --- Phase A: produce a plan without executing anything ---
       if (params.empty()) {
         try {
           // A savepoint, so that the expected failure below leaves the
           // transaction usable rather than aborted.
           pqxx::subtransaction sub{txn};
-          pqxx::result r = sub.exec("EXPLAIN (FORMAT JSON) " + sql);
+          pqxx::result r = sub.exec("EXPLAIN (SETTINGS, FORMAT JSON) " + sql);
           plan = json::parse(r[0][0].as<std::string>());
           sub.commit();
         } catch (const pqxx::sql_error& e) {
@@ -5661,7 +4075,7 @@ private:
           // GENERIC_PLAN is PostgreSQL 16+. On older servers attempting it
           // yields a confusing "unrecognized EXPLAIN option" rather than the
           // real problem, so short-circuit with the actionable hint instead.
-          if (sess.server_version() < 160000) {
+          if (!sess.has(Feature::GenericPlan)) {
             json out = {
               {"error", "the statement has $n placeholders and no params were supplied"},
               {"hint", "supply values via the params argument so the statement can be "
@@ -5673,7 +4087,7 @@ private:
             if (!stats.is_null()) out["statement"] = stats;
             return out;
           }
-          pqxx::result r = txn.exec("EXPLAIN (GENERIC_PLAN, FORMAT JSON) " + sql);
+          pqxx::result r = txn.exec("EXPLAIN (SETTINGS, GENERIC_PLAN, FORMAT JSON) " + sql);
           plan = json::parse(r[0][0].as<std::string>());
           generic = true;
         }
@@ -5695,7 +4109,7 @@ private:
 
         lits = build_execute_literals(txn, params);
         pqxx::result r = txn.exec(
-          "EXPLAIN (FORMAT JSON) EXECUTE " + prepared + "(" + lits + ")");
+          "EXPLAIN (SETTINGS, FORMAT JSON) EXECUTE " + prepared + "(" + lits + ")");
         plan = json::parse(r[0][0].as<std::string>());
       }
 
@@ -5717,7 +4131,7 @@ private:
           std::string target = prepared.empty()
             ? sql : ("EXECUTE " + prepared + "(" + lits + ")");
           pqxx::result r = txn.exec(
-            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + target);
+            "EXPLAIN (SETTINGS, ANALYZE, BUFFERS, FORMAT JSON) " + target);
           plan = json::parse(r[0][0].as<std::string>());
           analyzed = true;
         }
@@ -6105,7 +4519,7 @@ private:
       // Two different problems that look alike. pg_buffercache 1.4 shipped with
       // PostgreSQL 16, so on 14 and 15 there is no 1.4 to update to and
       // "ALTER EXTENSION ... UPDATE" would send the operator in a circle.
-      if (sess.server_version() < 160000) {
+      if (!sess.has(Feature::BufferCacheSummary)) {
         return {
           {"error", "pg_buffercache_summary() was added in pg_buffercache 1.4, "
                     "which ships with PostgreSQL 16. This server has "
@@ -6884,13 +5298,12 @@ private:
     // server that has no such column: absent means "this server cannot answer",
     // which is not what a null would say. subbinary and substream are PG14, the
     // supported floor.
-    const int v = sess.server_version();
     const std::string opt =
-      std::string(v >= 150000 ? ", 'two_phase', subtwophasestate"
+      std::string(sess.has(Feature::SubTwoPhase) ? ", 'two_phase', subtwophasestate"
                                 ", 'disable_on_error', subdisableonerr" : "") +
-                 (v >= 160000 ? ", 'origin', suborigin"
+                 (sess.has(Feature::SubOrigin) ? ", 'origin', suborigin"
                                 ", 'run_as_owner', subrunasowner" : "") +
-                 (v >= 170000 ? ", 'failover', subfailover" : "");
+                 (sess.has(Feature::SubFailover) ? ", 'failover', subfailover" : "");
     std::string query =
       "SELECT JSONB_OBJECT_AGG(subname, JSONB_BUILD_OBJECT("
       "  'owner',              subowner::regrole::text"
@@ -6937,25 +5350,24 @@ private:
   const json subscription_stats() {
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
-    const int v = sess.server_version();
 
     // worker_type is PG17. Below it the type is inferred from whether the
     // worker is bound to a relation, which is what the pre-17 idiom was. That
     // collapses 'parallel apply' into 'apply' -- both are apply workers with a
     // null relid -- and leader_pid still tells them apart on 16.
     const std::string worker_type =
-      v >= 170000 ? "st.worker_type"
+      sess.has(Feature::SubWorkerType) ? "st.worker_type"
                   : "CASE WHEN st.relid IS NOT NULL THEN 'table synchronization' "
                     "ELSE 'apply' END";
-    const std::string leader_pid = v >= 160000 ? "st.leader_pid" : "NULL::int";
+    const std::string leader_pid = sess.has(Feature::SubLeaderPid) ? "st.leader_pid" : "NULL::int";
 
     // pg_stat_subscription_stats is PG15. On 14, the supported floor, the view
     // does not exist at all, so the whole errors key is omitted rather than
     // returned as nulls: absent means "this server cannot answer", which is
     // not the same as zero errors.
-    const bool has_stats = v >= 150000;
+    const bool has_stats = sess.has(Feature::SubscriptionStatsView);
     // The seven conflict counters are PG18.
-    const std::string conflicts = v >= 180000 ?
+    const std::string conflicts = sess.has(Feature::SubConflictCounters) ?
       ", 'conflicts', JSONB_BUILD_OBJECT("
       "   'insert_exists',             ss.confl_insert_exists"
       " , 'update_origin_differs',     ss.confl_update_origin_differs"
@@ -7074,7 +5486,6 @@ private:
                                const std::string& object) {
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
-    const int v = sess.server_version();
 
     // A role that does not exist makes every has_*_privilege call raise, so it
     // is established first and reported as a fact rather than an error: "no
@@ -7100,7 +5511,7 @@ private:
     // MAINTAIN is PostgreSQL 17. Asking for it on an older server raises
     // rather than returning false, so it is gated rather than probed.
     const std::string maintain =
-      v >= 170000 ? ", 'MAINTAIN', has_table_privilege($1, c.oid, 'MAINTAIN')" : "";
+      sess.has(Feature::MaintainPrivilege) ? ", 'MAINTAIN', has_table_privilege($1, c.oid, 'MAINTAIN')" : "";
 
     pqxx::result rel = pqxx_exec(txn,
       "SELECT JSONB_BUILD_OBJECT("
@@ -7256,7 +5667,17 @@ private:
       "    , 'default', current_setting('default_statistics_target')::int"
       "    , 'effective', COALESCE(NULLIF(a.attstattarget, -1),"
       "                            current_setting('default_statistics_target')::int))"
-      ", 'inherited', ps.inherited)"
+      ", 'inherited', ps.inherited"
+      // pg_stats is defined WITH (security_barrier) and carries
+      //   AND (c.relrowsecurity = false OR NOT row_security_active(c.oid))
+      // so on a table with RLS active for this role the view returns no row at
+      // all -- not a filtered row, no row. Every statistic then reads as null,
+      // which is indistinguishable from a table nobody has analyzed. This is
+      // the common case rather than the corner one wherever RLS is the norm,
+      // so the condition is detected and reported instead of being left for
+      // the caller to deduce.
+      ", 'stats_hidden_by_rls',"
+      "    (c.relrowsecurity AND row_security_active(c.oid)))"
       "  FROM pg_attribute AS a"
       "  JOIN pg_class AS c ON c.oid = a.attrelid"
       "  JOIN pg_namespace AS n ON n.oid = c.relnamespace"
@@ -7277,13 +5698,25 @@ private:
     json out = json::parse(res[0][0].as<std::string>());
     // A column with no row in pg_stats at all is a different statement from one
     // whose values are all common, and both come back as nulls otherwise.
-    if (out["n_distinct"].is_null())
-      out["note"] = "no pg_stats row for this column: either nothing has "
-                    "analyzed the table, or the current role cannot read its "
-                    "statistics -- pg_stats filters on has_column_privilege. "
-                    "tableStats carries the analyze timestamps that tell those "
-                    "apart, and checkRoleAccess says whether the role can read "
-                    "the column.";
+    if (out["n_distinct"].is_null()) {
+      if (out.value("stats_hidden_by_rls", false))
+        out["note"] = "row-level security is enabled on this table and active "
+                      "for the current role, and pg_stats returns no row at all "
+                      "in that case -- so these nulls say nothing about whether "
+                      "the table has been analyzed. The statistics exist and the "
+                      "planner uses them; this view cannot show them to this "
+                      "role. Ask as the table owner (who is exempt unless FORCE "
+                      "ROW LEVEL SECURITY is set) or as a role RLS does not "
+                      "apply to. checkRoleAccess reports which of those this "
+                      "role is.";
+      else
+        out["note"] = "no pg_stats row for this column: either nothing has "
+                      "analyzed the table, or the current role cannot read its "
+                      "statistics -- pg_stats filters on has_column_privilege. "
+                      "tableStats carries the analyze timestamps that tell those "
+                      "apart, and checkRoleAccess says whether the role can read "
+                      "the column.";
+    }
     else if (out["histogram_bounds"].is_null())
       out["note"] = "no histogram for this column. ANALYZE builds one only from "
                     "the values left after the most common ones are taken into "
@@ -7439,30 +5872,66 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
-      SELECT JSONB_OBJECT_AGG(
-               s.stxname,
-               JSONB_BUILD_OBJECT(
-                 'table',       s.stxrelid::regclass::text,
-                 'columns',     COALESCE(cols, '[]'::jsonb),
-                 'kinds',       COALESCE(kinds, '[]'::jsonb),
-                 'description', COALESCE(obj_description(s.oid, 'pg_statistic_ext'), '')
-               )
-             )
-      FROM pg_statistic_ext AS s
-      LEFT JOIN LATERAL (
-          SELECT JSONB_AGG(attname ORDER BY attnum) AS cols
-          FROM pg_attribute
-          WHERE attrelid = s.stxrelid
-            AND attnum = ANY(s.stxkeys)
-      ) _lat27 ON true
-      LEFT JOIN LATERAL (
-          SELECT JSONB_AGG(CASE k WHEN 'd' THEN 'ndistinct' WHEN 'f' THEN 'dependencies'
-                                   WHEN 'm' THEN 'mcv' WHEN 'e' THEN 'expressions' END) AS kinds
-          FROM unnest(s.stxkind) AS k
-      ) _lat28 ON true
-      WHERE s.stxnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1);
-    )";
+    // pg_statistic_ext is the DEFINITION. A CREATE STATISTICS that has never
+    // been ANALYZEd has a row there, no data anywhere, and changes no plan --
+    // and through 4.2.0 this tool reported it identically to a working one.
+    // The built data lives in pg_statistic_ext_data. 4.2.0's prompt audit
+    // added "check whether extended statistics exist" to explain-and-fix and
+    // diagnose-slow-query precisely so neither would recommend creating what
+    // was already there, so existence had to stop meaning the catalog row and
+    // start meaning the statistics.
+    //
+    // stxdinherit is PostgreSQL 15 and later, where it also became part of the
+    // key: an object on a partitioned parent can carry separate data for the
+    // parent alone and for the whole inheritance tree. Aggregated rather than
+    // picked, so `built` is true if either exists and built_for_inherited says
+    // which. On 14 there is one row per object and the question cannot arise,
+    // so the key is null there rather than a guess.
+    const std::string inherit_sel = sess.has(Feature::ExtendedStatsInherit)
+      ? ", COALESCE(JSONB_AGG(DISTINCT d.stxdinherit), '[]'::jsonb) AS built_for"
+      : ", NULL::jsonb AS built_for";
+
+    const std::string query =
+      "SELECT JSONB_OBJECT_AGG("
+      "         s.stxname,"
+      "         JSONB_BUILD_OBJECT("
+      "           'table',       s.stxrelid::regclass::text,"
+      "           'columns',     COALESCE(_cols.cols, '[]'::jsonb),"
+      "           'kinds',       COALESCE(_kinds.kinds, '[]'::jsonb),"
+      "           'built',       COALESCE(built.any_data, false),"
+      "           'built_kinds', COALESCE(built.kinds, '[]'::jsonb),"
+      "           'built_for_inherited', built.built_for,"
+      "           'description', COALESCE(obj_description(s.oid, 'pg_statistic_ext'), '')"
+      "         ))"
+      "  FROM pg_statistic_ext AS s"
+      "  LEFT JOIN LATERAL ("
+      "      SELECT JSONB_AGG(attname ORDER BY attnum) AS cols"
+      "        FROM pg_attribute"
+      "       WHERE attrelid = s.stxrelid AND attnum = ANY(s.stxkeys)"
+      "  ) _cols ON true"
+      "  LEFT JOIN LATERAL ("
+      "      SELECT JSONB_AGG(CASE k WHEN 'd' THEN 'ndistinct' WHEN 'f' THEN 'dependencies'"
+      "                              WHEN 'm' THEN 'mcv' WHEN 'e' THEN 'expressions' END) AS kinds"
+      "        FROM unnest(s.stxkind) AS k"
+      "  ) _kinds ON true"
+      "  LEFT JOIN LATERAL ("
+      "      SELECT bool_or(d.stxdndistinct IS NOT NULL"
+      "                  OR d.stxddependencies IS NOT NULL"
+      "                  OR d.stxdmcv IS NOT NULL"
+      "                  OR d.stxdexpr IS NOT NULL) AS any_data"
+      "           , COALESCE(JSONB_AGG(DISTINCT bk) FILTER (WHERE bk IS NOT NULL),"
+      "                      '[]'::jsonb) AS kinds"
+      + inherit_sel +
+      "        FROM pg_statistic_ext_data AS d"
+      "        LEFT JOIN LATERAL unnest(ARRAY["
+      "               CASE WHEN d.stxdndistinct    IS NOT NULL THEN 'ndistinct'    END,"
+      "               CASE WHEN d.stxddependencies IS NOT NULL THEN 'dependencies' END,"
+      "               CASE WHEN d.stxdmcv          IS NOT NULL THEN 'mcv'          END,"
+      "               CASE WHEN d.stxdexpr         IS NOT NULL THEN 'expressions'  END])"
+      "             AS bk ON true"
+      "       WHERE d.stxoid = s.oid"
+      "  ) built ON true"
+      " WHERE s.stxnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1);";
 
     pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
 
@@ -7903,11 +6372,11 @@ private:
 
     // Each EXPLAIN runs inside a savepoint so that a failing statement leaves
     // the transaction usable -- the reset on the way out needs it alive.
-    const bool pg16 = sess.server_version() >= 160000;
+    const bool pg16 = sess.has(Feature::GenericPlan);
     auto plan_of = [&]() -> json {
       try {
         pqxx::subtransaction sub{txn};
-        pqxx::result r = sub.exec("EXPLAIN (FORMAT JSON) " + sql);
+        pqxx::result r = sub.exec("EXPLAIN (SETTINGS, FORMAT JSON) " + sql);
         json p = json::parse(r[0][0].as<std::string>());
         sub.commit();
         return p;
@@ -7916,7 +6385,7 @@ private:
         // same fallback explainQuery uses, and it is PostgreSQL 16+.
         if (e.sqlstate() != "42P02" || !pg16) throw;
         pqxx::subtransaction sub{txn};
-        pqxx::result r = sub.exec("EXPLAIN (FORMAT JSON, GENERIC_PLAN) " + sql);
+        pqxx::result r = sub.exec("EXPLAIN (SETTINGS, FORMAT JSON, GENERIC_PLAN) " + sql);
         json p = json::parse(r[0][0].as<std::string>());
         sub.commit();
         return p;
@@ -8151,7 +6620,14 @@ private:
   // not in tableDetails, but they are cheap, which is why they are not behind
   // the gate that tableSize is.
   //
-  // size_estimate is relpages * 8192 and is deliberately not called `size`.
+  // size_estimate is relpages * block_size and is deliberately not called
+  // `size`. It multiplied by a literal 8192 through 4.2.0, which is only the
+  // default: pg_class.relpages is documented as a count of pages "of size
+  // BLCKSZ", and BLCKSZ is a compile-time option between 1kB and 32kB. On a
+  // server built with anything else every estimate was wrong by the ratio, and
+  // silently. current_setting('block_size') is a preset GUC, readable by any
+  // role and constant for the life of the server, so this costs nothing.
+  //
   // relpages is set by VACUUM and ANALYZE, so between runs it can be arbitrarily
   // stale -- on a table that has doubled since the last analyze it is half the
   // truth. estimated_from carries the timestamp that produced it so a caller can
@@ -8165,7 +6641,7 @@ private:
   // the last sequential scan, which turns a large seq_scan count into something
   // actionable.
   static std::string stats_pg16_fragment(int server_version) {
-    return server_version >= 160000
+    return server_version >= feature_since(Feature::TableStatsSeqScanDetail)
       ? R"(, 'n_tup_newpage_upd', s.n_tup_newpage_upd,
             'last_seq_scan', s.last_seq_scan)"
       : "";
@@ -8188,7 +6664,7 @@ private:
   // it dates relpages and reltuples, which any of the four refreshes equally.
   static constexpr const char* kTableStatsCommon = R"(
                'rows', c.reltuples,
-               'size_estimate', c.relpages::bigint * 8192,
+               'size_estimate', c.relpages::bigint * current_setting('block_size')::bigint,
                'estimated_from', GREATEST(s.last_vacuum, s.last_autovacuum,
                                           s.last_analyze, s.last_autoanalyze),
                'seq_scan', s.seq_scan, 'idx_scan', s.idx_scan,
@@ -8210,13 +6686,21 @@ private:
     // finished query, which is what the pre-4.0.0 tableDetails did: if the two
     // ever drifted the erase silently did nothing and the pg14/pg15 jobs failed
     // on an undefined column.
-    const std::string idx_pg16 = sess.server_version() >= 160000
+    const std::string idx_pg16 = sess.has(Feature::IndexLastScan)
       ? R"(, 'last_use', si.last_idx_scan)" : "";
 
     std::string query = std::string(R"(
       SELECT JSONB_BUILD_OBJECT(
                'table', c.relname,)") + kTableStatsCommon + pg16 + R"(,
                'columns', COALESCE(columns, '{}'::jsonb),
+               -- pg_stats returns NO ROW for a table whose RLS is active for
+               -- this role, so every per-column statistic below comes back null
+               -- and reads exactly like a table nobody has analyzed. Reported
+               -- rather than left to be deduced: the analyze timestamps beside
+               -- it prove the statistics exist, and the two together are the
+               -- only way to tell "not collected" from "not visible to you".
+               'stats_hidden_by_rls',
+                 (c.relrowsecurity AND row_security_active(c.oid)),
                'indexes', COALESCE(indexes, '{}'::jsonb))
       FROM pg_class AS c
       LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
@@ -8772,304 +7256,9 @@ private:
   // whole reason the ~50 query methods needed no changes to gain fan-out.
   bool dispatch_tool(const std::string& tool_name, const json& arguments,
                      json& result_content) {
-    if (tool_name == "listConnections") {
-      result_content = connections();
-    }
-    else if (tool_name == "listTopology") {
-      result_content = topology();
-    }
-    else if (tool_name == "verifyTopology") {
-      result_content = verify_topology();
-    }
-    else if (tool_name == "bufferCacheSummary") {
-      result_content = buffer_cache_summary();
-    }
-    else if (tool_name == "bufferCacheContents") {
-      int limit = arguments.contains("limit") && arguments["limit"].is_number_integer()
-        ? arguments["limit"].get<int>() : 20;
-      result_content = buffer_cache_contents(limit);
-    }
-    else if (tool_name == "listSchemas") {
-      result_content = schemas();
-    }
-    else if (tool_name == "listTables") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      result_content = tables(target_schema);
-    }
-    else if (tool_name == "tableDetails") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      std::string target_table = arguments.contains("table") ? arguments["table"].get<std::string>() : "";
-      result_content = table(target_schema, target_table);
-    }
-    else if (tool_name == "searchTables") {
-      std::string web_search = arguments.contains("web_search") ? arguments["web_search"].get<std::string>() : "";
-      result_content = search(web_search);
-    }
-    else if (tool_name == "evaluateIndex") {
-      std::string sql = arguments.contains("sql") ? arguments["sql"].get<std::string>() : "";
-      json creates = arguments.contains("create") ? arguments["create"] : json::array();
-      json hides   = arguments.contains("hide")   ? arguments["hide"]   : json::array();
-      result_content = evaluate_index(sql, creates, hides);
-    }
-    else if (tool_name == "checkPrivileges") {
-      result_content = check_privileges();
-    }
-    else if (tool_name == "tableStats") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      std::string target_table = arguments.contains("table") ? arguments["table"].get<std::string>() : "";
-      result_content = table_stats(target_schema, target_table);
-    }
-    else if (tool_name == "listTableStats") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      result_content = list_table_stats(target_schema);
-    }
-    else if (tool_name == "tableSize") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      std::string target_table = arguments.contains("table") ? arguments["table"].get<std::string>() : "";
-      result_content = table_size(target_schema, target_table);
-    }
-    else if (tool_name == "listTableSizes") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      result_content = list_table_sizes(target_schema);
-    }
-    else if (tool_name == "listFunctions") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      result_content = functions(target_schema);
-    }
-    else if (tool_name == "functionDetails") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      std::string func_name = arguments.contains("function") ? arguments["function"].get<std::string>() : "";
-      result_content = function_detail(target_schema, func_name);
-    }
-    else if (tool_name == "searchFunctions") {
-      std::string web_search = arguments.contains("web_search") ? arguments["web_search"].get<std::string>() : "";
-      result_content = search_functions(web_search);
-    }
-    else if (tool_name == "listEnums") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      result_content = enums(target_schema);
-    }
-    else if (tool_name == "enumDetails") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      std::string enum_name = arguments.contains("enum") ? arguments["enum"].get<std::string>() : "";
-      result_content = enum_detail(target_schema, enum_name);
-    }
-    else if (tool_name == "searchEnums") {
-      std::string web_search = arguments.contains("web_search") ? arguments["web_search"].get<std::string>() : "";
-      result_content = search_enums(web_search);
-    }
-    else if (tool_name == "listTypes") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      result_content = types(target_schema);
-    }
-    else if (tool_name == "typeDetails") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      std::string type_name = arguments.contains("type") ? arguments["type"].get<std::string>() : "";
-      result_content = type_detail(target_schema, type_name);
-    }
-    else if (tool_name == "listRoles") {
-      result_content = roles();
-    }
-    else if (tool_name == "listForeignTables") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      result_content = foreign_tables(target_schema);
-    }
-    else if (tool_name == "listForeignServers") {
-      result_content = foreign_servers();
-    }
-    else if (tool_name == "listTablespaces") {
-      result_content = tablespaces();
-    }
-    else if (tool_name == "listCollations") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      result_content = collations(target_schema);
-    }
-    else if (tool_name == "listEventTriggers") {
-      result_content = event_triggers();
-    }
-    else if (tool_name == "listPublications") {
-      result_content = publications();
-    }
-    else if (tool_name == "listSubscriptions") {
-      result_content = subscriptions();
-    }
-    else if (tool_name == "subscriptionStats") {
-      result_content = subscription_stats();
-    }
-    else if (tool_name == "diskUsage") {
-      result_content = disk_usage();
-    }
-    else if (tool_name == "columnHistogram") {
-      result_content = column_histogram(
-        arguments.value("schema", std::string()),
-        arguments.value("table", std::string()),
-        arguments.value("column", std::string()));
-    }
-    else if (tool_name == "checkRoleAccess") {
-      result_content = check_role_access(
-        arguments.value("grantee", std::string()),
-        arguments.value("schema", std::string()),
-        arguments.value("object", std::string()));
-    }
-    else if (tool_name == "listLanguages") {
-      result_content = languages();
-    }
-    else if (tool_name == "listExtendedStatistics") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      result_content = extended_statistics(target_schema);
-    }
-    else if (tool_name == "listOperators") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      result_content = operators(target_schema);
-    }
-    else if (tool_name == "listOperatorClasses") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      result_content = operator_classes(target_schema);
-    }
-    else if (tool_name == "listAccessMethods") {
-      result_content = access_methods();
-    }
-    else if (tool_name == "listCasts") {
-      result_content = casts();
-    }
-    else if (tool_name == "listTextSearchConfigs") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      result_content = text_search_configs(target_schema);
-    }
-    else if (tool_name == "listSequences") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      result_content = sequences(target_schema);
-    }
-    else if (tool_name == "listExtensions") {
-      result_content = extensions();
-    }
-    else if (tool_name == "databaseSize") {
-      result_content = database_size();
-    }
-    else if (tool_name == "serverSettings") {
-      result_content = server_settings();
-    }
-    else if (tool_name == "currentActivity") {
-      int pid = arguments.contains("pid") && arguments["pid"].is_number_integer()
-        ? arguments["pid"].get<int>() : 0;
-      std::string qid = arguments.contains("query_id") && arguments["query_id"].is_string()
-        ? arguments["query_id"].get<std::string>() : "";
-      double min_dur = arguments.contains("min_duration_s") && arguments["min_duration_s"].is_number()
-        ? arguments["min_duration_s"].get<double>() : 0;
-      std::string st = arguments.contains("state") && arguments["state"].is_string()
-        ? arguments["state"].get<std::string>() : "";
-      result_content = activity(pid, qid, min_dur, st);
-    }
-    else if (tool_name == "currentLocks") {
-      int pid = arguments.contains("pid") && arguments["pid"].is_number_integer()
-        ? arguments["pid"].get<int>() : 0;
-      result_content = locks(pid);
-    }
-    else if (tool_name == "replicationSlots") {
-      result_content = replication_slots();
-    }
-    else if (tool_name == "databaseStats") {
-      result_content = database_stats();
-    }
-    else if (tool_name == "statementStats") {
-      int limit = arguments.contains("limit") ? arguments["limit"].get<int>() : 20;
-      std::string qid;
-      if (arguments.contains("query_id")) {
-        if (arguments["query_id"].is_string()) qid = arguments["query_id"].get<std::string>();
-        else if (arguments["query_id"].is_number_integer())
-          qid = std::to_string(arguments["query_id"].get<long long>());
-      }
-      std::string ord = arguments.contains("order_by") && arguments["order_by"].is_string()
-        ? arguments["order_by"].get<std::string>() : "";
-      long long min_calls = arguments.contains("min_calls") && arguments["min_calls"].is_number_integer()
-        ? arguments["min_calls"].get<long long>() : 0;
-      result_content = statement_stats(limit, qid, ord, min_calls);
-    }
-    else if (tool_name == "wraparoundStatus") {
-      // No schema default here: wraparound is a whole-database property, and
-      // silently scoping it to "public" would understate the risk.
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "";
-      int limit = arguments.contains("limit") ? arguments["limit"].get<int>() : 20;
-      result_content = wraparound_status(target_schema, limit);
-    }
-    else if (tool_name == "checkpointStats") {
-      result_content = checkpoint_stats();
-    }
-    else if (tool_name == "progressStats") {
-      int pid = arguments.contains("pid") && arguments["pid"].is_number_integer()
-        ? arguments["pid"].get<int>() : 0;
-      std::string rel = arguments.contains("relation") && arguments["relation"].is_string()
-        ? arguments["relation"].get<std::string>() : "";
-      result_content = progress_stats(pid, rel);
-    }
-    else if (tool_name == "ioStats") {
-      int pid = arguments.contains("pid") && arguments["pid"].is_number_integer()
-        ? arguments["pid"].get<int>() : 0;
-      std::string bt = arguments.contains("backend_type") && arguments["backend_type"].is_string()
-        ? arguments["backend_type"].get<std::string>() : "";
-      std::string ob = arguments.contains("object") && arguments["object"].is_string()
-        ? arguments["object"].get<std::string>() : "";
-      std::string cx = arguments.contains("context") && arguments["context"].is_string()
-        ? arguments["context"].get<std::string>() : "";
-      result_content = io_stats(pid, bt, ob, cx);
-    }
-    else if (tool_name == "tableIOStats") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      std::string target_table  = arguments.contains("table")  ? arguments["table"].get<std::string>()  : "";
-      int limit = arguments.contains("limit") ? arguments["limit"].get<int>() : 20;
-      result_content = table_io_stats(target_schema, target_table, limit);
-    }
-    else if (tool_name == "hostCapacity") {
-      long long ram_mb = arguments.contains("ram_mb") && arguments["ram_mb"].is_number_integer()
-        ? arguments["ram_mb"].get<long long>() : 0;
-      int vcpus = arguments.contains("vcpus") && arguments["vcpus"].is_number_integer()
-        ? arguments["vcpus"].get<int>() : 0;
-      std::string storage = arguments.contains("storage") && arguments["storage"].is_string()
-        ? arguments["storage"].get<std::string>() : "";
-      result_content = host_capacity(ram_mb, vcpus, storage);
-    }
-    else if (tool_name == "duplicateIndexes") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      std::string target_table  = arguments.contains("table")  ? arguments["table"].get<std::string>()  : "";
-      result_content = duplicate_indexes(target_schema, target_table);
-    }
-    else if (tool_name == "tableBloat") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      std::string target_table  = arguments.contains("table")  ? arguments["table"].get<std::string>()  : "";
-      bool exact = arguments.contains("exact") ? arguments["exact"].get<bool>() : false;
-      result_content = table_bloat(target_schema, target_table, exact);
-    }
-    else if (tool_name == "indexBloat") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      std::string target_index  = arguments.contains("index")  ? arguments["index"].get<std::string>()  : "";
-      result_content = index_bloat(target_schema, target_index);
-    }
-    else if (tool_name == "checkKey") {
-      std::string target_schema = arguments.contains("schema") ? arguments["schema"].get<std::string>() : "public";
-      std::string target_table  = arguments.contains("table")  ? arguments["table"].get<std::string>()  : "";
-      json vals = arguments.contains("values") ? arguments["values"] : json::array();
-      result_content = check_key(target_schema, target_table, vals);
-    }
-    else if (tool_name == "explainQuery") {
-      // queryid is documented as a string because a 64-bit value does not
-      // survive JSON number precision, but accept a number too rather than
-      // fail with a raw nlohmann type error.
-      std::string qid;
-      if (arguments.contains("queryid")) {
-        if (arguments["queryid"].is_string())
-          qid = arguments["queryid"].get<std::string>();
-        else if (arguments["queryid"].is_number_integer())
-          qid = std::to_string(arguments["queryid"].get<long long>());
-      }
-      std::string sql = arguments.contains("sql") ? arguments["sql"].get<std::string>() : "";
-      json prms = arguments.contains("params") ? arguments["params"] : json::array();
-      bool do_analyze = arguments.contains("analyze") ? arguments["analyze"].get<bool>() : false;
-      int tmo = arguments.contains("timeout_ms") ? arguments["timeout_ms"].get<int>() : 0;
-      result_content = explain_query(qid, sql, prms, do_analyze, tmo);
-    }
-    else {
-      return false;
-    }
+    const auto it = tool_index().find(tool_name);
+    if (it == tool_index().end()) return false;
+    result_content = it->second->run(*this, Args{arguments});
     // Every tool payload is a JSON object, enforced here rather than trusted
     // of ~50 query methods. `structuredContent` may only be an object, so from
     // 4.0.0 a null payload is not merely untidy -- it is unrepresentable in the

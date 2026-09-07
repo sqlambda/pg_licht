@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pg_licht_mcp VERSION 4.2.0 LANGUAGES CXX)
+project(pg_licht_mcp VERSION 4.2.1 LANGUAGES CXX)
 
 # Standard bin/ and share/man/ layout, so `cmake --install` produces a tree that
 # can be dropped onto a prefix as-is: the release tarballs are staged this way,
@@ -25,7 +25,12 @@ find_package(nlohmann_json REQUIRED)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/SafetyFlags.cmake)
 
-add_executable(pg_licht_mcp src/main.cpp)
+# The two registries compile as their own translation units. They are the
+# largest literal blocks in the project -- 62 tool definitions and 12 prompts --
+# and nothing else needs recompiling when one of them is edited.
+set(PGLICHT_REGISTRY_SOURCES src/tool_defs.cpp src/prompt_defs.cpp)
+
+add_executable(pg_licht_mcp src/main.cpp ${PGLICHT_REGISTRY_SOURCES})
 target_compile_definitions(pg_licht_mcp PRIVATE PGLICHT_VERSION="${PROJECT_VERSION}")
 target_link_libraries(pg_licht_mcp
     PRIVATE
@@ -47,7 +52,7 @@ option(BUILD_TESTING "Build the test suite" ON)
 if(BUILD_TESTING)
     enable_testing()
     find_package(GTest REQUIRED)
-    add_executable(pg_licht_mcp_test src/test_main.cpp)
+    add_executable(pg_licht_mcp_test src/test_main.cpp ${PGLICHT_REGISTRY_SOURCES})
     target_compile_definitions(pg_licht_mcp_test PRIVATE
         PGLICHT_VERSION="${PROJECT_VERSION}"
         # The shipped example connections file, so a test can prove it still

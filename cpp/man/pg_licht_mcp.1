@@ -1,7 +1,7 @@
 .\" Copyright (c) 2026 Daniel Cristian.
 .\" Licensed under the Apache License, Version 2.0; see LICENSE.
 .\"
-.Dd September 4, 2026
+.Dd September 7, 2026
 .Dt PG_LICHT_MCP 1
 .Os pg-licht
 .Sh NAME
@@ -589,7 +589,11 @@ for measured sizes see
 .It Ic tableStats Ar schema Ar table
 Statistics PostgreSQL already keeps for one table: estimated row count,
 .Va size_estimate
-.Pq Li relpages No * 8192 No with the Va estimated_from No timestamp that produced it ,
+.Pq Li relpages No * Li block_size No with the Va estimated_from No timestamp that produced it ,
+.Li block_size
+is the server's compile-time
+.Li BLCKSZ ,
+8192 unless it was built otherwise.
 .Va seq_scan
 and
 .Va idx_scan ,
@@ -1149,10 +1153,31 @@ Transaction id and multixact wraparound headroom.
 For every database:
 .Li age(datfrozenxid) ,
 .Li age(datminmxid) ,
-and each as a percentage of
-.Va autovacuum_freeze_max_age
-and of the hard limit of 2146483647 transactions, at which the cluster stops
-accepting commands that assign a new transaction id.
+and each as a percentage of its own
+.Va freeze_max_age
+and of the limit of 2144483647, at which the cluster stops
+accepting commands that assign a new transaction id or multixact.
+Both axes carry both budgets: multixacts have the same three-million stop
+limit and the same forty-million warning as transaction ids, and members-space
+exhaustion is its own incident.
+That figure is
+.Sy not
+2\(ha31: PostgreSQL refuses new transaction ids three million short of
+wraparound
+.Pq Li xidStopLimit = xidWrapLimit \- 3000000 ,
+and begins warning in the log forty million short of it.
+Both are reported \(em
+.Va wraparound_limit
+and
+.Va wraparound_warn_limit
+under
+.Va limits ,
+with
+.Va xids_until_wraparound_limit
+and
+.Va xids_until_warn_limit
+per database.
+The warning threshold is the one an operator has usually already seen fire.
 For tables: the oldest by
 .Li age(relfrozenxid) ,
 with the effective
