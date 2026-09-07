@@ -738,6 +738,11 @@ private:
   // ones a cap must not drop.
   static constexpr int kRoleLimit = 200;
 
+  // How many member tables listPublications names per publication. A
+  // publication FOR ALL TABLES expands to the whole database, so the list is
+  // unbounded by construction and the count is the answer that scales.
+  static constexpr int kPublicationTableNames = 50;
+
   // The current sweep member's config, carrying the bounded connect.
   //
   // Set only while fan_out is running a member, so every query method goes on
@@ -4283,6 +4288,34 @@ private:
         return {{"error", "the statement has parameters that could not be planned generically"},
                 {"hint", "supply values via the params argument"},
                 {"detail", e.what()}};
+      // 42883 on a statement recovered from pg_stat_statements is almost always
+      // the normalization, not the statement. Normalizing replaces every
+      // literal with $n and strips its type, so a placeholder in a position
+      // where nothing constrains it -- CASE WHEN ... THEN $6 ELSE $7 is the
+      // usual one -- is assigned text at PARSE time and the operator lookup
+      // fails before any value is bound. Supplying params cannot fix that,
+      // which is the part worth saying: without it a caller retries with
+      // params, gets the identical error, and has no way to tell whether the
+      // params were even applied.
+      if (ss == "42883")
+        return {{"error", "the statement references an operator or function that "
+                          "does not exist for the types PostgreSQL inferred"},
+                {"params_supplied", !params.empty()},
+                {"hint", std::string(
+                   params.empty()
+                     ? "supply values via the params argument if the types are "
+                       "inferable. "
+                     : "params WERE applied and did not help, which is the "
+                       "expected outcome here. ") +
+                   "If this statement came from pg_stat_statements, the cause is "
+                   "usually normalization rather than the statement: replacing a "
+                   "literal with $n strips its type, and a placeholder nothing "
+                   "constrains (typically CASE WHEN ... THEN $n ELSE $n) is "
+                   "assigned text when the statement is parsed -- before any "
+                   "value is bound, so no params argument can change it. Pass the "
+                   "statement to 'sql' with the literals written back in, or add "
+                   "explicit casts such as $1::numeric, and it will plan."},
+                {"detail", e.what()}};
       if (ss == "42P01")
         return {{"error", "a relation referenced by the statement does not exist"},
                 {"hint", "the statement may target a different database; check "
@@ -5360,7 +5393,15 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    // The same unbounded expansion listSchemas had, and it is worse here:
+    // FOR ALL TABLES resolves through pg_publication_tables to every table in
+    // the database, so a publication declared in one line expands to thousands
+    // of names. Past the client's payload limit the tool returns nothing, so a
+    // cluster with one big publication reports no publications at all.
+    //
+    // table_count is what the question needs -- "is this publication carrying
+    // what I think" -- and all_tables already says the list is the catalog.
+    std::string query = std::string(R"(
       SELECT JSONB_OBJECT_AGG(
                p.pubname,
                JSONB_BUILD_OBJECT(
@@ -5370,12 +5411,17 @@ private:
                  'update',     p.pubupdate,
                  'delete',     p.pubdelete,
                  'truncate',   p.pubtruncate,
-                 'tables',     COALESCE(tables, '[]'::jsonb)
+                 'table_count', COALESCE(table_count, 0),
+                 'tables',     COALESCE(tables, '[]'::jsonb),
+                 'tables_truncated', COALESCE(table_count, 0) > )") + std::to_string(kPublicationTableNames) + R"(
                )
              )
       FROM pg_publication AS p
       LEFT JOIN LATERAL (
-          SELECT JSONB_AGG(pt.schemaname || '.' || pt.tablename) AS tables
+          SELECT count(*) AS table_count,
+                 to_jsonb((array_agg(pt.schemaname || '.' || pt.tablename
+                                     ORDER BY pt.schemaname, pt.tablename)
+                          )[1:)" + std::to_string(kPublicationTableNames) + R"(]) AS tables
           FROM pg_publication_tables AS pt
           WHERE pt.pubname = p.pubname
       ) _lat26 ON true;

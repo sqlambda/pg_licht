@@ -1772,6 +1772,47 @@ TEST_F(PostgresMCPServerTest, AMissingSchemaIsNamedRatherThanReturnedAsEmpty) {
   }
 }
 
+// A publication FOR ALL TABLES resolves through pg_publication_tables to every
+// table in the database, so the member list is unbounded by construction --
+// the same defect listSchemas had, and worse, because one line of DDL produces
+// it. Past the payload limit the tool returns nothing, so a cluster with one
+// big publication reports no publications at all.
+TEST_F(PostgresMCPServerTest, PublicationsCountMembersRatherThanNamingThemAll) {
+  json r = srv->call_publications();
+  ASSERT_FALSE(r.empty()) << r.dump(2);
+  for (auto& [name, p] : r.items()) {
+    ASSERT_TRUE(p.contains("table_count")) << name << ": " << p.dump(2);
+    EXPECT_LE(p["tables"].size(), 50u) << name << " must cap its member names";
+    EXPECT_EQ(p["tables_truncated"].get<bool>(), p["table_count"].get<int>() > 50);
+    if (!p["tables_truncated"].get<bool>()) {
+      EXPECT_EQ(p["tables"].size(), (size_t)p["table_count"].get<int>()) << name;
+    }
+  }
+}
+
+// A statement recovered from pg_stat_statements can be unplannable because of
+// the normalization rather than the statement: replacing a literal with $n
+// strips its type, and a placeholder nothing constrains is assigned text at
+// parse time -- before any value is bound, so params cannot fix it. Retrying
+// with params and getting the identical error, with no indication the params
+// were applied, is what this message exists to prevent.
+TEST_F(PostgresMCPServerTest, AnUninferableParameterTypeExplainsItselfAndSaysParamsCannotHelp) {
+  // CASE ... THEN $1 ELSE $2 constrains neither branch, so both become text and
+  // the numeric addition has no operator.
+  const std::string sql =
+      "SELECT id + (CASE WHEN id > 0 THEN $1 ELSE $2 END) FROM grocery.users";
+  json r = srv->call_explain_query("", sql, json::array({1, 2}), false, 0);
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  ASSERT_TRUE(r.contains("hint")) << r.dump(2);
+  EXPECT_TRUE(r.contains("params_supplied")) << r.dump(2);
+  EXPECT_TRUE(r["params_supplied"].get<bool>());
+  // The two things a caller cannot otherwise learn: params were applied, and
+  // no params argument will help.
+  const std::string hint = r["hint"].get<std::string>();
+  EXPECT_NE(hint.find("WERE applied"), std::string::npos) << hint;
+  EXPECT_NE(hint.find("normalization"), std::string::npos) << hint;
+}
+
 // --- listOperators ---
 
 TEST_F(PostgresMCPServerTest, ListOperatorsReturnsCustomOperator) {

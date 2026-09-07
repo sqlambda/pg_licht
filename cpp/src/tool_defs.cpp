@@ -264,7 +264,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args&) -> json {
          return s.event_triggers(); }},
       {"listPublications",
-       "return logical replication publications with owner, all-tables flag, per-operation flags (insert/update/delete/truncate), and member tables",
+       "return logical replication publications with owner, all-tables flag, per-operation flags (insert/update/delete/truncate), table_count, and up to 50 member table names. tables_truncated says when a publication carries more than the names shown -- a publication FOR ALL TABLES resolves to every table in the database, so the member list is unbounded by construction and the count is the figure that scales",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", json::object()}
