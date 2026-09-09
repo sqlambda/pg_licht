@@ -1888,6 +1888,143 @@ TEST_F(PostgresMCPServerTest, PartitionDetailsSeparatesNotPartitionedFromNotTher
   EXPECT_NE(gone["error"].get<std::string>().find("no such table"), std::string::npos);
 }
 
+// checkRoleAccess answers whether a role may USE an object. Nothing answered
+// the inverse, which is the whole of "role cannot be dropped because some
+// objects depend on it" -- a message that reports a count and names nothing.
+TEST_F(PostgresMCPServerTest, RoleDependenciesNamesWhatBlocksADropAndCountsWhatItCannotName) {
+  const std::string role = "licht_dep_" + std::to_string(getpid());
+  const std::string sch  = "dep_" + std::to_string(getpid());
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+    n.exec("CREATE ROLE \"" + role + "\"");
+  }
+  {
+    pqxx::connection owner(test_url);
+    pqxx::nontransaction n(owner);
+    n.exec("CREATE SCHEMA " + sch + " AUTHORIZATION \"" + role + "\"");
+    n.exec("CREATE TABLE " + sch + ".owned (a int)");
+    n.exec("ALTER TABLE " + sch + ".owned OWNER TO \"" + role + "\"");
+    n.exec("CREATE TABLE " + sch + ".granted (a int)");
+    n.exec("GRANT SELECT ON " + sch + ".granted TO \"" + role + "\"");
+  }
+
+  json r = srv->call_role_dependencies(role);
+  ASSERT_TRUE(r.contains("total")) << r.dump(2);
+  EXPECT_TRUE(r["exists"].get<bool>());
+  EXPECT_GE(r["total"].get<int>(), 3);
+  // owner blocks DROP ROLE outright and is cleared by REASSIGN OWNED; acl is
+  // cleared by DROP OWNED. Which is which decides the fix.
+  ASSERT_TRUE(r["by_kind"].contains("owner")) << r.dump(2);
+  EXPECT_GE(r["by_kind"]["owner"].get<int>(), 2);
+  EXPECT_TRUE(r["by_kind"].contains("acl")) << r.dump(2);
+
+  bool named_owned = false, named_granted = false;
+  for (const auto& o : r["objects"]) {
+    if (!o["name"].is_string()) continue;
+    const std::string nm = o["name"].get<std::string>();
+    if (nm == sch + ".owned")   { named_owned = true;   EXPECT_EQ(o["dependency"], "owner"); }
+    if (nm == sch + ".granted") { named_granted = true; EXPECT_EQ(o["dependency"], "acl"); }
+  }
+  EXPECT_TRUE(named_owned) << r["objects"].dump(2);
+  EXPECT_TRUE(named_granted) << r["objects"].dump(2);
+
+  // A role nothing depends on is an answer, not an error.
+  json none = srv->call_role_dependencies("no_such_role_" + std::to_string(getpid()));
+  EXPECT_FALSE(none["exists"].get<bool>()) << none.dump(2);
+  EXPECT_EQ(none["total"].get<int>(), 0);
+
+  {
+    pqxx::connection owner(test_url);
+    pqxx::nontransaction n(owner);
+    n.exec("DROP SCHEMA " + sch + " CASCADE");
+  }
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+  }
+}
+
+// The standing cause of "the new table is not readable and every old one is":
+// a missing default, which presents as a broken grant.
+TEST_F(PostgresMCPServerTest, DefaultPrivilegesReportWhatTheNextObjectWillGet) {
+  const std::string sch = "dacl_" + std::to_string(getpid());
+  {
+    pqxx::connection owner(test_url);
+    pqxx::nontransaction n(owner);
+    n.exec("CREATE SCHEMA " + sch);
+    n.exec("ALTER DEFAULT PRIVILEGES IN SCHEMA " + sch + " GRANT SELECT ON TABLES TO PUBLIC");
+  }
+  json r = srv->call_default_privileges(sch);
+  ASSERT_TRUE(r.contains("default_privileges")) << r.dump(2);
+  ASSERT_EQ(r["default_privileges"].size(), 1u) << r.dump(2);
+  auto& e = r["default_privileges"][0];
+  EXPECT_EQ(e["scope"].get<std::string>(), "schema");
+  EXPECT_EQ(e["schema"].get<std::string>(), sch);
+  EXPECT_EQ(e["object_type"].get<std::string>(), "table");
+  ASSERT_TRUE(e["grants"].contains("PUBLIC")) << e.dump(2);
+  // granted_by matters: a default applies only to objects the granting role
+  // creates, so the entry is inert for anybody else.
+  EXPECT_TRUE(e.contains("granted_by"));
+  {
+    pqxx::connection owner(test_url);
+    pqxx::nontransaction n(owner);
+    n.exec("ALTER DEFAULT PRIVILEGES IN SCHEMA " + sch + " REVOKE SELECT ON TABLES FROM PUBLIC");
+    n.exec("DROP SCHEMA " + sch + " CASCADE");
+  }
+}
+
+// Large objects live in a catalog, so every size tool here is blind to them --
+// "the database grew and no table did".
+TEST_F(PostgresMCPServerTest, LargeObjectsAreCountedAndDeliberatelyNotSized) {
+  json before = srv->call_large_objects();
+  ASSERT_TRUE(before.contains("total")) << before.dump(2);
+  const int n0 = before["total"].get<int>();
+
+  pqxx::connection owner(test_url);
+  long long oid = 0;
+  {
+    pqxx::nontransaction n(owner);
+    oid = n.query_value<long long>("SELECT lo_create(0)");
+  }
+  json after = srv->call_large_objects();
+  EXPECT_EQ(after["total"].get<int>(), n0 + 1) << after.dump(2);
+  EXPECT_FALSE(after["by_owner"].empty()) << after.dump(2);
+  // Sizes are absent on purpose rather than null: the bytes are in
+  // pg_largeobject, which is not publicly readable.
+  for (auto& [k, v] : after.items()) { (void)v; EXPECT_NE(k, "bytes"); }
+  EXPECT_NE(after["note"].get<std::string>().find("pg_largeobject"), std::string::npos);
+  {
+    pqxx::nontransaction n(owner);
+    n.exec("SELECT lo_unlink(" + std::to_string(oid) + ")");
+  }
+}
+
+// The only source of replication lag as a TIME. replicationSlots reports what
+// a slot retains in bytes; subscriptionStats cannot measure lag at all.
+TEST_F(PostgresMCPServerTest, ReplicationStatsReportsSendersAndOrigins) {
+  json r = srv->call_replication_stats();
+  ASSERT_TRUE(r.contains("replication")) << r.dump(2);
+  ASSERT_TRUE(r.contains("origins")) << r.dump(2);
+  ASSERT_TRUE(r.contains("note"));
+  // Each half is on its own savepoint, so one being refused leaves the other
+  // answered rather than failing the call.
+  EXPECT_TRUE(r["replication"].is_object());
+  EXPECT_TRUE(r["origins"].is_object());
+
+  // The harness runs a standby, so the primary has a sender to report.
+  if (std::getenv("STANDBY_URL") != nullptr && !r["replication"].contains("error")) {
+    ASSERT_FALSE(r["replication"].empty()) << r["replication"].dump(2);
+    for (auto& [name, s] : r["replication"].items()) {
+      (void)name;
+      EXPECT_TRUE(s.contains("state")) << s.dump(2);
+      EXPECT_TRUE(s.contains("sent_lsn"));
+      EXPECT_TRUE(s.contains("replay_lag_s"));
+      EXPECT_TRUE(s.contains("replay_behind_bytes"));
+    }
+  }
+}
+
 // --- listOperators ---
 
 TEST_F(PostgresMCPServerTest, ListOperatorsReturnsCustomOperator) {

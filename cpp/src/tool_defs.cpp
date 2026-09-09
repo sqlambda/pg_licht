@@ -82,6 +82,43 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
          return s.table_stats(a.str("schema", "public"), a.str("table", "")); }},
+      {"roleDependencies",
+       "return what depends on one role, cluster-wide, from pg_shdepend. checkRoleAccess answers whether a role may USE an object; this answers the inverse, which is the whole of \"role cannot be dropped because some objects depend on it\" -- a message that reports a count and names nothing. by_kind separates owner (which blocks DROP ROLE outright and is cleared by REASSIGN OWNED) from acl and policy (cleared by DROP OWNED), because that decides whether you reassign or hunt. IMPORTANT: pg_shdepend is shared across the cluster, so total and by_database cover EVERY database; but an object id is only resolvable from the database it lives in, so 'objects' names only those in this database and the shared catalogs. A row counted in another database is real and unnamed here -- connect there and ask again. Reporting only what this database can see would answer 'nothing depends on it' to somebody about to DROP the role",
+       []() -> json { return {
+   		{"type", "object"},
+   		{"properties", {
+   		    {"role", {{"type", "string"}, {"description", "role name to ask about"}}}
+   		  }},
+   		{"required", {"role"}}
+   	      }; },
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.role_dependencies(a.str("role")); }},
+      {"defaultPrivileges",
+       "return ALTER DEFAULT PRIVILEGES entries (pg_default_acl): what grants the NEXT object of each type will get, per granting role and per schema. checkRoleAccess answers about the objects that exist; this is the only thing that answers about the ones that do not yet, and it is the standing cause of \"the new table is not readable and every old one is\" -- which presents as a broken grant and is a missing default. scope 'global' (defaclnamespace = 0) overrides the hard-wired defaults for that object type; scope 'schema' entries are ADDED to the global ones, so two entries for one type are cumulative rather than conflicting. Note that defaults apply only to objects created by the granting role, which is why granted_by is reported beside every entry",
+       []() -> json { return {
+   		{"type", "object"},
+   		{"properties", {
+   		    {"schema", {{"type", "string"}, {"description", "restrict to one schema; omit for every entry including the global ones"}}}
+   		  }}
+   	      }; },
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.default_privileges(a.str("schema")); }},
+      {"largeObjects",
+       "return how many large objects this database holds and who owns them (pg_largeobject_metadata). Large objects live in a catalog rather than in any user relation, so tableSize, listTableSizes and tableStats are all blind to them while diskUsage.databases counts their bytes -- the signature is \"the database grew and no table did\", which triage-disk-space could not otherwise resolve: it ranks tables, finds nothing, and stops. NO SIZES: the bytes are in pg_largeobject, which is not publicly readable and which the documentation directs callers away from, so a size sum is not reliably available here and is not invented. An unreferenced large object cannot be identified from the catalog alone either -- it is unreferenced only if no column holds its oid -- and lo_unlink on a live oid loses data, so confirm against the application before deleting",
+       []() -> json { return {
+   		{"type", "object"},
+   		{"properties", json::object()}
+   	      }; },
+       [](PostgresMCPServer& s, const Args&) -> json {
+         return s.large_objects(); }},
+      {"replicationStats",
+       "return every WAL sender on this server (pg_stat_replication) with its state, sync_state, sent/write/flush/replay LSNs, the byte gap to replay, and write_lag/flush_lag/replay_lag as SECONDS -- plus replication origin progress. This is the only source of replication lag as a TIME: replicationSlots reports what a slot RETAINS in bytes, and subscriptionStats cannot measure lag at all because neither of its LSN columns references the publisher. Serves physical standbys and logical subscribers alike. Two readings that are routinely misread: the view is security-restricted PER ROW rather than refused, so a role without pg_read_all_stats sees the senders exist with many columns null, which looks like an idle replica rather than a permission answer; and the lag columns revert to NULL a short time after a standby has entirely caught up and WAL activity stops, so a null lag on an idle replica means caught up while a non-null one is the last measurement rather than the current state",
+       []() -> json { return {
+   		{"type", "object"},
+   		{"properties", json::object()}
+   	      }; },
+       [](PostgresMCPServer& s, const Args&) -> json {
+         return s.replication_stats(); }},
       {"listPartitions",
        "return every partitioned table in a schema with its partitioning strategy (range/list/hash), the partition key, how many partitions it has, their combined estimated row count and size, whether a DEFAULT partition exists and how many rows it holds, and how many partitions are themselves partitioned. Reads reltuples and relpages from the catalog, so no relation is opened and no lock is taken -- for measured sizes call listTableSizes on the schema the partitions live in. A growing default partition is the finding to look for: rows land there when they match no bound, so it is a missing partition that has not failed loudly yet. Name a parent to partitionDetails for the per-partition bounds and vacuum state",
        []() -> json { return {

@@ -552,6 +552,11 @@ public:
   }
   const json call_list_table_stats(const std::string& schema) { return list_table_stats(schema); }
   const json call_list_partitions(const std::string& schema) { return list_partitions(schema); }
+  const json call_role_dependencies(const std::string& r) { return role_dependencies(r); }
+  const json call_default_privileges() { return default_privileges(""); }
+  const json call_default_privileges(const std::string& sc) { return default_privileges(sc); }
+  const json call_large_objects() { return large_objects(); }
+  const json call_replication_stats() { return replication_stats(); }
   const json call_partition_details(const std::string& sc, const std::string& t) {
     return partition_details(sc, t);
   }
@@ -1381,6 +1386,18 @@ private:
       // catalog columns and therefore identical on a physical replica.
       {"partitionDetails",      {true,  true,  true,  false}},
       {"listPartitions",        {true,  false, false, false}},
+      // pg_shdepend and pg_default_acl are catalogs, replicated byte for
+      // byte, so a replication_group sweep would return the same answer per
+      // member. pg_shdepend is additionally shared across the cluster, so
+      // the count it reports is already cluster-wide from any database --
+      // but the NAMES are per database, which is why it is per_database.
+      {"roleDependencies",      {true,  false, false, false}},
+      {"defaultPrivileges",     {true,  false, false, false}},
+      {"largeObjects",          {true,  false, false, false}},
+      // Every member of a replication group has its own WAL senders, and a
+      // replica that is itself a sender is exactly what this finds, so this
+      // is worth asking of each server rather than one.
+      {"replicationStats",      {true,  false, true,  false}},
       {"tableStats",            {true,  true,  true,  false}},
       // Same row, and for the same reason. pg_subscription is a shared catalog
       // scoped by subdbid, so the answer is per database; the workers, their
@@ -1795,6 +1812,16 @@ private:
       // --- statistics keyed by object ---
       {"listTableStats",         schema_map("table name", "that table's statistics counters and size estimate")},
       {"listPartitions",         schema_map("partitioned table name", "its strategy, key, partition count and default partition")},
+      {"defaultPrivileges",      schema_fixed("Default privileges: what grants the NEXT object gets.",
+                                   {{"default_privileges", "array"}})},
+      {"largeObjects",           schema_fixed("Large objects, which no size tool can see.",
+                                   {{"total", "integer"}, {"by_owner", "object"}, {"note", "string"}})},
+      {"roleDependencies",       schema_fixed("What depends on one role, cluster-wide.",
+                                   {{"role", "string"}, {"exists", "boolean"}, {"total", "integer"},
+                                    {"by_kind", "object"}, {"by_database", "object"},
+                                    {"resolvable_in_this_database", "integer"}, {"objects", "array"}})},
+      {"replicationStats",       schema_fixed("WAL senders and replication origins.",
+                                   {{"replication", "object"}, {"origins", "object"}, {"note", "string"}})},
       {"listTableSizes",         schema_map("table name", "that table's measured size, index size and total")},
       {"tableIOStats",           schema_map("schema-qualified table name", "its buffer cache hit ratios and scan counts")},
       {"databaseStats",          schema_map("database name", "that database's pg_stat_database counters")},
@@ -6974,6 +7001,286 @@ private:
   // partitions, which is deliberately not folded in here -- a parent with
   // three hundred children would be three hundred relation opens behind one
   // innocent-looking call.
+  // What depends on a role, cluster-wide. checkRoleAccess answers "may this
+  // role use this object"; nothing answered the inverse, and the inverse is
+  // the whole of
+  //
+  //   ERROR:  role "x" cannot be dropped because some objects depend on it
+  //   DETAIL: 4 objects in database app
+  //
+  // -- a message that reports a count and refuses to name anything.
+  //
+  // pg_shdepend is shared across the cluster: one copy, not one per database.
+  // That is what makes the count cross-database and the names not. objid is
+  // only resolvable from the database it lives in, so entries for other
+  // databases are counted and named by database, never by object. Saying so is
+  // the point -- a tool that silently reported only the current database would
+  // answer "nothing depends on this role" to somebody about to DROP it.
+  const json role_dependencies(const std::string& role) {
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+
+    const std::string query = R"(
+      WITH d AS (
+        SELECT s.dbid, s.classid, s.objid, s.objsubid, s.deptype
+          FROM pg_shdepend AS s
+          JOIN pg_authid AS a ON a.oid = s.refobjid
+         WHERE a.rolname = $1
+           AND s.refclassid = 'pg_authid'::regclass
+      )
+      SELECT JSONB_BUILD_OBJECT(
+        'role', $1,
+        'exists', EXISTS (SELECT 1 FROM pg_authid WHERE rolname = $1),
+        'total', (SELECT count(*) FROM d),
+        -- deptype, spelled out. 'o' is the one that blocks DROP ROLE outright;
+        -- 'a' and 'r' are cleared by REASSIGN OWNED / DROP OWNED, and knowing
+        -- which is which is the difference between reassigning and hunting.
+        'by_kind', COALESCE((
+          SELECT JSONB_OBJECT_AGG(k, n) FROM (
+            SELECT CASE deptype WHEN 'o' THEN 'owner'
+                                WHEN 'a' THEN 'acl'
+                                WHEN 'i' THEN 'init_acl'
+                                WHEN 'r' THEN 'policy'
+                                WHEN 't' THEN 'tablespace'
+                                ELSE deptype::text END AS k,
+                   count(*) AS n
+              FROM d GROUP BY 1) AS x), '{}'::jsonb),
+        -- dbid 0 is a shared object (a database, a tablespace, another role).
+        'by_database', COALESCE((
+          SELECT JSONB_OBJECT_AGG(name, n) FROM (
+            SELECT CASE WHEN d.dbid = 0 THEN '(shared objects)'
+                        ELSE COALESCE(db.datname, '(dropped database ' || d.dbid || ')')
+                   END AS name,
+                   count(*) AS n
+              FROM d LEFT JOIN pg_database AS db ON db.oid = d.dbid
+             GROUP BY 1) AS y), '{}'::jsonb),
+        'resolvable_in_this_database',
+          (SELECT count(*) FROM d WHERE d.dbid IN (0, (SELECT oid FROM pg_database
+                                                        WHERE datname = current_database()))),
+        -- Names, for the rows this database can resolve. A row in another
+        -- database is a count above and nothing here, which is honest rather
+        -- than empty: connect there and ask again.
+        'objects', COALESCE((
+          SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                   'kind', c.relname,
+                   'name', CASE
+                             WHEN d.classid = 'pg_class'::regclass
+                               THEN (SELECT n.nspname || '.' || r.relname
+                                       FROM pg_class r JOIN pg_namespace n
+                                         ON n.oid = r.relnamespace WHERE r.oid = d.objid)
+                             WHEN d.classid = 'pg_proc'::regclass
+                               THEN (SELECT n.nspname || '.' || p.proname
+                                       FROM pg_proc p JOIN pg_namespace n
+                                         ON n.oid = p.pronamespace WHERE p.oid = d.objid)
+                             WHEN d.classid = 'pg_namespace'::regclass
+                               THEN (SELECT nspname FROM pg_namespace WHERE oid = d.objid)
+                             WHEN d.classid = 'pg_database'::regclass
+                               THEN (SELECT datname FROM pg_database WHERE oid = d.objid)
+                             WHEN d.classid = 'pg_tablespace'::regclass
+                               THEN (SELECT spcname FROM pg_tablespace WHERE oid = d.objid)
+                             WHEN d.classid = 'pg_authid'::regclass
+                               THEN (SELECT rolname FROM pg_authid WHERE oid = d.objid)
+                             WHEN d.classid = 'pg_type'::regclass
+                               THEN (SELECT n.nspname || '.' || t.typname
+                                       FROM pg_type t JOIN pg_namespace n
+                                         ON n.oid = t.typnamespace WHERE t.oid = d.objid)
+                             ELSE NULL END,
+                   'column', NULLIF(d.objsubid, 0),
+                   'dependency', CASE d.deptype WHEN 'o' THEN 'owner'
+                                                WHEN 'a' THEN 'acl'
+                                                WHEN 'i' THEN 'init_acl'
+                                                WHEN 'r' THEN 'policy'
+                                                WHEN 't' THEN 'tablespace'
+                                                ELSE d.deptype::text END)
+                 ORDER BY c.relname, d.objid)
+            FROM d JOIN pg_class AS c ON c.oid = d.classid
+           WHERE d.dbid IN (0, (SELECT oid FROM pg_database
+                                 WHERE datname = current_database()))), '[]'::jsonb));
+    )";
+
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{role});
+    if (!res.empty() && !res[0][0].is_null())
+      return json::parse(res[0][0].as<std::string>());
+    return {};
+  }
+
+  // ALTER DEFAULT PRIVILEGES, which decides what grants the NEXT object gets.
+  // checkRoleAccess answers about the objects that exist; this is the only
+  // thing that answers about the ones that do not yet, and it is the standing
+  // cause of "the new table isn't readable and every old one is" -- which
+  // presents as a broken grant and is a missing default.
+  const json default_privileges(const std::string& schema) {
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+
+    const std::string query = R"(
+      SELECT COALESCE(JSONB_AGG(JSONB_BUILD_OBJECT(
+               -- defaclnamespace = 0 is a "global" entry that overrides the
+               -- hard-wired defaults for the type; a non-zero one is per-schema
+               -- and its privileges are ADDED to the global ones. Two entries
+               -- for the same type are therefore cumulative, not conflicting.
+               'scope', CASE WHEN d.defaclnamespace = 0 THEN 'global' ELSE 'schema' END,
+               'schema', n.nspname,
+               'granted_by', pg_get_userbyid(d.defaclrole),
+               'object_type', CASE d.defaclobjtype
+                                WHEN 'r' THEN 'table'    WHEN 'S' THEN 'sequence'
+                                WHEN 'f' THEN 'function' WHEN 'T' THEN 'type'
+                                WHEN 'n' THEN 'schema'   WHEN 'L' THEN 'large object'
+                                ELSE d.defaclobjtype::text END,
+               'grants', COALESCE(g.grants, '{}'::jsonb))
+             ORDER BY d.defaclnamespace <> 0, n.nspname, d.defaclobjtype), '[]'::jsonb)
+        FROM pg_default_acl AS d
+        LEFT JOIN pg_namespace AS n ON n.oid = d.defaclnamespace
+        LEFT JOIN LATERAL (
+            SELECT JSONB_OBJECT_AGG(grantee, privs) AS grants
+              FROM (SELECT COALESCE(r.rolname, 'PUBLIC') AS grantee,
+                           JSONB_AGG(a.privilege_type ORDER BY a.privilege_type) AS privs
+                      FROM aclexplode(d.defaclacl) AS a
+                      LEFT JOIN pg_roles AS r ON r.oid = a.grantee
+                     GROUP BY COALESCE(r.rolname, 'PUBLIC')) AS s) AS g ON true
+       WHERE $1 = '' OR n.nspname = $1;
+    )";
+
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
+    if (!res.empty() && !res[0][0].is_null())
+      return {{"default_privileges", json::parse(res[0][0].as<std::string>())}};
+    return {{"default_privileges", json::array()}};
+  }
+
+  // Large objects live in a catalog rather than in any user relation, so
+  // tableSize, listTableSizes and tableStats are all blind to them while
+  // diskUsage.databases counts their bytes. The signature is "the database
+  // grew and no table did", which triage-disk-space could not resolve: it
+  // would rank tables, find nothing, and stop.
+  //
+  // Counted and owned, never sized. The bytes live in pg_largeobject, which
+  // the documentation says is no longer publicly readable and directs callers
+  // here instead -- so a size sum is not reliably available to this server and
+  // is not attempted. Saying that is better than a number that is null on
+  // every server with a permission structure.
+  const json large_objects() {
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+
+    const std::string query = R"(
+      SELECT JSONB_BUILD_OBJECT(
+        'total', (SELECT count(*) FROM pg_largeobject_metadata),
+        'by_owner', COALESCE((
+          SELECT JSONB_OBJECT_AGG(owner, n) FROM (
+            SELECT pg_get_userbyid(lomowner) AS owner, count(*) AS n
+              FROM pg_largeobject_metadata GROUP BY 1) AS s), '{}'::jsonb),
+        -- An orphan is a large object no column references. Detecting that
+        -- exhaustively means knowing every oid/lo column in the schema, which
+        -- this server does not, so the count is reported and the method is
+        -- named rather than guessed at.
+        'note', 'Sizes are not reported: the bytes live in pg_largeobject, '
+                'which is not publicly readable, and the documentation directs '
+                'callers to pg_largeobject_metadata for the list instead. '
+                'A large object is unreferenced only if no column holds its '
+                'oid, which cannot be determined from the catalog alone -- '
+                'lo_unlink on a live oid loses data, so confirm against the '
+                'application before deleting anything.');
+    )";
+
+    pqxx::result res = txn.exec(query);
+    if (!res.empty() && !res[0][0].is_null())
+      return json::parse(res[0][0].as<std::string>());
+    return {};
+  }
+
+  // The publisher side, which nothing here read. replicationSlots reports what
+  // a slot RETAINS, in bytes; subscriptionStats cannot measure lag at all by
+  // construction (neither of its LSN columns references the publisher). So
+  // between the three tools this server had, "how far behind is this replica,
+  // in seconds" had no answer anywhere.
+  //
+  // pg_stat_replication is the only source of write_lag, flush_lag and
+  // replay_lag -- as INTERVALS, for physical standbys and logical subscribers
+  // alike -- beside sent_lsn against write/flush/replay_lsn.
+  //
+  // Runs on its own savepoint alongside the origin status, because the two
+  // fail independently: pg_stat_replication is security-restricted per row
+  // rather than refused, while the origin function can be refused outright.
+  const json replication_stats() {
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+    json out = json::object();
+
+    // Documented behaviour worth carrying, because it is the reading most
+    // likely to be misread: "If the standby server has entirely caught up with
+    // the sending server and there is no more WAL activity, the most recently
+    // measured lag times will continue to be displayed for a short time and
+    // then show NULL." A null lag on an idle replica is caught up, not broken,
+    // and a stale non-null one is the last measurement rather than the current
+    // state.
+    try {
+      pqxx::subtransaction sub{txn};
+      pqxx::result r = sub.exec(R"(
+        SELECT COALESCE(JSONB_OBJECT_AGG(key, obj), '{}'::jsonb) FROM (
+          SELECT COALESCE(NULLIF(application_name, ''), 'pid ' || pid::text) AS key,
+                 JSONB_BUILD_OBJECT(
+                   'pid',              pid,
+                   'user',             usename,
+                   'application_name', application_name,
+                   'client_addr',      host(client_addr),
+                   'backend_start',    backend_start,
+                   'backend_xmin',     backend_xmin::text,
+                   'state',            state,
+                   'sync_state',       sync_state,
+                   'sync_priority',    sync_priority,
+                   'sent_lsn',         sent_lsn::text,
+                   'write_lsn',        write_lsn::text,
+                   'flush_lsn',        flush_lsn::text,
+                   'replay_lsn',       replay_lsn::text,
+                   'write_lag_s',      round(EXTRACT(EPOCH FROM write_lag)::numeric, 3),
+                   'flush_lag_s',      round(EXTRACT(EPOCH FROM flush_lag)::numeric, 3),
+                   'replay_lag_s',     round(EXTRACT(EPOCH FROM replay_lag)::numeric, 3),
+                   'reply_time',       reply_time,
+                   -- The byte gap between what the publisher has written and
+                   -- what this consumer has replayed. Complements the lag
+                   -- intervals: bytes say how much, seconds say how long.
+                   'replay_behind_bytes',
+                     CASE WHEN NOT pg_is_in_recovery()
+                          THEN pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) END
+                 ) AS obj
+            FROM pg_stat_replication) AS s)");
+      out["replication"] = json::parse(r[0][0].as<std::string>());
+      sub.commit();
+    } catch (const pqxx::sql_error& e) {
+      out["replication"] = json{{"error", "could not read pg_stat_replication"},
+                                {"detail", e.what()}};
+    }
+
+    try {
+      pqxx::subtransaction sub{txn};
+      pqxx::result r = sub.exec(R"(
+        SELECT COALESCE(JSONB_OBJECT_AGG(external_id, JSONB_BUILD_OBJECT(
+                 'local_id',   local_id,
+                 'remote_lsn', remote_lsn::text,
+                 'local_lsn',  local_lsn::text)), '{}'::jsonb)
+          FROM pg_replication_origin_status)");
+      out["origins"] = json::parse(r[0][0].as<std::string>());
+      sub.commit();
+    } catch (const pqxx::sql_error& e) {
+      out["origins"] = json{{"error", "could not read pg_replication_origin_status"},
+                            {"hint", "reading replication origin progress is a "
+                                     "restricted operation; a role with pg_monitor "
+                                     "or superuser can see it"},
+                            {"detail", e.what()}};
+    }
+
+    out["note"] =
+      "pg_stat_replication is security-restricted per row rather than refused: "
+      "a role without pg_read_all_stats or pg_monitor sees the sessions exist "
+      "and finds many columns null, which reads like an idle replica rather "
+      "than a permission answer -- call checkPrivileges. Lag columns revert to "
+      "NULL a short time after a standby has entirely caught up and WAL "
+      "activity stops, so a null lag on an idle replica means caught up, and a "
+      "non-null one on an idle replica is the last measurement rather than the "
+      "current state.";
+    return out;
+  }
+
   const json list_partitions(const std::string& schema) {
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
