@@ -2025,6 +2025,97 @@ TEST_F(PostgresMCPServerTest, ReplicationStatsReportsSendersAndOrigins) {
   }
 }
 
+// work_mem alone changes the ALGORITHM rather than the cost. Until 4.3.0 the
+// plan was always built in this server's session, which is not the one the
+// statement runs in.
+TEST_F(PostgresMCPServerTest, PlannerSettingsChangeThePlanAndAreReported) {
+  const std::string sql =
+      "SELECT id, count(*) FROM grocery.users GROUP BY id";
+
+  json small = srv->call_explain_query("", sql, json::array(), false, 0,
+                                       json{{"work_mem", "64kB"},
+                                            {"enable_hashagg", "off"}}, "");
+  ASSERT_TRUE(small.contains("planning_environment")) << small.dump(2);
+  EXPECT_EQ(small["planning_environment"]["applied"]["work_mem"], "64kB");
+  EXPECT_EQ(small["planning_environment"]["applied"]["enable_hashagg"], "off");
+  // EXPLAIN (SETTINGS) is the server's own account of what it planned under,
+  // so the two must agree -- that pairing is the whole point of 4.2.1's
+  // SETTINGS block plus this argument.
+  ASSERT_TRUE(small["plan"][0].contains("Settings")) << small["plan"][0].dump(2);
+  EXPECT_EQ(small["plan"][0]["Settings"]["enable_hashagg"], "off");
+
+  // ...and it really is local: a later call with no settings sees none of it.
+  json plain = srv->call_explain_query("", sql, json::array(), false, 0);
+  EXPECT_FALSE(plain.contains("planning_environment")) << plain.dump(2);
+  if (plain["plan"][0].contains("Settings")) {
+    EXPECT_FALSE(plain["plan"][0]["Settings"].contains("enable_hashagg"))
+        << "set_config(is_local) must not survive the transaction";
+  }
+}
+
+// An allowlist, not a denylist. An arbitrary passthrough would hand away
+// default_transaction_read_only, statement_timeout and role -- three of this
+// server's four safety properties -- through a convenience argument.
+TEST_F(PostgresMCPServerTest, OnlyPlannerSettingsAreAccepted) {
+  const std::string sql = "SELECT 1";
+  for (const auto& bad : {"default_transaction_read_only", "statement_timeout",
+                          "role", "session_authorization", "search_path"}) {
+    json r = srv->call_explain_query("", sql, json::array(), false, 0,
+                                     json{{bad, "x"}}, "");
+    ASSERT_TRUE(r.contains("error")) << bad << ": " << r.dump(2);
+    EXPECT_NE(r["error"].get<std::string>().find(bad), std::string::npos);
+    // Refused, not ignored: no plan comes back at all, because a plan labelled
+    // as built under an environment that was never applied is the failure this
+    // whole release keeps correcting.
+    EXPECT_FALSE(r.contains("plan")) << bad << ": " << r.dump(2);
+  }
+  // search_path is excluded on purpose and the refusal says why.
+  json sp = srv->call_explain_query("", sql, json::array(), false, 0,
+                                    json{{"search_path", "public"}}, "");
+  EXPECT_NE(sp["hint"].get<std::string>().find("resolves"), std::string::npos)
+      << sp["hint"];
+}
+
+// The form the question is actually asked in: "why is it slow for the
+// application". Removes the step where a human copies values out of
+// hostCapacity.overrides by hand and gets one wrong.
+TEST_F(PostgresMCPServerTest, PlanAsRoleTakesThePlannerSettingsAndReportsTheRest) {
+  const std::string role = "licht_par_" + std::to_string(getpid());
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+    n.exec("CREATE ROLE \"" + role + "\"");
+    n.exec("ALTER ROLE \"" + role + "\" SET work_mem = '256MB'");
+    // Not a planner setting: it must be reported as skipped, never applied and
+    // never silently dropped.
+    n.exec("ALTER ROLE \"" + role + "\" SET statement_timeout = '7s'");
+  }
+
+  json r = srv->call_explain_query("", "SELECT 1", json::array(), false, 0,
+                                   json::object(), role);
+  ASSERT_TRUE(r.contains("planning_environment")) << r.dump(2);
+  auto& pe = r["planning_environment"];
+  EXPECT_EQ(pe["from_role"].get<std::string>(), role);
+  EXPECT_EQ(pe["applied"]["work_mem"], "256MB");
+  bool skipped_timeout = false;
+  for (const auto& sk : pe["skipped_from_role"])
+    if (sk["name"] == "statement_timeout") {
+      skipped_timeout = true;
+      EXPECT_EQ(sk["reason"], "not a planner setting");
+    }
+  EXPECT_TRUE(skipped_timeout) << pe.dump(2);
+
+  json gone = srv->call_explain_query("", "SELECT 1", json::array(), false, 0,
+                                      json::object(), role + "_absent");
+  ASSERT_TRUE(gone.contains("error")) << gone.dump(2);
+  EXPECT_NE(gone["error"].get<std::string>().find("no such role"), std::string::npos);
+
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+  }
+}
+
 // --- listOperators ---
 
 TEST_F(PostgresMCPServerTest, ListOperatorsReturnsCustomOperator) {

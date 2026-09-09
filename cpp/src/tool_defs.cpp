@@ -56,12 +56,18 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		    {"create", {{"type", "array"}, {"items", {{"type", "string"}}},
    		                {"description", "CREATE INDEX statements to plan against"}}},
    		    {"hide", {{"type", "array"}, {"items", {{"type", "string"}}},
-   		              {"description", "names of existing indexes to plan without"}}}
+   		              {"description", "names of existing indexes to plan without"}}},
+   		    {"settings", {{"type", "object"},
+   		                  {"description", "planner settings to apply for both halves of the comparison, e.g. {\"work_mem\": \"512MB\"}. Applied with set_config(is_local) so they revert with the transaction. Allowlisted; an unknown name is refused and nothing is planned"}}},
+   		    {"plan_as_role", {{"type", "string"},
+   		                      {"description", "compare under what this role carries in pg_db_role_setting. Both the before and the after plan use it, which is the point: an environment that does not match production makes both costs answer a different question"}}}
    		  }},
    		{"required", {"sql"}}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         return s.evaluate_index(a.str("sql", ""), a.arr("create"), a.arr("hide")); }},
+         json settings = a.contains("settings") ? a["settings"] : json::object();
+         return s.evaluate_index(a.str("sql", ""), a.arr("create"), a.arr("hide"),
+                                 settings, a.str("plan_as_role")); }},
       {"checkPrivileges",
        "report which tools the current role can actually use on this connection, and how the rest fall short. Most of this server works for any role that can connect, because the catalog is world-readable; what varies is the monitoring extras and whether the role can read table data. Call this first when working against an unfamiliar connection or a restricted role -- the alternative is discovering the limits tool by tool, and a privilege-filtered answer is easy to mistake for an empty one. Names no role memberships and no GRANT statements: what a caller needs is which tools work. This is about THIS server's operations for the CONNECTING role, and is not an object permission check -- for whether some other role may read a given table, view or function, and which rows row-level security then leaves it, use the check-role-access prompt. Tools absent from both lists are fully available",
        []() -> json { return {
@@ -772,7 +778,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args& a) -> json {
          return s.check_key(a.str("schema", "public"), a.str("table", ""), a.arr("values")); }},
       {"explainQuery",
-       "return the raw EXPLAIN (FORMAT JSON) plan for a statement, either recovered from pg_stat_statements by queryid (full untruncated text) or supplied directly as sql. Runs in a read-only transaction bounded by statement_timeout. Statements with $n placeholders are planned with GENERIC_PLAN unless concrete params are supplied, in which case the statement is PREPAREd and planned with real values. analyze:true runs EXPLAIN (ANALYZE, BUFFERS), which really executes the statement, and is honoured only after the plan is proven free of any ModifyTable node -- so data-modifying statements, including data-modifying CTEs, are never executed; it also requires an explicit timeout_ms. Returns the plan verbatim plus generic/analyzed/read_only flags and the pg_stat_statements row; no heuristics and no generated DDL, the plan is yours to interpret. Every plan carries a Settings block (EXPLAIN SETTINGS) naming the settings that differ from the built-in default, because the plan is built in THIS server's session and not in the one the statement really runs in -- work_mem alone can change the algorithm rather than the cost, turning a HashAggregate into a Sort plus GroupAggregate. Compare it against hostCapacity.overrides, which reports the per-role and per-database settings pg_settings cannot show: where they differ, this plan is not the plan production gets",
+       "return the raw EXPLAIN (FORMAT JSON) plan for a statement, either recovered from pg_stat_statements by queryid (full untruncated text) or supplied directly as sql. Runs in a read-only transaction bounded by statement_timeout. Statements with $n placeholders are planned with GENERIC_PLAN unless concrete params are supplied, in which case the statement is PREPAREd and planned with real values. analyze:true runs EXPLAIN (ANALYZE, BUFFERS), which really executes the statement, and is honoured only after the plan is proven free of any ModifyTable node -- so data-modifying statements, including data-modifying CTEs, are never executed; it also requires an explicit timeout_ms. Returns the plan verbatim plus generic/analyzed/read_only flags and the pg_stat_statements row; no heuristics and no generated DDL, the plan is yours to interpret. Every plan carries a Settings block (EXPLAIN SETTINGS) naming the settings that differ from the built-in default, because the plan is built in THIS server's session and not in the one the statement really runs in -- work_mem alone can change the algorithm rather than the cost, turning a HashAggregate into a Sort plus GroupAggregate. Compare it against hostCapacity.overrides, which reports the per-role and per-database settings pg_settings cannot show: where they differ, this plan is not the plan production gets -- and plan_as_role then plans it under what that role actually carries, so the difference between the two plans becomes the finding rather than a caveat. planning_environment reports what was applied and, for plan_as_role, what was skipped",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
@@ -795,7 +801,11 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		    {"timeout_ms", {
    			{"type", "integer"},
    			{"description", "statement_timeout for the explain, in milliseconds, clamped to [100, 30000]. Required when analyze is true; defaults to 5000 for plan-only calls"}
-   		      }}
+   		      }},
+   		    {"settings", {{"type", "object"},
+   		                  {"description", "planner settings to apply for this plan only, e.g. {\"work_mem\": \"512MB\"}. Applied with set_config(is_local) so they revert with the transaction and cannot leak to another session. Allowlisted to settings that change a PLAN; an unknown name is refused and nothing is planned, rather than ignored"}}},
+   		    {"plan_as_role", {{"type", "string"},
+   		                      {"description", "plan under what this role carries in pg_db_role_setting, filtered to planner settings. Non-planner entries such as search_path or statement_timeout are reported under skipped_from_role rather than dropped silently"}}}
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
@@ -813,7 +823,9 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
          json prms = a.contains("params") ? a["params"] : json::array();
          bool do_analyze = a.contains("analyze") ? a["analyze"].get<bool>() : false;
          int tmo = a.contains("timeout_ms") ? a["timeout_ms"].get<int>() : 0;
-         return s.explain_query(qid, sql, prms, do_analyze, tmo); }},
+         json settings = a.contains("settings") ? a["settings"] : json::object();
+         std::string as_role = a.str("plan_as_role");
+         return s.explain_query(qid, sql, prms, do_analyze, tmo, settings, as_role); }},
       {"verifyTopology",
        "connect to every configured connection and report what each server actually is: its role (primary or replica, from pg_is_in_recovery(), observed now rather than configured), its system identifier, database, address, port and version -- then check the declared topology against them. A physical replica carries the same system identifier as its primary forever, so the identifier alone cannot separate the two axes: same identifier with the same host and port is one instance, same identifier on different hosts is a replication group. Reports declarations the servers contradict, connections that share an identifier but are not declared together (an undeclared replica is where 'is this index used?' quietly gets the wrong answer), a replication group with no primary, and split brain. Logical replication cannot be verified this way and is reported as such rather than as a mismatch. Connects once per configured connection, sequentially, with a short connect timeout; a connection that fails is reported and does not abort the rest",
        []() -> json { return {

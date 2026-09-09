@@ -697,13 +697,18 @@ public:
   const json call_check_privileges() { return check_privileges(); }
   const json call_evaluate_index(const std::string& sql, const json& create_defs,
                                  const json& hide_names) {
-    return evaluate_index(sql, create_defs, hide_names);
+    return evaluate_index(sql, create_defs, hide_names, json::object(), "");
   }
   const json call_buffer_cache_summary() { return buffer_cache_summary(); }
   const json call_buffer_cache_contents(int limit) { return buffer_cache_contents(limit); }
   const json call_explain_query(const std::string& queryid, const std::string& sql,
                                 const json& params, bool analyze, int timeout_ms) {
-    return explain_query(queryid, sql, params, analyze, timeout_ms);
+    return explain_query(queryid, sql, params, analyze, timeout_ms, json::object(), "");
+  }
+  const json call_explain_query(const std::string& queryid, const std::string& sql,
+                                const json& params, bool analyze, int timeout_ms,
+                                const json& settings, const std::string& as_role) {
+    return explain_query(queryid, sql, params, analyze, timeout_ms, settings, as_role);
   }
 
 private:
@@ -4024,8 +4029,143 @@ private:
     return it->get<std::string>();
   }
 
+  // The settings a caller may apply before a plan is produced.
+  //
+  // An allowlist, not a denylist, and that is the whole safety argument. An
+  // arbitrary SET passthrough would let a caller turn off
+  // default_transaction_read_only, remove statement_timeout, or change role /
+  // session_authorization -- three of this server's four safety properties,
+  // handed away through a convenience argument. The set that changes a PLAN is
+  // bounded and known, and every entry is USERSET, so none of it needs a
+  // privilege this server does not already have.
+  //
+  // search_path is deliberately absent even though it changes plans, because
+  // it does so by changing WHICH OBJECTS the statement resolves to. That is a
+  // different question from how they are joined, and quietly planning against
+  // a different table than the caller meant is worse than refusing.
+  static bool is_planner_setting(const std::string& name) {
+    // Every enable_* GUC is a planner method toggle by convention, and new
+    // ones arrive most releases -- enable_group_by_reordering in 17,
+    // enable_distinct_reordering and enable_self_join_elimination in 18. The
+    // prefix rule is what keeps this table from needing an edit per release.
+    if (name.rfind("enable_", 0) == 0) return true;
+    static const std::set<std::string> kAllowed = {
+      // memory
+      "work_mem", "hash_mem_multiplier", "maintenance_work_mem",
+      // costs
+      "seq_page_cost", "random_page_cost", "cpu_tuple_cost",
+      "cpu_index_tuple_cost", "cpu_operator_cost", "effective_cache_size",
+      "effective_io_concurrency",
+      // parallelism
+      "max_parallel_workers_per_gather", "parallel_setup_cost",
+      "parallel_tuple_cost", "min_parallel_table_scan_size",
+      "min_parallel_index_scan_size",
+      // join search
+      "from_collapse_limit", "join_collapse_limit", "geqo", "geqo_threshold",
+      // partitioning and caching
+      "constraint_exclusion", "plan_cache_mode",
+      // jit
+      "jit", "jit_above_cost", "jit_inline_above_cost", "jit_optimize_above_cost",
+    };
+    return kAllowed.count(name) > 0;
+  }
+
+  // Applies planner settings for the remainder of THIS transaction.
+  //
+  // set_config(name, value, is_local := true) rather than a built SET LOCAL
+  // string: it is a function call with bound parameters, so a value cannot
+  // escape into SQL text at all. is_local means the value reverts at commit,
+  // so it cannot leak across a connection a pooler hands to somebody else --
+  // the same property that made the read-only guard transaction-scoped rather
+  // than session-scoped, and the same reason.
+  //
+  // Returns an error object when a name is not allowlisted. Silently dropping
+  // it would return a plan the caller believes was built under an environment
+  // that was never applied, which is the exact failure class this release
+  // keeps correcting -- reintroduced through the fix for it.
+  json apply_planner_settings(pqxx::work& txn, const json& settings, json& applied) {
+    if (!settings.is_object()) return {};
+    for (auto it = settings.begin(); it != settings.end(); ++it) {
+      const std::string name = it.key();
+      if (!is_planner_setting(name))
+        return {{"error", "\"" + name + "\" is not a planner setting and will not be applied"},
+                {"hint", "only settings that change a PLAN are accepted: work_mem, "
+                         "hash_mem_multiplier, the cost knobs, the parallelism knobs, "
+                         "every enable_*, the join-search limits, constraint_exclusion, "
+                         "plan_cache_mode and the jit knobs. search_path is excluded on "
+                         "purpose: it changes which objects the statement resolves to "
+                         "rather than how they are joined, and planning against a "
+                         "different table than you meant is worse than this refusal. "
+                         "Nothing was applied and no plan was produced."}};
+      const std::string value = it->is_string() ? it->get<std::string>() : it->dump();
+      try {
+        pqxx_exec(txn, "SELECT set_config($1, $2, true)", pqxx::params{name, value});
+        applied[name] = value;
+      } catch (const pqxx::sql_error& e) {
+        return {{"error", "could not apply \"" + name + "\" = \"" + value + "\""},
+                {"hint", "the setting exists in this server's allowlist but the value "
+                         "was refused; check the unit and the range. Nothing was "
+                         "applied and no plan was produced."},
+                {"detail", e.what()}};
+      }
+    }
+    return {};
+  }
+
+  // The same, taken from what a role is actually configured with.
+  //
+  // This is the form the question is asked in -- "why is it slow for the
+  // application" -- and it removes the step where a human copies values out of
+  // hostCapacity.overrides by hand and gets one wrong.
+  //
+  // Skipped entries are listed rather than dropped. A role carrying a
+  // search_path or a statement_timeout gets neither applied, and a plan that
+  // silently ignored half the role's environment while claiming to be that
+  // role's plan would be worse than one that never claimed it.
+  json apply_role_settings(pqxx::work& txn, const std::string& role,
+                           json& applied, json& skipped, bool& role_exists) {
+    pqxx::result r = pqxx_exec(txn,
+      "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1),"
+      "       COALESCE((SELECT JSONB_AGG(cfg ORDER BY cfg)"
+      "                   FROM pg_db_role_setting s"
+      "                   JOIN pg_roles rr ON rr.oid = s.setrole"
+      "                   CROSS JOIN LATERAL unnest(s.setconfig) AS cfg"
+      "                  WHERE rr.rolname = $1"
+      "                    AND s.setdatabase IN (0, (SELECT oid FROM pg_database"
+      "                                               WHERE datname = current_database()))),"
+      "                '[]'::jsonb)::text",
+      pqxx::params{role});
+    role_exists = r[0][0].as<bool>();
+    if (!role_exists)
+      return {{"error", "no such role: \"" + role + "\""},
+              {"hint", "listRoles names them; pass 'pattern' there if the role is "
+                       "outside the cap. Nothing was applied and no plan was produced."}};
+
+    for (const auto& e : json::parse(r[0][1].as<std::string>())) {
+      const std::string cfg = e.get<std::string>();
+      const auto eq = cfg.find('=');
+      if (eq == std::string::npos) continue;
+      const std::string name  = cfg.substr(0, eq);
+      const std::string value = cfg.substr(eq + 1);
+      if (!is_planner_setting(name)) {
+        skipped.push_back({{"name", name}, {"value", value},
+                           {"reason", "not a planner setting"}});
+        continue;
+      }
+      try {
+        pqxx_exec(txn, "SELECT set_config($1, $2, true)", pqxx::params{name, value});
+        applied[name] = value;
+      } catch (const pqxx::sql_error&) {
+        skipped.push_back({{"name", name}, {"value", value},
+                           {"reason", "the server refused the value"}});
+      }
+    }
+    return {};
+  }
+
   const json explain_query(const std::string& queryid, const std::string& sql_in,
-                           const json& params, bool analyze, int timeout_ms) {
+                           const json& params, bool analyze, int timeout_ms,
+                           const json& settings, const std::string& plan_as_role) {
     // --- argument validation (caller errors -> isError:true via dispatch) ---
     if (queryid.empty() && sql_in.empty())
       throw std::runtime_error("one of queryid or sql is required");
@@ -4060,6 +4200,37 @@ private:
 
     Session sess = open_session(tmo);
     pqxx::work& txn = sess.txn();
+
+    // The planning environment, applied before anything is planned and only
+    // for this transaction. Refusals return here rather than planning under a
+    // half-applied environment and labelling the result as though it were
+    // whole.
+    json applied = json::object(), skipped = json::array();
+    bool role_exists = true;
+    if (!plan_as_role.empty()) {
+      json err = apply_role_settings(txn, plan_as_role, applied, skipped, role_exists);
+      if (!err.is_null() && !err.empty()) return err;
+    }
+    // Explicit settings win, because they are the caller's deliberate
+    // override of what the role happens to carry.
+    {
+      json err = apply_planner_settings(txn, settings, applied);
+      if (!err.is_null() && !err.empty()) return err;
+    }
+    json plan_env;
+    if (!applied.empty() || !plan_as_role.empty()) {
+      plan_env = json::object();
+      plan_env["applied"] = applied;
+      if (!plan_as_role.empty()) {
+        plan_env["from_role"] = plan_as_role;
+        plan_env["skipped_from_role"] = skipped;
+      }
+      plan_env["note"] =
+        "Applied with set_config(..., is_local := true), so these revert when "
+        "this transaction ends and cannot leak to another session. The plan "
+        "below was built under them; the Settings block reports what the "
+        "server saw.";
+    }
 
     // --- resolve the statement text ---
     std::string sql = sql_in;
@@ -4225,6 +4396,7 @@ private:
             // On the queryid path the statement was already recovered; return it
             // so the caller still gets the stats and can retry with params.
             if (!stats.is_null()) out["statement"] = stats;
+            if (!plan_env.is_null()) out["planning_environment"] = plan_env;
             return out;
           }
           pqxx::result r = txn.exec("EXPLAIN (SETTINGS, GENERIC_PLAN, FORMAT JSON) " + sql);
@@ -4290,6 +4462,7 @@ private:
       };
       if (!note.empty())    out["note"] = note;
       if (!stats.is_null()) out["statement"] = stats;
+      if (!plan_env.is_null()) out["planning_environment"] = plan_env;
       return out;
 
     } catch (const pqxx::sql_error& e) {
@@ -6522,7 +6695,8 @@ private:
   // exception, which protects the next call from this one. Either alone would
   // do most of the job; both is cheap and neither depends on the other.
   const json evaluate_index(const std::string& sql, const json& create_defs,
-                            const json& hide_names) {
+                            const json& hide_names, const json& settings,
+                            const std::string& plan_as_role) {
     if (sql.empty()) throw std::runtime_error("sql is required");
     if (!create_defs.is_array() || !hide_names.is_array())
       throw std::runtime_error("create and hide must be arrays");
@@ -6535,6 +6709,30 @@ private:
 
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
+
+    // The same defect as explainQuery had, and worse here: the whole output is
+    // a before/after cost comparison, so an environment that does not match
+    // production makes BOTH halves answer a different question than the one
+    // asked. Applied for this transaction only, from the same allowlist.
+    json applied = json::object(), skipped = json::array();
+    bool role_exists = true;
+    if (!plan_as_role.empty()) {
+      json err = apply_role_settings(txn, plan_as_role, applied, skipped, role_exists);
+      if (!err.is_null() && !err.empty()) return err;
+    }
+    {
+      json err = apply_planner_settings(txn, settings, applied);
+      if (!err.is_null() && !err.empty()) return err;
+    }
+    json plan_env;
+    if (!applied.empty() || !plan_as_role.empty()) {
+      plan_env = json::object();
+      plan_env["applied"] = applied;
+      if (!plan_as_role.empty()) {
+        plan_env["from_role"] = plan_as_role;
+        plan_env["skipped_from_role"] = skipped;
+      }
+    }
 
     const std::string hypo = extension_schema(txn, "hypopg");
     if (hypo.empty())
@@ -6670,6 +6868,7 @@ private:
       {"indexes", indexes}
     };
     if (!hidden.empty()) out["hidden"] = hidden;
+    if (!plan_env.is_null()) out["planning_environment"] = plan_env;
     out["note"] = "Hypothetical indexes are planned against and never built. "
                   "The cost is the planner's estimate, not a measurement: it "
                   "says the plan would change, not how long it would take.";
