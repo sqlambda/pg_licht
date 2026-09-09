@@ -216,6 +216,8 @@ enum class Feature {
   SubTwoPhase,              // pg_subscription.subtwophasestate
   SubscriptionStatsView,    // pg_stat_subscription_stats
   ExtendedStatsInherit,     // pg_statistic_ext_data.stxdinherit
+  PublicationSchemas,       // pg_publication_namespace (FOR TABLES IN SCHEMA)
+  ParameterAcl,             // pg_parameter_acl (GRANT SET ON PARAMETER)
   // 16
   PgStatIo,                 // the pg_stat_io view
   GenericPlan,              // EXPLAIN (GENERIC_PLAN)
@@ -250,7 +252,9 @@ constexpr int feature_since(Feature f) {
   switch (f) {
     case Feature::SubTwoPhase:
     case Feature::SubscriptionStatsView:
-    case Feature::ExtendedStatsInherit:     return 150000;
+    case Feature::ExtendedStatsInherit:
+    case Feature::PublicationSchemas:
+    case Feature::ParameterAcl:            return 150000;
 
     case Feature::PgStatIo:
     case Feature::GenericPlan:
@@ -5529,7 +5533,15 @@ private:
                  'owner',       spcowner::regrole::text,
                  'location',    COALESCE(NULLIF(pg_tablespace_location(oid), ''), '(default)'),
                  'options',     spcoptions,
-                 'description', COALESCE(obj_description(oid, 'pg_tablespace'), '')
+                 -- shobj_description, not obj_description. A tablespace is a
+                 -- SHARED object, so COMMENT ON TABLESPACE writes to
+                 -- pg_shdescription and obj_description() -- which reads
+                 -- pg_description -- returns null for every one of them.
+                 -- Verified on PostgreSQL 18: a commented tablespace gave
+                 -- NULL through obj_description and the comment through
+                 -- shobj_description. Every tablespace comment has been
+                 -- invisible here, reported as '' rather than as missing.
+                 'description', COALESCE(shobj_description(oid, 'pg_tablespace'), '')
                )
              )
       FROM pg_tablespace;
@@ -5609,6 +5621,19 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
+    // FOR TABLES IN SCHEMA is PostgreSQL 15. pg_publication_tables resolves
+    // the members either way, so the MEMBERS were never missing -- what was
+    // lost is the DECLARATION, and that decides what happens next: a table
+    // created later in a published schema joins the publication by itself,
+    // while one added to a table-list publication does not. Two publications
+    // with identical members today can behave differently tomorrow.
+    const std::string sch_pub = sess.has(Feature::PublicationSchemas)
+      ? ", 'schemas', COALESCE((SELECT JSONB_AGG(n.nspname ORDER BY n.nspname)"
+        "                         FROM pg_publication_namespace pn"
+        "                         JOIN pg_namespace n ON n.oid = pn.pnnspid"
+        "                        WHERE pn.pnpubid = p.oid), '[]'::jsonb)"
+      : "";
+
     // The same unbounded expansion listSchemas had, and it is worse here:
     // FOR ALL TABLES resolves through pg_publication_tables to every table in
     // the database, so a publication declared in one line expands to thousands
@@ -5629,7 +5654,7 @@ private:
                  'truncate',   p.pubtruncate,
                  'table_count', COALESCE(table_count, 0),
                  'tables',     COALESCE(tables, '[]'::jsonb),
-                 'tables_truncated', COALESCE(table_count, 0) > )") + std::to_string(kPublicationTableNames) + R"(
+                 'tables_truncated', COALESCE(table_count, 0) > )") + std::to_string(kPublicationTableNames) + sch_pub + R"(
                )
              )
       FROM pg_publication AS p
@@ -7219,7 +7244,12 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    const std::string query = R"(
+    const std::string param_acl = sess.has(Feature::ParameterAcl)
+      ? "WHEN d.classid = 'pg_parameter_acl'::regclass "
+        "THEN (SELECT parname FROM pg_parameter_acl WHERE oid = d.objid)"
+      : "";
+
+    const std::string query = std::string(R"(
       WITH d AS (
         SELECT s.dbid, s.classid, s.objid, s.objsubid, s.deptype
           FROM pg_shdepend AS s
@@ -7283,6 +7313,19 @@ private:
                                THEN (SELECT n.nspname || '.' || t.typname
                                        FROM pg_type t JOIN pg_namespace n
                                          ON n.oid = t.typnamespace WHERE t.oid = d.objid)
+                             -- GRANT SET ON PARAMETER records a shared
+                             -- dependency like any other grant, so these rows
+                             -- were already being COUNTED here and only the
+                             -- name was missing. pg_parameter_acl is
+                             -- PostgreSQL 15 and later.
+                             --
+                             -- Gated rather than guarded. to_regclass would
+                             -- keep the comparison safe on 14, but the branch
+                             -- also SELECTs from the catalog by name, and
+                             -- PostgreSQL parses the whole statement -- an
+                             -- unreachable branch still has to resolve. So the
+                             -- text is only emitted where the catalog exists.
+                             )" + param_acl + R"(
                              ELSE NULL END,
                    'column', NULLIF(d.objsubid, 0),
                    'dependency', CASE d.deptype WHEN 'o' THEN 'owner'
@@ -7295,7 +7338,7 @@ private:
             FROM d JOIN pg_class AS c ON c.oid = d.classid
            WHERE d.dbid IN (0, (SELECT oid FROM pg_database
                                  WHERE datname = current_database()))), '[]'::jsonb));
-    )";
+    )");
 
     pqxx::result res = pqxx_exec(txn, query, pqxx::params{role});
     if (!res.empty() && !res[0][0].is_null())

@@ -89,7 +89,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args& a) -> json {
          return s.table_stats(a.str("schema", "public"), a.str("table", "")); }},
       {"roleDependencies",
-       "return what depends on one role, cluster-wide, from pg_shdepend. checkRoleAccess answers whether a role may USE an object; this answers the inverse, which is the whole of \"role cannot be dropped because some objects depend on it\" -- a message that reports a count and names nothing. by_kind separates owner (which blocks DROP ROLE outright and is cleared by REASSIGN OWNED) from acl and policy (cleared by DROP OWNED), because that decides whether you reassign or hunt. IMPORTANT: pg_shdepend is shared across the cluster, so total and by_database cover EVERY database; but an object id is only resolvable from the database it lives in, so 'objects' names only those in this database and the shared catalogs. A row counted in another database is real and unnamed here -- connect there and ask again. Reporting only what this database can see would answer 'nothing depends on it' to somebody about to DROP the role",
+       "return what depends on one role, cluster-wide, from pg_shdepend. checkRoleAccess answers whether a role may USE an object; this answers the inverse, which is the whole of \"role cannot be dropped because some objects depend on it\" -- a message that reports a count and names nothing. by_kind separates owner (which blocks DROP ROLE outright and is cleared by REASSIGN OWNED) from acl and policy (cleared by DROP OWNED), because that decides whether you reassign or hunt. Named objects include parameters granted with GRANT SET ON PARAMETER on PostgreSQL 15 and later, which are shared dependencies like any other grant. IMPORTANT: pg_shdepend is shared across the cluster, so total and by_database cover EVERY database; but an object id is only resolvable from the database it lives in, so 'objects' names only those in this database and the shared catalogs. A row counted in another database is real and unnamed here -- connect there and ask again. Reporting only what this database can see would answer 'nothing depends on it' to somebody about to DROP the role",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
@@ -303,7 +303,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args&) -> json {
          return s.foreign_servers(); }},
       {"listTablespaces",
-       "return cluster-wide tablespaces with owner, filesystem location, options, and description",
+       "return cluster-wide tablespaces with owner, filesystem location, options, and description. The description comes from pg_shdescription: a tablespace is a shared object, so COMMENT ON TABLESPACE does not land in pg_description and obj_description() cannot see it",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", json::object()}
@@ -330,7 +330,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args&) -> json {
          return s.event_triggers(); }},
       {"listPublications",
-       "return logical replication publications with owner, all-tables flag, per-operation flags (insert/update/delete/truncate), table_count, and up to 50 member table names. tables_truncated says when a publication carries more than the names shown -- a publication FOR ALL TABLES resolves to every table in the database, so the member list is unbounded by construction and the count is the figure that scales",
+       "return logical replication publications with owner, all-tables flag, per-operation flags (insert/update/delete/truncate), table_count, up to 50 member table names, and on PostgreSQL 15+ the schemas published wholesale via FOR TABLES IN SCHEMA. That declaration is not cosmetic: a table created later in a published schema joins the publication by itself, while one added to a table-list publication does not -- so two publications with identical members today can behave differently tomorrow. tables_truncated says when a publication carries more than the names shown -- a publication FOR ALL TABLES resolves to every table in the database, so the member list is unbounded by construction and the count is the figure that scales",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", json::object()}

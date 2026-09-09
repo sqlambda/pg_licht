@@ -2116,6 +2116,52 @@ TEST_F(PostgresMCPServerTest, PlanAsRoleTakesThePlannerSettingsAndReportsTheRest
   }
 }
 
+// A tablespace is a SHARED object, so COMMENT ON TABLESPACE writes to
+// pg_shdescription. listTablespaces read it through obj_description(), which
+// reads pg_description, and therefore reported '' for every commented
+// tablespace since the tool existed -- silence that reads as "no comment".
+// Verified on PostgreSQL 18: obj_description gave NULL and shobj_description
+// gave the text for the same tablespace.
+TEST_F(PostgresMCPServerTest, TablespaceCommentsComeFromTheSharedCatalog) {
+  pqxx::connection c(test_url);
+  pqxx::nontransaction n(c);
+  // pg_default always exists and is the one tablespace every cluster has.
+  n.exec("COMMENT ON TABLESPACE pg_default IS 'licht test comment'");
+
+  json r = srv->call_tablespaces();
+  ASSERT_TRUE(r.contains("pg_default")) << r.dump(2);
+  EXPECT_EQ(r["pg_default"]["description"].get<std::string>(), "licht test comment")
+      << r["pg_default"].dump(2);
+
+  n.exec("COMMENT ON TABLESPACE pg_default IS NULL");
+}
+
+// FOR TABLES IN SCHEMA is PostgreSQL 15. The members were never missing --
+// pg_publication_tables resolves them either way -- but the DECLARATION was,
+// and it decides what happens next: a table created later in a published
+// schema joins by itself, one added to a table-list publication does not.
+TEST_F(PostgresMCPServerTest, PublicationsSayWhichSchemasArePublishedWholesale) {
+  pqxx::connection c(test_url);
+  if (c.server_version() < 150000) GTEST_SKIP() << "FOR TABLES IN SCHEMA is PostgreSQL 15+";
+  const std::string pub = "licht_pub_" + std::to_string(getpid());
+  {
+    pqxx::nontransaction n(c);
+    n.exec("CREATE PUBLICATION " + pub + " FOR TABLES IN SCHEMA grocery");
+  }
+  json r = srv->call_publications();
+  ASSERT_TRUE(r.contains(pub)) << r.dump(2);
+  ASSERT_TRUE(r[pub].contains("schemas")) << r[pub].dump(2);
+  std::vector<std::string> sch(r[pub]["schemas"].begin(), r[pub]["schemas"].end());
+  EXPECT_NE(std::find(sch.begin(), sch.end(), "grocery"), sch.end()) << r[pub].dump(2);
+  // The members are still resolved, which is what makes the declaration the
+  // only thing that was missing.
+  EXPECT_GT(r[pub]["table_count"].get<int>(), 0) << r[pub].dump(2);
+  {
+    pqxx::nontransaction n(c);
+    n.exec("DROP PUBLICATION " + pub);
+  }
+}
+
 // --- listOperators ---
 
 TEST_F(PostgresMCPServerTest, ListOperatorsReturnsCustomOperator) {
