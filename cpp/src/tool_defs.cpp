@@ -82,6 +82,29 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
          return s.table_stats(a.str("schema", "public"), a.str("table", "")); }},
+      {"listPartitions",
+       "return every partitioned table in a schema with its partitioning strategy (range/list/hash), the partition key, how many partitions it has, their combined estimated row count and size, whether a DEFAULT partition exists and how many rows it holds, and how many partitions are themselves partitioned. Reads reltuples and relpages from the catalog, so no relation is opened and no lock is taken -- for measured sizes call listTableSizes on the schema the partitions live in. A growing default partition is the finding to look for: rows land there when they match no bound, so it is a missing partition that has not failed loudly yet. Name a parent to partitionDetails for the per-partition bounds and vacuum state",
+       []() -> json { return {
+   		{"type", "object"},
+   		{"properties", {
+   		    {"schema", {{"type", "string"}}}
+   		  }},
+   		{"required", {"schema"}}
+   	      }; },
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.list_partitions(a.str("schema", "public")); }},
+      {"partitionDetails",
+       "return one partitioned table with every partition: its bound expression verbatim, whether it is the DEFAULT, whether it is itself partitioned, estimated rows and size, and the per-partition live/dead tuples, scan counters and vacuum and analyze timestamps. Those statistics are the reason this exists: autovacuum runs per PARTITION, so a parent has no vacuum state of its own and ranking parents finds nothing while one child falls behind. Bounds are returned verbatim rather than parsed -- a bound carries whatever types the key columns have, and a misparsed boundary is worse than an unparsed one; for a RANGE parent, comparing the highest upper bound against now() is how to see that next period's partition was never created. counters_since says when the scan counters were last reset. Returns a clear error naming the relkind if the table exists but is not partitioned",
+       []() -> json { return {
+   		{"type", "object"},
+   		{"properties", {
+   		    {"table", {{"type", "string"}}},
+   		    {"schema", {{"type", "string"}}}
+   		  }},
+   		{"required", {"table", "schema"}}
+   	      }; },
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.partition_details(a.str("schema", "public"), a.str("table")); }},
       {"listTableStats",
        "return the statistics PostgreSQL keeps for every table in a schema: estimated row count, seq_scan and idx_scan counts, live and dead tuples, rows modified since the last analyze, rows inserted since the last vacuum, and the manual and automatic vacuum and analyze times as four separate fields (last_vacuum and last_analyze are the manual ones, exactly as in pg_stat_user_tables -- a recent last_vacuum beside a null last_autovacuum means the table is being kept alive by hand and autovacuum is not reaching it). Reads the catalog and the statistics collector only -- no relation is opened and no file is measured. Carries no per-column histograms; name one table to tableStats for those. size_estimate is relpages*block_size (the server's BLCKSZ, 8192 unless it was built otherwise) and is only as fresh as estimated_from says: for measured sizes call listTableSizes",
        []() -> json { return {
@@ -94,7 +117,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args& a) -> json {
          return s.list_table_stats(a.str("schema", "public")); }},
       {"tableSize",
-       "measure one table on disk: main fork, total table size including TOAST and the free space and visibility maps, index size, grand total, the TOAST relation and each index individually. COSTS MORE THAN IT LOOKS: these functions open the relation with AccessShareLock, so on a table an ALTER TABLE is rewriting the call waits behind AccessExclusiveLock until statement_timeout fires. Prefer size_estimate from tableStats, which is free, and call this when the estimate is too stale to act on. A partitioned table reports its own storage, which is zero -- measure the partitions",
+       "measure one table on disk: main fork, total table size including TOAST and the free space and visibility maps, index size, grand total, the TOAST relation and each index individually. COSTS MORE THAN IT LOOKS: these functions open the relation with AccessShareLock, so on a table an ALTER TABLE is rewriting the call waits behind AccessExclusiveLock until statement_timeout fires. Prefer size_estimate from tableStats, which is free, and call this when the estimate is too stale to act on. A partitioned table reports its own storage, which is zero -- measure the partitions, which partitionDetails names",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
@@ -106,7 +129,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args& a) -> json {
          return s.table_size(a.str("schema", "public"), a.str("table", "")); }},
       {"listTableSizes",
-       "measure every table in a schema on disk: table size, index size and grand total per relation. COSTS MORE THAN IT LOOKS, and more here than in tableSize: one relation is opened per table, each taking AccessShareLock, so a single table held under AccessExclusiveLock by an ALTER TABLE blocks the whole call rather than one row of it, and on a large schema this is thousands of file-metadata calls. Prefer size_estimate from listTableStats, which is free, and call this when the estimates are too stale to act on. Partitioned tables report their own storage, which is zero",
+       "measure every table in a schema on disk: table size, index size and grand total per relation. COSTS MORE THAN IT LOOKS, and more here than in tableSize: one relation is opened per table, each taking AccessShareLock, so a single table held under AccessExclusiveLock by an ALTER TABLE blocks the whole call rather than one row of it, and on a large schema this is thousands of file-metadata calls. Prefer size_estimate from listTableStats, which is free, and call this when the estimates are too stale to act on. Partitioned tables report their own storage, which is zero; listPartitions summarises them and partitionDetails names their partitions",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {

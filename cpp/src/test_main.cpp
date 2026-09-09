@@ -262,6 +262,13 @@ protected:
 
       txn.exec("CREATE TYPE grocery.price_range AS RANGE (subtype = numeric)");
 
+      txn.exec("CREATE TABLE grocery.events (id bigint, at date NOT NULL, note text) PARTITION BY RANGE (at)");
+      txn.exec("CREATE TABLE grocery.events_2026_01 PARTITION OF grocery.events FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')");
+      txn.exec("CREATE TABLE grocery.events_2026_02 PARTITION OF grocery.events FOR VALUES FROM ('2026-02-01') TO ('2026-03-01')");
+      txn.exec("CREATE TABLE grocery.events_default PARTITION OF grocery.events DEFAULT");
+      txn.exec("INSERT INTO grocery.events VALUES (1,'2026-01-15','a'),(2,'2026-01-16','b'),(3,'2026-02-02','c'),(4,'2030-06-01','late')");
+      txn.exec("ANALYZE grocery.events");
+
       txn.exec("CREATE STATISTICS grocery.orders_stats (dependencies) ON user_id, amount FROM grocery.orders");
       txn.exec("COMMENT ON STATISTICS grocery.orders_stats IS 'user_id/amount correlation'");
 
@@ -1811,6 +1818,74 @@ TEST_F(PostgresMCPServerTest, AnUninferableParameterTypeExplainsItselfAndSaysPar
   const std::string hint = r["hint"].get<std::string>();
   EXPECT_NE(hint.find("WERE applied"), std::string::npos) << hint;
   EXPECT_NE(hint.find("normalization"), std::string::npos) << hint;
+}
+
+// relkind 'p' was used in five places and only ever to print the words
+// "partitioned table". tableSize's own description says "measure the
+// partitions" -- an instruction this server gave no way to follow until 4.3.0.
+TEST_F(PostgresMCPServerTest, ListPartitionsSummarisesAParentAndFlagsItsDefault) {
+  json r = srv->call_list_partitions("grocery");
+  ASSERT_TRUE(r.contains("events")) << r.dump(2);
+  auto& e = r["events"];
+  EXPECT_EQ(e["strategy"].get<std::string>(), "range");
+  EXPECT_NE(e["key"].get<std::string>().find("at"), std::string::npos) << e["key"];
+  EXPECT_EQ(e["partitions"].get<int>(), 3);
+  // The finding this exists for: rows that matched no bound landed in the
+  // default, which is a missing partition that has not failed loudly yet.
+  EXPECT_TRUE(e["has_default"].get<bool>()) << e.dump(2);
+  EXPECT_EQ(e["default_partition"].get<std::string>(), "events_default");
+  EXPECT_GT(e["default_rows"].get<long long>(), 0) << e.dump(2);
+  EXPECT_GE(e["rows"].get<long long>(), 4);
+  EXPECT_EQ(e["sub_partitioned"].get<int>(), 0);
+
+  // A partition is not a top-level parent and must not be listed twice.
+  EXPECT_FALSE(r.contains("events_2026_01")) << r.dump(2);
+}
+
+TEST_F(PostgresMCPServerTest, PartitionDetailsCarriesBoundsAndPerPartitionVacuumState) {
+  json r = srv->call_partition_details("grocery", "events");
+  ASSERT_TRUE(r.contains("partitions")) << r.dump(2);
+  EXPECT_EQ(r["strategy"].get<std::string>(), "range");
+  ASSERT_TRUE(r.contains("counters_since"));
+  ASSERT_EQ(r["partitions"].size(), 3u) << r.dump(2);
+
+  bool saw_default = false, saw_january = false;
+  for (const auto& p : r["partitions"]) {
+    if (p["is_default"].get<bool>()) {
+      saw_default = true;
+      EXPECT_EQ(p["bound"].get<std::string>(), "DEFAULT");
+    } else if (p["name"].get<std::string>() == "events_2026_01") {
+      saw_january = true;
+      // Verbatim, not parsed: the bound carries whatever types the key
+      // columns have.
+      EXPECT_NE(p["bound"].get<std::string>().find("2026-01-01"), std::string::npos)
+          << p["bound"];
+      EXPECT_NE(p["bound"].get<std::string>().find("2026-02-01"), std::string::npos);
+    }
+    // The whole reason this tool exists: autovacuum runs per partition, so the
+    // vacuum state lives on the child and a parent has none of its own.
+    EXPECT_TRUE(p.contains("n_dead_tup")) << p.dump(2);
+    EXPECT_TRUE(p.contains("last_autovacuum"));
+    EXPECT_TRUE(p.contains("idx_scan"));
+    EXPECT_FALSE(p["is_partitioned"].get<bool>());
+  }
+  EXPECT_TRUE(saw_default) << r.dump(2);
+  EXPECT_TRUE(saw_january) << r.dump(2);
+}
+
+// Reaching for it after listTables named an ordinary relation is the habit
+// this error exists for; "not partitioned" and "does not exist" are different
+// answers.
+TEST_F(PostgresMCPServerTest, PartitionDetailsSeparatesNotPartitionedFromNotThere) {
+  json plain = srv->call_partition_details("grocery", "users");
+  ASSERT_TRUE(plain.contains("error")) << plain.dump(2);
+  EXPECT_NE(plain["error"].get<std::string>().find("not a partitioned table"),
+            std::string::npos);
+  EXPECT_NE(plain["hint"].get<std::string>().find("relkind"), std::string::npos);
+
+  json gone = srv->call_partition_details("grocery", "no_such_relation_here");
+  ASSERT_TRUE(gone.contains("error")) << gone.dump(2);
+  EXPECT_NE(gone["error"].get<std::string>().find("no such table"), std::string::npos);
 }
 
 // --- listOperators ---

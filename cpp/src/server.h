@@ -551,6 +551,10 @@ public:
     return table_stats(schema, table_name);
   }
   const json call_list_table_stats(const std::string& schema) { return list_table_stats(schema); }
+  const json call_list_partitions(const std::string& schema) { return list_partitions(schema); }
+  const json call_partition_details(const std::string& sc, const std::string& t) {
+    return partition_details(sc, t);
+  }
   const json call_table_size(const std::string& schema, const std::string& table_name) {
     return table_size(schema, table_name);
   }
@@ -1370,6 +1374,13 @@ private:
       // scan counts and dead tuples are each server's own, and vacuum only
       // runs on the primary.
       {"listTableStats",        {true,  true,  true,  false}},
+      // partitionDetails carries per-partition vacuum state and scan
+      // counters, so it splits the way tableStats does: the structure is
+      // replicated, the counters beside it are not, and vacuum only runs on
+      // the primary. listPartitions reads reltuples and relpages, which are
+      // catalog columns and therefore identical on a physical replica.
+      {"partitionDetails",      {true,  true,  true,  false}},
+      {"listPartitions",        {true,  false, false, false}},
       {"tableStats",            {true,  true,  true,  false}},
       // Same row, and for the same reason. pg_subscription is a shared catalog
       // scoped by subdbid, so the answer is per database; the workers, their
@@ -1783,6 +1794,7 @@ private:
 
       // --- statistics keyed by object ---
       {"listTableStats",         schema_map("table name", "that table's statistics counters and size estimate")},
+      {"listPartitions",         schema_map("partitioned table name", "its strategy, key, partition count and default partition")},
       {"listTableSizes",         schema_map("table name", "that table's measured size, index size and total")},
       {"tableIOStats",           schema_map("schema-qualified table name", "its buffer cache hit ratios and scan counts")},
       {"databaseStats",          schema_map("database name", "that database's pg_stat_database counters")},
@@ -1791,6 +1803,10 @@ private:
       {"bufferCacheContents",    schema_map("schema-qualified relation name", "its buffered pages and usage counts")},
 
       // --- fixed shapes ---
+      {"partitionDetails",       schema_fixed("One partitioned table and every partition it has.",
+                                   {{"table", "string"}, {"strategy", "string"}, {"key", "string"},
+                                    {"is_partition_of", "string"}, {"counters_since", "string"},
+                                    {"partitions", "array"}})},
       {"tableDetails",           schema_fixed("One table's structure.",
                                    {{"table", "string"}, {"kind", "string"}, {"description", "string"},
                                     {"columns", "object"}, {"primary_key", "array"}, {"indexes", "object"},
@@ -6944,6 +6960,157 @@ private:
     if (!res.empty() && !res[0][0].is_null())
       return json::parse(res[0][0].as<std::string>());
     return {};
+  }
+
+  // Partitioning, which nothing here read until 4.3.0. relkind 'p' was used in
+  // five places and only ever to print the words "partitioned table", so a
+  // parent's children, its key, its bounds and its default partition were all
+  // invisible -- while tableSize's own description told the caller to "measure
+  // the partitions", an instruction this server gave no way to follow.
+  //
+  // Cheap by construction: reltuples and relpages are catalog columns set by
+  // VACUUM and ANALYZE, so this opens no relation and takes no lock. The
+  // measured counterpart is listTableSizes on the schema holding the
+  // partitions, which is deliberately not folded in here -- a parent with
+  // three hundred children would be three hundred relation opens behind one
+  // innocent-looking call.
+  const json list_partitions(const std::string& schema) {
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+
+    const std::string query = R"(
+      SELECT JSONB_OBJECT_AGG(parent, obj)
+        FROM (
+          SELECT c.relname AS parent,
+                 JSONB_BUILD_OBJECT(
+                   'strategy', CASE p.partstrat WHEN 'r' THEN 'range'
+                                                WHEN 'l' THEN 'list'
+                                                WHEN 'h' THEN 'hash'
+                                                ELSE p.partstrat::text END,
+                   'key', pg_get_partkeydef(c.oid),
+                   'partitions', count(ch.oid),
+                   -- A default partition catches every row that matched no
+                   -- bound, so it is the difference between an insert that
+                   -- fails loudly and one that silently lands in the wrong
+                   -- place. Its row count is the finding, not its existence.
+                   'has_default',
+                     COALESCE(bool_or(pg_get_expr(ch.relpartbound, ch.oid) = 'DEFAULT'), false),
+                   'default_partition',
+                     max(ch.relname) FILTER (
+                       WHERE pg_get_expr(ch.relpartbound, ch.oid) = 'DEFAULT'),
+                   'default_rows',
+                     (max(ch.reltuples) FILTER (
+                        WHERE pg_get_expr(ch.relpartbound, ch.oid) = 'DEFAULT'))::bigint,
+                   'rows', COALESCE(sum(GREATEST(ch.reltuples, 0))::bigint, 0),
+                   'size_estimate',
+                     COALESCE(sum(ch.relpages)::bigint, 0)
+                       * current_setting('block_size')::bigint,
+                   -- A partition may itself be partitioned. Reporting the
+                   -- count rather than recursing keeps this one query, and
+                   -- partitionDetails names them.
+                   'sub_partitioned',
+                     count(*) FILTER (WHERE ch.relkind = 'p')
+                 ) AS obj
+            FROM pg_class AS c
+            JOIN pg_partitioned_table AS p ON p.partrelid = c.oid
+            LEFT JOIN pg_inherits AS i  ON i.inhparent = c.oid
+            LEFT JOIN pg_class    AS ch ON ch.oid = i.inhrelid
+           WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
+             -- Only top-level parents: a sub-partitioned child is reported
+             -- under its own parent rather than twice.
+             AND NOT c.relispartition
+           GROUP BY c.oid, c.relname, p.partstrat) AS s;
+    )";
+
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
+    if (!res.empty() && !res[0][0].is_null())
+      return json::parse(res[0][0].as<std::string>());
+    json missing = no_such_schema(txn, schema);
+    return missing.is_null() ? json::object() : missing;
+  }
+
+  // One parent, every partition, with the readings that decide which one is
+  // the problem. The per-partition statistics already existed in
+  // pg_stat_user_tables -- autovacuum runs per partition, so a parent has no
+  // vacuum state of its own and bloat-and-vacuum-review was ranking a relation
+  // whose counters are always zero while the child that is behind went
+  // unlisted.
+  const json partition_details(const std::string& schema, const std::string& table) {
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+
+    const std::string query = std::string(R"(
+      SELECT JSONB_BUILD_OBJECT(
+        'table',    c.relname,
+        'strategy', CASE p.partstrat WHEN 'r' THEN 'range'
+                                     WHEN 'l' THEN 'list'
+                                     WHEN 'h' THEN 'hash'
+                                     ELSE p.partstrat::text END,
+        'key',      pg_get_partkeydef(c.oid),
+        'is_partition_of',
+          (SELECT pn.nspname || '.' || pc.relname
+             FROM pg_inherits pi
+             JOIN pg_class pc ON pc.oid = pi.inhparent
+             JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+            WHERE pi.inhrelid = c.oid),
+        )") + kCountersSince + R"(,
+        'partitions', COALESCE((
+          SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                   'name',    ch.relname,
+                   'schema',  chn.nspname,
+                   -- Verbatim. Parsing a bound generically is not possible --
+                   -- it carries whatever types the key columns have -- and a
+                   -- misparsed boundary is worse than an unparsed one. For a
+                   -- RANGE parent, comparing the highest upper bound here
+                   -- against now() is how to see that next period's partition
+                   -- was never created, which is the classic overnight failure.
+                   'bound',   pg_get_expr(ch.relpartbound, ch.oid),
+                   'is_default', pg_get_expr(ch.relpartbound, ch.oid) = 'DEFAULT',
+                   'is_partitioned', ch.relkind = 'p',
+                   'rows', GREATEST(ch.reltuples, 0)::bigint,
+                   'size_estimate',
+                     ch.relpages::bigint * current_setting('block_size')::bigint,
+                   'n_live_tup', s.n_live_tup,
+                   'n_dead_tup', s.n_dead_tup,
+                   'n_mod_since_analyze', s.n_mod_since_analyze,
+                   'n_ins_since_vacuum',  s.n_ins_since_vacuum,
+                   'seq_scan', s.seq_scan,
+                   'idx_scan', s.idx_scan,
+                   'last_vacuum',      s.last_vacuum,
+                   'last_autovacuum',  s.last_autovacuum,
+                   'last_analyze',     s.last_analyze,
+                   'last_autoanalyze', s.last_autoanalyze)
+                 ORDER BY pg_get_expr(ch.relpartbound, ch.oid) = 'DEFAULT', ch.relname)
+            FROM pg_inherits AS i
+            JOIN pg_class AS ch ON ch.oid = i.inhrelid
+            JOIN pg_namespace AS chn ON chn.oid = ch.relnamespace
+            LEFT JOIN pg_stat_user_tables AS s ON s.relid = ch.oid
+           WHERE i.inhparent = c.oid), '[]'::jsonb))
+        FROM pg_class AS c
+        JOIN pg_partitioned_table AS p ON p.partrelid = c.oid
+       WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
+         AND c.relname = $2;
+    )";
+
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, table});
+    if (!res.empty() && !res[0][0].is_null())
+      return json::parse(res[0][0].as<std::string>());
+
+    // Not partitioned and does not exist are different answers, and the first
+    // is the one a caller reaches by habit after listTables named the relation.
+    pqxx::result k = pqxx_exec(
+      txn, "SELECT c.relkind::text FROM pg_class c JOIN pg_namespace n "
+           "ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2",
+      pqxx::params{schema, table});
+    if (!k.empty())
+      return {{"error", "\"" + schema + "." + table + "\" is not a partitioned table"},
+              {"hint", "relkind is '" + k[0][0].as<std::string>() + "'; only a "
+                       "partitioned table (relkind 'p') has partitions. "
+                       "listPartitions names every partitioned table in a schema, "
+                       "and tableDetails describes an ordinary one."}};
+    return {{"error", "no such table: \"" + schema + "." + table + "\""},
+            {"hint", "listTables names every relation in a schema. Names are "
+                     "case sensitive here exactly as they are in the catalog."}};
   }
 
   const json list_table_stats(const std::string& schema) {
