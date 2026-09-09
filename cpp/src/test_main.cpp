@@ -2162,6 +2162,7 @@ TEST_F(PostgresMCPServerTest, PublicationsSayWhichSchemasArePublishedWholesale) 
   }
 }
 
+
 // --- listOperators ---
 
 TEST_F(PostgresMCPServerTest, ListOperatorsReturnsCustomOperator) {

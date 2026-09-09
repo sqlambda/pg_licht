@@ -137,7 +137,7 @@ for free space. The prompt leads with what makes the obvious response wrong:
 `VACUUM FULL` needs free space equal to the table and its indexes *before* it
 releases any, so it is not a disk-full action.
 
-Counts: 50 of 62 operations for a bare login role, 58 with `pg_monitor` — the
+Counts: 57 of 68 operations for a bare login role, 63 with `pg_monitor` — the
 `pg_ls_*` directory reads `diskUsage` uses are part of what that role grants.
 
 `triage-active-sessions` is for a server running more sessions at once than it
@@ -166,7 +166,7 @@ indexes and current lock waits can tell the two apart. **Completions** are offer
 
 ## Tools
 
-62 read-only operations, grouped as schema exploration, catalog search, cluster-wide
+68 read-only operations, grouped as schema exploration, catalog search, cluster-wide
 objects, extensibility and text search, foreign data and replication, monitoring and
 statistics, diagnostics and query planning, topology, and connections. Highlights include
 `tableDetails` (columns, indexes, constraints, foreign keys in both directions, triggers,
@@ -176,8 +176,8 @@ its `EXPLAIN` plan).
 
 `checkPrivileges` reports which of them the current role can actually use on a given
 connection. Most work for any role that can connect, since the catalog is world-readable:
-measured on PostgreSQL 18, a bare login role runs 50 of 62 at full fidelity, the monitoring
-role 58, and the ones that remain are those that read row data. Worth calling first
+measured on PostgreSQL 18, a bare login role runs 57 of 68 at full fidelity, the monitoring
+role 63, and the ones that remain are those that read row data. Worth calling first
 against an unfamiliar connection — a privilege-filtered answer is easy to mistake for an
 empty one, since `tableStats` on a role without `SELECT` returns columns with null
 statistics, exactly like a table that was never analyzed.
@@ -342,7 +342,7 @@ the tool, which takes precedence over both.
 
 | | |
 |---|---|
-| `man pg_licht_mcp` | configuration, connection strings, all 62 operations, MCP client setup |
+| `man pg_licht_mcp` | configuration, connection strings, all 68 operations, MCP client setup |
 | [INSTALL.md](INSTALL.md) | Homebrew, deb, rpm, tarball, verifying, uninstalling |
 | [BUILD.md](BUILD.md) | building from source, tests, sanitizers, CI, release process |
 | [CHANGES.md](CHANGES.md) | changelog |

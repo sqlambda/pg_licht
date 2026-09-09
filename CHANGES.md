@@ -1,5 +1,204 @@
 # Changelog
 
+## 4.3.0 (2026-09-09)
+
+Six new tools, from the twenty-four PostgreSQL catalogs this server did not
+read. Each closes a question the existing tools could only get halfway to, and
+one of them makes an instruction this server already gave finally executable.
+
+Sixty-eight operations. Measured on PostgreSQL 18: a bare login role runs 57 of
+them at full fidelity, a role with `pg_monitor` 63.
+
+### Added
+
+- **`listPartitions` and `partitionDetails`.** Nothing here read
+  `pg_partitioned_table` or `pg_inherits`. `relkind = 'p'` appeared in five
+  places and only ever printed the words "partitioned table", so a parent's
+  children, its key, its bounds and its default partition were all invisible —
+  while `tableSize`'s own description told the caller to *"measure the
+  partitions"*, an instruction there was no way to follow. That is why this is
+  the first item of the release: it makes existing advice executable rather than
+  adding a new answer.
+
+  `listPartitions` summarises every parent in a schema — strategy, key,
+  partition count, combined rows and size, and whether a `DEFAULT` partition
+  exists and how many rows it holds. It reads `reltuples` and `relpages`, which
+  are catalog columns, so it opens no relation and takes no lock. Measured sizes
+  are deliberately not folded in: a parent with three hundred children would be
+  three hundred relation opens behind an innocent-looking call.
+
+  `partitionDetails` carries the per-partition statistics, which is the point of
+  it. **Autovacuum runs per partition**, so a parent has no vacuum state of its
+  own — its `n_dead_tup` cannot move — and `bloat-and-vacuum-review` was ranking
+  a relation whose counters are permanently zero while the child that had fallen
+  behind went unlisted. The prompt now takes partitions from here and ranks
+  those.
+
+  Bounds are returned **verbatim, never parsed**. A bound carries whatever types
+  the key columns have, so parsing one generically is not possible and a
+  misparsed boundary is worse than an unparsed one. For a range parent, the
+  highest upper bound against `now()` is how to see that next period's partition
+  was never created — the classic overnight failure — and that is readable off
+  the text.
+
+  `default_rows` is the finding to look for: rows land in a `DEFAULT` partition
+  when they match no bound, so a growing default is a missing partition that has
+  not failed loudly *yet*.
+
+- **`roleDependencies`** — the inverse of `checkRoleAccess`. That tool answers
+  whether a role may *use* an object; nothing answered what depends *on* it,
+  which is the whole of
+
+  ```
+  ERROR:  role "x" cannot be dropped because some objects depend on it
+  DETAIL: 4 objects in database app
+  ```
+
+  — a message that reports a count and names nothing. `by_kind` separates
+  `owner`, which blocks `DROP ROLE` outright and is cleared by `REASSIGN OWNED`,
+  from `acl` and `policy`, which `DROP OWNED` clears; that distinction is the
+  fix, not a detail.
+
+  `pg_shdepend` is shared across the cluster, and that cuts both ways. The count
+  and the per-database breakdown cover **every** database. The names do not: an
+  object id resolves only from the database it lives in, so `objects` carries
+  this database and the shared catalogs while others appear as counts.
+  Reporting only what is resolvable would have answered *"nothing depends on
+  this role"* to somebody about to drop it.
+
+- **`defaultPrivileges`** — `ALTER DEFAULT PRIVILEGES`, which decides what
+  grants the **next** object gets. `checkRoleAccess` answers about the objects
+  that exist, and a correct answer today that is wrong for tomorrow's table is
+  the standing cause of "the new table is not readable and every old one is" —
+  which presents as a broken grant and is a missing default. Scope `global`
+  (`defaclnamespace = 0`) overrides the hard-wired defaults while per-schema
+  entries are *added* to them, so two entries for one type are cumulative rather
+  than conflicting, and `granted_by` is reported because a default applies only
+  to objects that role creates.
+
+- **`largeObjects`** — growth no size tool can see. Large objects live in a
+  catalog rather than in any user relation, so `tableSize`, `listTableSizes` and
+  `tableStats` are all blind to them while `diskUsage.databases` counts their
+  bytes. The signature is *"the database grew and no table did"*, which
+  `triage-disk-space` could not resolve: it would rank tables, find nothing, and
+  stop.
+
+  Counted and owned, **never sized**. The bytes are in `pg_largeobject`, which
+  the documentation says is no longer publicly readable and directs callers away
+  from, so a size is not available here and is not invented. The prompt is told
+  not to propose `lo_unlink` from a count either: an object is unreferenced only
+  if no column holds its oid, which the catalog cannot answer, and unlinking a
+  live one loses data.
+
+- **`replicationStats`** — the publisher side, and the only source of lag as a
+  **time**. `replicationSlots` reports what a slot *retains*, in bytes;
+  `subscriptionStats` cannot measure lag at all, because neither of its LSN
+  columns references the publisher. So "how far behind is this replica, in
+  seconds" had no answer anywhere. Serves physical standbys and logical
+  subscribers alike, and both halves run on their own savepoint because they
+  fail differently.
+
+  Two readings it states because both are routinely misread. The view is
+  security-restricted **per row** rather than refused, so a role without
+  `pg_read_all_stats` sees the senders exist with many columns null — which
+  looks like an idle replica and is a permission answer. And the lag columns
+  revert to `NULL` a short time after a standby has entirely caught up and WAL
+  activity stops, so a null lag on an idle replica means caught up, while a
+  non-null one there is the last measurement rather than the current state.
+
+- **`explainQuery` and `evaluateIndex` take `settings` and `plan_as_role`.**
+  4.2.1 made the mismatch visible — every `EXPLAIN` gained `SETTINGS`, so a plan
+  said what environment produced it, and `hostCapacity.overrides` said what
+  production uses. Neither removed it. `work_mem` alone changes the algorithm
+  rather than the cost: measured on PostgreSQL 18 over 400,000 rows with
+  identical statistics, one statement planned as `GroupAggregate` over a `Sort`
+  at 64kB and as `HashAggregate` at 512MB.
+
+  Three decisions carry the safety:
+
+  `set_config(name, value, is_local := true)` rather than a built `SET LOCAL`
+  string. It is a function call with bound parameters, so a value cannot escape
+  into SQL text at all, and `is_local` means the setting reverts when the
+  transaction ends — it cannot leak across a connection a pooler hands to
+  somebody else. That is the property that made the read-only guard
+  transaction-scoped rather than session-scoped, and the same reason. A test
+  asserts it by planning again afterwards and requiring the setting to be gone.
+
+  **An allowlist, not a denylist.** An arbitrary passthrough would let a caller
+  turn off `default_transaction_read_only`, remove `statement_timeout`, or
+  change `role` and `session_authorization` — three of this server's four safety
+  properties, handed away through a convenience argument. The set that changes a
+  plan is bounded and known, and every entry is `USERSET`. `enable_*` is
+  admitted by prefix, because every one of them is a planner toggle by
+  convention and new ones arrive most releases.
+
+  **An unknown name is refused and nothing is planned.** Silently dropping it
+  would return a plan the caller believes was built under an environment that
+  was never applied — the exact failure class 4.2.1 and 4.2.2 kept correcting,
+  reintroduced through the fix for it.
+
+  `search_path` is excluded even though it changes plans, because it does so by
+  changing *which objects the statement resolves to* rather than how they are
+  joined; planning against a different table than the caller meant is worse than
+  refusing, and the refusal says so. `plan_as_role` reads `pg_db_role_setting`
+  and applies only the planner half, listing what it skipped rather than
+  dropping it.
+
+  `evaluateIndex` takes both for a reason of its own: its whole output is a
+  before/after cost comparison, so an environment that does not match production
+  makes **both halves** answer a different question.
+
+  `explain-and-fix` and `diagnose-slow-query` now plan twice and compare rather
+  than noting a caveat. It is the same shape as the generic-versus-custom
+  comparison they already make: two plans, one difference, and the difference is
+  the answer. Where they agree, the environment is ruled *out* instead of
+  carried.
+
+- **`listPublications` reports the schemas published via `FOR TABLES IN SCHEMA`**
+  (PostgreSQL 15+). The members were never missing —
+  `pg_publication_tables` resolves them either way — but the *declaration* was,
+  and it decides what happens next: a table created later in a published schema
+  joins the publication by itself, while one added to a table-list publication
+  does not. Two publications with identical members today can behave differently
+  tomorrow.
+
+- **`roleDependencies` names parameters granted with `GRANT SET ON PARAMETER`**
+  (PostgreSQL 15+). Those are shared dependencies like any other grant, so the
+  rows were already in the total and only the name was absent.
+
+### Fixed
+
+- **Tablespace comments were never readable.** `listTablespaces` read its
+  description through `obj_description(oid, 'pg_tablespace')`. A tablespace is a
+  **shared** object, so `COMMENT ON TABLESPACE` writes to `pg_shdescription`,
+  and `obj_description()` reads `pg_description` — so every commented tablespace
+  has reported `''` since the tool existed. Not null, not missing: empty, which
+  reads as "no comment".
+
+  Verified on PostgreSQL 18 before changing anything: the same tablespace gave
+  `NULL` through `obj_description` and the comment through `shobj_description`.
+
+### Compatibility
+
+Additive except for one corrected field.
+
+`listTablespaces.description` now returns the comment where one exists, having
+previously returned `''` for every tablespace. A caller that treated empty as
+"no comment" will start seeing text.
+
+Everything else adds. `listPublications` gains `schemas` on PostgreSQL 15 and
+later; `explainQuery` and `evaluateIndex` gain two optional input properties and
+a `planning_environment` key that appears only when one of them is used; the six
+new tools are new names. No existing tool's name or input schema changes and no
+key is removed.
+
+### Deliberately not built
+
+`pg_seclabel`, `pg_shseclabel` and `pg_init_privs`. Security labels are
+meaningful only with a label provider in use, and `init_privs` is extension
+bookkeeping. Neither has an operational question behind it, which is the bar
+this project sets for a new tool.
+
 ## 4.2.2 (2026-09-07)
 
 4.2.1 was exercised against a real 617 GB cluster — 24 schemas, 3,165 tables,

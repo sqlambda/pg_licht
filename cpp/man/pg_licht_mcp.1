@@ -1,7 +1,7 @@
 .\" Copyright (c) 2026 Daniel Cristian.
 .\" Licensed under the Apache License, Version 2.0; see LICENSE.
 .\"
-.Dd September 7, 2026
+.Dd September 9, 2026
 .Dt PG_LICHT_MCP 1
 .Os pg-licht
 .Sh NAME
@@ -1148,6 +1148,100 @@ Only this I/O context, e.g.
 or
 .Ql bulkwrite .
 .El
+.It Ic listPartitions Va schema
+Every partitioned table in a schema: strategy, partition key, partition count,
+combined estimated rows and size, whether a
+.Sy DEFAULT
+partition exists and how many rows it holds, and how many partitions are
+themselves partitioned.
+Reads
+.Li reltuples
+and
+.Li relpages ,
+so no relation is opened and no lock is taken.
+.Pp
+A growing default partition is the finding: rows land there when they match no
+bound, so it is a missing partition that has not failed loudly yet.
+.It Ic partitionDetails Va schema , Va table
+One parent and every partition: the bound expression verbatim, whether it is the
+.Sy DEFAULT ,
+whether it is itself partitioned, estimated rows and size, and the per-partition
+live and dead tuples, scan counters and vacuum and analyze timestamps.
+.Pp
+Autovacuum runs per
+.Sy partition ,
+so a parent has no vacuum state of its own and ranking parents finds nothing
+while one child falls behind.
+Bounds are verbatim rather than parsed: a bound carries whatever types the key
+columns have, and a misparsed boundary is worse than an unparsed one.
+For a range parent, the highest upper bound against
+.Li now()
+says whether the next period's partition exists.
+.It Ic roleDependencies Va role
+What depends on one role, from
+.Li pg_shdepend .
+.Va by_kind
+separates
+.Li owner ,
+which blocks
+.Sy DROP ROLE
+and is cleared by
+.Sy REASSIGN OWNED ,
+from
+.Li acl
+and
+.Li policy ,
+which
+.Sy DROP OWNED
+clears.
+.Pp
+.Li pg_shdepend
+is shared across the cluster, so the counts cover every database; an object id
+resolves only from the database it lives in, so
+.Va objects
+names this database and the shared catalogs while others appear as counts.
+.It Ic defaultPrivileges Op Va schema
+.Sy ALTER DEFAULT PRIVILEGES
+entries: what grants the
+.Sy next
+object of each type will get.
+Scope
+.Li global
+overrides the hard-wired defaults; per-schema entries are added to them.
+A default applies only to objects created by
+.Va granted_by .
+.It Ic largeObjects
+How many large objects this database holds and who owns them.
+Large objects live in a catalog rather than a relation, so every size tool here
+is blind to them while
+.Ic diskUsage
+counts their bytes.
+No sizes: the bytes are in
+.Li pg_largeobject ,
+which is not publicly readable.
+.It Ic replicationStats
+Every WAL sender on this server with state, sync state, the LSNs, the byte gap
+to replay, and
+.Va write_lag ,
+.Va flush_lag
+and
+.Va replay_lag
+in seconds \(em plus replication origin progress.
+The only source of replication lag as a
+.Sy time .
+.Pp
+Two readings that are routinely misread.
+The view is security restricted
+.Sy per row
+rather than refused, so a role without
+.Li pg_read_all_stats
+sees the senders exist with columns null, which looks like an idle replica and
+is a permission answer.
+And the lag columns revert to
+.Dv NULL
+a short time after a standby has entirely caught up and WAL activity stops, so a
+null lag there means caught up while a non-null one is the last measurement
+rather than the current state.
 .It Ic wraparoundStatus Op Va schema , Va limit
 Transaction id and multixact wraparound headroom.
 For every database:
