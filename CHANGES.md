@@ -66,6 +66,10 @@ them at full fidelity, a role with `pg_monitor` 63.
   Reporting only what is resolvable would have answered *"nothing depends on
   this role"* to somebody about to drop it.
 
+  Reads `pg_roles`, never `pg_authid`, so a bare login role can ask. That is
+  the role most likely to be asking: the one that cannot run `DROP ROLE`
+  itself and wants to know what to hand the person who can.
+
 - **`defaultPrivileges`** — `ALTER DEFAULT PRIVILEGES`, which decides what
   grants the **next** object gets. `checkRoleAccess` answers about the objects
   that exist, and a correct answer today that is wrong for tomorrow's table is

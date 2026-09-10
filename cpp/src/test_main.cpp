@@ -1945,6 +1945,67 @@ TEST_F(PostgresMCPServerTest, RoleDependenciesNamesWhatBlocksADropAndCountsWhatI
   }
 }
 
+// pg_authid has no public SELECT. The first version of this tool joined it,
+// and every non-superuser -- the role most likely to be asking before a DROP
+// ROLE it cannot itself run -- got "permission denied for table pg_authid" and
+// no answer. pg_roles carries everything this tool reads. The superuser test
+// above cannot see the difference, which is why this one exists.
+TEST_F(PostgresMCPServerTest, RoleDependenciesAnswersABareLoginRole) {
+  const std::string asker  = "licht_depask_" + std::to_string(getpid());
+  const std::string target = "licht_deptgt_" + std::to_string(getpid());
+  const std::string sch    = "depb_" + std::to_string(getpid());
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + asker + "\"");
+    n.exec("CREATE ROLE \"" + asker + "\" LOGIN");
+    n.exec("DROP ROLE IF EXISTS \"" + target + "\"");
+    n.exec("CREATE ROLE \"" + target + "\"");
+  }
+  {
+    pqxx::connection owner(test_url);
+    pqxx::nontransaction n(owner);
+    n.exec("CREATE SCHEMA " + sch + " AUTHORIZATION \"" + target + "\"");
+  }
+  const std::string url = std::regex_replace(
+      test_url, std::regex(R"(\buser\s*=\s*\S+)"), "") + " user=" + asker;
+
+  // Same two reasons this may be impossible here as the other restricted-role
+  // tests: peer auth refuses the login, or a forced-user pooler hands back the
+  // superuser's session whichever role was asked for.
+  bool usable = false;
+  try {
+    pqxx::connection probe(url);
+    pqxx::work t(probe);
+    usable = (t.exec("SELECT current_user")[0][0].as<std::string>() == asker);
+  } catch (const std::exception&) {
+  }
+
+  if (usable) {
+    PostgresMCPServer unpriv{url};
+    json r = unpriv.call_role_dependencies(target);
+    ASSERT_FALSE(r.contains("error")) << r.dump(2);
+    ASSERT_TRUE(r.contains("total")) << r.dump(2);
+    EXPECT_TRUE(r["exists"].get<bool>());
+    EXPECT_GE(r["total"].get<int>(), 1);
+    bool named = false;
+    for (const auto& o : r["objects"])
+      if (o["name"].is_string() && o["name"].get<std::string>() == sch) named = true;
+    EXPECT_TRUE(named) << r["objects"].dump(2);
+  }
+
+  {
+    pqxx::connection owner(test_url);
+    pqxx::nontransaction n(owner);
+    n.exec("DROP SCHEMA " + sch);
+  }
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + target + "\"");
+    n.exec("DROP ROLE IF EXISTS \"" + asker + "\"");
+  }
+  if (!usable) GTEST_SKIP() << "cannot log in as an unprivileged role here";
+}
+
 // The standing cause of "the new table is not readable and every old one is":
 // a missing default, which presents as a broken grant.
 TEST_F(PostgresMCPServerTest, DefaultPrivilegesReportWhatTheNextObjectWillGet) {

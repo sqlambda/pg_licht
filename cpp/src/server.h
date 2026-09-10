@@ -7253,13 +7253,18 @@ private:
       WITH d AS (
         SELECT s.dbid, s.classid, s.objid, s.objsubid, s.deptype
           FROM pg_shdepend AS s
-          JOIN pg_authid AS a ON a.oid = s.refobjid
+          -- pg_roles, never pg_authid. pg_authid has no public SELECT, so a
+          -- bare login role reading it gets "permission denied" and no answer
+          -- at all -- and that is the role most likely to be asking before a
+          -- DROP ROLE it does not itself have the privilege to run. The
+          -- refclassid comparison is a regclass literal and reads nothing.
+          JOIN pg_roles AS a ON a.oid = s.refobjid
          WHERE a.rolname = $1
            AND s.refclassid = 'pg_authid'::regclass
       )
       SELECT JSONB_BUILD_OBJECT(
         'role', $1,
-        'exists', EXISTS (SELECT 1 FROM pg_authid WHERE rolname = $1),
+        'exists', EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1),
         'total', (SELECT count(*) FROM d),
         -- deptype, spelled out. 'o' is the one that blocks DROP ROLE outright;
         -- 'a' and 'r' are cleared by REASSIGN OWNED / DROP OWNED, and knowing
@@ -7307,8 +7312,13 @@ private:
                                THEN (SELECT datname FROM pg_database WHERE oid = d.objid)
                              WHEN d.classid = 'pg_tablespace'::regclass
                                THEN (SELECT spcname FROM pg_tablespace WHERE oid = d.objid)
+                             -- pg_roles again: this branch is unreachable for
+                             -- most rows, and that does not help. Its condition
+                             -- is a column, not a constant, so the subselect
+                             -- stays in the range table and the permission
+                             -- check fires whether or not a row ever takes it.
                              WHEN d.classid = 'pg_authid'::regclass
-                               THEN (SELECT rolname FROM pg_authid WHERE oid = d.objid)
+                               THEN (SELECT rolname FROM pg_roles WHERE oid = d.objid)
                              WHEN d.classid = 'pg_type'::regclass
                                THEN (SELECT n.nspname || '.' || t.typname
                                        FROM pg_type t JOIN pg_namespace n
