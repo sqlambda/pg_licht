@@ -154,7 +154,10 @@ them at full fidelity, a role with `pg_monitor` 63.
   joined; planning against a different table than the caller meant is worse than
   refusing, and the refusal says so. `plan_as_role` reads `pg_db_role_setting`
   and applies only the planner half, listing what it skipped rather than
-  dropping it.
+  dropping it. A per-database entry (`ALTER ROLE ... IN DATABASE`) overrides
+  the role-wide one, which is the precedence the server itself gives them; the
+  entries are applied in that order so the last one applied is the one
+  production runs under.
 
   `evaluateIndex` takes both for a reason of its own: its whole output is a
   before/after cost comparison, so an environment that does not match production

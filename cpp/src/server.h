@@ -4128,9 +4128,16 @@ private:
   // role's plan would be worse than one that never claimed it.
   json apply_role_settings(pqxx::work& txn, const std::string& role,
                            json& applied, json& skipped, bool& role_exists) {
+    // ORDER BY s.setdatabase, cfg: role-wide entries (setdatabase = 0) first,
+    // this database's entries after them. They are applied in this order and
+    // the last one wins, which is the precedence PostgreSQL itself gives them
+    // -- ALTER ROLE r IN DATABASE d SET overrides ALTER ROLE r SET. Ordered by
+    // text alone, "work_mem=1GB" sorts before "work_mem=64MB" and the role-wide
+    // 64MB would be what got planned under, in the one configuration where the
+    // tool's promise of "the plan the application gets" matters most.
     pqxx::result r = pqxx_exec(txn,
       "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1),"
-      "       COALESCE((SELECT JSONB_AGG(cfg ORDER BY cfg)"
+      "       COALESCE((SELECT JSONB_AGG(cfg ORDER BY s.setdatabase, cfg)"
       "                   FROM pg_db_role_setting s"
       "                   JOIN pg_roles rr ON rr.oid = s.setrole"
       "                   CROSS JOIN LATERAL unnest(s.setconfig) AS cfg"

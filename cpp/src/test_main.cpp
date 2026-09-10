@@ -2164,6 +2164,24 @@ TEST_F(PostgresMCPServerTest, PlanAsRoleTakesThePlannerSettingsAndReportsTheRest
   auto& pe = r["planning_environment"];
   EXPECT_EQ(pe["from_role"].get<std::string>(), role);
   EXPECT_EQ(pe["applied"]["work_mem"], "256MB");
+
+  // A per-database entry overrides the role-wide one -- that is the precedence
+  // PostgreSQL gives ALTER ROLE ... IN DATABASE, and the first version of this
+  // applied the entries in text order, under which "work_mem=1GB" sorted before
+  // "work_mem=256MB" and the role-wide value won. 1GB is chosen because it
+  // sorts FIRST as text: the test fails under the old order and passes only
+  // when database-specific entries are applied last.
+  {
+    pqxx::connection c(test_url);
+    pqxx::nontransaction n(c);
+    const std::string db = n.exec("SELECT current_database()")[0][0].as<std::string>();
+    n.exec("ALTER ROLE \"" + role + "\" IN DATABASE \"" + db + "\" SET work_mem = '1GB'");
+  }
+  json db_r = srv->call_explain_query("", "SELECT 1", json::array(), false, 0,
+                                      json::object(), role);
+  ASSERT_TRUE(db_r.contains("planning_environment")) << db_r.dump(2);
+  EXPECT_EQ(db_r["planning_environment"]["applied"]["work_mem"], "1GB")
+      << db_r["planning_environment"].dump(2);
   bool skipped_timeout = false;
   for (const auto& sk : pe["skipped_from_role"])
     if (sk["name"] == "statement_timeout") {

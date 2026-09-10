@@ -805,7 +805,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		    {"settings", {{"type", "object"},
    		                  {"description", "planner settings to apply for this plan only, e.g. {\"work_mem\": \"512MB\"}. Applied with set_config(is_local) so they revert with the transaction and cannot leak to another session. Allowlisted to settings that change a PLAN; an unknown name is refused and nothing is planned, rather than ignored"}}},
    		    {"plan_as_role", {{"type", "string"},
-   		                      {"description", "plan under what this role carries in pg_db_role_setting, filtered to planner settings. Non-planner entries such as search_path or statement_timeout are reported under skipped_from_role rather than dropped silently"}}}
+   		                      {"description", "plan under what this role carries in pg_db_role_setting, filtered to planner settings. A per-database entry (ALTER ROLE ... IN DATABASE) overrides the role-wide one, as the server itself applies them. Non-planner entries such as search_path or statement_timeout are reported under skipped_from_role rather than dropped silently"}}}
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
