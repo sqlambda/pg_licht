@@ -2241,6 +2241,148 @@ TEST_F(PostgresMCPServerTest, OnlyPlannerSettingsAreAccepted) {
       << sp["hint"];
 }
 
+// --- the execution budget: settings under analyze ---
+//
+// analyze EXECUTES, and then caller settings set the footprint of a statement
+// that really runs. Neither the read-only guard nor the timeout bounds memory,
+// so executing under explicit settings is bounded by the host capacity the
+// operator declared, and refused outright where none is declared.
+namespace {
+// A server over the test database with host capacity declared through the
+// environment, exactly as a single-DATABASE_URL deployment declares it. The
+// fixture clears these variables, and this restores that state before
+// returning, so no other test sees them.
+std::unique_ptr<PostgresMCPServer> server_with_capacity(const std::string& url,
+                                                        const char* ram_mb,
+                                                        const char* vcpus) {
+  ::setenv("PG_LICHT_HOST_RAM_MB", ram_mb, 1);
+  ::setenv("PG_LICHT_HOST_VCPUS", vcpus, 1);
+  auto reg = pglicht::ConnectionRegistry::from_url(url, "pg-licht-test");
+  ::unsetenv("PG_LICHT_HOST_RAM_MB");
+  ::unsetenv("PG_LICHT_HOST_VCPUS");
+  return std::make_unique<PostgresMCPServer>(std::move(reg));
+}
+
+// A table big enough for the planner to go parallel once the costs allow it,
+// and a sort to give the plan a node bounded by work_mem.
+struct BudgetTable {
+  std::string sch;
+  pqxx::connection c;
+  explicit BudgetTable(const std::string& url)
+      : sch("eb_" + std::to_string(getpid())), c(url) {
+    pqxx::nontransaction n(c);
+    n.exec("CREATE SCHEMA " + sch);
+    n.exec("CREATE TABLE " + sch + ".t AS SELECT g AS id, g % 97 AS k "
+           "FROM generate_series(1, 100000) AS g");
+    n.exec("ANALYZE " + sch + ".t");
+  }
+  ~BudgetTable() {
+    try { pqxx::nontransaction n(c); n.exec("DROP SCHEMA " + sch + " CASCADE"); }
+    catch (...) {}
+  }
+  std::string sort_sql() const { return "SELECT id FROM " + sch + ".t ORDER BY k"; }
+  std::string count_sql() const { return "SELECT count(*) FROM " + sch + ".t"; }
+};
+
+json parallel_settings() {
+  return json{{"max_parallel_workers_per_gather", "4"}, {"parallel_setup_cost", "0"},
+              {"parallel_tuple_cost", "0"}, {"min_parallel_table_scan_size", "0"}};
+}
+}  // namespace
+
+TEST_F(PostgresMCPServerTest, WithNoDeclaredCapacityNoSettingsAreExecuted) {
+  // The fixture's server declares no capacity.
+  BudgetTable t(test_url);
+  json r = srv->call_explain_query("", t.sort_sql(), json::array(), true, 5000,
+                                   json{{"work_mem", "4MB"}}, "");
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  // Planned under the settings, never executed under them.
+  EXPECT_FALSE(r["analyzed"].get<bool>()) << r.dump(2);
+  ASSERT_TRUE(r.contains("plan"));
+  EXPECT_NE(r["note"].get<std::string>().find("host_ram_mb"), std::string::npos) << r["note"];
+  const auto& b = r["planning_environment"]["execution_budget"];
+  EXPECT_FALSE(b["allowed"].get<bool>()) << b.dump(2);
+  EXPECT_TRUE(b["host"].empty()) << b.dump(2);
+
+  // Unchanged without settings: the connection's own environment runs.
+  json plain = srv->call_explain_query("", t.sort_sql(), json::array(), true, 5000);
+  EXPECT_TRUE(plain["analyzed"].get<bool>()) << plain.dump(2);
+
+  // plan_as_role alone is production's own environment, and is not budgeted.
+  const std::string role = "licht_eb_" + std::to_string(getpid());
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+    n.exec("CREATE ROLE \"" + role + "\"");
+    n.exec("ALTER ROLE \"" + role + "\" SET work_mem = '8MB'");
+  }
+  json as_role = srv->call_explain_query("", t.sort_sql(), json::array(), true, 5000,
+                                         json::object(), role);
+  EXPECT_TRUE(as_role["analyzed"].get<bool>()) << as_role.dump(2);
+  EXPECT_FALSE(as_role["planning_environment"].contains("execution_budget"))
+      << as_role["planning_environment"].dump(2);
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+  }
+}
+
+TEST_F(PostgresMCPServerTest, SettingsWithinTheDeclaredBudgetAreExecuted) {
+  BudgetTable t(test_url);
+  auto s = server_with_capacity(test_url, "8192", "16");
+  json r = s->call_explain_query("", t.sort_sql(), json::array(), true, 5000,
+                                 json{{"work_mem", "4MB"}}, "");
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  EXPECT_TRUE(r["analyzed"].get<bool>()) << r.dump(2);
+  const auto& b = r["planning_environment"]["execution_budget"];
+  EXPECT_TRUE(b["allowed"].get<bool>()) << b.dump(2);
+  EXPECT_EQ(b["host"]["source"], "environment") << b.dump(2);
+  // A tenth of 8192 MB.
+  EXPECT_EQ(b["memory_budget_bytes"].get<long long>(), 8192LL * 1048576 / 10);
+  EXPECT_GE(b["memory_nodes"].get<int>(), 1) << b.dump(2);
+  EXPECT_GE(b["worst_case_memory_bytes"].get<long long>(), 4LL * 1048576) << b.dump(2);
+  EXPECT_LE(b["worst_case_memory_bytes"].get<long long>(),
+            b["memory_budget_bytes"].get<long long>());
+}
+
+TEST_F(PostgresMCPServerTest, MemoryBeyondTheDeclaredBudgetIsPlannedButNotExecuted) {
+  BudgetTable t(test_url);
+  // A tenth of 1024 MB is about 102 MB; one sort at 1GB is past it.
+  auto s = server_with_capacity(test_url, "1024", "16");
+  json r = s->call_explain_query("", t.sort_sql(), json::array(), true, 5000,
+                                 json{{"work_mem", "1GB"}}, "");
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  EXPECT_FALSE(r["analyzed"].get<bool>()) << r.dump(2);
+  ASSERT_TRUE(r.contains("plan"));
+  EXPECT_NE(r["note"].get<std::string>().find("worst-case memory"), std::string::npos)
+      << r["note"];
+  const auto& b = r["planning_environment"]["execution_budget"];
+  EXPECT_FALSE(b["allowed"].get<bool>());
+  EXPECT_GE(b["worst_case_memory_bytes"].get<long long>(), 1024LL * 1048576) << b.dump(2);
+}
+
+TEST_F(PostgresMCPServerTest, WorkersBeyondTheDeclaredBudgetArePlannedButNotExecuted) {
+  BudgetTable t(test_url);
+  // Four vCPUs allow one worker; the settings make the planner ask for four.
+  auto small = server_with_capacity(test_url, "65536", "4");
+  json r = small->call_explain_query("", t.count_sql(), json::array(), true, 5000,
+                                     parallel_settings(), "");
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  const auto& b = r["planning_environment"]["execution_budget"];
+  ASSERT_GT(b["workers_planned"].get<int>(), 1)
+      << "the planner did not go parallel, so this test proves nothing: " << r["plan"].dump(2);
+  EXPECT_EQ(b["workers_budget"].get<int>(), 1);
+  EXPECT_FALSE(r["analyzed"].get<bool>()) << r.dump(2);
+  EXPECT_NE(r["note"].get<std::string>().find("parallel worker"), std::string::npos)
+      << r["note"];
+
+  // Sixteen vCPUs allow four, and the same call runs.
+  auto big = server_with_capacity(test_url, "65536", "16");
+  json ok = big->call_explain_query("", t.count_sql(), json::array(), true, 5000,
+                                    parallel_settings(), "");
+  EXPECT_TRUE(ok["analyzed"].get<bool>()) << ok.dump(2);
+}
+
 // The form the question is actually asked in: "why is it slow for the
 // application". Removes the step where a human copies values out of
 // hostCapacity.overrides by hand and gets one wrong.

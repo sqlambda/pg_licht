@@ -338,6 +338,14 @@ Or, with a single `DATABASE_URL`, via `PG_LICHT_HOST_RAM_MB` and `PG_LICHT_HOST_
 agent that inspects the host at run time can instead pass `ram_mb` and `vcpus` straight to
 the tool, which takes precedence over both.
 
+The declared figures also bound one thing that executes. `explainQuery` with `analyze` and
+explicit `settings` runs the statement under those settings only if the plan's worst-case
+memory fits in a tenth of `host_ram_mb` and it uses at most one parallel worker per four
+`host_vcpus`. With no declared capacity it runs under no settings change at all and returns
+the plan unexecuted. The read-only guard and the timeout do not bound memory, and one
+out-of-memory kill restarts every connection on the instance. The per-call `ram_mb` and
+`vcpus` arguments do not count here: a caller cannot raise its own limit.
+
 ## Documentation
 
 | | |

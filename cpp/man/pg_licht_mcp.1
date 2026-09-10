@@ -1789,6 +1789,34 @@ An unknown name is refused and nothing is planned, rather than ignored.
 .Va search_path
 is excluded on purpose: it changes which objects the statement resolves to
 rather than how they are joined.
+.Pp
+With
+.Va analyze
+the statement is executed under these settings only within a budget taken from
+the host capacity declared for the connection, as
+.Va host_ram_mb
+and
+.Va host_vcpus .
+The worst case the plan's memory limits permit must stay within a tenth of the
+declared RAM: each sort-like node at
+.Va work_mem ,
+each hash node at
+.Va work_mem
+times
+.Va hash_mem_multiplier ,
+times the processes running it.
+The plan may use at most one parallel worker per four declared vCPUs.
+With no declared capacity, no settings change is executed at all.
+A refused plan is still returned with
+.Va analyzed
+false, and
+.Va execution_budget
+under
+.Va planning_environment
+carries the arithmetic.
+The read-only guard and the timeout bound what the statement writes and how long
+it runs, but not what it allocates, and an out-of-memory kill of one backend
+restarts every connection on the instance.
 .It Va plan_as_role
 Plan under what this role carries in
 .Li pg_db_role_setting ,
@@ -1806,6 +1834,8 @@ rather than dropped silently.
 Explicit
 .Va settings
 win over what the role carries.
+On its own it is not held to the execution budget, because it applies what the
+role already runs with in production.
 .El
 .Pp
 When either is given the result carries

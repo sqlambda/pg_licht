@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <chrono>
 #include <functional>
+#include <limits>
 #include <cctype>
 #include <iostream>
 #include <map>
@@ -4037,6 +4038,148 @@ private:
     return it->get<std::string>();
   }
 
+  // --- the execution budget for EXPLAIN ANALYZE under caller settings ---
+  //
+  // settings exists to change a PLAN, and for planning that is safe. analyze
+  // EXECUTES, and then work_mem, hash_mem_multiplier and the parallelism knobs
+  // set the resource footprint of a statement that really runs. The read-only
+  // guard and the 30s timeout bound what it writes and how long it runs, and
+  // neither bounds memory: work_mem goes to 2TB per sort or hash node and
+  // hash_mem_multiplier to 1000. A hash join at those values can exhaust RAM
+  // in seconds, and an OOM kill of one backend restarts every connection on
+  // the instance. That is an outage caused by a read-only tool call.
+  //
+  // So caller-supplied settings may be EXECUTED only within a budget taken
+  // from the host capacity the operator declared for this connection --
+  // host_ram_mb and host_vcpus, per connection, inherited from its
+  // [instance:...] section, or from the environment. Never from a tool
+  // argument: a caller must not be able to raise its own limit. With either
+  // figure absent there is nothing to bound against, and no settings change is
+  // executed at all; the plan built under the settings is still returned.
+  //
+  // plan_as_role alone is not budgeted. It applies what that role already runs
+  // with in production, so it cannot exceed production's own footprint.
+  static constexpr long long kAnalyzeRamShareDivisor = 10;  // a tenth of RAM
+  static constexpr int kAnalyzeVcpusPerWorker = 4;          // 1 worker / 4 vCPUs
+
+  struct ExecFootprint {
+    double worst_bytes = 0;   // double: work_mem x 1000 x participants overflows int64
+    int memory_nodes = 0;
+    int workers = 0;
+  };
+
+  // The worst case the executor may allocate for a plan, from the plan's own
+  // shape. Each memory-using node is limited to work_mem, or to hash_mem
+  // (work_mem x hash_mem_multiplier) for a hash table, and every process that
+  // runs the node gets its own allowance: under a Gather that is the planned
+  // workers plus the leader. A Parallel Hash shares one table, but its size
+  // limit is also hash_mem x participants, so the same product holds.
+  //
+  // An upper bound on what the limits permit, not a prediction -- a node that
+  // never reaches its limit uses less. Deliberately conservative where the
+  // plan cannot say: every CTE Scan is counted, though scans of one CTE share
+  // a tuplestore.
+  static void plan_footprint(const json& node, double work_mem, double hash_mem,
+                             double participants, ExecFootprint& fp) {
+    if (!node.is_object()) return;
+    const std::string type  = node.value("Node Type", "");
+    const std::string strat = node.value("Strategy", "");
+    const bool hashed =
+        type == "Hash" || type == "Memoize" || type == "Recursive Union" ||
+        ((type == "Aggregate" || type == "SetOp") &&
+         (strat == "Hashed" || strat == "Mixed"));
+    const bool bounded_by_work_mem =
+        type == "Sort" || type == "Incremental Sort" || type == "Materialize" ||
+        type == "WindowAgg" || type == "Function Scan" ||
+        type == "Table Function Scan" || type == "CTE Scan" ||
+        type == "Bitmap Heap Scan";
+    if (hashed)                   { fp.worst_bytes += hash_mem * participants; fp.memory_nodes++; }
+    else if (bounded_by_work_mem) { fp.worst_bytes += work_mem * participants; fp.memory_nodes++; }
+
+    double below = participants;
+    if (type == "Gather" || type == "Gather Merge") {
+      const int w = node.value("Workers Planned", 0);
+      fp.workers += w;
+      below = participants * (w + 1);
+    }
+    if (node.contains("Plans") && node["Plans"].is_array())
+      for (const auto& child : node["Plans"])
+        plan_footprint(child, work_mem, hash_mem, below, fp);
+  }
+
+  // Decides whether a plan built under caller settings may be executed, and
+  // says why in either case. `allowed` is the decision; everything else is the
+  // arithmetic, so a refusal can be checked rather than taken on trust.
+  json analyze_budget(pqxx::work& txn, const json& plan) {
+    const pglicht::HostCapacity& cap = active_cfg().capacity;
+    json out = json::object();
+    json host = json::object();
+    if (cap.ram_mb > 0) host["ram_mb"] = cap.ram_mb;
+    if (cap.vcpus > 0)  host["vcpus"]  = cap.vcpus;
+    if (!cap.source.empty()) host["source"] = cap.source;
+    out["host"] = host;
+
+    if (cap.ram_mb <= 0 || cap.vcpus <= 0) {
+      std::string missing = cap.ram_mb <= 0 && cap.vcpus <= 0 ? "host_ram_mb and host_vcpus"
+                          : cap.ram_mb <= 0 ? "host_ram_mb" : "host_vcpus";
+      out["allowed"] = false;
+      out["reason"] =
+          "not analyzed: executing under explicit settings is bounded by the host "
+          "capacity declared for this connection, and " + missing + " is not "
+          "declared, so no settings change may be executed. Declare host_ram_mb and "
+          "host_vcpus on the connection or its [instance:...] section (or "
+          "PG_LICHT_HOST_RAM_MB and PG_LICHT_HOST_VCPUS for a single DATABASE_URL). "
+          "Omit settings to analyze under the connection's own environment, or use "
+          "plan_as_role, which is production's own. The plan below was built under "
+          "the settings and not executed.";
+      return out;
+    }
+
+    pqxx::result r = txn.exec(
+        "SELECT pg_size_bytes(current_setting('work_mem'))::float8, "
+        "       current_setting('hash_mem_multiplier')::float8");
+    const double work_mem = r[0][0].as<double>();
+    const double hash_mem = work_mem * r[0][1].as<double>();
+
+    ExecFootprint fp;
+    if (plan.is_array() && !plan.empty() && plan[0].contains("Plan"))
+      plan_footprint(plan[0]["Plan"], work_mem, hash_mem, 1.0, fp);
+
+    const long long mem_budget = cap.ram_mb * 1048576LL / kAnalyzeRamShareDivisor;
+    const int worker_budget = cap.vcpus / kAnalyzeVcpusPerWorker;
+    const long long worst =
+        fp.worst_bytes >= 9.0e18 ? std::numeric_limits<long long>::max()
+                                 : static_cast<long long>(fp.worst_bytes);
+
+    out["memory_budget_bytes"]     = mem_budget;
+    out["worst_case_memory_bytes"] = worst;
+    out["memory_nodes"]            = fp.memory_nodes;
+    out["workers_budget"]          = worker_budget;
+    out["workers_planned"]         = fp.workers;
+    out["rule"] =
+        "at most a tenth of declared RAM for the worst case the plan's memory "
+        "limits permit (each sort-like node at work_mem, each hash node at "
+        "work_mem x hash_mem_multiplier, times the processes running it), and at "
+        "most one parallel worker per four declared vCPUs";
+
+    std::string why;
+    if (fp.worst_bytes > static_cast<double>(mem_budget))
+      why = "the plan's worst-case memory, " + std::to_string(worst) + " bytes over " +
+            std::to_string(fp.memory_nodes) + " memory-using node(s), exceeds the "
+            "budget of " + std::to_string(mem_budget) + " bytes (a tenth of the "
+            "declared " + std::to_string(cap.ram_mb) + " MB)";
+    if (fp.workers > worker_budget)
+      why += std::string(why.empty() ? "" : ", and ") + "the plan asks for " +
+             std::to_string(fp.workers) + " parallel worker(s) against a budget of " +
+             std::to_string(worker_budget) + " (one per four of the declared " +
+             std::to_string(cap.vcpus) + " vCPUs)";
+    out["allowed"] = why.empty();
+    if (!why.empty())
+      out["reason"] = "not analyzed: " + why + ". Lower the settings and call again; "
+                      "the plan below was built under them and not executed.";
+    return out;
+  }
+
   // The settings a caller may apply before a plan is produced.
   //
   // An allowlist, not a denylist, and that is the whole safety argument. An
@@ -4452,6 +4595,10 @@ private:
       bool read_only = !plan_has_modify(plan);
       bool analyzed = false;
       std::string note;
+      // Caller settings that would shape a real execution. plan_as_role alone
+      // does not count: see analyze_budget.
+      const bool explicit_settings = settings.is_object() && !settings.empty();
+      json exec_budget;
 
       // --- Phase B: optionally execute, only once proven safe ---
       if (analyze) {
@@ -4462,6 +4609,12 @@ private:
           note = "not analyzed: the statement has $n placeholders and no params "
                  "were supplied, so only a generic plan could be produced; supply "
                  "params to get a real plan and enable ANALYZE";
+        } else if (explicit_settings &&
+                   !(exec_budget = analyze_budget(txn, plan)).value("allowed", false)) {
+          // Refused the way the other two are: the plan is still returned,
+          // analyzed stays false, and the note says why. The arithmetic goes
+          // into planning_environment so a refusal can be checked.
+          note = exec_budget.value("reason", std::string("not analyzed"));
         } else {
           std::string target = prepared.empty()
             ? sql : ("EXECUTE " + prepared + "(" + lits + ")");
@@ -4485,7 +4638,10 @@ private:
       };
       if (!note.empty())    out["note"] = note;
       if (!stats.is_null()) out["statement"] = stats;
-      if (!plan_env.is_null()) out["planning_environment"] = plan_env;
+      if (!plan_env.is_null()) {
+        if (!exec_budget.is_null()) plan_env["execution_budget"] = exec_budget;
+        out["planning_environment"] = plan_env;
+      }
       return out;
 
     } catch (const pqxx::sql_error& e) {

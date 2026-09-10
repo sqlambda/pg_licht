@@ -186,6 +186,23 @@ them at full fidelity, a role with `pg_monitor` 63.
   before/after cost comparison, so an environment that does not match production
   makes **both halves** answer a different question.
 
+  **Executing under `settings` is budgeted by the declared host.** `analyze`
+  really runs the statement, and then `work_mem`, `hash_mem_multiplier` and the
+  parallelism knobs set the footprint of something that executes. The read-only
+  guard and the timeout bound what it writes and how long it runs, not what it
+  allocates: `work_mem` goes to 2TB per node and `hash_mem_multiplier` to 1000,
+  and one out-of-memory kill restarts every connection on the instance. So with
+  explicit `settings`, `analyze` executes only if the worst case the plan's own
+  memory limits permit — each sort-like node at `work_mem`, each hash node at
+  `work_mem × hash_mem_multiplier`, times the processes running it — fits in a
+  tenth of `host_ram_mb`, and the plan uses at most one parallel worker per four
+  `host_vcpus`. With no declared capacity, no settings change is executed at
+  all. Either way a refused plan is still returned, `analyzed` stays false, and
+  `planning_environment.execution_budget` carries the arithmetic. Capacity comes
+  from the connection, its `[instance:...]` section or the environment — never
+  from a tool argument, so a caller cannot raise its own limit. `plan_as_role`
+  on its own is not budgeted: it applies what that role already runs with.
+
   `explain-and-fix` and `diagnose-slow-query` now plan twice and compare rather
   than noting a caveat. It is the same shape as the generic-versus-custom
   comparison they already make: two plans, one difference, and the difference is
