@@ -33,8 +33,10 @@ using json = nlohmann::json;
 
 // pqxx 7.9+ renamed exec_params to exec(sql, pqxx::params).
 // Use PQXX_VERSION_MINOR to select the right overload at compile time.
-template<typename P>
-inline pqxx::result pqxx_exec(pqxx::work& txn, const std::string& sql, P&& params) {
+// Templated on the transaction type so a pqxx::subtransaction can use it too;
+// both overloads live on transaction_base.
+template<typename T, typename P>
+inline pqxx::result pqxx_exec(T& txn, const std::string& sql, P&& params) {
 #if PQXX_VERSION_MAJOR > 7 || (PQXX_VERSION_MAJOR == 7 && PQXX_VERSION_MINOR >= 9)
   return txn.exec(sql, std::forward<P>(params));
 #else
@@ -4163,8 +4165,16 @@ private:
                            {"reason", "not a planner setting"}});
         continue;
       }
+      // One savepoint per setting. A refused set_config is an SQL error, and an
+      // SQL error aborts the transaction: without the savepoint every later
+      // set_config and the EXPLAIN itself would fail with "current transaction
+      // is aborted", each reported here as a refusal it was not. RELEASE
+      // SAVEPOINT keeps a set_config(is_local) value in the parent, so a value
+      // applied inside the savepoint is still in force when the plan is built.
       try {
-        pqxx_exec(txn, "SELECT set_config($1, $2, true)", pqxx::params{name, value});
+        pqxx::subtransaction sub{txn};
+        pqxx_exec(sub, "SELECT set_config($1, $2, true)", pqxx::params{name, value});
+        sub.commit();
         applied[name] = value;
       } catch (const pqxx::sql_error&) {
         skipped.push_back({{"name", name}, {"value", value},

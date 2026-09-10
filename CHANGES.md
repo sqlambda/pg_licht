@@ -157,7 +157,9 @@ them at full fidelity, a role with `pg_monitor` 63.
   dropping it. A per-database entry (`ALTER ROLE ... IN DATABASE`) overrides
   the role-wide one, which is the precedence the server itself gives them; the
   entries are applied in that order so the last one applied is the one
-  production runs under.
+  production runs under. Each is applied on its own savepoint: a refused value
+  is reported under `skipped_from_role` and the rest still apply, rather than
+  one bad entry aborting the transaction and taking the plan with it.
 
   `evaluateIndex` takes both for a reason of its own: its whole output is a
   before/after cost comparison, so an environment that does not match production

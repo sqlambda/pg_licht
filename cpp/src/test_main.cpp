@@ -2201,6 +2201,57 @@ TEST_F(PostgresMCPServerTest, PlanAsRoleTakesThePlannerSettingsAndReportsTheRest
   }
 }
 
+// A refused set_config is an SQL error, and an SQL error aborts the
+// transaction. The first version caught it and carried on, so every later
+// setting and the EXPLAIN itself failed with "current transaction is aborted"
+// -- each reported as a refusal it was not. ALTER ROLE validates values as it
+// stores them, so the only way to plant a bad one is to write the catalog row.
+TEST_F(PostgresMCPServerTest, ARefusedRoleSettingDoesNotTakeThePlanDown) {
+  const std::string role = "licht_bad_" + std::to_string(getpid());
+  {
+    pqxx::connection c(test_url);
+    pqxx::nontransaction n(c);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+    n.exec("CREATE ROLE \"" + role + "\"");
+    // Role-wide entries are applied before this database's, so the bad value
+    // goes role-wide and the good one per database: the good one is then
+    // applied AFTER the failure, which is what the fix has to survive.
+    n.exec("ALTER ROLE \"" + role + "\" SET work_mem = '64MB'");
+    n.exec("UPDATE pg_db_role_setting SET setconfig = ARRAY['work_mem=bogus']"
+           " WHERE setdatabase = 0 AND setrole = "
+           "(SELECT oid FROM pg_roles WHERE rolname = " + n.quote(role) + ")");
+    const std::string db = n.exec("SELECT current_database()")[0][0].as<std::string>();
+    n.exec("ALTER ROLE \"" + role + "\" IN DATABASE \"" + db + "\" SET enable_seqscan = off");
+  }
+
+  json r = srv->call_explain_query("", "SELECT count(*) FROM grocery.users",
+                                   json::array(), false, 0, json::object(), role);
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  ASSERT_TRUE(r.contains("plan")) << r.dump(2);
+  auto& pe = r["planning_environment"];
+  EXPECT_EQ(pe["applied"]["enable_seqscan"], "off") << pe.dump(2);
+  EXPECT_FALSE(pe["applied"].contains("work_mem")) << pe.dump(2);
+  int refused = 0;
+  for (const auto& sk : pe["skipped_from_role"])
+    if (sk["reason"] == "the server refused the value") {
+      ++refused;
+      EXPECT_EQ(sk["name"], "work_mem");
+      EXPECT_EQ(sk["value"], "bogus");
+    }
+  // Exactly the one that was bad -- not it plus everything that came after.
+  EXPECT_EQ(refused, 1) << pe.dump(2);
+  // And the value applied inside its savepoint is still in force when the plan
+  // is built: RELEASE SAVEPOINT keeps a set_config(is_local) in the parent.
+  ASSERT_TRUE(r["plan"][0].contains("Settings")) << r["plan"][0].dump(2);
+  EXPECT_EQ(r["plan"][0]["Settings"]["enable_seqscan"], "off");
+
+  {
+    pqxx::connection c(test_url);
+    pqxx::nontransaction n(c);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+  }
+}
+
 // A tablespace is a SHARED object, so COMMENT ON TABLESPACE writes to
 // pg_shdescription. listTablespaces read it through obj_description(), which
 // reads pg_description, and therefore reported '' for every commented
