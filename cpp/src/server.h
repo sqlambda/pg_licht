@@ -7405,6 +7405,14 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
+    // A named schema that does not exist is an error, as it is in every other
+    // schema-taking tool. An empty list here would read as "no defaults are
+    // set", which is a real and different answer.
+    if (!schema.empty()) {
+      json missing = no_such_schema(txn, schema);
+      if (!missing.is_null()) return missing;
+    }
+
     const std::string query = R"(
       SELECT COALESCE(JSONB_AGG(JSONB_BUILD_OBJECT(
                -- defaclnamespace = 0 is a "global" entry that overrides the
@@ -7430,7 +7438,11 @@ private:
                       FROM aclexplode(d.defaclacl) AS a
                       LEFT JOIN pg_roles AS r ON r.oid = a.grantee
                      GROUP BY COALESCE(r.rolname, 'PUBLIC')) AS s) AS g ON true
-       WHERE $1 = '' OR n.nspname = $1;
+       -- A named schema keeps the global entries too. Per-schema entries
+       -- are ADDED to the global ones, so "what will the next table in this
+       -- schema get" is both sets together; filtering the global ones out
+       -- answered half the question and presented it as the whole.
+       WHERE $1 = '' OR n.nspname = $1 OR d.defaclnamespace = 0;
     )";
 
     pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});

@@ -2081,16 +2081,35 @@ TEST_F(PostgresMCPServerTest, RoleDependenciesAnswersABareLoginRole) {
 // a missing default, which presents as a broken grant.
 TEST_F(PostgresMCPServerTest, DefaultPrivilegesReportWhatTheNextObjectWillGet) {
   const std::string sch = "dacl_" + std::to_string(getpid());
+  // A global entry for a throwaway role, so the superuser the other tests run
+  // as keeps its hard-wired defaults.
+  const std::string grantor = "licht_dacl_" + std::to_string(getpid());
   {
     pqxx::connection owner(test_url);
     pqxx::nontransaction n(owner);
     n.exec("CREATE SCHEMA " + sch);
     n.exec("ALTER DEFAULT PRIVILEGES IN SCHEMA " + sch + " GRANT SELECT ON TABLES TO PUBLIC");
+    n.exec("DROP ROLE IF EXISTS \"" + grantor + "\"");
+    n.exec("CREATE ROLE \"" + grantor + "\"");
+    n.exec("ALTER DEFAULT PRIVILEGES FOR ROLE \"" + grantor + "\" GRANT SELECT ON TABLES TO PUBLIC");
   }
   json r = srv->call_default_privileges(sch);
   ASSERT_TRUE(r.contains("default_privileges")) << r.dump(2);
-  ASSERT_EQ(r["default_privileges"].size(), 1u) << r.dump(2);
-  auto& e = r["default_privileges"][0];
+  // Per-schema entries are ADDED to the global ones, so naming a schema must
+  // return both: the first version filtered the global entry out and answered
+  // half of "what will the next table here get".
+  const json* schema_entry = nullptr;
+  bool saw_global = false;
+  for (const auto& d : r["default_privileges"]) {
+    if (d["scope"] == "schema") {
+      EXPECT_EQ(d["schema"].get<std::string>(), sch) << d.dump(2);
+      schema_entry = &d;
+    }
+    if (d["scope"] == "global" && d["granted_by"] == grantor) saw_global = true;
+  }
+  EXPECT_TRUE(saw_global) << r.dump(2);
+  ASSERT_NE(schema_entry, nullptr) << r.dump(2);
+  auto& e = *schema_entry;
   EXPECT_EQ(e["scope"].get<std::string>(), "schema");
   EXPECT_EQ(e["schema"].get<std::string>(), sch);
   EXPECT_EQ(e["object_type"].get<std::string>(), "table");
@@ -2098,11 +2117,19 @@ TEST_F(PostgresMCPServerTest, DefaultPrivilegesReportWhatTheNextObjectWillGet) {
   // granted_by matters: a default applies only to objects the granting role
   // creates, so the entry is inert for anybody else.
   EXPECT_TRUE(e.contains("granted_by"));
+
+  // A schema that does not exist is an error, as everywhere else. An empty
+  // list would read as "no defaults are set", which is a different answer.
+  json gone = srv->call_default_privileges(sch + "_absent");
+  ASSERT_TRUE(gone.contains("error")) << gone.dump(2);
+  EXPECT_NE(gone["error"].get<std::string>().find("no such schema"), std::string::npos);
   {
     pqxx::connection owner(test_url);
     pqxx::nontransaction n(owner);
     n.exec("ALTER DEFAULT PRIVILEGES IN SCHEMA " + sch + " REVOKE SELECT ON TABLES FROM PUBLIC");
     n.exec("DROP SCHEMA " + sch + " CASCADE");
+    n.exec("DROP OWNED BY \"" + grantor + "\"");
+    n.exec("DROP ROLE IF EXISTS \"" + grantor + "\"");
   }
 }
 

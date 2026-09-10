@@ -90,7 +90,10 @@ them at full fidelity, a role with `pg_monitor` 63.
   (`defaclnamespace = 0`) overrides the hard-wired defaults while per-schema
   entries are *added* to them, so two entries for one type are cumulative rather
   than conflicting, and `granted_by` is reported because a default applies only
-  to objects that role creates.
+  to objects that role creates. Naming a `schema` therefore returns that
+  schema's entries **and** the global ones — both decide what the next table
+  there gets — and a schema that does not exist is an error rather than an
+  empty list that would read as "no defaults set".
 
 - **`largeObjects`** — growth no size tool can see. Large objects live in a
   catalog rather than in any user relation, so `tableSize`, `listTableSizes` and

@@ -104,7 +104,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
-   		    {"schema", {{"type", "string"}, {"description", "restrict to one schema; omit for every entry including the global ones"}}}
+   		    {"schema", {{"type", "string"}, {"description", "restrict to one schema's entries plus the global ones, which apply there too because per-schema entries are added to them; omit for every entry. A schema that does not exist is an error"}}}
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {

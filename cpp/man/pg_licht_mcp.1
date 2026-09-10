@@ -1228,6 +1228,10 @@ Scope
 overrides the hard-wired defaults; per-schema entries are added to them.
 A default applies only to objects created by
 .Va granted_by .
+Naming a
+.Va schema
+returns its entries and the global ones, since both decide what the next object
+there gets; a schema that does not exist is an error.
 .It Ic largeObjects
 How many large objects this database holds and who owns them.
 Large objects live in a catalog rather than a relation, so every size tool here
