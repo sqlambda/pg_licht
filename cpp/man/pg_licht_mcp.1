@@ -1243,7 +1243,8 @@ No sizes: the bytes are in
 which is not publicly readable.
 .It Ic replicationStats
 Every WAL sender on this server with state, sync state, the LSNs, the byte gap
-to replay, and
+to replay \(em on a cascading standby measured from the WAL it has received
+\(em and
 .Va write_lag ,
 .Va flush_lag
 and

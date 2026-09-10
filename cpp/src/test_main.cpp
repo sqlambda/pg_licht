@@ -6491,6 +6491,22 @@ std::string standby_url() {
 }
 }  // namespace
 
+// A standby can be a sender too, and replay_behind_bytes has its own branch
+// for it: pg_current_wal_lsn() raises in recovery, so the minuend there is the
+// later of received and replayed WAL. The rig's standby has no replicas of its
+// own, so no row reaches the branch -- but the statement is planned and
+// type-checked in recovery, which is what this guards. The cascade itself was
+// verified by hand; see the comment on replay_behind_bytes.
+TEST(ReplicationStatsOnAStandby, RunsInRecoveryWithoutError) {
+  if (standby_url().empty())
+    GTEST_SKIP() << "no STANDBY_URL; run cpp/test/run-pooled-tests.sh";
+  PostgresMCPServer standby{standby_url()};
+  json r = standby.call_replication_stats();
+  ASSERT_TRUE(r.contains("replication")) << r.dump(2);
+  EXPECT_TRUE(r["replication"].is_object()) << r.dump(2);
+  EXPECT_FALSE(r["replication"].contains("error")) << r["replication"].dump(2);
+}
+
 TEST(SessionRoleTest, ObservesTheReplicaSideOnAStandby) {
   if (standby_url().empty())
     GTEST_SKIP() << "no STANDBY_URL; run cpp/test/run-pooled-tests.sh";

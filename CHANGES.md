@@ -125,6 +125,12 @@ them at full fidelity, a role with `pg_monitor` 63.
   whose reason to exist is "which replica is behind" cannot be allowed to lose
   a replica.
 
+  `replay_behind_bytes` works on a **cascading standby** too. There
+  `pg_current_wal_lsn()` raises, so the gap is measured from the later of the
+  WAL the standby has received and replayed — which is what a cascading
+  walsender can send — rather than being null for exactly the server whose
+  downstream replicas have no other byte reading.
+
   Two readings it states because both are routinely misread. The view is
   security-restricted **per row** rather than refused, so a role without
   `pg_read_all_stats` sees the senders exist with many columns null — which

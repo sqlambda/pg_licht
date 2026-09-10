@@ -7550,12 +7550,25 @@ private:
                    'flush_lag_s',      round(EXTRACT(EPOCH FROM flush_lag)::numeric, 3),
                    'replay_lag_s',     round(EXTRACT(EPOCH FROM replay_lag)::numeric, 3),
                    'reply_time',       reply_time,
-                   -- The byte gap between what the publisher has written and
-                   -- what this consumer has replayed. Complements the lag
+                   -- The byte gap between what this server can send and what
+                   -- this consumer has replayed. Complements the lag
                    -- intervals: bytes say how much, seconds say how long.
+                   --
+                   -- On a primary that is pg_current_wal_lsn(). On a
+                   -- cascading standby pg_current_wal_lsn() raises, and the
+                   -- first version returned NULL there -- for exactly the
+                   -- server whose downstream replicas have no other byte
+                   -- reading. A cascading walsender sends up to the later of
+                   -- what it has received and what it has replayed (its
+                   -- GetStandbyFlushRecPtr), so that is the minuend. Verified
+                   -- on an 18 cascade with the leaf's replay paused: NULL
+                   -- before, 12970272 after, equal to sent_lsn - replay_lsn.
                    'replay_behind_bytes',
-                     CASE WHEN NOT pg_is_in_recovery()
-                          THEN pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) END
+                     pg_wal_lsn_diff(
+                       CASE WHEN pg_is_in_recovery()
+                            THEN GREATEST(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn())
+                            ELSE pg_current_wal_lsn() END,
+                       replay_lsn)
                  ) AS obj
             FROM pg_stat_replication) AS s)");
       out["replication"] = json::parse(r[0][0].as<std::string>());
