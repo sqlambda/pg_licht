@@ -7607,9 +7607,17 @@ private:
                    'default_partition',
                      max(ch.relname) FILTER (
                        WHERE pg_get_expr(ch.relpartbound, ch.oid) = 'DEFAULT'),
+                   -- NULL when the default has never been analyzed, never 0
+                   -- and never -1. reltuples is -1 until the first VACUUM or
+                   -- ANALYZE, and stays -1 after rows arrive (verified on
+                   -- 18.6: two rows inserted, still -1). Clamping to 0 would
+                   -- report a default partition that is filling up as empty,
+                   -- and that is the one reading this field exists to catch.
+                   -- has_default separates "no default" from "not measured".
                    'default_rows',
                      (max(ch.reltuples) FILTER (
-                        WHERE pg_get_expr(ch.relpartbound, ch.oid) = 'DEFAULT'))::bigint,
+                        WHERE pg_get_expr(ch.relpartbound, ch.oid) = 'DEFAULT'
+                          AND ch.reltuples >= 0))::bigint,
                    'rows', COALESCE(sum(GREATEST(ch.reltuples, 0))::bigint, 0),
                    'size_estimate',
                      COALESCE(sum(ch.relpages)::bigint, 0)
@@ -7676,9 +7684,17 @@ private:
                    'bound',   pg_get_expr(ch.relpartbound, ch.oid),
                    'is_default', pg_get_expr(ch.relpartbound, ch.oid) = 'DEFAULT',
                    'is_partitioned', ch.relkind = 'p',
-                   'rows', GREATEST(ch.reltuples, 0)::bigint,
+                   -- NULL rather than 0 for a partition never analyzed, for
+                   -- the reason default_rows gives in listPartitions: -1 means
+                   -- "not measured" and survives inserts, so a clamp would
+                   -- call a filling partition empty. relpages is set by the
+                   -- same VACUUM or ANALYZE, so its 0 means the same thing and
+                   -- the size estimate goes null with it.
+                   'rows', CASE WHEN ch.reltuples < 0 THEN NULL
+                                ELSE ch.reltuples::bigint END,
                    'size_estimate',
-                     ch.relpages::bigint * current_setting('block_size')::bigint,
+                     CASE WHEN ch.reltuples < 0 THEN NULL
+                          ELSE ch.relpages::bigint * current_setting('block_size')::bigint END,
                    'n_live_tup', s.n_live_tup,
                    'n_dead_tup', s.n_dead_tup,
                    'n_mod_since_analyze', s.n_mod_since_analyze,

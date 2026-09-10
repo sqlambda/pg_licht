@@ -1154,6 +1154,14 @@ combined estimated rows and size, whether a
 .Sy DEFAULT
 partition exists and how many rows it holds, and how many partitions are
 themselves partitioned.
+.Va default_rows
+is
+.Dv null ,
+not zero, when the default partition has never been analyzed:
+.Li reltuples
+stays at \-1 until then even after rows arrive, and
+.Va has_default
+says whether a default exists at all.
 Reads
 .Li reltuples
 and
@@ -1167,6 +1175,10 @@ One parent and every partition: the bound expression verbatim, whether it is the
 .Sy DEFAULT ,
 whether it is itself partitioned, estimated rows and size, and the per-partition
 live and dead tuples, scan counters and vacuum and analyze timestamps.
+Rows and size are
+.Dv null
+for a partition that has never been analyzed, rather than a zero that would
+read as empty.
 .Pp
 Autovacuum runs per
 .Sy partition ,

@@ -1842,6 +1842,49 @@ TEST_F(PostgresMCPServerTest, ListPartitionsSummarisesAParentAndFlagsItsDefault)
   EXPECT_FALSE(r.contains("events_2026_01")) << r.dump(2);
 }
 
+// reltuples is -1 until the first VACUUM or ANALYZE, and it stays -1 after
+// rows arrive. default_rows returned it raw, so a fresh default partition
+// reported -1 rows; the obvious clamp to 0 would have been worse, calling a
+// default that is filling up empty -- the one reading the field exists for.
+TEST_F(PostgresMCPServerTest, NeverAnalyzedPartitionsReportNullRowsNotZero) {
+  const std::string sch = "pna_" + std::to_string(getpid());
+  pqxx::connection c(test_url);
+  {
+    pqxx::nontransaction n(c);
+    n.exec("CREATE SCHEMA " + sch);
+    n.exec("CREATE TABLE " + sch + ".p (a int) PARTITION BY LIST (a)");
+    n.exec("CREATE TABLE " + sch + ".p_one PARTITION OF " + sch + ".p FOR VALUES IN (1)");
+    // autovacuum off so nothing analyzes behind the test's back.
+    n.exec("CREATE TABLE " + sch + ".p_def PARTITION OF " + sch + ".p DEFAULT"
+           " WITH (autovacuum_enabled = off)");
+    n.exec("INSERT INTO " + sch + ".p SELECT 7 FROM generate_series(1, 5)");
+  }
+
+  json lp = srv->call_list_partitions(sch);
+  ASSERT_TRUE(lp.contains("p")) << lp.dump(2);
+  EXPECT_TRUE(lp["p"]["has_default"].get<bool>());
+  // Five rows are in there. -1 was wrong, and 0 would have been wrong too.
+  EXPECT_TRUE(lp["p"]["default_rows"].is_null()) << lp["p"].dump(2);
+
+  json pd = srv->call_partition_details(sch, "p");
+  ASSERT_TRUE(pd.contains("partitions")) << pd.dump(2);
+  for (const auto& part : pd["partitions"]) {
+    EXPECT_TRUE(part["rows"].is_null()) << part.dump(2);
+    EXPECT_TRUE(part["size_estimate"].is_null()) << part.dump(2);
+  }
+
+  {
+    pqxx::nontransaction n(c);
+    n.exec("ANALYZE " + sch + ".p_def");
+  }
+  json after = srv->call_list_partitions(sch);
+  ASSERT_TRUE(after["p"]["default_rows"].is_number()) << after["p"].dump(2);
+  EXPECT_EQ(after["p"]["default_rows"].get<long long>(), 5);
+
+  pqxx::nontransaction n(c);
+  n.exec("DROP SCHEMA " + sch + " CASCADE");
+}
+
 TEST_F(PostgresMCPServerTest, PartitionDetailsCarriesBoundsAndPerPartitionVacuumState) {
   json r = srv->call_partition_details("grocery", "events");
   ASSERT_TRUE(r.contains("partitions")) << r.dump(2);

@@ -43,7 +43,11 @@ them at full fidelity, a role with `pg_monitor` 63.
 
   `default_rows` is the finding to look for: rows land in a `DEFAULT` partition
   when they match no bound, so a growing default is a missing partition that has
-  not failed loudly *yet*.
+  not failed loudly *yet*. It is `null`, not `0`, until the default has been
+  analyzed: `reltuples` is `-1` until the first `VACUUM` or `ANALYZE` and stays
+  there after rows arrive, so a zero would call a filling default empty — the
+  one reading the field exists to catch. `partitionDetails` does the same for
+  each partition's `rows` and `size_estimate`.
 
 - **`roleDependencies`** — the inverse of `checkRoleAccess`. That tool answers
   whether a role may *use* an object; nothing answered what depends *on* it,
