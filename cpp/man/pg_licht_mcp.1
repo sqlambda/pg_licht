@@ -1200,6 +1200,12 @@ is shared across the cluster, so the counts cover every database; an object id
 resolves only from the database it lives in, so
 .Va objects
 names this database and the shared catalogs while others appear as counts.
+Tables, functions, schemas and types are named as
+.Ar schema . Ns Ar name ;
+every other class, a policy or a default privilege included, by
+.Fn pg_identify_object ,
+so a policy reads as
+.Ql p on public.t .
 .It Ic defaultPrivileges Op Va schema
 .Sy ALTER DEFAULT PRIVILEGES
 entries: what grants the

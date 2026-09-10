@@ -7361,7 +7361,22 @@ private:
                              -- unreachable branch still has to resolve. So the
                              -- text is only emitted where the catalog exists.
                              )" + param_acl + R"(
-                             ELSE NULL END,
+                             -- Everything else through pg_identify_object, which
+                             -- names any class this database can resolve:
+                             -- 'p on public.t' for a policy, 'for role x in
+                             -- schema s on tables' for a default privilege, the
+                             -- oid for a large object, and the language, foreign
+                             -- server, subscription, extension or event trigger
+                             -- by name. The first version returned NULL for all
+                             -- of them -- including 'policy', the kind by_kind
+                             -- promotes as the difference between REASSIGN OWNED
+                             -- and DROP OWNED. It reads through the syscache and
+                             -- checks no privilege, so a bare role gets names
+                             -- too (verified on 18.6). The explicit branches
+                             -- above stay because their unquoted schema.name
+                             -- format is what callers already read.
+                             ELSE (pg_identify_object(d.classid, d.objid, 0)).identity
+                             END,
                    'column', NULLIF(d.objsubid, 0),
                    'dependency', CASE d.deptype WHEN 'o' THEN 'owner'
                                                 WHEN 'a' THEN 'acl'

@@ -66,6 +66,14 @@ them at full fidelity, a role with `pg_monitor` 63.
   Reporting only what is resolvable would have answered *"nothing depends on
   this role"* to somebody about to drop it.
 
+  Every row this database can resolve carries a name. Tables, functions,
+  schemas and types read as `schema.name`; every other class goes through
+  PostgreSQL's own `pg_identify_object`, so a policy reads as
+  `p on public.t` and a default privilege as
+  `for role x in schema s on tables`. That matters most for `policy`, the
+  kind `by_kind` separates out: a count with nothing to point at is the
+  `DROP ROLE` error message over again.
+
   Reads `pg_roles`, never `pg_authid`, so a bare login role can ask. That is
   the role most likely to be asking: the one that cannot run `DROP ROLE`
   itself and wants to know what to hand the person who can.

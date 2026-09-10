@@ -1907,6 +1907,12 @@ TEST_F(PostgresMCPServerTest, RoleDependenciesNamesWhatBlocksADropAndCountsWhatI
     n.exec("ALTER TABLE " + sch + ".owned OWNER TO \"" + role + "\"");
     n.exec("CREATE TABLE " + sch + ".granted (a int)");
     n.exec("GRANT SELECT ON " + sch + ".granted TO \"" + role + "\"");
+    // Two classes the explicit branches do not cover, and which came back
+    // with a null name until pg_identify_object became the fallback. Both go
+    // with the schema, so the DROP SCHEMA CASCADE below cleans them up.
+    n.exec("CREATE POLICY licht_pol ON " + sch + ".granted TO \"" + role + "\" USING (true)");
+    n.exec("ALTER DEFAULT PRIVILEGES IN SCHEMA " + sch +
+           " GRANT SELECT ON TABLES TO \"" + role + "\"");
   }
 
   json r = srv->call_role_dependencies(role);
@@ -1928,6 +1934,28 @@ TEST_F(PostgresMCPServerTest, RoleDependenciesNamesWhatBlocksADropAndCountsWhatI
   }
   EXPECT_TRUE(named_owned) << r["objects"].dump(2);
   EXPECT_TRUE(named_granted) << r["objects"].dump(2);
+
+  // Every row this database can resolve carries a name. The policy is the one
+  // that matters: by_kind counts it as 'policy', which DROP OWNED clears, and
+  // a count with nothing to point at is the DROP ROLE error message again.
+  bool named_policy = false, named_default = false;
+  for (const auto& o : r["objects"]) {
+    ASSERT_TRUE(o["name"].is_string()) << "unnamed row: " << o.dump(2);
+    const std::string nm = o["name"].get<std::string>();
+    if (o["kind"] == "pg_policy") {
+      named_policy = true;
+      EXPECT_EQ(o["dependency"], "policy");
+      EXPECT_NE(nm.find("licht_pol"), std::string::npos) << nm;
+      EXPECT_NE(nm.find(sch + ".granted"), std::string::npos) << nm;
+    }
+    if (o["kind"] == "pg_default_acl") {
+      named_default = true;
+      EXPECT_NE(nm.find(sch), std::string::npos) << nm;
+    }
+  }
+  EXPECT_TRUE(named_policy) << r["objects"].dump(2);
+  EXPECT_TRUE(named_default) << r["objects"].dump(2);
+  EXPECT_GE(r["by_kind"].value("policy", 0), 1) << r["by_kind"].dump(2);
 
   // A role nothing depends on is an answer, not an error.
   json none = srv->call_role_dependencies("no_such_role_" + std::to_string(getpid()));
