@@ -2077,7 +2077,13 @@ TEST_F(PostgresMCPServerTest, ReplicationStatsReportsSendersAndOrigins) {
   if (std::getenv("STANDBY_URL") != nullptr && !r["replication"].contains("error")) {
     ASSERT_FALSE(r["replication"].empty()) << r["replication"].dump(2);
     for (auto& [name, s] : r["replication"].items()) {
-      (void)name;
+      // The key carries the pid. A walreceiver's default application_name is
+      // its cluster_name, which Debian sets per major rather than per host, so
+      // two standbys routinely share one -- and a name-only key would fold
+      // them into a single entry with nothing to say so.
+      EXPECT_NE(name.find("pid " + std::to_string(s["pid"].get<int>())),
+                std::string::npos) << name;
+      EXPECT_TRUE(s.contains("application_name")) << s.dump(2);
       EXPECT_TRUE(s.contains("state")) << s.dump(2);
       EXPECT_TRUE(s.contains("sent_lsn"));
       EXPECT_TRUE(s.contains("replay_lag_s"));

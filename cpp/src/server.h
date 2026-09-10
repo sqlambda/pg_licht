@@ -7469,7 +7469,17 @@ private:
       pqxx::subtransaction sub{txn};
       pqxx::result r = sub.exec(R"(
         SELECT COALESCE(JSONB_OBJECT_AGG(key, obj), '{}'::jsonb) FROM (
-          SELECT COALESCE(NULLIF(application_name, ''), 'pid ' || pid::text) AS key,
+          -- Keyed by application_name AND pid, never by name alone. A
+          -- walreceiver's default application_name is the standby's
+          -- cluster_name, and Debian packaging sets that per major rather than
+          -- per host ('18/main' on every install); unpackaged builds all default
+          -- to 'walreceiver'. Two such standbys share a key, and
+          -- JSONB_OBJECT_AGG keeps one value per key -- so the tool whose
+          -- reason to exist is "which replica is behind" would silently lose
+          -- one of them. The pid is what pg_stat_replication itself is keyed by.
+          SELECT CASE WHEN COALESCE(application_name, '') = ''
+                      THEN 'pid ' || pid::text
+                      ELSE application_name || ' (pid ' || pid::text || ')' END AS key,
                  JSONB_BUILD_OBJECT(
                    'pid',              pid,
                    'user',             usename,

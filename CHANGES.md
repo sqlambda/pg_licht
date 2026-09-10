@@ -102,6 +102,14 @@ them at full fidelity, a role with `pg_monitor` 63.
   subscribers alike, and both halves run on their own savepoint because they
   fail differently.
 
+  Senders are keyed by `application_name` **plus pid**. A walreceiver's default
+  `application_name` is the standby's `cluster_name`, and Debian packaging sets
+  that per major rather than per host — `18/main` on every install — while
+  unpackaged builds all default to `walreceiver`. Two such standbys share a
+  name, and an object keyed by name alone keeps one of them, silently. The tool
+  whose reason to exist is "which replica is behind" cannot be allowed to lose
+  a replica.
+
   Two readings it states because both are routinely misread. The view is
   security-restricted **per row** rather than refused, so a role without
   `pg_read_all_stats` sees the senders exist with many columns null — which

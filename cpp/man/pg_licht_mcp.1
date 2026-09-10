@@ -1229,6 +1229,12 @@ and
 in seconds \(em plus replication origin progress.
 The only source of replication lag as a
 .Sy time .
+Senders are keyed by
+.Va application_name
+plus pid: a walreceiver's default name is its
+.Va cluster_name ,
+which Debian sets per major rather than per host, so two standbys routinely
+share one and a name-only key would fold them into a single entry.
 .Pp
 Two readings that are routinely misread.
 The view is security restricted
