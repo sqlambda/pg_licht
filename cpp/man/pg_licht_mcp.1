@@ -1563,8 +1563,14 @@ cleared by neither
 .Ic ROLLBACK ,
 a new transaction, nor
 .Ic DISCARD ALL ,
-which is what PgBouncer issues as
+PgBouncer's default
 .Va server_reset_query .
+A transaction-mode pooler cannot be asked to help either: it runs no reset query
+at all unless
+.Va server_reset_query_always
+is set, and even then
+.Ic DISCARD ALL
+does not clear it.
 This operation therefore resets explicitly on the way in and on the way out, so
 that behind a transaction pooler one caller's hypothetical index cannot reshape
 the next caller's plans.
@@ -2730,13 +2736,14 @@ rather than succeed silently.
 .Pp
 That guard is deliberately transaction-scoped rather than session-scoped.
 Under a connection pooler in transaction mode, such as PgBouncer with
-.Li pool_mode = transaction
-and
-.Li server_reset_query = DISCARD ALL ,
-the server connection is returned to the pool at commit and its session state is
-wiped, so a
+.Li pool_mode = transaction ,
+the server connection is returned to the pool at commit and the next call may be
+handed a different one, so a
 .Ic SET
 issued once at startup silently stops applying to later calls.
+Whether the pooler also resets the connection it takes back
+.Pq Va server_reset_query , No which transaction mode skips by default
+changes nothing here: session state cannot be relied on either way.
 Transaction scope is the scope a pooler preserves.
 The setting cannot be pushed into the connection string either: PgBouncer
 rejects GUCs in the startup packet outright, which is why the

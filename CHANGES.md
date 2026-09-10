@@ -1686,10 +1686,13 @@ number that moves under it.
   forward.** A hypothetical index lives in backend-local memory for the whole
   session and is cleared by none of the things that would be expected to clear
   it — measured: not `ROLLBACK`, not a new transaction, and **not `DISCARD
-  ALL`**, which is exactly what PgBouncer issues as `server_reset_query`. Only
-  `hypopg_reset()` removes it. Behind a transaction-mode pooler that would
-  leave one caller's hypothetical index on the backend, silently reshaping the
-  next caller's plans. So `hypopg_reset()` runs on the way in, protecting this
+  ALL`**, PgBouncer's default `server_reset_query`. Only `hypopg_reset()`
+  removes it. Behind a transaction-mode pooler that would leave one caller's
+  hypothetical index on the backend, silently reshaping the next caller's
+  plans — and the pooler cannot be asked to help: in transaction mode it runs
+  no reset query at all unless `server_reset_query_always` is set, and forcing
+  that on does not clear hypopg either, because `DISCARD ALL` does not.
+  Measured end to end through a real PgBouncer, both ways. So `hypopg_reset()` runs on the way in, protecting this
   call from whatever a previous one left, and again on the way out through a
   scope guard that survives an exception. A test asserts a second call's
   baseline is unchanged — it can only fail behind the pooler, and passes

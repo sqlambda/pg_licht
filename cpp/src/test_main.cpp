@@ -6033,9 +6033,12 @@ TEST_F(PostgresMCPServerTest, EvaluateIndexBuildsNothingAndKeepsTheGuard) {
 TEST_F(PostgresMCPServerTest, AHypotheticalIndexDoesNotLeakToTheNextCall) {
   // The reason the reset bracket exists. Measured against hypopg 1.4.3: a
   // hypothetical index survives ROLLBACK, survives into a new transaction, and
-  // survives DISCARD ALL -- which is exactly what PgBouncer issues as
-  // server_reset_query. Behind a transaction pooler that means one caller's
-  // hypothetical index would reshape the next caller's plans, silently.
+  // survives DISCARD ALL -- PgBouncer's default server_reset_query, which in
+  // transaction mode it does not even run unless server_reset_query_always is
+  // set, and which does not clear hypopg when it does run. Behind a
+  // transaction pooler that means one caller's hypothetical index would
+  // reshape the next caller's plans, silently, with nothing the pooler can be
+  // configured to do about it.
   //
   // A direct connection is fresh every call, so this can only ever fail behind
   // the pooler; it passes trivially otherwise rather than failing spuriously.

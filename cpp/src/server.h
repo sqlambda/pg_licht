@@ -48,12 +48,14 @@ inline pqxx::result pqxx_exec(T& txn, const std::string& sql, P&& params) {
 // disconnect on scope exit.
 //
 // Why connect per call rather than hold one connection: the target deployment
-// is PgBouncer in transaction mode (pool_mode=transaction,
-// server_reset_query=DISCARD ALL). There the server connection is handed back
-// to the pool at COMMIT and wiped, so *session* state does not survive between
-// transactions. An earlier version set `default_transaction_read_only` once at
-// startup and committed; behind such a pooler that setting was silently
-// discarded and every later call ran without the read-only guard.
+// is PgBouncer in transaction mode (pool_mode=transaction). There the server
+// connection is handed back to the pool at COMMIT and the next transaction may
+// land on a different one, so *session* state cannot be relied on between
+// transactions -- whether or not the pooler also resets the connection it
+// takes back (server_reset_query, which transaction mode skips by default).
+// An earlier version set `default_transaction_read_only` once at startup and
+// committed; behind such a pooler that setting was silently absent from every
+// later call that landed elsewhere, and the read-only guard with it.
 //
 // So nothing here relies on session state. The read-only guarantee and the
 // statement timeout are both transaction-scoped, which is exactly the scope a
@@ -6727,11 +6729,17 @@ private:
   // THE RESET BRACKET IS NOT OPTIONAL. Measured against hypopg 1.4.3: a
   // hypothetical index lives in backend-local memory for the whole session and
   // is cleared by none of the things that would be expected to clear it --
-  // not ROLLBACK, not a new transaction, and not DISCARD ALL, which is exactly
-  // what PgBouncer issues as server_reset_query. Only hypopg_reset() removes
-  // it. Against a transaction-mode pooler that means one caller's hypothetical
-  // index would otherwise stay on the backend and silently reshape the next
-  // caller's plans -- a wrong answer with nothing to indicate it. So the reset
+  // not ROLLBACK, not a new transaction, and not DISCARD ALL, PgBouncer's
+  // default server_reset_query. Only hypopg_reset() removes it. Against a
+  // transaction-mode pooler that means one caller's hypothetical index would
+  // otherwise stay on the backend and silently reshape the next caller's
+  // plans -- a wrong answer with nothing to indicate it. The pooler cannot be
+  // asked to help: in transaction mode it runs no reset query at all unless
+  // server_reset_query_always is set (its manual's reasoning is that
+  // transaction-pooled connections "should not have any need for a reset
+  // query" -- true of core session state, false of memory an extension owns),
+  // and forcing that on does not clear hypopg either. Both measured through a
+  // real PgBouncer on 2026-09-03: two independent failures to catch it. So the reset
   // runs on the way in, which protects this call from whatever a previous one
   // left, and again on the way out through a scope guard that survives an
   // exception, which protects the next call from this one. Either alone would
