@@ -7305,6 +7305,27 @@ TEST_F(TopologyFixture, IndexToolsMaySweepAReplicationGroup) {
   EXPECT_EQ(rpc_payload(r)["members"].size(), 2u);
 }
 
+// Every member of a replication group has its own WAL senders, a cascading
+// standby included, so this is the sweep replicationStats exists for. The
+// first scope row had it per_database and not per_server, which refused this
+// with "byte-identical across a replication group" -- false for senders.
+TEST_F(TopologyFixture, ReplicationStatsSweepsAReplicationGroupAndNotAnInstance) {
+  auto ha = server_from(ini_with("replication_group = ha\n") +
+                        section("twin", test_url, "replication_group = ha\n"));
+  json r = rpc_call(*ha, "replicationStats", {{"replication_group", "ha"}});
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  EXPECT_EQ(rpc_payload(r)["members"].size(), 2u);
+
+  // pg_stat_replication and the origins are instance-wide, so asking every
+  // database on one postmaster would repeat one answer.
+  auto inst = server_from(ini_with("instance = pg-01\n") +
+                          section("twin", test_url, "instance = pg-01\n"));
+  json i = rpc_call(*inst, "replicationStats", {{"instance", "pg-01"}});
+  ASSERT_TRUE(i.contains("error")) << i.dump(2);
+  EXPECT_NE(i["error"]["message"].get<std::string>().find("instance-wide"),
+            std::string::npos);
+}
+
 TEST_F(TopologyFixture, AGroupSweepCollapsesMembersThatWouldAnswerIdentically) {
   // A group may span instances, so it cannot be refused outright -- but two
   // databases on one postmaster answering an instance-wide question would

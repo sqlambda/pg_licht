@@ -1410,8 +1410,15 @@ private:
       {"largeObjects",          {true,  false, false, false}},
       // Every member of a replication group has its own WAL senders, and a
       // replica that is itself a sender is exactly what this finds, so this
-      // is worth asking of each server rather than one.
-      {"replicationStats",      {true,  false, true,  false}},
+      // is worth asking of each server rather than one: per_server. Both
+      // pg_stat_replication and the replication origins are instance-wide --
+      // pg_replication_origin is a shared catalog -- so every database on one
+      // postmaster returns the same rows: not per_database. And a cascading
+      // standby's senders are real, not vacuum-side noise: not
+      // primary_authoritative. The first version had all three the other way
+      // round, which refused the replication-group sweep this tool exists
+      // for and let an instance sweep repeat one answer per database.
+      {"replicationStats",      {false, true,  false, false}},
       {"tableStats",            {true,  true,  true,  false}},
       // Same row, and for the same reason. pg_subscription is a shared catalog
       // scoped by subdbid, so the answer is per database; the workers, their

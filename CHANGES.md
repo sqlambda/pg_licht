@@ -123,6 +123,10 @@ them at full fidelity, a role with `pg_monitor` 63.
   error for `origins`. `checkPrivileges` reports the tool as degraded for every
   role that cannot read the view, naming which half falls short.
 
+  It sweeps a `replication_group` — one answer per member, since each has its
+  own senders — and refuses an `instance` sweep, since every database on one
+  postmaster sees the same ones.
+
   Senders are keyed by `application_name` **plus pid**. A walreceiver's default
   `application_name` is the standby's `cluster_name`, and Debian packaging sets
   that per major rather than per host — `18/main` on every install — while
