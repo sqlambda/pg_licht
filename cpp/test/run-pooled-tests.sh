@@ -21,12 +21,20 @@
 #   PG_PORT     port for the temp cluster                 (default: 55432)
 #   BOUNCER_PORT port for the companion pooler            (default: 56432)
 #   STANDBY_PORT port for the streaming standby           (default: 57432)
+#   SUBSCRIBER_PORT port for the logical subscriber       (default: 58432)
+#   CASCADE_PORT port for the cascading standby           (default: 59432)
 #
 # A physical standby is streamed off the primary with pg_basebackup and its
 # conninfo is exported as STANDBY_URL. The role and topology tests use it to
 # check the replica side of pg_is_in_recovery() and the shared system
 # identifier; they skip when STANDBY_URL is unset, so a plain `ctest` run is
 # unaffected.
+#
+# A second standby is then streamed off the FIRST one, so the first is a
+# cascading standby: in recovery, and a WAL sender at the same time. Its
+# conninfo is exported as CASCADE_URL. That is the one configuration where
+# replicationStats cannot use pg_current_wal_lsn(), which raises in recovery,
+# and it was verified only by hand until the rig built one.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -58,6 +66,7 @@ PG_PORT="${PG_PORT:-55432}"
 BOUNCER_PORT="${BOUNCER_PORT:-56432}"
 STANDBY_PORT="${STANDBY_PORT:-57432}"
 SUBSCRIBER_PORT="${SUBSCRIBER_PORT:-58432}"
+CASCADE_PORT="${CASCADE_PORT:-59432}"
 
 for req in "$PG_BINDIR/initdb" "$PG_BINDIR/pg_ctl" "$PG_BINDIR/createdb" \
            "$PG_BINDIR/pg_basebackup" "$PG_BINDIR/psql" "$PGBOUNCER" "$TEST_BIN"; do
@@ -72,12 +81,14 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/pglicht-rig.XXXXXX")"
 PGDATA="$work/pg"
 SBDATA="$work/standby"
 SUBDATA="$work/subscriber"
+CADATA="$work/cascade"
 BDIR="$work/bouncer"
 mkdir -p "$PGDATA" "$BDIR"
 
 cleanup() {
   [ -f "$BDIR/pgbouncer.pid" ] && kill "$(cat "$BDIR/pgbouncer.pid")" 2>/dev/null || true
   "$PG_BINDIR/pg_ctl" -D "$SUBDATA" -m immediate stop >/dev/null 2>&1 || true
+  "$PG_BINDIR/pg_ctl" -D "$CADATA" -m immediate stop >/dev/null 2>&1 || true
   "$PG_BINDIR/pg_ctl" -D "$SBDATA" -m immediate stop >/dev/null 2>&1 || true
   "$PG_BINDIR/pg_ctl" -D "$PGDATA" -m immediate stop >/dev/null 2>&1 || true
   rm -rf "$work"
@@ -125,6 +136,45 @@ CONF
 "$PG_BINDIR/pg_ctl" -D "$SBDATA" -l "$SBDATA/pg.log" -w start >/dev/null
 STANDBY_URL="host=127.0.0.1 port=$STANDBY_PORT dbname=pglicht user=pglicht"
 export STANDBY_URL
+
+# --- cascading standby -----------------------------------------------------
+# Streams off the standby, not the primary, which makes the standby a WAL
+# sender while it is in recovery. cluster_name becomes the walreceiver's
+# application_name, so the standby's pg_stat_replication names this one.
+#
+# The base backup is taken from the PRIMARY and only the replication
+# connection points at the standby. A base backup taken from a standby is
+# refused while the primary runs with full_page_writes = off ("WAL generated
+# with full_page_writes=off was replayed since last restartpoint"), and this
+# rig turns it off for speed; a backup from the primary forces full-page
+# writes for its own duration, so it is safe either way. What makes it a
+# cascade is where it streams from, not where it was copied from.
+echo "--- pg_basebackup a cascading standby on $CASCADE_PORT (streams from $STANDBY_PORT)"
+"$PG_BINDIR/pg_basebackup" -h 127.0.0.1 -p "$PG_PORT" -U pglicht \
+    -D "$CADATA" -X stream >/dev/null
+touch "$CADATA/standby.signal"
+
+cat >> "$CADATA/postgresql.conf" <<CONF
+port = $CASCADE_PORT
+unix_socket_directories = '$work'
+cluster_name = 'licht_cascade'
+primary_conninfo = 'host=127.0.0.1 port=$STANDBY_PORT user=pglicht application_name=licht_cascade'
+CONF
+
+"$PG_BINDIR/pg_ctl" -D "$CADATA" -l "$CADATA/pg.log" -w start >/dev/null
+# Wait for it to be streaming, so the tests see a sender rather than one still
+# connecting. Bounded, and fatal if it never arrives: a rig that silently lost
+# its cascade would turn the cascade tests into skips.
+streaming=""
+for _ in $(seq 1 50); do
+  streaming=$("$PG_BINDIR/psql" -X -qtA -h 127.0.0.1 -p "$STANDBY_PORT" -U pglicht -d pglicht \
+    -c "SELECT count(*) FROM pg_stat_replication WHERE application_name = 'licht_cascade' AND state = 'streaming'")
+  [ "$streaming" = "1" ] && break
+  sleep 0.2
+done
+[ "$streaming" = "1" ] || { echo "cascading standby never started streaming" >&2; exit 1; }
+CASCADE_URL="host=127.0.0.1 port=$CASCADE_PORT dbname=pglicht user=pglicht"
+export CASCADE_URL
 
 # --- logical subscriber ----------------------------------------------------
 # A separate cluster, and it has to be: logical replication between two
@@ -220,4 +270,5 @@ echo; echo "================ POOLED (port $BOUNCER_PORT) ================"; tail
 
 echo
 echo "OK: suite passed both directly and through the transaction-mode pooler"
-echo "    (standby on $STANDBY_PORT covered the replica-side role tests)."
+echo "    (standby on $STANDBY_PORT covered the replica-side role tests, and the"
+echo "    cascade on $CASCADE_PORT the standby-as-sender ones)."

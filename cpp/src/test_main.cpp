@@ -6739,6 +6739,40 @@ TEST(ReplicationStatsOnAStandby, RunsInRecoveryWithoutError) {
   EXPECT_FALSE(r["replication"].contains("error")) << r["replication"].dump(2);
 }
 
+// The rig streams a second standby off the first, so the first is a cascading
+// standby: in recovery and a WAL sender at once. replay_behind_bytes was NULL
+// there for every sender until it stopped using pg_current_wal_lsn(), which
+// raises in recovery -- exactly the server whose downstream replicas have no
+// other byte reading. This is the row the previous test could not reach.
+TEST(ReplicationStatsOnAStandby, ACascadingStandbyMeasuresItsSendersInBytes) {
+  const char* cascade = std::getenv("CASCADE_URL");
+  if (standby_url().empty() || cascade == nullptr)
+    GTEST_SKIP() << "no CASCADE_URL; run cpp/test/run-pooled-tests.sh";
+  PostgresMCPServer standby{standby_url()};
+  json r = standby.call_replication_stats();
+  ASSERT_TRUE(r["replication"].is_object()) << r.dump(2);
+  bool found = false;
+  for (auto& [key, s] : r["replication"].items()) {
+    if (s["application_name"] != "licht_cascade") continue;
+    found = true;
+    // Keyed by name and pid, so two cascades sharing a cluster_name could
+    // not fold into one entry.
+    EXPECT_NE(key.find("pid"), std::string::npos) << key;
+    ASSERT_TRUE(s["replay_behind_bytes"].is_number())
+        << "null on a cascading standby is the bug this guards: " << s.dump(2);
+    EXPECT_GE(s["replay_behind_bytes"].get<long long>(), 0) << s.dump(2);
+    EXPECT_EQ(s["state"], "streaming") << s.dump(2);
+  }
+  EXPECT_TRUE(found) << "the rig's cascade is not among the standby's senders: "
+                     << r["replication"].dump(2);
+
+  // And the cascade itself is a replica that sends nothing.
+  PostgresMCPServer leaf{std::string(cascade)};
+  json l = leaf.call_replication_stats();
+  EXPECT_TRUE(l["replication"].is_object()) << l.dump(2);
+  EXPECT_TRUE(l["replication"].empty()) << l["replication"].dump(2);
+}
+
 TEST(SessionRoleTest, ObservesTheReplicaSideOnAStandby) {
   if (standby_url().empty())
     GTEST_SKIP() << "no STANDBY_URL; run cpp/test/run-pooled-tests.sh";
