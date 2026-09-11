@@ -231,6 +231,18 @@ them at full fidelity, a role with `pg_monitor` 63.
   (PostgreSQL 15+). Those are shared dependencies like any other grant, so the
   rows were already in the total and only the name was absent.
 
+- **A site, and an `llms.txt` generated from the binary.** llms.txt
+  (llmstxt.org) is how an agent that has not installed a tool yet learns what
+  it is, and it is found by URL path — so it needs a site, and this project had
+  none. The release workflow now publishes a minimal landing page, the man page
+  rendered to HTML, and `llms.txt` to https://sqlambda.github.io/pg_licht/
+  after each release. `llms.txt` is never written by hand:
+  `tools/generate-llms-txt.py` asks the shipped binary for its version, tools
+  and prompts over stdio, the same way a client does, and links each one to
+  its own entry in the manual — failing if any has no entry. It drives the
+  binary with a throwaway config so a developer's own connections file is
+  never read. The `llms_txt` ctest runs it on every build.
+
 ### Fixed
 
 - **Tablespace comments were never readable.** `listTablespaces` read its

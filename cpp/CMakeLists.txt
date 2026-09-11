@@ -90,6 +90,19 @@ if(BUILD_TESTING)
     add_test(NAME protocol_compat
              COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/protocol-compat.sh
                      $<TARGET_FILE:pg_licht_mcp>)
+
+    # llms.txt, generated from the binary as the release workflow does, so a
+    # tool without a man page entry -- or a generator broken by a change to
+    # tools/list -- fails here rather than at tag time. Needs mandoc to render
+    # the man page the entries link into, and python3 for the generator.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(MANDOC_EXECUTABLE AND Python3_Interpreter_FOUND)
+        add_test(NAME llms_txt
+                 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/llms-txt.sh
+                         $<TARGET_FILE:pg_licht_mcp>)
+    else()
+        message(STATUS "mandoc or python3 not found: skipping the llms_txt test")
+    endif()
 endif()
 
 message(STATUS "Using compiler: ${CMAKE_CXX_COMPILER} (${CMAKE_CXX_COMPILER_ID})")

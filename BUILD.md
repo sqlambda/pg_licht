@@ -154,13 +154,25 @@ not duplicate it.
 
 - `.github/workflows/sanitizers.yml` — ASan/UBSan, TSan, Valgrind, and the pooled-connection
   job, each across PostgreSQL 14, 15, 16, 17, and 18.
+- `.github/workflows/sanitizers.yml` also builds with clang (`plain-clang`), so a warning
+  only clang raises fails under `-Werror`.
 - `.github/workflows/release.yml` — 7 build targets (Linux x86_64/arm64, Debian 13 deb,
   Rocky 9 rpm, macOS arm64). Tarballs are staged through `cmake --install`; deb and rpm are
   produced by CPack, which picks up the same install rules. libpqxx is pinned via
-  `PQXX_VERSION`.
+  `PQXX_VERSION`. The `.deb` Depends is derived by `dpkg-shlibdeps`; the `.rpm` requires
+  PGDG's `libpq5` by name.
+- `verify-packages` then installs every `.deb` on plain Debian 13 and every `.rpm` on Rocky
+  Linux 9 with PGDG enabled, runs the binary and finds the man page. The release waits for
+  it.
+- `site` builds the GitHub Pages site on every run: `site/index.html`, the man page
+  rendered by `mandoc -T html`, and `llms.txt` generated from the shipped binary by
+  `tools/generate-llms-txt.py`. The generator fails if any tool or prompt has no entry in
+  the man page; the `llms_txt` ctest runs the same generator locally.
 
 ## Release process
 
-Push a `v*` tag on `main`. The release workflow builds and uploads all seven artifacts,
-creates the GitHub release, and bumps the Homebrew tap formula (URL and sha256)
-automatically.
+Push a `v*` tag on `main`. The release workflow builds all seven artifacts, installs each
+package in its target distribution, creates the GitHub release, and bumps the Homebrew tap
+formula (URL and sha256) automatically. After the release succeeds, `deploy-site` publishes
+the site and `llms.txt` to https://sqlambda.github.io/pg_licht/, so both always describe a
+released version. Nothing about the site or `llms.txt` is edited by hand.

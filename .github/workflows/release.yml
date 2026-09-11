@@ -374,3 +374,65 @@ jobs:
           # so it lives only in this process and not on the runner's disk.
           git push "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" \
                    "HEAD:$(git rev-parse --abbrev-ref HEAD)"
+
+  # The site: a landing page, the man page rendered to HTML, and llms.txt.
+  # llms.txt (https://llmstxt.org) is found by URL path, so it needs a site to
+  # live under; a copy in the repository would be found by nothing.
+  #
+  # Built on every run, so a broken generator or a tool with no man page entry
+  # fails a pull request rather than a tag. Deployed only by deploy-site, and
+  # only for a release tag after the release itself succeeded, so the site
+  # always describes a version that exists.
+  site:
+    name: Site and llms.txt
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # The shipped Linux binary, not a rebuild: llms.txt is generated from
+      # what the release actually contains.
+      - uses: actions/download-artifact@v4
+        with:
+          name: pg_licht_mcp-linux-x86_64
+
+      - name: Generate
+        env:
+          # A tag's own README and CHANGES for a release; main otherwise.
+          REF: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'main' }}
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y mandoc libpq5
+          mkdir -p stage _site
+          tar -xzf pg_licht_mcp-linux-x86_64.tar.gz -C stage
+          cp site/index.html _site/
+          mandoc -T html cpp/man/pg_licht_mcp.1 > _site/pg_licht_mcp.1.html
+          # Fails if any tool or prompt lacks a man page anchor to link to.
+          python3 tools/generate-llms-txt.py --binary stage/bin/pg_licht_mcp \
+            --man-html _site/pg_licht_mcp.1.html --ref "$REF" --output _site/llms.txt
+          # Served as-is: no Jekyll pass over the generated files.
+          touch _site/.nojekyll
+          head -3 _site/llms.txt
+          ls -la _site
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy-site:
+    name: Publish the site
+    needs: [site, release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

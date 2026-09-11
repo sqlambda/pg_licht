@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pg-licht</title>
+<meta name="description" content="A read-only PostgreSQL server for the Model Context Protocol.">
+<!--
+  A landing page, not documentation. Its job is to give llms.txt a URL to live
+  under and to point at the documents that already carry the content: every
+  substantive sentence stays in README, INSTALL and the man page. Deployed with
+  llms.txt and the rendered man page by the release workflow at each tag.
+-->
+<style>
+  :root {
+    --bg: #fbfaf7; --fg: #1d1f21; --muted: #5b6168; --rule: #e3e0d8;
+    --code-bg: #f1eee6; --link: #1f5fa8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181b; --fg: #e6e4df; --muted: #9aa0a6; --rule: #2c3035;
+      --code-bg: #202328; --link: #7fb2f0;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 17px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    padding-inline: 20px;
+  }
+  main { max-width: 42rem; margin: 0 auto; padding-block: 4rem 3rem; }
+  h1 { font-size: 2.4rem; letter-spacing: -0.02em; margin: 0 0 0.25rem; }
+  .tagline { color: var(--muted); font-size: 1.15rem; margin: 0 0 2.5rem; }
+  h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: 0.08em;
+       color: var(--muted); margin: 2.5rem 0 0.75rem; }
+  a { color: var(--link); }
+  pre {
+    background: var(--code-bg); border-radius: 6px; padding: 1rem 1.1rem;
+    overflow-x: auto; font-size: 0.9rem; line-height: 1.5;
+  }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  ul { padding-left: 1.2rem; }
+  li { margin: 0.35rem 0; }
+  footer { border-top: 1px solid var(--rule); margin-top: 3rem; padding-top: 1rem;
+           color: var(--muted); font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>pg-licht</h1>
+  <p class="tagline">A read-only PostgreSQL server for the Model Context Protocol.</p>
+
+  <p>It gives an AI assistant tools to explore schemas, read statistics and diagnose a
+  live PostgreSQL server, plus guided prompts for the common investigations. Every tool
+  call runs in its own read-only transaction with a statement timeout, and every catalog
+  query is parameterized.</p>
+
+  <h2>Install</h2>
+<pre><code>brew tap sqlambda/pg-licht &amp;&amp; brew install pg-licht
+
+claude mcp add --transport stdio pg-licht \
+  -e DATABASE_URL="postgresql://user:pass@host/dbname" \
+  -- /usr/local/bin/pg_licht_mcp</code></pre>
+  <p>Debian, Rocky Linux and tarball packages are on the
+  <a href="https://github.com/sqlambda/pg_licht/releases">releases page</a>;
+  <a href="https://github.com/sqlambda/pg_licht/blob/main/INSTALL.md">INSTALL</a> covers each.</p>
+
+  <h2>Read</h2>
+  <ul>
+    <li><a href="pg_licht_mcp.1.html">The manual</a>: configuration, connection strings, every tool and prompt</li>
+    <li><a href="https://github.com/sqlambda/pg_licht/blob/main/README.md">README</a>: the safety model, topology, host capacity</li>
+    <li><a href="https://github.com/sqlambda/pg_licht/blob/main/CHANGES.md">Changelog</a></li>
+    <li><a href="llms.txt">llms.txt</a>: the same, for an agent deciding whether to install it</li>
+  </ul>
+
+  <footer>
+    <a href="https://github.com/sqlambda/pg_licht">github.com/sqlambda/pg_licht</a> · Apache-2.0
+  </footer>
+</main>
+</body>
+</html>

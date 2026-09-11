@@ -355,6 +355,7 @@ out-of-memory kill restarts every connection on the instance. The per-call `ram_
 | [INSTALL.md](INSTALL.md) | Homebrew, deb, rpm, tarball, verifying, uninstalling |
 | [BUILD.md](BUILD.md) | building from source, tests, sanitizers, CI, release process |
 | [CHANGES.md](CHANGES.md) | changelog |
+| [sqlambda.github.io/pg_licht](https://sqlambda.github.io/pg_licht/) | the manual as HTML, and [`llms.txt`](https://sqlambda.github.io/pg_licht/llms.txt) for an agent deciding whether to install it |
 
 Before installing, the manual page can be read straight from the source tree:
 
