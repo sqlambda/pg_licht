@@ -47,10 +47,11 @@ jobs:
             sanitizer: THREAD
           # A second front end: clang's diagnostics differ from g++'s, and
           # SafetyFlags.cmake builds with -Werror, so a warning only clang
-          # raises fails here. Insurance rather than a bug-finder -- clang 22
-          # built 4.2.x clean, and clang 19 built 4.3.0 clean -- and it is not on
-          # the critical path. Build-only: no downstream job consumes its
-          # binary, so it is not uploaded.
+          # raises fails here. It builds its own libpqxx too, and caches it
+          # separately: its first run failed at link because clang mangles
+          # constrained templates differently from the g++-built library it was
+          # handed. Not on the critical path. Build-only: no downstream job
+          # consumes its binary, so it is not uploaded.
           - config: plain-clang
             sanitizer: NONE
             cxx: clang++
@@ -76,15 +77,20 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/pqxx
-          key: pqxx-${{ env.PQXX_VERSION }}-${{ runner.os }}-${{ runner.arch }}-libpq-${{ env.LIBPQ_VERSION }}
+          # The compiler is part of the key: clang and g++ mangle constrained
+          # templates differently, so clang code cannot link a g++-built
+          # libpqxx (undefined pqxx::internal::to_string_float<...> at link).
+          key: pqxx-${{ env.PQXX_VERSION }}-${{ runner.os }}-${{ runner.arch }}-libpq-${{ env.LIBPQ_VERSION }}-${{ matrix.cxx || 'gcc' }}
 
       - name: Build libpqxx
         if: steps.pqxx.outputs.cache-hit != 'true'
         run: |
           curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
+          # Built by the same compiler as pg_licht, for the reason in the key.
           cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON \
-            -DCMAKE_INSTALL_PREFIX="$HOME/pqxx"
+            -DCMAKE_INSTALL_PREFIX="$HOME/pqxx" \
+            ${{ matrix.cxx && format('-DCMAKE_CXX_COMPILER={0}', matrix.cxx) || '' }}
           cmake --build /tmp/libpqxx-build
           cmake --install /tmp/libpqxx-build
 
