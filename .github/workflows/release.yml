@@ -184,9 +184,100 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.${{ matrix.extension }}
 
+  # Four of the seven release assets are packages, and until 4.3.0 none of
+  # them was ever opened: the tarball was listed, the .deb and .rpm were
+  # uploaded unexamined. A listing would not be enough either -- it shows a
+  # Depends line and cannot say whether that line resolves. So each package is
+  # INSTALLED in a fresh container of the distribution it targets, the way
+  # INSTALL.md tells a user to, and the binary is run once.
+  #
+  # The two package types are checked against different rules, on purpose:
+  #   .deb  plain Debian, no postgresql.org repository. Its Depends is derived
+  #         by dpkg-shlibdeps from what the binary links, and Debian's own
+  #         libpq5 satisfies it; a pass here proves no false dependency crept in.
+  #   .rpm  Rocky Linux with PGDG enabled first, as INSTALL.md says. Its
+  #         Requires names PGDG's libpq5 deliberately, and the check asserts the
+  #         package that satisfied it is PGDG's, not the distribution's libpq.
+  verify-packages:
+    name: Install (${{ matrix.artifact }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            container: debian:trixie
+            artifact: pg_licht_mcp-linux-x86_64-debian13
+            extension: deb
+          - os: ubuntu-24.04-arm
+            container: debian:trixie
+            artifact: pg_licht_mcp-linux-arm64-debian13
+            extension: deb
+          - os: ubuntu-latest
+            container: rockylinux:9
+            artifact: pg_licht_mcp-linux-x86_64-rocky9
+            extension: rpm
+          - os: ubuntu-24.04-arm
+            container: rockylinux:9
+            artifact: pg_licht_mcp-linux-arm64-rocky9
+            extension: rpm
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+
+      - name: Install the .deb on plain Debian (no postgresql.org repository)
+        if: matrix.extension == 'deb'
+        run: |
+          set -eux
+          pkg=./${{ matrix.artifact }}.deb
+          depends=$(dpkg-deb -f "$pkg" Depends)
+          echo "Depends: $depends"
+          # Derived by dpkg-shlibdeps, so every library carries a minimum
+          # version and the C++ runtime is named. A bare "libpq5" means the
+          # derivation did not run and the hand-written line came back.
+          echo "$depends" | grep -q 'libpq5 (>='
+          echo "$depends" | grep -q 'libstdc++6 (>='
+          apt-get update
+          apt-get install -y "$pkg"
+          # Nothing configured the postgresql.org repository, so whatever
+          # satisfied libpq5 is Debian's own. Asserted rather than assumed.
+          libpq_version=$(dpkg-query -W -f='${Version}' libpq5)
+          echo "libpq5 $libpq_version"
+          if echo "$libpq_version" | grep -q pgdg; then
+            echo "libpq5 came from the postgresql.org repository on plain Debian" >&2
+            exit 1
+          fi
+          pg_licht_mcp --help
+          ls /usr/share/man/man1/pg_licht_mcp.1*
+          dpkg -L pg-licht
+
+      - name: Install the .rpm on Rocky Linux with PGDG, as INSTALL.md says
+        if: matrix.extension == 'rpm'
+        run: |
+          set -eux
+          pkg=./${{ matrix.artifact }}.rpm
+          rpm -qpR "$pkg"
+          # PGDG's package by name, never the distribution's libpq.
+          rpm -qpR "$pkg" | grep -qx 'libpq5'
+          dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-$(uname -m)/pgdg-redhat-repo-latest.noarch.rpm
+          dnf install -y "$pkg"
+          provider=$(rpm -q --whatprovides libpq5)
+          echo "libpq5 provided by: $provider"
+          echo "$provider" | grep -q PGDG
+          pg_licht_mcp --help
+          # rpmbuild may compress man pages, hence the glob.
+          ls /usr/share/man/man1/pg_licht_mcp.1*
+          rpm -ql pg-licht
+
   release:
     name: Create release and update Homebrew formula
-    needs: build
+    # A package that does not install blocks the release rather than shipping.
+    needs: [build, verify-packages]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 30
