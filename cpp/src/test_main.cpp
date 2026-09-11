@@ -4971,6 +4971,17 @@ TEST_F(PostgresMCPServerTest, EveryToolIsClassified) {
           d.find("each server's own") != std::string::npos ||
           d.find("Never runs across more than one connection") != std::string::npos;
       EXPECT_TRUE(classified) << name << " carries no scope note: " << d;
+      // And the note is a sentence of its own, not run into the one before.
+      for (const char* opener : {" This reading is instance-wide",
+                                 " A physical replica is byte-identical",
+                                 " The counters here are each server's own",
+                                 " Never runs across more than one connection"}) {
+        const auto at = d.find(opener);
+        if (at != std::string::npos && at > 0) {
+          EXPECT_TRUE(d[at - 1] == '.' || d[at - 1] == '!' || d[at - 1] == '?')
+              << name << " runs into its scope note: ..." << d.substr(at > 40 ? at - 40 : 0, 80);
+        }
+      }
     }
   }
 }

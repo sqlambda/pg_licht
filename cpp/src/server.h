@@ -2031,9 +2031,17 @@ private:
         }
       }
 
+      // The note is its own sentence. Most descriptions end without a full
+      // stop, so appending it bare produced "...for a schema A physical replica
+      // is byte-identical here" on 65 of 68 tools -- found by the llms.txt
+      // generator, which splits descriptions into sentences.
       const std::string note = scope_note(name, sc);
-      if (!note.empty())
-        tool["description"] = tool["description"].get<std::string>() + note;
+      if (!note.empty()) {
+        std::string d = tool["description"].get<std::string>();
+        while (!d.empty() && std::isspace(static_cast<unsigned char>(d.back()))) d.pop_back();
+        if (!d.empty() && d.back() != '.' && d.back() != '!' && d.back() != '?') d += '.';
+        tool["description"] = d + note;
+      }
 
       if (wants_annotations) {
         // Every tool runs inside SET TRANSACTION READ ONLY, which is what makes

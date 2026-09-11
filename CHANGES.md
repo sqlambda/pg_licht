@@ -243,6 +243,13 @@ them at full fidelity, a role with `pg_monitor` 63.
   Verified on PostgreSQL 18 before changing anything: the same tablespace gave
   `NULL` through `obj_description` and the comment through `shobj_description`.
 
+- **Tool descriptions ran into their scope note.** Every tool's description
+  gains a sentence saying where its answer varies — across databases, across
+  replicas — and 65 of the 68 descriptions ended without a full stop, so a
+  client read "…list for a schema A physical replica is byte-identical here".
+  The note is now its own sentence. Found by the `llms.txt` generator, which
+  splits descriptions into sentences.
+
 - **The `.deb` declares what the binary needs, derived rather than written.**
   Its `Depends` was a hand-written, unversioned `libpq5` that named none of
   the C++ runtime the binary also links. CPack now runs `dpkg-shlibdeps`,
