@@ -1865,6 +1865,12 @@ TEST_F(PostgresMCPServerTest, NeverAnalyzedPartitionsReportNullRowsNotZero) {
   EXPECT_TRUE(lp["p"]["has_default"].get<bool>());
   // Five rows are in there. -1 was wrong, and 0 would have been wrong too.
   EXPECT_TRUE(lp["p"]["default_rows"].is_null()) << lp["p"].dump(2);
+  // The same for the parent's sums: no leaf is measured, so there is no sum
+  // to report, and never_analyzed says why rather than a 0 that reads empty.
+  EXPECT_EQ(lp["p"]["leaf_partitions"].get<int>(), 2) << lp["p"].dump(2);
+  EXPECT_EQ(lp["p"]["never_analyzed"].get<int>(), 2) << lp["p"].dump(2);
+  EXPECT_TRUE(lp["p"]["rows"].is_null()) << lp["p"].dump(2);
+  EXPECT_TRUE(lp["p"]["size_estimate"].is_null()) << lp["p"].dump(2);
 
   json pd = srv->call_partition_details(sch, "p");
   ASSERT_TRUE(pd.contains("partitions")) << pd.dump(2);
@@ -1880,6 +1886,48 @@ TEST_F(PostgresMCPServerTest, NeverAnalyzedPartitionsReportNullRowsNotZero) {
   json after = srv->call_list_partitions(sch);
   ASSERT_TRUE(after["p"]["default_rows"].is_number()) << after["p"].dump(2);
   EXPECT_EQ(after["p"]["default_rows"].get<long long>(), 5);
+  // One leaf measured, one not: a partial sum, and a count saying it is one.
+  EXPECT_EQ(after["p"]["rows"].get<long long>(), 5) << after["p"].dump(2);
+  EXPECT_EQ(after["p"]["never_analyzed"].get<int>(), 1) << after["p"].dump(2);
+
+  pqxx::nontransaction n(c);
+  n.exec("DROP SCHEMA " + sch + " CASCADE");
+}
+
+// A sub-partitioned child has no storage of its own: its rows are in its
+// children. listPartitions summed direct children only, so every row held a
+// level down was missing from the parent's count -- 100 of 300 here.
+TEST_F(PostgresMCPServerTest, PartitionRowCountsReachEveryLeaf) {
+  const std::string sch = "psub_" + std::to_string(getpid());
+  pqxx::connection c(test_url);
+  {
+    pqxx::nontransaction n(c);
+    n.exec("CREATE SCHEMA " + sch);
+    n.exec("CREATE TABLE " + sch + ".ev (at date, region int) PARTITION BY RANGE (at)");
+    n.exec("CREATE TABLE " + sch + ".ev_jan PARTITION OF " + sch + ".ev "
+           "FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')");
+    n.exec("CREATE TABLE " + sch + ".ev_feb PARTITION OF " + sch + ".ev "
+           "FOR VALUES FROM ('2026-02-01') TO ('2026-03-01') PARTITION BY LIST (region)");
+    n.exec("CREATE TABLE " + sch + ".ev_feb_1 PARTITION OF " + sch + ".ev_feb FOR VALUES IN (1)");
+    n.exec("CREATE TABLE " + sch + ".ev_feb_2 PARTITION OF " + sch + ".ev_feb "
+           "FOR VALUES IN (2) WITH (autovacuum_enabled = off)");
+    n.exec("INSERT INTO " + sch + ".ev SELECT '2026-01-15', 1 FROM generate_series(1, 100)");
+    n.exec("INSERT INTO " + sch + ".ev SELECT '2026-02-15', 1 FROM generate_series(1, 200)");
+    n.exec("INSERT INTO " + sch + ".ev SELECT '2026-02-15', 2 FROM generate_series(1, 50)");
+    n.exec("ANALYZE " + sch + ".ev_jan");
+    n.exec("ANALYZE " + sch + ".ev_feb_1");
+  }
+
+  json r = srv->call_list_partitions(sch);
+  ASSERT_TRUE(r.contains("ev")) << r.dump(2);
+  const auto& e = r["ev"];
+  EXPECT_EQ(e["partitions"].get<int>(), 2) << e.dump(2);       // direct children
+  EXPECT_EQ(e["sub_partitioned"].get<int>(), 1) << e.dump(2);
+  EXPECT_EQ(e["leaf_partitions"].get<int>(), 3) << e.dump(2);  // jan, feb_1, feb_2
+  // jan and feb_1 are measured; feb_2 holds 50 rows and has never been.
+  EXPECT_EQ(e["rows"].get<long long>(), 300) << e.dump(2);
+  EXPECT_EQ(e["never_analyzed"].get<int>(), 1) << e.dump(2);
+  EXPECT_GT(e["size_estimate"].get<long long>(), 0) << e.dump(2);
 
   pqxx::nontransaction n(c);
   n.exec("DROP SCHEMA " + sch + " CASCADE");

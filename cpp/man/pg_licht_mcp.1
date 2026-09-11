@@ -1150,7 +1150,8 @@ or
 .El
 .It Ic listPartitions Va schema
 Every partitioned table in a schema: strategy, partition key, partition count,
-combined estimated rows and size, whether a
+the combined estimated rows and size of every leaf partition at any depth,
+whether a
 .Sy DEFAULT
 partition exists and how many rows it holds, and how many partitions are
 themselves partitioned.
@@ -1162,6 +1163,17 @@ not zero, when the default partition has never been analyzed:
 stays at \-1 until then even after rows arrive, and
 .Va has_default
 says whether a default exists at all.
+.Va rows
+and
+.Va size_estimate
+cover only the leaves that have been analyzed;
+.Va never_analyzed
+says how many of the
+.Va leaf_partitions
+they could not see, and both are
+.Dv null
+when none has been measured.
+A sub-partitioned child holds no rows itself, so its leaves are what is summed.
 Reads
 .Li reltuples
 and

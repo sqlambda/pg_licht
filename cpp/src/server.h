@@ -7821,16 +7821,57 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
+    // rows and size_estimate are summed over LEAF partitions at any depth, and
+    // only over the ones that have been measured. Until 4.3.0's review both
+    // were a sum over direct children with GREATEST(reltuples, 0), which was
+    // wrong twice over: a never-analyzed partition (reltuples -1, which
+    // survives inserts) counted as empty, and a sub-partitioned child has no
+    // storage of its own, so every row held by its grandchildren was left out
+    // entirely. never_analyzed says how many leaves the sums could not see.
+    //
+    // The tree is walked through pg_inherits with a recursive CTE rather than
+    // pg_partition_tree(): the function takes AccessShareLock on every
+    // partition it visits, and this tool's promise is that it opens no
+    // relation and takes no lock.
     const std::string query = R"(
+      WITH RECURSIVE parents AS (
+        SELECT c.oid, c.relname, p.partstrat
+          FROM pg_class AS c
+          JOIN pg_partitioned_table AS p ON p.partrelid = c.oid
+         WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
+           -- Only top-level parents: a sub-partitioned child is reported
+           -- under its own parent rather than twice.
+           AND NOT c.relispartition
+      ),
+      tree AS (
+        SELECT pr.oid AS root, i.inhrelid AS relid
+          FROM parents AS pr JOIN pg_inherits AS i ON i.inhparent = pr.oid
+        UNION ALL
+        SELECT t.root, i.inhrelid
+          FROM tree AS t JOIN pg_inherits AS i ON i.inhparent = t.relid
+      ),
+      leaves AS (
+        SELECT t.root,
+               count(*) AS n,
+               count(*) FILTER (WHERE l.reltuples < 0) AS never_analyzed,
+               sum(l.reltuples) FILTER (WHERE l.reltuples >= 0) AS rows,
+               -- relpages is set by the same VACUUM or ANALYZE as reltuples,
+               -- so a never-analyzed leaf's 0 means "not measured" too.
+               sum(l.relpages)  FILTER (WHERE l.reltuples >= 0) AS pages
+          FROM tree AS t JOIN pg_class AS l ON l.oid = t.relid
+         -- A partitioned child has no storage; its leaves hold the rows.
+         WHERE l.relkind <> 'p'
+         GROUP BY t.root
+      )
       SELECT JSONB_OBJECT_AGG(parent, obj)
         FROM (
-          SELECT c.relname AS parent,
+          SELECT pr.relname AS parent,
                  JSONB_BUILD_OBJECT(
-                   'strategy', CASE p.partstrat WHEN 'r' THEN 'range'
-                                                WHEN 'l' THEN 'list'
-                                                WHEN 'h' THEN 'hash'
-                                                ELSE p.partstrat::text END,
-                   'key', pg_get_partkeydef(c.oid),
+                   'strategy', CASE pr.partstrat WHEN 'r' THEN 'range'
+                                                 WHEN 'l' THEN 'list'
+                                                 WHEN 'h' THEN 'hash'
+                                                 ELSE pr.partstrat::text END,
+                   'key', pg_get_partkeydef(pr.oid),
                    'partitions', count(ch.oid),
                    -- A default partition catches every row that matched no
                    -- bound, so it is the difference between an insert that
@@ -7852,25 +7893,27 @@ private:
                      (max(ch.reltuples) FILTER (
                         WHERE pg_get_expr(ch.relpartbound, ch.oid) = 'DEFAULT'
                           AND ch.reltuples >= 0))::bigint,
-                   'rows', COALESCE(sum(GREATEST(ch.reltuples, 0))::bigint, 0),
+                   'leaf_partitions', COALESCE(lv.n, 0),
+                   'never_analyzed',  COALESCE(lv.never_analyzed, 0),
+                   -- Over the measured leaves. NULL when there are leaves and
+                   -- none has been measured; 0 when there are no leaves at
+                   -- all, since a parent with no partitions holds nothing.
+                   'rows',
+                     CASE WHEN COALESCE(lv.n, 0) = 0 THEN 0 ELSE lv.rows::bigint END,
                    'size_estimate',
-                     COALESCE(sum(ch.relpages)::bigint, 0)
-                       * current_setting('block_size')::bigint,
-                   -- A partition may itself be partitioned. Reporting the
-                   -- count rather than recursing keeps this one query, and
-                   -- partitionDetails names them.
+                     CASE WHEN COALESCE(lv.n, 0) = 0 THEN 0
+                          ELSE lv.pages::bigint * current_setting('block_size')::bigint END,
+                   -- A partition may itself be partitioned. Its leaves are
+                   -- counted above; partitionDetails on it names them.
                    'sub_partitioned',
-                     count(*) FILTER (WHERE ch.relkind = 'p')
+                     count(ch.oid) FILTER (WHERE ch.relkind = 'p')
                  ) AS obj
-            FROM pg_class AS c
-            JOIN pg_partitioned_table AS p ON p.partrelid = c.oid
-            LEFT JOIN pg_inherits AS i  ON i.inhparent = c.oid
+            FROM parents AS pr
+            LEFT JOIN pg_inherits AS i  ON i.inhparent = pr.oid
             LEFT JOIN pg_class    AS ch ON ch.oid = i.inhrelid
-           WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
-             -- Only top-level parents: a sub-partitioned child is reported
-             -- under its own parent rather than twice.
-             AND NOT c.relispartition
-           GROUP BY c.oid, c.relname, p.partstrat) AS s;
+            LEFT JOIN leaves      AS lv ON lv.root = pr.oid
+           GROUP BY pr.oid, pr.relname, pr.partstrat,
+                    lv.n, lv.never_analyzed, lv.rows, lv.pages) AS s;
     )";
 
     pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});

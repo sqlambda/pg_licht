@@ -49,6 +49,14 @@ them at full fidelity, a role with `pg_monitor` 63.
   one reading the field exists to catch. `partitionDetails` does the same for
   each partition's `rows` and `size_estimate`.
 
+  The parent's `rows` and `size_estimate` are summed over **leaf** partitions
+  at any depth, and only over the ones that have been measured, with
+  `leaf_partitions` and `never_analyzed` beside them. A sub-partitioned child
+  has no storage of its own, so a sum over direct children leaves out every row
+  a level down, and a never-analyzed leaf is not empty. The tree is walked
+  through `pg_inherits` rather than `pg_partition_tree()`, which locks every
+  partition it visits.
+
 - **`roleDependencies`** — the inverse of `checkRoleAccess`. That tool answers
   whether a role may *use* an object; nothing answered what depends *on* it,
   which is the whole of
