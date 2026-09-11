@@ -243,6 +243,15 @@ them at full fidelity, a role with `pg_monitor` 63.
   Verified on PostgreSQL 18 before changing anything: the same tablespace gave
   `NULL` through `obj_description` and the comment through `shobj_description`.
 
+- **The RPM install instructions left out the repository it needs.** The package
+  requires `libpq5`, which is the PostgreSQL project's own (PGDG) package, not the
+  distribution's `libpq` — deliberately. INSTALL.md gave only
+  `dnf install ./file.rpm`, and on a stock Rocky Linux 9 that stops with
+  `nothing provides libpq5`. It now enables the PGDG repository first. Verified
+  against the 4.2.2 RPM in a Rocky Linux 9 container: with the repository it
+  installs `libpq5` from `pgdg-common` and runs, and where the distribution's
+  `libpq` was already installed, `libpq5` replaces it.
+
 ### Compatibility
 
 Additive except for one corrected field.
