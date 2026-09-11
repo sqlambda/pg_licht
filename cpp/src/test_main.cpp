@@ -6533,6 +6533,37 @@ TEST_F(PostgresMCPServerTest, CheckPrivilegesReportsARestrictedRoleAccurately) {
     // pgstattuple is installed by the fixture, so this is a privilege denial
     // rather than an absent extension.
     EXPECT_TRUE(denied.count("tableBloat"));
+    // Both halves of replicationStats fall short for a bare role, and the
+    // entry names both.
+    EXPECT_TRUE(degraded.count("replicationStats"));
+    // roleDependencies reads only world-readable catalogs since it stopped
+    // joining pg_authid, so it must not appear at all.
+    EXPECT_FALSE(degraded.count("roleDependencies"));
+    EXPECT_FALSE(denied.count("roleDependencies"));
+
+    // A monitoring role is still degraded for replicationStats: no predefined
+    // role grants pg_replication_origin_status, pg_monitor included. The first
+    // version of the tool's own hint said otherwise.
+    {
+      pqxx::nontransaction n(*admin_conn);
+      n.exec("GRANT pg_monitor TO \"" + role + "\"");
+    }
+    PostgresMCPServer mon{url};
+    json m = mon.call_check_privileges();
+    bool rs_degraded = false;
+    for (const auto& d : m.value("degraded", json::array()))
+      if (d["tool"] == "replicationStats") {
+        rs_degraded = true;
+        const std::string what = d["what"].get<std::string>();
+        EXPECT_NE(what.find("origin"), std::string::npos) << what;
+        // With pg_monitor the senders are complete, so only origins is named.
+        EXPECT_EQ(what.find("columns null"), std::string::npos) << what;
+      }
+    EXPECT_TRUE(rs_degraded) << m.dump(2);
+    // And the origin half really is refused to it, as the entry says.
+    json rs = mon.call_replication_stats();
+    EXPECT_TRUE(rs["origins"].contains("error")) << rs.dump(2);
+    EXPECT_FALSE(rs["replication"].contains("error")) << rs.dump(2);
     EXPECT_NE(r["available"].get<size_t>(), r["tools"].get<size_t>());
     // The catalog is world-readable, so the great majority still works.
     EXPECT_GT(r["available"].get<size_t>(), r["tools"].get<size_t>() * 3 / 4);

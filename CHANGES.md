@@ -6,7 +6,7 @@ Six new tools, from the twenty-four PostgreSQL catalogs this server did not
 read. Each closes a question the existing tools could only get halfway to, and
 one of them makes an instruction this server already gave finally executable.
 
-Sixty-eight operations. Measured on PostgreSQL 18: a bare login role runs 57 of
+Sixty-eight operations. Measured on PostgreSQL 18: a bare login role runs 56 of
 them at full fidelity, a role with `pg_monitor` 63.
 
 ### Added
@@ -116,6 +116,12 @@ them at full fidelity, a role with `pg_monitor` 63.
   seconds" had no answer anywhere. Serves physical standbys and logical
   subscribers alike, and both halves run on their own savepoint because they
   fail differently.
+
+  The origin half needs the **superuser**. `pg_replication_origin_status` is
+  granted to no predefined role — `pg_monitor` and `pg_read_all_stats` both
+  lack it, verified on 18.6 — so a monitoring role gets complete senders and an
+  error for `origins`. `checkPrivileges` reports the tool as degraded for every
+  role that cannot read the view, naming which half falls short.
 
   Senders are keyed by `application_name` **plus pid**. A walreceiver's default
   `application_name` is the standby's `cluster_name`, and Debian packaging sets

@@ -7126,7 +7126,13 @@ private:
       " 'read_stats',   " + has_role("pg_read_all_stats")    + ","
       " 'read_settings'," + has_role("pg_read_all_settings") + ","
       " 'scan_tables',  " + has_role("pg_stat_scan_tables")  + ","
-      " 'read_data',    " + has_role("pg_read_all_data")     + ")";
+      " 'read_data',    " + has_role("pg_read_all_data")     + ","
+      // Asked of the view itself rather than inferred from a role: no
+      // predefined role grants it -- pg_monitor and pg_read_all_stats both
+      // lack it, verified on 18.6 -- so only the superuser or an explicit
+      // GRANT reads it, and only has_table_privilege sees an explicit GRANT.
+      " 'origin_status', has_table_privilege("
+      "     'pg_catalog.pg_replication_origin_status', 'SELECT'))";
 
     pqxx::result res = txn.exec(query);
     const json p = json::parse(res[0][0].as<std::string>());
@@ -7137,6 +7143,7 @@ private:
     const bool settings  = monitor || p.value("read_settings", false);
     const bool scan      = monitor || p.value("scan_tables", false);
     const bool data      = super  || p.value("read_data", false);
+    const bool origins   = super  || p.value("origin_status", false);
 
     // Extension presence is a different failure from missing privilege, and
     // conflating them would send an operator to the wrong fix. Checked here so
@@ -7187,6 +7194,28 @@ private:
       degrade("currentActivity", "the query text and some columns of backends "
                                  "belonging to other roles are hidden");
 
+    // replicationStats has two halves that fail differently, so the entry says
+    // which. pg_stat_replication restricts per ROW: without the stats role the
+    // senders are listed with most columns null, which reads like an idle
+    // replica. pg_replication_origin_status is refused outright to everyone but
+    // the superuser unless granted, and pg_monitor does not grant it -- so this
+    // is degraded for a monitoring role too, which the 4.3.0 counts missed.
+    if (!stats || !origins) {
+      std::string what;
+      if (!stats)
+        what = "the WAL senders are listed with most of their columns null -- "
+               "which reads like an idle replica rather than a permission "
+               "answer -- because pg_stat_replication restricts per row";
+      if (!origins)
+        what += std::string(what.empty() ? "" : "; and ") +
+                "replication origin progress is refused: "
+                "pg_replication_origin_status is readable only by the superuser "
+                "or a role granted SELECT on it, and pg_monitor does not include "
+                "it" + (stats ? ", so origins is an error while the senders are "
+                                "complete" : "");
+      degrade("replicationStats", what);
+    }
+
     // The three that read row data. Not "denied": privilege here is per object,
     // so a role without blanket read access may still hold SELECT on some
     // tables and none on others. Reporting these as unavailable would be as
@@ -7200,6 +7229,11 @@ private:
       degrade("explainQuery", "fails on any statement referencing a table this "
                               "role cannot SELECT");
     }
+
+    // roleDependencies has no entry, deliberately: since it reads pg_roles
+    // rather than pg_authid, everything it touches is world-readable and
+    // pg_identify_object checks no privilege, so a bare login role gets the
+    // whole answer.
 
     // Everything not named is fully available. Counting rather than listing:
     // the exceptions are the answer, and enumerating 53 working tool names
@@ -7746,9 +7780,13 @@ private:
       sub.commit();
     } catch (const pqxx::sql_error& e) {
       out["origins"] = json{{"error", "could not read pg_replication_origin_status"},
-                            {"hint", "reading replication origin progress is a "
-                                     "restricted operation; a role with pg_monitor "
-                                     "or superuser can see it"},
+                            {"hint", "reading replication origin progress needs the "
+                                     "superuser or a role granted SELECT on "
+                                     "pg_replication_origin_status. No predefined "
+                                     "role includes it -- pg_monitor and "
+                                     "pg_read_all_stats do not -- so a monitoring "
+                                     "role gets this error too. The senders above "
+                                     "are unaffected"},
                             {"detail", e.what()}};
     }
 

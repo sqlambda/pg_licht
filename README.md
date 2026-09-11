@@ -137,7 +137,7 @@ for free space. The prompt leads with what makes the obvious response wrong:
 `VACUUM FULL` needs free space equal to the table and its indexes *before* it
 releases any, so it is not a disk-full action.
 
-Counts: 57 of 68 operations for a bare login role, 63 with `pg_monitor` — the
+Counts: 56 of 68 operations for a bare login role, 63 with `pg_monitor` — the
 `pg_ls_*` directory reads `diskUsage` uses are part of what that role grants.
 
 `triage-active-sessions` is for a server running more sessions at once than it
@@ -176,8 +176,9 @@ its `EXPLAIN` plan).
 
 `checkPrivileges` reports which of them the current role can actually use on a given
 connection. Most work for any role that can connect, since the catalog is world-readable:
-measured on PostgreSQL 18, a bare login role runs 57 of 68 at full fidelity, the monitoring
-role 63, and the ones that remain are those that read row data. Worth calling first
+measured on PostgreSQL 18, a bare login role runs 56 of 68 at full fidelity, the monitoring
+role 63. What remains for the monitoring role reads row data, apart from replication origin
+progress, which only the superuser can read. Worth calling first
 against an unfamiliar connection — a privilege-filtered answer is easy to mistake for an
 empty one, since `tableStats` on a role without `SELECT` returns columns with null
 statistics, exactly like a table that was never analyzed.
@@ -296,8 +297,8 @@ tool accepts depends on where its answer actually varies, and its input schema s
 | | varies across the databases of one instance | varies across members of a replication group |
 |---|---|---|
 | catalogs, `tableBloat`, the structure and size tools | yes | no — a physical replica is byte-identical |
-| `duplicateIndexes`, `indexBloat`, `tableIOStats`, `tableStats`, `listTableStats`, `subscriptionStats` | yes | **yes** — they carry `idx_scan`, or a worker of their own |
-| `currentActivity`, `currentLocks`, `statementStats`, buffer cache | no — instance-wide | yes |
+| `duplicateIndexes`, `indexBloat`, `tableIOStats`, `tableStats`, `listTableStats`, `partitionDetails`, `subscriptionStats` | yes | **yes** — they carry `idx_scan`, vacuum counters, or a worker of their own |
+| `currentActivity`, `currentLocks`, `statementStats`, `replicationStats`, buffer cache | no — instance-wide | yes |
 
 That middle row is the one worth knowing: an index that reads as unused on the primary may
 be carrying a replica's entire reporting workload, and only that replica's `idx_scan`
