@@ -372,6 +372,46 @@ replicas routinely run on smaller machines, and inheriting the primary's RAM
 would give every replica a confidently wrong
 .Va shared_buffers
 ratio.
+.Ss Budgets
+Limits
+.Nm
+applies to itself live in an optional
+.Pa budgets.ini .
+Today there is one: what
+.Ic explainQuery
+may execute when
+.Va analyze
+is combined with explicit
+.Va settings ,
+as shares of the host capacity declared for the connection.
+.Bd -literal -offset indent
+[analyze]
+memory_percent   = 10   ; worst-case plan memory, % of host_ram_mb
+vcpus_per_worker = 4    ; one parallel worker per this many host_vcpus
+.Ed
+.Pp
+Those are the built-in values, used when no file is found.
+.Va memory_percent
+takes 1 to 100 and
+.Va vcpus_per_worker
+1 to 1024.
+The first of these is read:
+.Ev PG_LICHT_BUDGETS ,
+which must then exist;
+.Pa budgets.ini
+in the same directory as the connections file in use; and
+.Pa ~/.config/pg_licht/budgets.ini .
+The last two are used only if they exist.
+.Pp
+The file is strict: an unknown section or key, or a value out of range, stops
+the server at startup rather than leaving a limit in force that the operator
+did not write.
+It holds no credentials and may be readable by anyone, but it must not be
+writable by anyone but its owner, since a file another user can edit is a limit
+another user can raise.
+Each refusal and each permitted run reports the values and the file they came
+from under
+.Va execution_budget .
 .Ss Resolution order
 The connection source is resolved in this order:
 .Bl -enum -width 2n
@@ -1809,15 +1849,21 @@ the host capacity declared for the connection, as
 .Va host_ram_mb
 and
 .Va host_vcpus .
-The worst case the plan's memory limits permit must stay within a tenth of the
-declared RAM: each sort-like node at
+The worst case the plan's memory limits permit must stay within a share of the
+declared RAM, 10% unless
+.Pa budgets.ini
+says otherwise: each sort-like node at
 .Va work_mem ,
 each hash node at
 .Va work_mem
 times
 .Va hash_mem_multiplier ,
 times the processes running it.
-The plan may use at most one parallel worker per four declared vCPUs.
+The plan may use at most one parallel worker per four declared vCPUs, again
+unless
+.Pa budgets.ini
+says otherwise; see
+.Sx Budgets .
 With no declared capacity, no settings change is executed at all.
 A refused plan is still returned with
 .Va analyzed
@@ -2415,6 +2461,13 @@ Path to a connections INI file, consulted after
 .Fl -config
 and before
 .Pa ~/.config/pg_licht/connections.ini .
+.It Ev PG_LICHT_BUDGETS
+Path to a
+.Pa budgets.ini ,
+consulted before the one beside the connections file and
+.Pa ~/.config/pg_licht/budgets.ini .
+See
+.Sx Budgets .
 .It Ev PG_LICHT_HOST_RAM_MB
 Total host memory in megabytes, read by
 .Ic hostCapacity .
@@ -2463,6 +2516,11 @@ strings are passed through unchanged.
 .It Pa ~/.config/pg_licht/connections.ini
 Default connections file, used only if it exists.
 Must not be group- or world-accessible.
+.It Pa ~/.config/pg_licht/budgets.ini
+Default budgets file, used only if it exists and no
+.Pa budgets.ini
+sits beside the connections file.
+Must not be group- or world-writable.
 .It Pa ~/.pg_service.conf
 libpq service definitions, referenced by the
 .Va service

@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <unistd.h>
 #include <sstream>
+#include <filesystem>
 #include <fstream>
 #include <sys/stat.h>
 #if defined(__GNUC__) && !defined(__clang__)
@@ -2429,6 +2430,134 @@ TEST_F(PostgresMCPServerTest, WorkersBeyondTheDeclaredBudgetArePlannedButNotExec
   json ok = big->call_explain_query("", t.count_sql(), json::array(), true, 5000,
                                     parallel_settings(), "");
   EXPECT_TRUE(ok["analyzed"].get<bool>()) << ok.dump(2);
+}
+
+// --- budgets.ini: the ratios behind the execution budget ---
+namespace {
+// A file in a fresh directory with the given mode, removed with the directory.
+struct BudgetsFile {
+  std::string dir, path;
+  BudgetsFile(const std::string& body, mode_t mode = 0644) {
+    char tmpl[] = "/tmp/licht-budgets-XXXXXX";
+    dir = ::mkdtemp(tmpl);
+    path = dir + "/budgets.ini";
+    std::ofstream(path) << body;
+    ::chmod(path.c_str(), mode);
+  }
+  ~BudgetsFile() { std::filesystem::remove_all(dir); }
+};
+}  // namespace
+
+TEST(BudgetsTest, WithNoFileTheBuiltInRatiosApply) {
+  const auto b = pglicht::Budgets::load("");
+  EXPECT_EQ(b.analyze_memory_percent, 10);
+  EXPECT_EQ(b.analyze_vcpus_per_worker, 4);
+  EXPECT_EQ(b.source, "built-in defaults");
+}
+
+TEST(BudgetsTest, TheShippedExampleLoadsAndStatesTheDefaults) {
+  // The example documents the defaults; if either drifts, this says so. Its
+  // CONTENT is what is under test, so it is copied to a 0644 file first: a
+  // checkout's mode follows the umask, and a group-writable one is refused by
+  // design -- which AFileOthersCanWriteIsRefused covers.
+  std::ifstream in(PGLICHT_EXAMPLE_BUDGETS);
+  ASSERT_TRUE(in) << PGLICHT_EXAMPLE_BUDGETS;
+  std::stringstream body;
+  body << in.rdbuf();
+  BudgetsFile copy(body.str(), 0644);
+  const auto ex = pglicht::Budgets::load(copy.path);
+  const pglicht::Budgets def;
+  EXPECT_EQ(ex.analyze_memory_percent, def.analyze_memory_percent);
+  EXPECT_EQ(ex.analyze_vcpus_per_worker, def.analyze_vcpus_per_worker);
+}
+
+TEST(BudgetsTest, ReadsBothRatiosAndNamesTheFile) {
+  BudgetsFile f("; limits\n[analyze]\nmemory_percent = 25   ; a quarter\n"
+                "vcpus_per_worker = 2\n");
+  const auto b = pglicht::Budgets::load(f.path);
+  EXPECT_EQ(b.analyze_memory_percent, 25);
+  EXPECT_EQ(b.analyze_vcpus_per_worker, 2);
+  EXPECT_EQ(b.source, f.path);
+}
+
+TEST(BudgetsTest, AnythingItDoesNotUnderstandFailsAtStartup) {
+  // A typo that silently kept the default would leave the operator believing
+  // a limit is in force that is not.
+  for (const char* body : {
+         "[analyze]\nmemory_percent = 0\n",          // zero is no budget at all
+         "[analyze]\nmemory_percent = 101\n",        // more than the machine
+         "[analyze]\nmemory_percent = ten\n",
+         "[analyze]\nvcpus_per_worker = 0\n",        // would divide by zero
+         "[analyze]\nmemory_precent = 10\n",         // misspelt key
+         "[analyse]\nmemory_percent = 10\n",         // misspelt section
+         "memory_percent = 10\n",                    // outside any section
+       }) {
+    BudgetsFile f(body);
+    EXPECT_THROW(pglicht::Budgets::load(f.path), std::runtime_error) << body;
+  }
+  EXPECT_THROW(pglicht::Budgets::load("/nonexistent/budgets.ini"), std::runtime_error);
+}
+
+TEST(BudgetsTest, AFileOthersCanWriteIsRefused) {
+  // Limits another user can edit are limits another user can raise.
+  BudgetsFile f("[analyze]\nmemory_percent = 10\n", 0666);
+  try {
+    pglicht::Budgets::load(f.path);
+    ADD_FAILURE() << "a world-writable budgets file was accepted";
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("chmod go-w"), std::string::npos) << e.what();
+  }
+  // Readable by others is fine: it holds no credentials.
+  BudgetsFile ok("[analyze]\nmemory_percent = 10\n", 0644);
+  EXPECT_NO_THROW(pglicht::Budgets::load(ok.path));
+}
+
+TEST(BudgetsTest, ResolutionOrderIsEnvironmentThenBesideTheConfigThenHome) {
+  BudgetsFile beside("[analyze]\nmemory_percent = 20\n");
+  const std::string config = beside.dir + "/connections.ini";
+
+  char tmpl[] = "/tmp/licht-home-XXXXXX";
+  const std::string home = ::mkdtemp(tmpl);
+  std::filesystem::create_directories(home + "/.config/pg_licht");
+  std::ofstream(home + "/.config/pg_licht/budgets.ini") << "[analyze]\n";
+
+  using pglicht::Budgets;
+  EXPECT_EQ(Budgets::resolve_path("/explicit.ini", config, home), "/explicit.ini");
+  EXPECT_EQ(Budgets::resolve_path("", config, home), beside.path);
+  EXPECT_EQ(Budgets::resolve_path("", "/nowhere/connections.ini", home),
+            home + "/.config/pg_licht/budgets.ini");
+  EXPECT_EQ(Budgets::resolve_path("", "", "/nonexistent-home"), "");
+  std::filesystem::remove_all(home);
+}
+
+// The ratios move what executes, and the answer says which file set them.
+TEST_F(PostgresMCPServerTest, BudgetsFromTheFileChangeWhatIsExecuted) {
+  BudgetTable t(test_url);
+
+  // A 1GB sort against 1024 MB declared: refused at the built-in 10%...
+  auto s = server_with_capacity(test_url, "1024", "4");
+  json refused = s->call_explain_query("", t.sort_sql(), json::array(), true, 5000,
+                                       json{{"work_mem", "1GB"}}, "");
+  EXPECT_FALSE(refused["analyzed"].get<bool>()) << refused.dump(2);
+
+  // ...and executed once budgets.ini allows the whole of it.
+  BudgetsFile f("[analyze]\nmemory_percent = 100\nvcpus_per_worker = 1\n");
+  s->set_budgets(pglicht::Budgets::load(f.path));
+  json allowed = s->call_explain_query("", t.sort_sql(), json::array(), true, 5000,
+                                       json{{"work_mem", "1GB"}}, "");
+  EXPECT_TRUE(allowed["analyzed"].get<bool>()) << allowed.dump(2);
+  const auto& b = allowed["planning_environment"]["execution_budget"];
+  EXPECT_EQ(b["budgets"]["source"], f.path) << b.dump(2);
+  EXPECT_EQ(b["budgets"]["memory_percent"], 100);
+  EXPECT_EQ(b["memory_budget_bytes"].get<long long>(), 1024LL * 1048576);
+  EXPECT_NE(b["rule"].get<std::string>().find("100%"), std::string::npos) << b["rule"];
+
+  // One worker per vCPU: four planned workers now fit in four vCPUs.
+  json par = s->call_explain_query("", t.count_sql(), json::array(), true, 5000,
+                                   parallel_settings(), "");
+  EXPECT_EQ(par["planning_environment"]["execution_budget"]["workers_budget"].get<int>(), 4)
+      << par.dump(2);
+  EXPECT_TRUE(par["analyzed"].get<bool>()) << par.dump(2);
 }
 
 // The form the question is actually asked in: "why is it slow for the

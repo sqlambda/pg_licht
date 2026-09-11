@@ -720,8 +720,14 @@ public:
     return explain_query(queryid, sql, params, analyze, timeout_ms, settings, as_role);
   }
 
+  // The limits from budgets.ini. Set once by main before run(); nothing else
+  // reads the file, so tests get the built-in defaults unless they set these.
+  void set_budgets(pglicht::Budgets b) { budgets_ = std::move(b); }
+  const pglicht::Budgets& budgets() const { return budgets_; }
+
 private:
   pglicht::ConnectionRegistry registry_;
+  pglicht::Budgets budgets_;
   // shared_ptr because parallel fan-out gives each worker its own server
   // object; they must share one cache or each would open its own connection.
   std::shared_ptr<ConnectionCache> cache_ = std::make_shared<ConnectionCache>();
@@ -4074,8 +4080,11 @@ private:
   //
   // plan_as_role alone is not budgeted. It applies what that role already runs
   // with in production, so it cannot exceed production's own footprint.
-  static constexpr long long kAnalyzeRamShareDivisor = 10;  // a tenth of RAM
-  static constexpr int kAnalyzeVcpusPerWorker = 4;          // 1 worker / 4 vCPUs
+  //
+  // The two ratios come from budgets.ini (pglicht::Budgets), loaded once at
+  // startup by main; a server built any other way -- the test fixture, the
+  // DATABASE_URL constructor -- keeps the built-in defaults, a tenth of RAM
+  // and one worker per four vCPUs, and never reads a developer's own file.
 
   struct ExecFootprint {
     double worst_bytes = 0;   // double: work_mem x 1000 x participants overflows int64
@@ -4160,8 +4169,9 @@ private:
     if (plan.is_array() && !plan.empty() && plan[0].contains("Plan"))
       plan_footprint(plan[0]["Plan"], work_mem, hash_mem, 1.0, fp);
 
-    const long long mem_budget = cap.ram_mb * 1048576LL / kAnalyzeRamShareDivisor;
-    const int worker_budget = cap.vcpus / kAnalyzeVcpusPerWorker;
+    const long long mem_budget =
+        cap.ram_mb * 1048576LL * budgets_.analyze_memory_percent / 100;
+    const int worker_budget = cap.vcpus / budgets_.analyze_vcpus_per_worker;
     const long long worst =
         fp.worst_bytes >= 9.0e18 ? std::numeric_limits<long long>::max()
                                  : static_cast<long long>(fp.worst_bytes);
@@ -4171,22 +4181,27 @@ private:
     out["memory_nodes"]            = fp.memory_nodes;
     out["workers_budget"]          = worker_budget;
     out["workers_planned"]         = fp.workers;
+    const std::string pct = std::to_string(budgets_.analyze_memory_percent);
+    const std::string per = std::to_string(budgets_.analyze_vcpus_per_worker);
     out["rule"] =
-        "at most a tenth of declared RAM for the worst case the plan's memory "
+        "at most " + pct + "% of declared RAM for the worst case the plan's memory "
         "limits permit (each sort-like node at work_mem, each hash node at "
         "work_mem x hash_mem_multiplier, times the processes running it), and at "
-        "most one parallel worker per four declared vCPUs";
+        "most one parallel worker per " + per + " declared vCPUs";
+    out["budgets"] = {{"memory_percent", budgets_.analyze_memory_percent},
+                      {"vcpus_per_worker", budgets_.analyze_vcpus_per_worker},
+                      {"source", budgets_.source}};
 
     std::string why;
     if (fp.worst_bytes > static_cast<double>(mem_budget))
       why = "the plan's worst-case memory, " + std::to_string(worst) + " bytes over " +
             std::to_string(fp.memory_nodes) + " memory-using node(s), exceeds the "
-            "budget of " + std::to_string(mem_budget) + " bytes (a tenth of the "
+            "budget of " + std::to_string(mem_budget) + " bytes (" + pct + "% of the "
             "declared " + std::to_string(cap.ram_mb) + " MB)";
     if (fp.workers > worker_budget)
       why += std::string(why.empty() ? "" : ", and ") + "the plan asks for " +
              std::to_string(fp.workers) + " parallel worker(s) against a budget of " +
-             std::to_string(worker_budget) + " (one per four of the declared " +
+             std::to_string(worker_budget) + " (one per " + per + " of the declared " +
              std::to_string(cap.vcpus) + " vCPUs)";
     out["allowed"] = why.empty();
     if (!why.empty())
@@ -8436,6 +8451,10 @@ private:
       std::atomic<size_t> next{0};
       auto worker = [&]() {
         PostgresMCPServer w(registry_, cache_);
+        // explainQuery never sweeps, so no worker computes an execution
+        // budget today; copied anyway so one that does cannot fall back to
+        // the built-in ratios behind the operator's back.
+        w.budgets_ = budgets_;
         for (size_t i = next.fetch_add(1); i < members.size(); i = next.fetch_add(1)) {
           const std::string& m = members[i];
           // Reset first: a member that never connects must not inherit the

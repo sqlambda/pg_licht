@@ -221,6 +221,14 @@ them at full fidelity, a role with `pg_monitor` 63.
   from a tool argument, so a caller cannot raise its own limit. `plan_as_role`
   on its own is not budgeted: it applies what that role already runs with.
 
+  The two ratios live in an optional **`budgets.ini`** — `memory_percent` and
+  `vcpus_per_worker` under `[analyze]`, 10 and 4 by default — read from
+  `$PG_LICHT_BUDGETS`, beside the connections file, or
+  `~/.config/pg_licht/budgets.ini`. It is strict: an unknown key or a value
+  out of range stops the server at startup, and a file other users can write
+  is refused, since a limit another user can edit is one they can raise.
+  `execution_budget` names the values and the file they came from.
+
   `explain-and-fix` and `diagnose-slow-query` now plan twice and compare rather
   than noting a caveat. It is the same shape as the generic-versus-custom
   comparison they already make: two plans, one difference, and the difference is

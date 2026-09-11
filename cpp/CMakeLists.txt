@@ -57,7 +57,8 @@ if(BUILD_TESTING)
         PGLICHT_VERSION="${PROJECT_VERSION}"
         # The shipped example connections file, so a test can prove it still
         # parses rather than leaving it to rot alongside the parser.
-        PGLICHT_EXAMPLE_INI="${CMAKE_CURRENT_SOURCE_DIR}/test/connections.example.ini")
+        PGLICHT_EXAMPLE_INI="${CMAKE_CURRENT_SOURCE_DIR}/test/connections.example.ini"
+        PGLICHT_EXAMPLE_BUDGETS="${CMAKE_CURRENT_SOURCE_DIR}/test/budgets.example.ini")
     target_link_libraries(pg_licht_mcp_test
         PRIVATE
             GTest::gtest

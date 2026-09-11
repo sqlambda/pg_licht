@@ -343,7 +343,17 @@ The declared figures also bound one thing that executes. `explainQuery` with `an
 explicit `settings` runs the statement under those settings only if the plan's worst-case
 memory fits in a tenth of `host_ram_mb` and it uses at most one parallel worker per four
 `host_vcpus`. With no declared capacity it runs under no settings change at all and returns
-the plan unexecuted. The read-only guard and the timeout do not bound memory, and one
+the plan unexecuted. Both ratios can be changed in a `budgets.ini`:
+
+```ini
+[analyze]
+memory_percent   = 10   ; worst-case plan memory, % of host_ram_mb
+vcpus_per_worker = 4    ; one parallel worker per this many host_vcpus
+```
+
+It is read from `$PG_LICHT_BUDGETS`, from beside the connections file, or from
+`~/.config/pg_licht/budgets.ini`, in that order, and must not be writable by other users.
+An example is in [cpp/test/budgets.example.ini](cpp/test/budgets.example.ini). The read-only guard and the timeout do not bound memory, and one
 out-of-memory kill restarts every connection on the instance. The per-call `ram_mb` and
 `vcpus` arguments do not count here: a caller cannot raise its own limit.
 
