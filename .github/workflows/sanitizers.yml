@@ -45,6 +45,15 @@ jobs:
             sanitizer: ADDRESS_UNDEFINED
           - config: thread
             sanitizer: THREAD
+          # A second front end: clang's diagnostics differ from g++'s, and
+          # SafetyFlags.cmake builds with -Werror, so a warning only clang
+          # raises fails here. Insurance rather than a bug-finder -- clang 22
+          # built 4.2.x clean, and clang 19 built 4.3.0 clean -- and it is not on
+          # the critical path. Build-only: no downstream job consumes its
+          # binary, so it is not uploaded.
+          - config: plain-clang
+            sanitizer: NONE
+            cxx: clang++
 
     steps:
       - uses: actions/checkout@v4
@@ -84,9 +93,12 @@ jobs:
           # lib64 as well as lib: CMake picks the directory, not this workflow.
           echo "PKG_CONFIG_PATH=$HOME/pqxx/lib/pkgconfig:$HOME/pqxx/lib64/pkgconfig" >> "$GITHUB_ENV"
           export PKG_CONFIG_PATH="$HOME/pqxx/lib/pkgconfig:$HOME/pqxx/lib64/pkgconfig"
+          # Only plain-clang names a compiler; the others keep CMake's default.
           cmake -S cpp -B cpp/build \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DPGLICHT_SANITIZER=${{ matrix.sanitizer }}
+            -DPGLICHT_SANITIZER=${{ matrix.sanitizer }} \
+            ${{ matrix.cxx && format('-DCMAKE_CXX_COMPILER={0}', matrix.cxx) || '' }}
+          grep -E '^CMAKE_CXX_COMPILER:' cpp/build/CMakeCache.txt
           cmake --build cpp/build --target pg_licht_mcp_test
 
       # Neither needs a database nor varies by PostgreSQL version, so they run
@@ -96,13 +108,14 @@ jobs:
       # because both switches are read once per process and cannot be toggled
       # from inside the gtest suite.
       - name: Lint the man page and check the response-shape contract
-        if: matrix.config == 'plain'
+        if: matrix.sanitizer == 'NONE'
         working-directory: cpp/build
         run: |
           cmake --build . --target pg_licht_mcp
           ctest -R "manpage_lint|protocol_compat" --output-on-failure
 
       - uses: actions/upload-artifact@v4
+        if: matrix.config != 'plain-clang'
         with:
           name: test-binary-${{ matrix.config }}
           path: cpp/build/pg_licht_mcp_test
