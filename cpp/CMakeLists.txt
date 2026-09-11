@@ -102,11 +102,27 @@ set(CPACK_PACKAGE_VENDOR "sqlambda")
 set(CPACK_PACKAGE_CONTACT "https://github.com/sqlambda/pg_licht")
 set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/sqlambda/pg_licht")
 
-# libpqxx is linked statically and baked into the binary; libpq remains the
-# only shared runtime dependency.
-set(CPACK_DEBIAN_PACKAGE_DEPENDS "libpq5")
+# libpqxx is linked statically and baked into the binary; libpq, libstdc++,
+# libgcc and libc stay shared.
+#
+# The .deb's Depends is DERIVED, not declared: dpkg-shlibdeps reads the
+# binary's NEEDED entries and the symbols it actually uses, and turns them into
+# minimum versions from each library's symbols file. Measured on the 4.2.2
+# binary: libc6 (>= 2.38), libgcc-s1 (>= 4.3), libpq5 (>= 10~~),
+# libstdc++6 (>= 14). The hand-written "libpq5" it replaces was incomplete --
+# it named none of the C++ runtime -- and carried no version at all. Every libpq
+# function the binary calls predates PostgreSQL 10, so Debian's own libpq5
+# satisfies it and the postgresql.org repository is not required; a Depends
+# that demanded it would be a false dependency. Needs the `file` utility at
+# package time, which the release workflow installs.
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_DEBIAN_PACKAGE_SECTION "database")
 
+# The RPM names PGDG's libpq5 on purpose: the PostgreSQL project's own package
+# (standalone in pgdg-common, also provided by postgresqlNN-libs), never the
+# distribution's libpq. INSTALL.md says to enable that repository first. The
+# C++ runtime and libc requirements are added by rpmbuild's automatic
+# dependency scan, as is libpq.so.5()(64bit), which libpq5 provides.
 set(CPACK_RPM_PACKAGE_REQUIRES "libpq5")
 set(CPACK_RPM_PACKAGE_LICENSE "Apache-2.0")
 set(CPACK_RPM_PACKAGE_GROUP "Applications/Databases")

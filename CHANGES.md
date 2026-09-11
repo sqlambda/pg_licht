@@ -243,6 +243,16 @@ them at full fidelity, a role with `pg_monitor` 63.
   Verified on PostgreSQL 18 before changing anything: the same tablespace gave
   `NULL` through `obj_description` and the comment through `shobj_description`.
 
+- **The `.deb` declares what the binary needs, derived rather than written.**
+  Its `Depends` was a hand-written, unversioned `libpq5` that named none of
+  the C++ runtime the binary also links. CPack now runs `dpkg-shlibdeps`,
+  which reads the binary's libraries and the symbols it uses: on the 4.2.2
+  binary that is `libc6 (>= 2.38), libgcc-s1 (>= 4.3), libpq5 (>= 10~~),
+  libstdc++6 (>= 14)`. Every libpq function called predates PostgreSQL 10, so
+  Debian's own `libpq5` satisfies it — verified by installing the 4.2.2 `.deb`
+  on plain Debian 13 — and the postgresql.org repository is not required.
+  The RPM is unchanged and deliberately names PGDG's `libpq5`.
+
 - **The RPM install instructions left out the repository it needs.** The package
   requires `libpq5`, which is the PostgreSQL project's own (PGDG) package, not the
   distribution's `libpq` — deliberately. INSTALL.md gave only

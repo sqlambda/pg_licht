@@ -40,8 +40,11 @@ Download the latest release for your platform from the
 sudo apt install ./pg_licht_mcp-linux-x86_64-debian13.deb
 ```
 
-Use `apt install ./file.deb` rather than `dpkg -i` so apt resolves the declared `libpq5`
-dependency automatically. Installs `/usr/bin/pg_licht_mcp`, already on `PATH`.
+Use `apt install ./file.deb` rather than `dpkg -i` so apt resolves the dependencies
+automatically. They are derived from the binary at build time: `libpq5` 10 or later and the
+C and C++ runtimes. Debian's own `libpq5` satisfies them, so the PostgreSQL project's apt
+repository is not needed for this package. Installs `/usr/bin/pg_licht_mcp`, already on
+`PATH`.
 
 ### Rocky Linux / RHEL / Fedora / other dnf-based distros (`.rpm`)
 
