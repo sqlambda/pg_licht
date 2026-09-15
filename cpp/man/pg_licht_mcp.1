@@ -549,9 +549,6 @@ needs to know what works.
 Naming a grant in the hint of an operation that failed is diagnosis; listing
 grants beside every unavailable operation would be a standing recommendation to
 escalate privilege, which is not this server's to make.
-.El
-.Ss Schema exploration
-.Bl -tag -width Ds
 .It Ic checkRoleAccess Ar grantee Ar schema Ar object
 Whether one role holds privileges on one table, view, sequence, function or
 procedure, answered by
@@ -592,6 +589,52 @@ Enabled with no applicable permissive policy denies everything.
 Not to be confused with
 .Ic checkPrivileges ,
 which reports which of this server's own operations the connecting role can run.
+.It Ic roleDependencies Va role
+What depends on one role, from
+.Li pg_shdepend .
+.Va by_kind
+separates
+.Li owner ,
+which blocks
+.Sy DROP ROLE
+and is cleared by
+.Sy REASSIGN OWNED ,
+from
+.Li acl
+and
+.Li policy ,
+which
+.Sy DROP OWNED
+clears.
+.Pp
+.Li pg_shdepend
+is shared across the cluster, so the counts cover every database; an object id
+resolves only from the database it lives in, so
+.Va objects
+names this database and the shared catalogs while others appear as counts.
+Tables, functions, schemas and types are named as
+.Ar schema . Ns Ar name ;
+every other class, a policy or a default privilege included, by
+.Fn pg_identify_object ,
+so a policy reads as
+.Ql p on public.t .
+.It Ic defaultPrivileges Op Va schema
+.Sy ALTER DEFAULT PRIVILEGES
+entries: what grants the
+.Sy next
+object of each type will get.
+Scope
+.Li global
+overrides the hard-wired defaults; per-schema entries are added to them.
+A default applies only to objects created by
+.Va granted_by .
+Naming a
+.Va schema
+returns its entries and the global ones, since both decide what the next object
+there gets; a schema that does not exist is an error.
+.El
+.Ss Schema exploration
+.Bl -tag -width Ds
 .It Ic listSchemas
 All schemas with their table and view names and role grants.
 .It Ic listTables Ar schema
@@ -746,6 +789,68 @@ thousands of file-metadata calls.
 This is one of the operations worth raising
 .Va statement_timeout_ms
 for.
+.It Ic listPartitions Va schema
+Every partitioned table in a schema: strategy, partition key, partition count,
+the combined estimated rows and size of every leaf partition at any depth,
+whether a
+.Sy DEFAULT
+partition exists and how many rows it holds, and how many partitions are
+themselves partitioned.
+.Va default_rows
+is
+.Dv null ,
+not zero, when the default partition has never been analyzed:
+.Li reltuples
+stays at \-1 until then even after rows arrive, and
+.Va has_default
+says whether a default exists at all.
+.Va rows
+and
+.Va size_estimate
+cover only the leaves that have been analyzed;
+.Va never_analyzed
+says how many of the
+.Va leaf_partitions
+they could not see, and both are
+.Dv null
+when none has been measured.
+A sub-partitioned child holds no rows itself, so its leaves are what is summed.
+Reads
+.Li reltuples
+and
+.Li relpages ,
+so no relation is opened and no lock is taken.
+.Pp
+A growing default partition is the finding: rows land there when they match no
+bound, so it is a missing partition that has not failed loudly yet.
+.It Ic partitionDetails Va schema , Va table
+One parent and every partition: the bound expression verbatim, whether it is the
+.Sy DEFAULT ,
+whether it is itself partitioned, estimated rows and size, and the per-partition
+live and dead tuples, scan counters and vacuum and analyze timestamps.
+Rows and size are
+.Dv null
+for a partition that has never been analyzed, rather than a zero that would
+read as empty.
+.Pp
+Autovacuum runs per
+.Sy partition ,
+so a parent has no vacuum state of its own and ranking parents finds nothing
+while one child falls behind.
+Bounds are verbatim rather than parsed: a bound carries whatever types the key
+columns have, and a misparsed boundary is worse than an unparsed one.
+For a range parent, the highest upper bound against
+.Li now()
+says whether the next period's partition exists.
+.It Ic largeObjects
+How many large objects this database holds and who owns them.
+Large objects live in a catalog rather than a relation, so every size tool here
+is blind to them while
+.Ic diskUsage
+counts their bytes.
+No sizes: the bytes are in
+.Li pg_largeobject ,
+which is not publicly readable.
 .It Ic listFunctions Ar schema
 Functions and procedures in
 .Ar schema
@@ -954,6 +1059,36 @@ and 17 adds
 .Va invalidation_reason
 and
 .Va inactive_since .
+.It Ic replicationStats
+Every WAL sender on this server with state, sync state, the LSNs, the byte gap
+to replay \(em on a cascading standby measured from the WAL it has received
+\(em and
+.Va write_lag ,
+.Va flush_lag
+and
+.Va replay_lag
+in seconds \(em plus replication origin progress.
+The only source of replication lag as a
+.Sy time .
+Senders are keyed by
+.Va application_name
+plus pid: a walreceiver's default name is its
+.Va cluster_name ,
+which Debian sets per major rather than per host, so two standbys routinely
+share one and a name-only key would fold them into a single entry.
+.Pp
+Two readings that are routinely misread.
+The view is security restricted
+.Sy per row
+rather than refused, so a role without
+.Li pg_read_all_stats
+sees the senders exist with columns null, which looks like an idle replica and
+is a permission answer.
+And the lag columns revert to
+.Dv NULL
+a short time after a standby has entirely caught up and WAL activity stops, so a
+null lag there means caught up while a non-null one is the last measurement
+rather than the current state.
 .El
 .Ss Monitoring and statistics
 .Bl -tag -width Ds
@@ -1188,141 +1323,6 @@ Only this I/O context, e.g.
 or
 .Ql bulkwrite .
 .El
-.It Ic listPartitions Va schema
-Every partitioned table in a schema: strategy, partition key, partition count,
-the combined estimated rows and size of every leaf partition at any depth,
-whether a
-.Sy DEFAULT
-partition exists and how many rows it holds, and how many partitions are
-themselves partitioned.
-.Va default_rows
-is
-.Dv null ,
-not zero, when the default partition has never been analyzed:
-.Li reltuples
-stays at \-1 until then even after rows arrive, and
-.Va has_default
-says whether a default exists at all.
-.Va rows
-and
-.Va size_estimate
-cover only the leaves that have been analyzed;
-.Va never_analyzed
-says how many of the
-.Va leaf_partitions
-they could not see, and both are
-.Dv null
-when none has been measured.
-A sub-partitioned child holds no rows itself, so its leaves are what is summed.
-Reads
-.Li reltuples
-and
-.Li relpages ,
-so no relation is opened and no lock is taken.
-.Pp
-A growing default partition is the finding: rows land there when they match no
-bound, so it is a missing partition that has not failed loudly yet.
-.It Ic partitionDetails Va schema , Va table
-One parent and every partition: the bound expression verbatim, whether it is the
-.Sy DEFAULT ,
-whether it is itself partitioned, estimated rows and size, and the per-partition
-live and dead tuples, scan counters and vacuum and analyze timestamps.
-Rows and size are
-.Dv null
-for a partition that has never been analyzed, rather than a zero that would
-read as empty.
-.Pp
-Autovacuum runs per
-.Sy partition ,
-so a parent has no vacuum state of its own and ranking parents finds nothing
-while one child falls behind.
-Bounds are verbatim rather than parsed: a bound carries whatever types the key
-columns have, and a misparsed boundary is worse than an unparsed one.
-For a range parent, the highest upper bound against
-.Li now()
-says whether the next period's partition exists.
-.It Ic roleDependencies Va role
-What depends on one role, from
-.Li pg_shdepend .
-.Va by_kind
-separates
-.Li owner ,
-which blocks
-.Sy DROP ROLE
-and is cleared by
-.Sy REASSIGN OWNED ,
-from
-.Li acl
-and
-.Li policy ,
-which
-.Sy DROP OWNED
-clears.
-.Pp
-.Li pg_shdepend
-is shared across the cluster, so the counts cover every database; an object id
-resolves only from the database it lives in, so
-.Va objects
-names this database and the shared catalogs while others appear as counts.
-Tables, functions, schemas and types are named as
-.Ar schema . Ns Ar name ;
-every other class, a policy or a default privilege included, by
-.Fn pg_identify_object ,
-so a policy reads as
-.Ql p on public.t .
-.It Ic defaultPrivileges Op Va schema
-.Sy ALTER DEFAULT PRIVILEGES
-entries: what grants the
-.Sy next
-object of each type will get.
-Scope
-.Li global
-overrides the hard-wired defaults; per-schema entries are added to them.
-A default applies only to objects created by
-.Va granted_by .
-Naming a
-.Va schema
-returns its entries and the global ones, since both decide what the next object
-there gets; a schema that does not exist is an error.
-.It Ic largeObjects
-How many large objects this database holds and who owns them.
-Large objects live in a catalog rather than a relation, so every size tool here
-is blind to them while
-.Ic diskUsage
-counts their bytes.
-No sizes: the bytes are in
-.Li pg_largeobject ,
-which is not publicly readable.
-.It Ic replicationStats
-Every WAL sender on this server with state, sync state, the LSNs, the byte gap
-to replay \(em on a cascading standby measured from the WAL it has received
-\(em and
-.Va write_lag ,
-.Va flush_lag
-and
-.Va replay_lag
-in seconds \(em plus replication origin progress.
-The only source of replication lag as a
-.Sy time .
-Senders are keyed by
-.Va application_name
-plus pid: a walreceiver's default name is its
-.Va cluster_name ,
-which Debian sets per major rather than per host, so two standbys routinely
-share one and a name-only key would fold them into a single entry.
-.Pp
-Two readings that are routinely misread.
-The view is security restricted
-.Sy per row
-rather than refused, so a role without
-.Li pg_read_all_stats
-sees the senders exist with columns null, which looks like an idle replica and
-is a permission answer.
-And the lag columns revert to
-.Dv NULL
-a short time after a standby has entirely caught up and WAL activity stops, so a
-null lag there means caught up while a non-null one is the last measurement
-rather than the current state.
 .It Ic wraparoundStatus Op Va schema , Va limit
 Transaction id and multixact wraparound headroom.
 For every database:
@@ -2879,3 +2879,78 @@ backend indefinitely.
 See
 .Sx The statement ceiling
 for the value and how to change it.
+.Ss What reaches the caller
+.Nm
+never writes, and it never selects rows from your tables.
+Every call is a read-only transaction, so nothing it runs can change data or
+schema.
+Two operations touch a user table, and neither returns its rows:
+.Ic checkKey
+answers only whether a row with the given primary key exists, though that answer
+is itself a fact about the table; and
+.Ic explainQuery
+with
+.Va analyze
+executes a statement the caller supplied, only once its plan is proven not to
+write, and returns the plan with row counts and timings rather than the rows.
+.Pp
+Values that came from your data can still reach the caller, in these places:
+.Bl -tag -width Ds
+.It Ic currentActivity , currentLocks
+The text of statements other sessions are running now, exactly as sent,
+including any literal a
+.Ic WHERE
+clause or a statement carries \(em a password in
+.Ic ALTER ROLE ... PASSWORD
+among them.
+Statements of other roles are hidden unless the connecting role holds
+.Li pg_read_all_stats .
+.It Ic statementStats , explainQuery
+Statement text recorded by
+.Li pg_stat_statements ,
+in which the constants of a planned statement are replaced by
+.Ar $n
+placeholders: up to 500 characters in a list, whole when one queryid is named.
+Statements of other roles read
+.Ql <insufficient privilege>
+without
+.Li pg_read_all_stats .
+.It Ic tableStats , columnHistogram
+Column statistics from
+.Li pg_stats :
+the most common values with their frequencies, and histogram bounds, which are
+sample values from the column.
+PostgreSQL returns them only for columns the connecting role may
+.Ic SELECT .
+.It Ic explainQuery , evaluateIndex
+Plans, which repeat the literals of the statement the caller wrote.
+.It Ic functionDetails , tableDetails
+Definitions as written: function source, view definitions, column defaults,
+check constraints and policy expressions, carrying whatever literals were
+written into them.
+.It Ic serverSettings
+Setting values.
+For a role allowed to read superuser-only settings that includes a standby's
+.Va primary_conninfo ,
+which may contain a password.
+.El
+.Pp
+No operation returns a password
+.Nm
+itself holds:
+.Ic listConnections
+never returns one and never expands a service file,
+.Ic listForeignServers
+returns server options but never user mappings, and
+.Ic listSubscriptions
+omits each subscription's connection string.
+.Pp
+The connecting role decides the rest.
+A role without
+.Ic SELECT
+on a column gets none of its statistics, and a role without
+.Li pg_read_all_stats
+sees only its own statements.
+.Ic checkPrivileges
+reports what the current role can reach, so the narrowest role that answers the
+question is the one to connect as.

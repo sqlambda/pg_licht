@@ -32,8 +32,16 @@ those whose cost scales with the server rather than with the query —
 connection where such a scan is the point of the call. Reaching it is reported as the ceiling being reached, naming
 the value and the key to change, rather than as an error.
 
-Full rationale, including the guarded exception for `explainQuery`, is in the
-SECURITY CONSIDERATIONS section of `man pg_licht_mcp`.
+pg_licht never writes and never selects rows from your tables. Values from your data can
+still reach the caller in a few named places: live and recorded statement text
+(`currentActivity`, `currentLocks`, `statementStats`), column statistics (`tableStats`,
+`columnHistogram`), plans that repeat a statement's literals, definitions as written, and
+settings such as a standby's `primary_conninfo`. No password pg_licht itself holds is ever
+returned. Connect as the narrowest role that answers the question; `checkPrivileges`
+reports what it can reach.
+
+Full rationale, including the guarded exception for `explainQuery` and the complete list of
+what reaches the caller, is in the SECURITY CONSIDERATIONS section of `man pg_licht_mcp`.
 
 ## Quick start
 
