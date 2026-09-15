@@ -259,6 +259,37 @@ them at full fidelity, a role with `pg_monitor` 63.
   binary with a throwaway config so a developer's own connections file is
   never read. The `llms_txt` ctest runs it on every build.
 
+  The landing page is an overview: one server for a whole fleet, read-only
+  enforced by PostgreSQL rather than by convention, and exactly what can and
+  cannot reach the caller. Its counts are filled in from the binary at build
+  time, and every other number on it was measured — the tool listing is the
+  same 135 KB with 1, 150 or 1,000 connections configured.
+
+  Beside it, an **HTML reference**: one page per tool and per prompt, 80 in
+  all, grouped by the manual's sections, in the shape of the PostgreSQL
+  manual's command pages — synopsis, description, parameters with required
+  and optional marked, output fields, where the answer varies, an example, and
+  related tools. Prompt pages carry the full text `prompts/get` returns.
+  `tools/gen-reference.py` builds it from the binary and the man page. The one
+  hand-written input is `tools/reference/examples.json`, whose examples are
+  **mocked** — invented values on a fictional database, nothing captured from
+  a real server — and each is validated against its tool's own input and
+  output schema, so a mock that drifts from its tool fails the build. Tools
+  that can return values from your data are marked on their page. The
+  `reference` ctest builds the whole site and checks that every tool has a
+  page and every internal link and anchor resolves; `llms.txt` entries now
+  link to these pages.
+
+- **The manual says exactly what can reach the caller.** A new subsection of
+  SECURITY CONSIDERATIONS, checked against the queries: pg_licht never writes
+  and never returns rows from your tables, but statement text
+  (`currentActivity`, `currentLocks`, `statementStats`, `explainQuery`),
+  column statistics (`tableStats`, `columnHistogram`), plans, definitions as
+  written, and settings such as a standby's `primary_conninfo` can carry
+  values, each limited further by PostgreSQL's own permissions. No behaviour
+  changes; this documents what 4.3.0 already does. Seven entries moved to the
+  manual section that matches what they answer, which the reference groups by.
+
 ### Fixed
 
 - **Tablespace comments were never readable.** `listTablespaces` read its

@@ -113,12 +113,12 @@ jobs:
       # two environment switches do -- end to end against the real binary,
       # because both switches are read once per process and cannot be toggled
       # from inside the gtest suite.
-      - name: Lint the man page, check the response-shape contract, generate llms.txt
+      - name: Lint the man page, check the response-shape contract, build the site
         if: matrix.sanitizer == 'NONE'
         working-directory: cpp/build
         run: |
           cmake --build . --target pg_licht_mcp
-          ctest -R "manpage_lint|protocol_compat|llms_txt" --output-on-failure
+          ctest -R "manpage_lint|protocol_compat|llms_txt|reference" --output-on-failure
 
       - uses: actions/upload-artifact@v4
         if: matrix.config != 'plain-clang'

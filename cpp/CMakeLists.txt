@@ -101,8 +101,14 @@ if(BUILD_TESTING)
         add_test(NAME llms_txt
                  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/llms-txt.sh
                          $<TARGET_FILE:pg_licht_mcp>)
+        # The HTML reference and landing page, built as the release builds
+        # them: every mocked example checked against its tool's schema, every
+        # tool and prompt with a page, every internal link resolving.
+        add_test(NAME reference
+                 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/reference.sh
+                         $<TARGET_FILE:pg_licht_mcp>)
     else()
-        message(STATUS "mandoc or python3 not found: skipping the llms_txt test")
+        message(STATUS "mandoc or python3 not found: skipping the llms_txt and reference tests")
     endif()
 endif()
 

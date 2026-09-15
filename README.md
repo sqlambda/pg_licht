@@ -32,7 +32,7 @@ those whose cost scales with the server rather than with the query —
 connection where such a scan is the point of the call. Reaching it is reported as the ceiling being reached, naming
 the value and the key to change, rather than as an error.
 
-pg_licht never writes and never selects rows from your tables. Values from your data can
+pg_licht never writes and never returns rows from your tables. Values from your data can
 still reach the caller in a few named places: live and recorded statement text
 (`currentActivity`, `currentLocks`, `statementStats`), column statistics (`tableStats`,
 `columnHistogram`), plans that repeat a statement's literals, definitions as written, and
@@ -373,7 +373,7 @@ out-of-memory kill restarts every connection on the instance. The per-call `ram_
 | [INSTALL.md](INSTALL.md) | Homebrew, deb, rpm, tarball, verifying, uninstalling |
 | [BUILD.md](BUILD.md) | building from source, tests, sanitizers, CI, release process |
 | [CHANGES.md](CHANGES.md) | changelog |
-| [sqlambda.github.io/pg_licht](https://sqlambda.github.io/pg_licht/) | the manual as HTML, and [`llms.txt`](https://sqlambda.github.io/pg_licht/llms.txt) for an agent deciding whether to install it |
+| [sqlambda.github.io/pg_licht](https://sqlambda.github.io/pg_licht/) | overview, the [reference](https://sqlambda.github.io/pg_licht/reference/) with a page per tool and prompt, the manual as HTML, and [`llms.txt`](https://sqlambda.github.io/pg_licht/llms.txt) |
 
 Before installing, the manual page can be read straight from the source tree:
 

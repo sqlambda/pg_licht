@@ -407,8 +407,12 @@ jobs:
           sudo apt-get install -y mandoc libpq5
           mkdir -p stage _site
           tar -xzf pg_licht_mcp-linux-x86_64.tar.gz -C stage
-          cp site/index.html _site/
           mandoc -T html cpp/man/pg_licht_mcp.1 > _site/pg_licht_mcp.1.html
+          # The reference, one page per tool and prompt, and the landing page
+          # filled in from the same binary. Fails if a mocked example no longer
+          # matches its tool's schema or a tool has no man page category.
+          python3 tools/gen-reference.py --binary stage/bin/pg_licht_mcp \
+            --out _site/reference --landing site/index.html --landing-out _site/index.html
           # Fails if any tool or prompt lacks a man page anchor to link to.
           python3 tools/generate-llms-txt.py --binary stage/bin/pg_licht_mcp \
             --man-html _site/pg_licht_mcp.1.html --ref "$REF" --output _site/llms.txt

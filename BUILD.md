@@ -164,10 +164,18 @@ not duplicate it.
 - `verify-packages` then installs every `.deb` on plain Debian 13 and every `.rpm` on Rocky
   Linux 9 with PGDG enabled, runs the binary and finds the man page. The release waits for
   it.
-- `site` builds the GitHub Pages site on every run: `site/index.html`, the man page
-  rendered by `mandoc -T html`, and `llms.txt` generated from the shipped binary by
-  `tools/generate-llms-txt.py`. The generator fails if any tool or prompt has no entry in
-  the man page; the `llms_txt` ctest runs the same generator locally.
+- `site` builds the GitHub Pages site on every run: the landing page filled in from
+  `site/index.html`, the man page rendered by `mandoc -T html`, the HTML reference from
+  `tools/gen-reference.py`, and `llms.txt` from `tools/generate-llms-txt.py`, all from the
+  shipped binary. The reference fails if a mocked example in `tools/reference/examples.json`
+  no longer matches its tool's schema, or a tool has no man page section; `llms.txt` fails if
+  a tool or prompt has no man page entry. The `llms_txt` and `reference` ctests run the same
+  generators locally, and `reference` also checks every internal link.
+
+  Adding a tool therefore means three things beyond the code: an entry in a man page
+  OPERATIONS section, which gives it a category; a mocked example in
+  `tools/reference/examples.json`; and, if it can return values from user data, a line under
+  "What reaches the caller" in SECURITY CONSIDERATIONS.
 
 ## Release process
 

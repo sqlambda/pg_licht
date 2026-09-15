@@ -4,22 +4,32 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>pg-licht</title>
-<meta name="description" content="A read-only PostgreSQL server for the Model Context Protocol.">
+<meta name="description" content="One read-only PostgreSQL MCP server for every database you run.">
 <!--
-  A landing page, not documentation. Its job is to give llms.txt a URL to live
-  under and to point at the documents that already carry the content: every
-  substantive sentence stays in README, INSTALL and the man page. Deployed with
-  llms.txt and the rendered man page by the release workflow at each tag.
+  A template. tools/gen-reference.py fills the double-braced names from the binary
+  at build time, so no count on this page can disagree with the release it
+  ships with. Every claim below is about pg_licht itself and was measured, not
+  assumed; where a number is written by hand, the source of it is noted beside
+  it in this comment block:
+    - tool listing size vs connection count: 135 KB with 1, 150 and 1,000
+      configured connections; startup 51-62 ms (2026-09-15)
+    - 56 and 63 of 68: checkPrivileges as a bare and a pg_monitor role on
+      PostgreSQL 18 (2026-09-10)
+    - sweeps: at most 32 members per call (kMaxSweepMembers), 16 at a time
+      (kSweepConcurrency); at most 32 idle connections kept warm (kMaxIdle),
+      all in cpp/src/server.h
 -->
 <style>
   :root {
-    --bg: #fbfaf7; --fg: #1d1f21; --muted: #5b6168; --rule: #e3e0d8;
-    --code-bg: #f1eee6; --link: #1f5fa8;
+    --bg: #fbfaf7; --panel: #ffffff; --fg: #1c1e21; --muted: #5d636b; --rule: #e4e1d9;
+    --accent: #1f5fa8; --accent-soft: #e8f0f9; --code-bg: #f2efe7;
+    --ok: #1f7a4d; --warn: #9a5b10; --warn-soft: #fbf1e3;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #16181b; --fg: #e6e4df; --muted: #9aa0a6; --rule: #2c3035;
-      --code-bg: #202328; --link: #7fb2f0;
+      --bg: #131518; --panel: #1a1d21; --fg: #e6e4df; --muted: #9ba1a8; --rule: #2b2f34;
+      --accent: #7fb2f0; --accent-soft: #1b2733; --code-bg: #1f2227;
+      --ok: #6fcf9c; --warn: #e2ad63; --warn-soft: #2b2418;
     }
   }
   * { box-sizing: border-box; }
@@ -28,53 +38,265 @@
     font: 17px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     padding-inline: 20px;
   }
-  main { max-width: 42rem; margin: 0 auto; padding-block: 4rem 3rem; }
-  h1 { font-size: 2.4rem; letter-spacing: -0.02em; margin: 0 0 0.25rem; }
-  .tagline { color: var(--muted); font-size: 1.15rem; margin: 0 0 2.5rem; }
-  h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: 0.08em;
-       color: var(--muted); margin: 2.5rem 0 0.75rem; }
-  a { color: var(--link); }
-  pre {
-    background: var(--code-bg); border-radius: 6px; padding: 1rem 1.1rem;
-    overflow-x: auto; font-size: 0.9rem; line-height: 1.5;
-  }
-  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-  ul { padding-left: 1.2rem; }
-  li { margin: 0.35rem 0; }
-  footer { border-top: 1px solid var(--rule); margin-top: 3rem; padding-top: 1rem;
-           color: var(--muted); font-size: 0.9rem; }
+  main { max-width: 64rem; margin: 0 auto; padding-block: 3.5rem 3rem; }
+  a { color: var(--accent); }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .9em; }
+  pre { background: var(--code-bg); border-radius: 8px; padding: 1rem 1.1rem; overflow-x: auto;
+        font-size: .88rem; line-height: 1.5; margin: 0; }
+  nav.top { display: flex; justify-content: space-between; align-items: center; gap: 1rem;
+            flex-wrap: wrap; font-size: .92rem; margin-bottom: 3rem; }
+  nav.top .brand { font-weight: 650; letter-spacing: -.01em; color: var(--fg); text-decoration: none; }
+  nav.top .links { display: flex; gap: 1.2rem; flex-wrap: wrap; }
+  nav.top .links a { color: var(--muted); text-decoration: none; }
+  nav.top .links a:hover { color: var(--accent); }
+
+  .hero h1 { font-size: clamp(2rem, 5vw, 3.1rem); line-height: 1.12; letter-spacing: -.025em;
+             margin: 0 0 1rem; max-width: 46rem; }
+  .hero p.lede { font-size: 1.2rem; color: var(--muted); max-width: 42rem; margin: 0 0 1.8rem; }
+  .cta { display: flex; gap: .8rem; flex-wrap: wrap; margin-bottom: 2.5rem; }
+  .btn { display: inline-block; padding: .6rem 1.1rem; border-radius: 7px; text-decoration: none;
+         font-weight: 600; font-size: .95rem; border: 1px solid var(--rule); color: var(--fg);
+         background: var(--panel); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: 1px;
+           background: var(--rule); border: 1px solid var(--rule); border-radius: 10px; overflow: hidden;
+           margin-bottom: 4rem; }
+  .stat { background: var(--panel); padding: 1.1rem 1.2rem; }
+  .stat b { display: block; font-size: 1.7rem; letter-spacing: -.02em; line-height: 1.2; }
+  .stat span { color: var(--muted); font-size: .88rem; }
+
+  section { margin-bottom: 4rem; }
+  section > h2 { font-size: 1.6rem; letter-spacing: -.015em; margin: 0 0 .6rem; }
+  section > p.intro { color: var(--muted); max-width: 44rem; margin: 0 0 1.6rem; }
+
+  .compare { display: grid; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); gap: 1rem; }
+  .card { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 1.3rem 1.4rem; }
+  .card h3 { margin: 0 0 .7rem; font-size: 1.05rem; }
+  .card ul { margin: 0; padding-left: 1.1rem; }
+  .card li { margin: .35rem 0; }
+  .card.us { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+  .card .label { display: inline-block; font-size: .72rem; font-weight: 700; text-transform: uppercase;
+                 letter-spacing: .06em; color: var(--muted); margin-bottom: .4rem; }
+  .card.us .label { color: var(--accent); }
+  .fine { color: var(--muted); font-size: .88rem; margin-top: .9rem; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); gap: 1rem; }
+  .feature { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 1.2rem 1.3rem; }
+  .feature h3 { margin: 0 0 .45rem; font-size: 1.02rem; }
+  .feature p { margin: 0; color: var(--muted); font-size: .95rem; }
+
+  .data { display: grid; grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr)); gap: 1rem; }
+  .never { background: var(--accent-soft); border-radius: 10px; padding: 1.3rem 1.4rem; }
+  .never h3, .exposed h3 { margin: 0 0 .6rem; font-size: 1.05rem; }
+  .never ul, .exposed ul { margin: 0; padding-left: 1.1rem; }
+  .never li, .exposed li { margin: .35rem 0; }
+  .exposed { background: var(--warn-soft); border-radius: 10px; padding: 1.3rem 1.4rem; }
+  .exposed h3 { color: var(--warn); }
+
+  .cats { list-style: none; padding: 0; margin: 0; display: grid;
+          grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr)); gap: .5rem; }
+  .cats li { display: flex; justify-content: space-between; gap: 1rem; background: var(--panel);
+             border: 1px solid var(--rule); border-radius: 8px; padding: .6rem .9rem; }
+  .cats li a { text-decoration: none; font-weight: 550; }
+  .cats li span { color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  .install { display: grid; grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr)); gap: 1rem; align-items: start; }
+  footer { border-top: 1px solid var(--rule); padding-top: 1.2rem; color: var(--muted); font-size: .9rem;
+           display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
 </style>
 </head>
 <body>
 <main>
-  <h1>pg-licht</h1>
-  <p class="tagline">A read-only PostgreSQL server for the Model Context Protocol.</p>
+  <nav class="top">
+    <a class="brand" href="index.html">pg-licht</a>
+    <div class="links">
+      <a href="reference/index.html">Reference</a>
+      <a href="pg_licht_mcp.1.html">Manual</a>
+      <a href="https://github.com/sqlambda/pg_licht/releases">Releases</a>
+      <a href="https://github.com/sqlambda/pg_licht">GitHub</a>
+    </div>
+  </nav>
 
-  <p>It gives an AI assistant tools to explore schemas, read statistics and diagnose a
-  live PostgreSQL server, plus guided prompts for the common investigations. Every tool
-  call runs in its own read-only transaction with a statement timeout, and every catalog
-  query is parameterized.</p>
+  <div class="hero">
+    <h1>One read-only PostgreSQL MCP server for every database you run.</h1>
+    <p class="lede">pg-licht gives an AI assistant {{TOOLS}} tools and {{PROMPTS}} guided
+    investigations for exploring schemas, reading statistics and diagnosing live servers.
+    It can never change your data, it never returns rows from your tables, and it answers
+    for a whole fleet from a single process.</p>
+    <div class="cta">
+      <a class="btn primary" href="#install">Install</a>
+      <a class="btn" href="reference/index.html">Browse the {{TOOLS}} tools</a>
+    </div>
+  </div>
 
-  <h2>Install</h2>
-<pre><code>brew tap sqlambda/pg-licht &amp;&amp; brew install pg-licht
+  <div class="stats">
+    <div class="stat"><b>{{TOOLS}}</b><span>read-only tools in {{CATEGORIES}} groups</span></div>
+    <div class="stat"><b>{{PROMPTS}}</b><span>guided investigations</span></div>
+    <div class="stat"><b>1</b><span>process for any number of connections</span></div>
+    <div class="stat"><b>0</b><span>statements that can write</span></div>
+    <div class="stat"><b>14&ndash;18</b><span>PostgreSQL majors tested on every change</span></div>
+  </div>
+
+  <section id="fleet">
+    <h2>One server for the whole fleet</h2>
+    <p class="intro">Every connected tool takes a <code>connection</code> argument, so one
+    pg-licht answers for one database or for hundreds. Connections are named once, in one
+    file, and opened only when a call needs them.</p>
+    <div class="compare">
+      <div class="card us">
+        <span class="label">One pg-licht</span>
+        <h3>A hundred databases, one entry in your MCP client</h3>
+        <ul>
+          <li>One process, one connections file, credentials kept in libpq's own
+          <code>.pgpass</code> and service files.</li>
+          <li>One tool listing in the agent's session. Its size is the same with 1, 150 or
+          1,000 connections configured, and startup stays under a tenth of a second.</li>
+          <li>Connections open when a call needs them; up to 32 idle ones stay warm, and the
+          least recently used is closed first.</li>
+          <li>Ask a replication group, an instance or any labelled group in one call: up to
+          32 members per call, 16 at a time, one result per member, and any beyond 32 listed
+          as skipped rather than silently left out.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <span class="label">One server per database</span>
+        <h3>A hundred entries, a hundred sets of settings</h3>
+        <ul>
+          <li>A hundred processes to start, update and keep logged in.</li>
+          <li>A hundred copies of the same tools, each under a different server name, for the
+          agent to tell apart.</li>
+          <li>A client that loads tool definitions up front carries every copy in the session.</li>
+          <li>No way to ask the same question of a replica and its primary in one call.</li>
+        </ul>
+      </div>
+    </div>
+    <p class="fine">Measured with 1, 150 and 1,000 configured connections. One caveat worth
+    knowing: <code>listConnections</code> returns every connection in one answer, roughly
+    400 bytes each, so on a very large fleet prefer naming the connection you want.</p>
+  </section>
+
+  <section id="safe">
+    <h2>Read-only by construction, not by convention</h2>
+    <p class="intro">Safety is enforced by PostgreSQL on every call, not left to how the
+    assistant behaves.</p>
+    <div class="grid">
+      <div class="feature"><h3>A read-only transaction per call</h3>
+        <p>Every tool runs inside its own <code>READ ONLY</code> transaction. A write, even one
+        reached through a bug, fails in PostgreSQL rather than succeeding.</p></div>
+      <div class="feature"><h3>A timeout on every statement</h3>
+        <p><code>statement_timeout</code> is set on the same transaction, two minutes by
+        default and set per connection, so no call can hold a backend indefinitely.</p></div>
+      <div class="feature"><h3>No SQL built from arguments</h3>
+        <p>Catalog queries are parameterized. No schema, table or search term is ever
+        concatenated into SQL text.</p></div>
+      <div class="feature"><h3>Plans are proven before anything runs</h3>
+        <p><code>explainQuery</code> executes a statement only after its plan is shown to
+        contain no write, and only within a memory and CPU budget taken from the host you
+        declared.</p></div>
+      <div class="feature"><h3>Safe behind PgBouncer</h3>
+        <p>The guards are transaction-scoped, so they hold under transaction pooling. The
+        whole suite runs through a real PgBouncer on every change.</p></div>
+      <div class="feature"><h3>Honest about privileges</h3>
+        <p><code>checkPrivileges</code> says which tools the connecting role can really use:
+        56 of 68 for a bare login role, 63 with <code>pg_monitor</code>.</p></div>
+    </div>
+  </section>
+
+  <section id="data">
+    <h2>It reads the catalog, not your tables</h2>
+    <p class="intro">pg-licht describes structure and statistics. It is built so that an
+    assistant can understand a database without seeing what is in it, and it is exact about
+    the few places where values can still appear.</p>
+    <div class="data">
+      <div class="never">
+        <h3>Never</h3>
+        <ul>
+          <li>Writes, alters or deletes anything.</li>
+          <li>Returns rows from a table. The two tools that read one return only a yes or no
+          (<code>checkKey</code>) or a plan with row counts (<code>explainQuery</code>).</li>
+          <li>Returns a password it holds, a user mapping's options, or a subscription's
+          connection string.</li>
+        </ul>
+      </div>
+      <div class="exposed">
+        <h3>Where values can appear ({{EXPOSED_COUNT}} tools, each marked)</h3>
+        <ul>
+          <li>Statement text: what sessions are running now, and what
+          <code>pg_stat_statements</code> recorded.</li>
+          <li>Column statistics: most common values and histogram bounds.</li>
+          <li>Plans and definitions, which repeat the literals written into them.</li>
+          <li>Settings, such as a standby's <code>primary_conninfo</code>.</li>
+        </ul>
+      </div>
+    </div>
+    <p class="fine">Each of these is limited further by PostgreSQL's own permissions: a role
+    without <code>SELECT</code> on a column gets none of its statistics, and a role without
+    <code>pg_read_all_stats</code> sees only its own statements. Connect as the narrowest
+    role that answers the question. The full list is under
+    <a href="pg_licht_mcp.1.html#What_reaches_the_caller">What reaches the caller</a> in the manual.</p>
+  </section>
+
+  <section id="more">
+    <h2>Built for the questions operators actually ask</h2>
+    <div class="grid">
+      <div class="feature"><h3>Guided investigations</h3>
+        <p>{{PROMPTS}} prompts walk the assistant through slow queries, lock contention,
+        deadlocks, bloat, disk space, replication slots and schema changes, tool by tool.</p></div>
+      <div class="feature"><h3>Topology aware</h3>
+        <p>Label connections by instance and replication group. Roles are observed on each
+        call, never configured, and <code>verifyTopology</code> checks the labels against the
+        servers.</p></div>
+      <div class="feature"><h3>Answers a client can check</h3>
+        <p>Every tool declares its output schema and is marked read-only, and clients on MCP
+        2025-06-18 or later receive structured results.</p></div>
+      <div class="feature"><h3>Tested where it matters</h3>
+        <p>PostgreSQL 14 through 18, under AddressSanitizer, ThreadSanitizer and valgrind,
+        through a pooler, with a standby, a cascading standby and a logical subscriber,
+        built with both g++ and clang.</p></div>
+      <div class="feature"><h3>Packages that are installed before they ship</h3>
+        <p>Every <code>.deb</code> and <code>.rpm</code> is installed on the distribution it
+        targets and run before a release is published.</p></div>
+      <div class="feature"><h3>Documentation generated from the binary</h3>
+        <p>The <a href="reference/index.html">reference</a> and
+        <a href="llms.txt">llms.txt</a> are built from the release itself, so they cannot
+        describe a version that does not exist.</p></div>
+    </div>
+  </section>
+
+  <section id="tools">
+    <h2>{{TOOLS}} tools, grouped by what they answer</h2>
+    <ul class="cats">
+{{CATEGORY_LIST}}
+    </ul>
+  </section>
+
+  <section id="install">
+    <h2>Install</h2>
+    <div class="install">
+<pre><code>brew tap sqlambda/pg-licht
+brew install pg-licht
 
 claude mcp add --transport stdio pg-licht \
-  -e DATABASE_URL="postgresql://user:pass@host/dbname" \
-  -- /usr/local/bin/pg_licht_mcp</code></pre>
-  <p>Debian, Rocky Linux and tarball packages are on the
-  <a href="https://github.com/sqlambda/pg_licht/releases">releases page</a>;
-  <a href="https://github.com/sqlambda/pg_licht/blob/main/INSTALL.md">INSTALL</a> covers each.</p>
+  -e DATABASE_URL="postgresql://user@host/db" \
+  -- pg_licht_mcp</code></pre>
+<pre><code># ~/.config/pg_licht/connections.ini
+[billing_prod]
+service  = billing_ro
+instance = pg-prod-01
 
-  <h2>Read</h2>
-  <ul>
-    <li><a href="pg_licht_mcp.1.html">The manual</a>: configuration, connection strings, every tool and prompt</li>
-    <li><a href="https://github.com/sqlambda/pg_licht/blob/main/README.md">README</a>: the safety model, topology, host capacity</li>
-    <li><a href="https://github.com/sqlambda/pg_licht/blob/main/CHANGES.md">Changelog</a></li>
-    <li><a href="llms.txt">llms.txt</a>: the same, for an agent deciding whether to install it</li>
-  </ul>
+[billing_replica]
+service           = billing_replica_ro
+replication_group = billing-ha</code></pre>
+    </div>
+    <p class="fine">Debian 13 and Rocky Linux 9 packages and tarballs are on the
+    <a href="https://github.com/sqlambda/pg_licht/releases">releases page</a>; see
+    <a href="https://github.com/sqlambda/pg_licht/blob/main/INSTALL.md">INSTALL</a> for each.</p>
+  </section>
 
   <footer>
-    <a href="https://github.com/sqlambda/pg_licht">github.com/sqlambda/pg_licht</a> · Apache-2.0
+    <span>pg-licht {{VERSION}} · Apache-2.0</span>
+    <span><a href="https://github.com/sqlambda/pg_licht">github.com/sqlambda/pg_licht</a></span>
   </footer>
 </main>
 </body>

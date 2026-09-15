@@ -131,8 +131,11 @@ def anchors(man_html):
 def render(version, tools, prompts, base_url, ref, man_anchors):
     manual = f"{base_url}/pg_licht_mcp.1.html"
 
+    # Each entry links to its own page in the HTML reference, which carries
+    # the parameters, output and an example. The man page anchor check below
+    # stays: it is what guarantees every entry is documented at all.
     def link(name):
-        return f"{manual}#{name}" if man_anchors is not None else manual
+        return f"{base_url}/reference/{name}.html"
 
     if man_anchors is not None:
         missing = [x["name"] for x in tools + prompts if x["name"] not in man_anchors]
@@ -164,8 +167,10 @@ def render(version, tools, prompts, base_url, ref, man_anchors):
         "topology, host capacity",
         f"- [INSTALL]({REPO}/blob/{ref}/INSTALL.md): Homebrew, deb, rpm, tarball, "
         "verifying, uninstalling",
-        f"- [Manual]({manual}): configuration, connection strings, every tool and "
-        "prompt in full",
+        f"- [Reference]({base_url}/reference/index.html): every tool and prompt, "
+        "grouped by what it answers, with parameters, output and an example",
+        f"- [Manual]({manual}): configuration, connection strings, security "
+        "considerations, every tool and prompt in full",
         "",
         "## Tools",
         "",

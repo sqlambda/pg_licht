@@ -2881,10 +2881,10 @@ See
 for the value and how to change it.
 .Ss What reaches the caller
 .Nm
-never writes, and it never selects rows from your tables.
+never writes, and it never returns rows from your tables.
 Every call is a read-only transaction, so nothing it runs can change data or
 schema.
-Two operations touch a user table, and neither returns its rows:
+Two operations read a user table, and neither returns its rows:
 .Ic checkKey
 answers only whether a row with the given primary key exists, though that answer
 is itself a fact about the table; and
