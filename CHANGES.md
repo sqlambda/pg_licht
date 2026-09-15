@@ -1,6 +1,6 @@
 # Changelog
 
-## 4.3.0 (2026-09-09)
+## 4.3.0 (2026-09-15)
 
 Six new tools, from the twenty-four PostgreSQL catalogs this server did not
 read. Each closes a question the existing tools could only get halfway to, and
