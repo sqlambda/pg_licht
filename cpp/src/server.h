@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <chrono>
 #include <functional>
+#include <limits>
 #include <cctype>
 #include <iostream>
 #include <map>
@@ -33,8 +34,10 @@ using json = nlohmann::json;
 
 // pqxx 7.9+ renamed exec_params to exec(sql, pqxx::params).
 // Use PQXX_VERSION_MINOR to select the right overload at compile time.
-template<typename P>
-inline pqxx::result pqxx_exec(pqxx::work& txn, const std::string& sql, P&& params) {
+// Templated on the transaction type so a pqxx::subtransaction can use it too;
+// both overloads live on transaction_base.
+template<typename T, typename P>
+inline pqxx::result pqxx_exec(T& txn, const std::string& sql, P&& params) {
 #if PQXX_VERSION_MAJOR > 7 || (PQXX_VERSION_MAJOR == 7 && PQXX_VERSION_MINOR >= 9)
   return txn.exec(sql, std::forward<P>(params));
 #else
@@ -46,12 +49,14 @@ inline pqxx::result pqxx_exec(pqxx::work& txn, const std::string& sql, P&& param
 // disconnect on scope exit.
 //
 // Why connect per call rather than hold one connection: the target deployment
-// is PgBouncer in transaction mode (pool_mode=transaction,
-// server_reset_query=DISCARD ALL). There the server connection is handed back
-// to the pool at COMMIT and wiped, so *session* state does not survive between
-// transactions. An earlier version set `default_transaction_read_only` once at
-// startup and committed; behind such a pooler that setting was silently
-// discarded and every later call ran without the read-only guard.
+// is PgBouncer in transaction mode (pool_mode=transaction). There the server
+// connection is handed back to the pool at COMMIT and the next transaction may
+// land on a different one, so *session* state cannot be relied on between
+// transactions -- whether or not the pooler also resets the connection it
+// takes back (server_reset_query, which transaction mode skips by default).
+// An earlier version set `default_transaction_read_only` once at startup and
+// committed; behind such a pooler that setting was silently absent from every
+// later call that landed elsewhere, and the read-only guard with it.
 //
 // So nothing here relies on session state. The read-only guarantee and the
 // statement timeout are both transaction-scoped, which is exactly the scope a
@@ -216,6 +221,8 @@ enum class Feature {
   SubTwoPhase,              // pg_subscription.subtwophasestate
   SubscriptionStatsView,    // pg_stat_subscription_stats
   ExtendedStatsInherit,     // pg_statistic_ext_data.stxdinherit
+  PublicationSchemas,       // pg_publication_namespace (FOR TABLES IN SCHEMA)
+  ParameterAcl,             // pg_parameter_acl (GRANT SET ON PARAMETER)
   // 16
   PgStatIo,                 // the pg_stat_io view
   GenericPlan,              // EXPLAIN (GENERIC_PLAN)
@@ -250,7 +257,9 @@ constexpr int feature_since(Feature f) {
   switch (f) {
     case Feature::SubTwoPhase:
     case Feature::SubscriptionStatsView:
-    case Feature::ExtendedStatsInherit:     return 150000;
+    case Feature::ExtendedStatsInherit:
+    case Feature::PublicationSchemas:
+    case Feature::ParameterAcl:            return 150000;
 
     case Feature::PgStatIo:
     case Feature::GenericPlan:
@@ -551,6 +560,15 @@ public:
     return table_stats(schema, table_name);
   }
   const json call_list_table_stats(const std::string& schema) { return list_table_stats(schema); }
+  const json call_list_partitions(const std::string& schema) { return list_partitions(schema); }
+  const json call_role_dependencies(const std::string& r) { return role_dependencies(r); }
+  const json call_default_privileges() { return default_privileges(""); }
+  const json call_default_privileges(const std::string& sc) { return default_privileges(sc); }
+  const json call_large_objects() { return large_objects(); }
+  const json call_replication_stats() { return replication_stats(); }
+  const json call_partition_details(const std::string& sc, const std::string& t) {
+    return partition_details(sc, t);
+  }
   const json call_table_size(const std::string& schema, const std::string& table_name) {
     return table_size(schema, table_name);
   }
@@ -688,17 +706,28 @@ public:
   const json call_check_privileges() { return check_privileges(); }
   const json call_evaluate_index(const std::string& sql, const json& create_defs,
                                  const json& hide_names) {
-    return evaluate_index(sql, create_defs, hide_names);
+    return evaluate_index(sql, create_defs, hide_names, json::object(), "");
   }
   const json call_buffer_cache_summary() { return buffer_cache_summary(); }
   const json call_buffer_cache_contents(int limit) { return buffer_cache_contents(limit); }
   const json call_explain_query(const std::string& queryid, const std::string& sql,
                                 const json& params, bool analyze, int timeout_ms) {
-    return explain_query(queryid, sql, params, analyze, timeout_ms);
+    return explain_query(queryid, sql, params, analyze, timeout_ms, json::object(), "");
   }
+  const json call_explain_query(const std::string& queryid, const std::string& sql,
+                                const json& params, bool analyze, int timeout_ms,
+                                const json& settings, const std::string& as_role) {
+    return explain_query(queryid, sql, params, analyze, timeout_ms, settings, as_role);
+  }
+
+  // The limits from budgets.ini. Set once by main before run(); nothing else
+  // reads the file, so tests get the built-in defaults unless they set these.
+  void set_budgets(pglicht::Budgets b) { budgets_ = std::move(b); }
+  const pglicht::Budgets& budgets() const { return budgets_; }
 
 private:
   pglicht::ConnectionRegistry registry_;
+  pglicht::Budgets budgets_;
   // shared_ptr because parallel fan-out gives each worker its own server
   // object; they must share one cache or each would open its own connection.
   std::shared_ptr<ConnectionCache> cache_ = std::make_shared<ConnectionCache>();
@@ -1370,6 +1399,32 @@ private:
       // scan counts and dead tuples are each server's own, and vacuum only
       // runs on the primary.
       {"listTableStats",        {true,  true,  true,  false}},
+      // partitionDetails carries per-partition vacuum state and scan
+      // counters, so it splits the way tableStats does: the structure is
+      // replicated, the counters beside it are not, and vacuum only runs on
+      // the primary. listPartitions reads reltuples and relpages, which are
+      // catalog columns and therefore identical on a physical replica.
+      {"partitionDetails",      {true,  true,  true,  false}},
+      {"listPartitions",        {true,  false, false, false}},
+      // pg_shdepend and pg_default_acl are catalogs, replicated byte for
+      // byte, so a replication_group sweep would return the same answer per
+      // member. pg_shdepend is additionally shared across the cluster, so
+      // the count it reports is already cluster-wide from any database --
+      // but the NAMES are per database, which is why it is per_database.
+      {"roleDependencies",      {true,  false, false, false}},
+      {"defaultPrivileges",     {true,  false, false, false}},
+      {"largeObjects",          {true,  false, false, false}},
+      // Every member of a replication group has its own WAL senders, and a
+      // replica that is itself a sender is exactly what this finds, so this
+      // is worth asking of each server rather than one: per_server. Both
+      // pg_stat_replication and the replication origins are instance-wide --
+      // pg_replication_origin is a shared catalog -- so every database on one
+      // postmaster returns the same rows: not per_database. And a cascading
+      // standby's senders are real, not vacuum-side noise: not
+      // primary_authoritative. The first version had all three the other way
+      // round, which refused the replication-group sweep this tool exists
+      // for and let an instance sweep repeat one answer per database.
+      {"replicationStats",      {false, true,  false, false}},
       {"tableStats",            {true,  true,  true,  false}},
       // Same row, and for the same reason. pg_subscription is a shared catalog
       // scoped by subdbid, so the answer is per database; the workers, their
@@ -1783,6 +1838,17 @@ private:
 
       // --- statistics keyed by object ---
       {"listTableStats",         schema_map("table name", "that table's statistics counters and size estimate")},
+      {"listPartitions",         schema_map("partitioned table name", "its strategy, key, partition count and default partition")},
+      {"defaultPrivileges",      schema_fixed("Default privileges: what grants the NEXT object gets.",
+                                   {{"default_privileges", "array"}})},
+      {"largeObjects",           schema_fixed("Large objects, which no size tool can see.",
+                                   {{"total", "integer"}, {"by_owner", "object"}, {"note", "string"}})},
+      {"roleDependencies",       schema_fixed("What depends on one role, cluster-wide.",
+                                   {{"role", "string"}, {"exists", "boolean"}, {"total", "integer"},
+                                    {"by_kind", "object"}, {"by_database", "object"},
+                                    {"resolvable_in_this_database", "integer"}, {"objects", "array"}})},
+      {"replicationStats",       schema_fixed("WAL senders and replication origins.",
+                                   {{"replication", "object"}, {"origins", "object"}, {"note", "string"}})},
       {"listTableSizes",         schema_map("table name", "that table's measured size, index size and total")},
       {"tableIOStats",           schema_map("schema-qualified table name", "its buffer cache hit ratios and scan counts")},
       {"databaseStats",          schema_map("database name", "that database's pg_stat_database counters")},
@@ -1791,6 +1857,10 @@ private:
       {"bufferCacheContents",    schema_map("schema-qualified relation name", "its buffered pages and usage counts")},
 
       // --- fixed shapes ---
+      {"partitionDetails",       schema_fixed("One partitioned table and every partition it has.",
+                                   {{"table", "string"}, {"strategy", "string"}, {"key", "string"},
+                                    {"is_partition_of", "string"}, {"counters_since", "string"},
+                                    {"partitions", "array"}})},
       {"tableDetails",           schema_fixed("One table's structure.",
                                    {{"table", "string"}, {"kind", "string"}, {"description", "string"},
                                     {"columns", "object"}, {"primary_key", "array"}, {"indexes", "object"},
@@ -1967,9 +2037,17 @@ private:
         }
       }
 
+      // The note is its own sentence. Most descriptions end without a full
+      // stop, so appending it bare produced "...for a schema A physical replica
+      // is byte-identical here" on 65 of 68 tools -- found by the llms.txt
+      // generator, which splits descriptions into sentences.
       const std::string note = scope_note(name, sc);
-      if (!note.empty())
-        tool["description"] = tool["description"].get<std::string>() + note;
+      if (!note.empty()) {
+        std::string d = tool["description"].get<std::string>();
+        while (!d.empty() && std::isspace(static_cast<unsigned char>(d.back()))) d.pop_back();
+        if (!d.empty() && d.back() != '.' && d.back() != '!' && d.back() != '?') d += '.';
+        tool["description"] = d + note;
+      }
 
       if (wants_annotations) {
         // Every tool runs inside SET TRANSACTION READ ONLY, which is what makes
@@ -3981,8 +4059,309 @@ private:
     return it->get<std::string>();
   }
 
+  // --- the execution budget for EXPLAIN ANALYZE under caller settings ---
+  //
+  // settings exists to change a PLAN, and for planning that is safe. analyze
+  // EXECUTES, and then work_mem, hash_mem_multiplier and the parallelism knobs
+  // set the resource footprint of a statement that really runs. The read-only
+  // guard and the 30s timeout bound what it writes and how long it runs, and
+  // neither bounds memory: work_mem goes to 2TB per sort or hash node and
+  // hash_mem_multiplier to 1000. A hash join at those values can exhaust RAM
+  // in seconds, and an OOM kill of one backend restarts every connection on
+  // the instance. That is an outage caused by a read-only tool call.
+  //
+  // So caller-supplied settings may be EXECUTED only within a budget taken
+  // from the host capacity the operator declared for this connection --
+  // host_ram_mb and host_vcpus, per connection, inherited from its
+  // [instance:...] section, or from the environment. Never from a tool
+  // argument: a caller must not be able to raise its own limit. With either
+  // figure absent there is nothing to bound against, and no settings change is
+  // executed at all; the plan built under the settings is still returned.
+  //
+  // plan_as_role alone is not budgeted. It applies what that role already runs
+  // with in production, so it cannot exceed production's own footprint.
+  //
+  // The two ratios come from budgets.ini (pglicht::Budgets), loaded once at
+  // startup by main; a server built any other way -- the test fixture, the
+  // DATABASE_URL constructor -- keeps the built-in defaults, a tenth of RAM
+  // and one worker per four vCPUs, and never reads a developer's own file.
+
+  struct ExecFootprint {
+    double worst_bytes = 0;   // double: work_mem x 1000 x participants overflows int64
+    int memory_nodes = 0;
+    int workers = 0;
+  };
+
+  // The worst case the executor may allocate for a plan, from the plan's own
+  // shape. Each memory-using node is limited to work_mem, or to hash_mem
+  // (work_mem x hash_mem_multiplier) for a hash table, and every process that
+  // runs the node gets its own allowance: under a Gather that is the planned
+  // workers plus the leader. A Parallel Hash shares one table, but its size
+  // limit is also hash_mem x participants, so the same product holds.
+  //
+  // An upper bound on what the limits permit, not a prediction -- a node that
+  // never reaches its limit uses less. Deliberately conservative where the
+  // plan cannot say: every CTE Scan is counted, though scans of one CTE share
+  // a tuplestore.
+  static void plan_footprint(const json& node, double work_mem, double hash_mem,
+                             double participants, ExecFootprint& fp) {
+    if (!node.is_object()) return;
+    const std::string type  = node.value("Node Type", "");
+    const std::string strat = node.value("Strategy", "");
+    const bool hashed =
+        type == "Hash" || type == "Memoize" || type == "Recursive Union" ||
+        ((type == "Aggregate" || type == "SetOp") &&
+         (strat == "Hashed" || strat == "Mixed"));
+    const bool bounded_by_work_mem =
+        type == "Sort" || type == "Incremental Sort" || type == "Materialize" ||
+        type == "WindowAgg" || type == "Function Scan" ||
+        type == "Table Function Scan" || type == "CTE Scan" ||
+        type == "Bitmap Heap Scan";
+    if (hashed)                   { fp.worst_bytes += hash_mem * participants; fp.memory_nodes++; }
+    else if (bounded_by_work_mem) { fp.worst_bytes += work_mem * participants; fp.memory_nodes++; }
+
+    double below = participants;
+    if (type == "Gather" || type == "Gather Merge") {
+      const int w = node.value("Workers Planned", 0);
+      fp.workers += w;
+      below = participants * (w + 1);
+    }
+    if (node.contains("Plans") && node["Plans"].is_array())
+      for (const auto& child : node["Plans"])
+        plan_footprint(child, work_mem, hash_mem, below, fp);
+  }
+
+  // Decides whether a plan built under caller settings may be executed, and
+  // says why in either case. `allowed` is the decision; everything else is the
+  // arithmetic, so a refusal can be checked rather than taken on trust.
+  json analyze_budget(pqxx::work& txn, const json& plan) {
+    const pglicht::HostCapacity& cap = active_cfg().capacity;
+    json out = json::object();
+    json host = json::object();
+    if (cap.ram_mb > 0) host["ram_mb"] = cap.ram_mb;
+    if (cap.vcpus > 0)  host["vcpus"]  = cap.vcpus;
+    if (!cap.source.empty()) host["source"] = cap.source;
+    out["host"] = host;
+
+    if (cap.ram_mb <= 0 || cap.vcpus <= 0) {
+      std::string missing = cap.ram_mb <= 0 && cap.vcpus <= 0 ? "host_ram_mb and host_vcpus"
+                          : cap.ram_mb <= 0 ? "host_ram_mb" : "host_vcpus";
+      out["allowed"] = false;
+      out["reason"] =
+          "not analyzed: executing under explicit settings is bounded by the host "
+          "capacity declared for this connection, and " + missing + " is not "
+          "declared, so no settings change may be executed. Declare host_ram_mb and "
+          "host_vcpus on the connection or its [instance:...] section (or "
+          "PG_LICHT_HOST_RAM_MB and PG_LICHT_HOST_VCPUS for a single DATABASE_URL). "
+          "Omit settings to analyze under the connection's own environment, or use "
+          "plan_as_role, which is production's own. The plan below was built under "
+          "the settings and not executed.";
+      return out;
+    }
+
+    pqxx::result r = txn.exec(
+        "SELECT pg_size_bytes(current_setting('work_mem'))::float8, "
+        "       current_setting('hash_mem_multiplier')::float8");
+    const double work_mem = r[0][0].as<double>();
+    const double hash_mem = work_mem * r[0][1].as<double>();
+
+    ExecFootprint fp;
+    if (plan.is_array() && !plan.empty() && plan[0].contains("Plan"))
+      plan_footprint(plan[0]["Plan"], work_mem, hash_mem, 1.0, fp);
+
+    const long long mem_budget =
+        cap.ram_mb * 1048576LL * budgets_.analyze_memory_percent / 100;
+    const int worker_budget = cap.vcpus / budgets_.analyze_vcpus_per_worker;
+    const long long worst =
+        fp.worst_bytes >= 9.0e18 ? std::numeric_limits<long long>::max()
+                                 : static_cast<long long>(fp.worst_bytes);
+
+    out["memory_budget_bytes"]     = mem_budget;
+    out["worst_case_memory_bytes"] = worst;
+    out["memory_nodes"]            = fp.memory_nodes;
+    out["workers_budget"]          = worker_budget;
+    out["workers_planned"]         = fp.workers;
+    const std::string pct = std::to_string(budgets_.analyze_memory_percent);
+    const std::string per = std::to_string(budgets_.analyze_vcpus_per_worker);
+    out["rule"] =
+        "at most " + pct + "% of declared RAM for the worst case the plan's memory "
+        "limits permit (each sort-like node at work_mem, each hash node at "
+        "work_mem x hash_mem_multiplier, times the processes running it), and at "
+        "most one parallel worker per " + per + " declared vCPUs";
+    out["budgets"] = {{"memory_percent", budgets_.analyze_memory_percent},
+                      {"vcpus_per_worker", budgets_.analyze_vcpus_per_worker},
+                      {"source", budgets_.source}};
+
+    std::string why;
+    if (fp.worst_bytes > static_cast<double>(mem_budget))
+      why = "the plan's worst-case memory, " + std::to_string(worst) + " bytes over " +
+            std::to_string(fp.memory_nodes) + " memory-using node(s), exceeds the "
+            "budget of " + std::to_string(mem_budget) + " bytes (" + pct + "% of the "
+            "declared " + std::to_string(cap.ram_mb) + " MB)";
+    if (fp.workers > worker_budget)
+      why += std::string(why.empty() ? "" : ", and ") + "the plan asks for " +
+             std::to_string(fp.workers) + " parallel worker(s) against a budget of " +
+             std::to_string(worker_budget) + " (one per " + per + " of the declared " +
+             std::to_string(cap.vcpus) + " vCPUs)";
+    out["allowed"] = why.empty();
+    if (!why.empty())
+      out["reason"] = "not analyzed: " + why + ". Lower the settings and call again; "
+                      "the plan below was built under them and not executed.";
+    return out;
+  }
+
+  // The settings a caller may apply before a plan is produced.
+  //
+  // An allowlist, not a denylist, and that is the whole safety argument. An
+  // arbitrary SET passthrough would let a caller turn off
+  // default_transaction_read_only, remove statement_timeout, or change role /
+  // session_authorization -- three of this server's four safety properties,
+  // handed away through a convenience argument. The set that changes a PLAN is
+  // bounded and known, and every entry is USERSET, so none of it needs a
+  // privilege this server does not already have.
+  //
+  // search_path is deliberately absent even though it changes plans, because
+  // it does so by changing WHICH OBJECTS the statement resolves to. That is a
+  // different question from how they are joined, and quietly planning against
+  // a different table than the caller meant is worse than refusing.
+  static bool is_planner_setting(const std::string& name) {
+    // Every enable_* GUC is a planner method toggle by convention, and new
+    // ones arrive most releases -- enable_group_by_reordering in 17,
+    // enable_distinct_reordering and enable_self_join_elimination in 18. The
+    // prefix rule is what keeps this table from needing an edit per release.
+    if (name.rfind("enable_", 0) == 0) return true;
+    static const std::set<std::string> kAllowed = {
+      // memory
+      "work_mem", "hash_mem_multiplier", "maintenance_work_mem",
+      // costs
+      "seq_page_cost", "random_page_cost", "cpu_tuple_cost",
+      "cpu_index_tuple_cost", "cpu_operator_cost", "effective_cache_size",
+      "effective_io_concurrency",
+      // parallelism
+      "max_parallel_workers_per_gather", "parallel_setup_cost",
+      "parallel_tuple_cost", "min_parallel_table_scan_size",
+      "min_parallel_index_scan_size",
+      // join search
+      "from_collapse_limit", "join_collapse_limit", "geqo", "geqo_threshold",
+      // partitioning and caching
+      "constraint_exclusion", "plan_cache_mode",
+      // jit
+      "jit", "jit_above_cost", "jit_inline_above_cost", "jit_optimize_above_cost",
+    };
+    return kAllowed.count(name) > 0;
+  }
+
+  // Applies planner settings for the remainder of THIS transaction.
+  //
+  // set_config(name, value, is_local := true) rather than a built SET LOCAL
+  // string: it is a function call with bound parameters, so a value cannot
+  // escape into SQL text at all. is_local means the value reverts at commit,
+  // so it cannot leak across a connection a pooler hands to somebody else --
+  // the same property that made the read-only guard transaction-scoped rather
+  // than session-scoped, and the same reason.
+  //
+  // Returns an error object when a name is not allowlisted. Silently dropping
+  // it would return a plan the caller believes was built under an environment
+  // that was never applied, which is the exact failure class this release
+  // keeps correcting -- reintroduced through the fix for it.
+  json apply_planner_settings(pqxx::work& txn, const json& settings, json& applied) {
+    if (!settings.is_object()) return {};
+    for (auto it = settings.begin(); it != settings.end(); ++it) {
+      const std::string name = it.key();
+      if (!is_planner_setting(name))
+        return {{"error", "\"" + name + "\" is not a planner setting and will not be applied"},
+                {"hint", "only settings that change a PLAN are accepted: work_mem, "
+                         "hash_mem_multiplier, the cost knobs, the parallelism knobs, "
+                         "every enable_*, the join-search limits, constraint_exclusion, "
+                         "plan_cache_mode and the jit knobs. search_path is excluded on "
+                         "purpose: it changes which objects the statement resolves to "
+                         "rather than how they are joined, and planning against a "
+                         "different table than you meant is worse than this refusal. "
+                         "Nothing was applied and no plan was produced."}};
+      const std::string value = it->is_string() ? it->get<std::string>() : it->dump();
+      try {
+        pqxx_exec(txn, "SELECT set_config($1, $2, true)", pqxx::params{name, value});
+        applied[name] = value;
+      } catch (const pqxx::sql_error& e) {
+        return {{"error", "could not apply \"" + name + "\" = \"" + value + "\""},
+                {"hint", "the setting exists in this server's allowlist but the value "
+                         "was refused; check the unit and the range. Nothing was "
+                         "applied and no plan was produced."},
+                {"detail", e.what()}};
+      }
+    }
+    return {};
+  }
+
+  // The same, taken from what a role is actually configured with.
+  //
+  // This is the form the question is asked in -- "why is it slow for the
+  // application" -- and it removes the step where a human copies values out of
+  // hostCapacity.overrides by hand and gets one wrong.
+  //
+  // Skipped entries are listed rather than dropped. A role carrying a
+  // search_path or a statement_timeout gets neither applied, and a plan that
+  // silently ignored half the role's environment while claiming to be that
+  // role's plan would be worse than one that never claimed it.
+  json apply_role_settings(pqxx::work& txn, const std::string& role,
+                           json& applied, json& skipped, bool& role_exists) {
+    // ORDER BY s.setdatabase, cfg: role-wide entries (setdatabase = 0) first,
+    // this database's entries after them. They are applied in this order and
+    // the last one wins, which is the precedence PostgreSQL itself gives them
+    // -- ALTER ROLE r IN DATABASE d SET overrides ALTER ROLE r SET. Ordered by
+    // text alone, "work_mem=1GB" sorts before "work_mem=64MB" and the role-wide
+    // 64MB would be what got planned under, in the one configuration where the
+    // tool's promise of "the plan the application gets" matters most.
+    pqxx::result r = pqxx_exec(txn,
+      "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1),"
+      "       COALESCE((SELECT JSONB_AGG(cfg ORDER BY s.setdatabase, cfg)"
+      "                   FROM pg_db_role_setting s"
+      "                   JOIN pg_roles rr ON rr.oid = s.setrole"
+      "                   CROSS JOIN LATERAL unnest(s.setconfig) AS cfg"
+      "                  WHERE rr.rolname = $1"
+      "                    AND s.setdatabase IN (0, (SELECT oid FROM pg_database"
+      "                                               WHERE datname = current_database()))),"
+      "                '[]'::jsonb)::text",
+      pqxx::params{role});
+    role_exists = r[0][0].as<bool>();
+    if (!role_exists)
+      return {{"error", "no such role: \"" + role + "\""},
+              {"hint", "listRoles names them; pass 'pattern' there if the role is "
+                       "outside the cap. Nothing was applied and no plan was produced."}};
+
+    for (const auto& e : json::parse(r[0][1].as<std::string>())) {
+      const std::string cfg = e.get<std::string>();
+      const auto eq = cfg.find('=');
+      if (eq == std::string::npos) continue;
+      const std::string name  = cfg.substr(0, eq);
+      const std::string value = cfg.substr(eq + 1);
+      if (!is_planner_setting(name)) {
+        skipped.push_back({{"name", name}, {"value", value},
+                           {"reason", "not a planner setting"}});
+        continue;
+      }
+      // One savepoint per setting. A refused set_config is an SQL error, and an
+      // SQL error aborts the transaction: without the savepoint every later
+      // set_config and the EXPLAIN itself would fail with "current transaction
+      // is aborted", each reported here as a refusal it was not. RELEASE
+      // SAVEPOINT keeps a set_config(is_local) value in the parent, so a value
+      // applied inside the savepoint is still in force when the plan is built.
+      try {
+        pqxx::subtransaction sub{txn};
+        pqxx_exec(sub, "SELECT set_config($1, $2, true)", pqxx::params{name, value});
+        sub.commit();
+        applied[name] = value;
+      } catch (const pqxx::sql_error&) {
+        skipped.push_back({{"name", name}, {"value", value},
+                           {"reason", "the server refused the value"}});
+      }
+    }
+    return {};
+  }
+
   const json explain_query(const std::string& queryid, const std::string& sql_in,
-                           const json& params, bool analyze, int timeout_ms) {
+                           const json& params, bool analyze, int timeout_ms,
+                           const json& settings, const std::string& plan_as_role) {
     // --- argument validation (caller errors -> isError:true via dispatch) ---
     if (queryid.empty() && sql_in.empty())
       throw std::runtime_error("one of queryid or sql is required");
@@ -4017,6 +4396,37 @@ private:
 
     Session sess = open_session(tmo);
     pqxx::work& txn = sess.txn();
+
+    // The planning environment, applied before anything is planned and only
+    // for this transaction. Refusals return here rather than planning under a
+    // half-applied environment and labelling the result as though it were
+    // whole.
+    json applied = json::object(), skipped = json::array();
+    bool role_exists = true;
+    if (!plan_as_role.empty()) {
+      json err = apply_role_settings(txn, plan_as_role, applied, skipped, role_exists);
+      if (!err.is_null() && !err.empty()) return err;
+    }
+    // Explicit settings win, because they are the caller's deliberate
+    // override of what the role happens to carry.
+    {
+      json err = apply_planner_settings(txn, settings, applied);
+      if (!err.is_null() && !err.empty()) return err;
+    }
+    json plan_env;
+    if (!applied.empty() || !plan_as_role.empty()) {
+      plan_env = json::object();
+      plan_env["applied"] = applied;
+      if (!plan_as_role.empty()) {
+        plan_env["from_role"] = plan_as_role;
+        plan_env["skipped_from_role"] = skipped;
+      }
+      plan_env["note"] =
+        "Applied with set_config(..., is_local := true), so these revert when "
+        "this transaction ends and cannot leak to another session. The plan "
+        "below was built under them; the Settings block reports what the "
+        "server saw.";
+    }
 
     // --- resolve the statement text ---
     std::string sql = sql_in;
@@ -4182,6 +4592,7 @@ private:
             // On the queryid path the statement was already recovered; return it
             // so the caller still gets the stats and can retry with params.
             if (!stats.is_null()) out["statement"] = stats;
+            if (!plan_env.is_null()) out["planning_environment"] = plan_env;
             return out;
           }
           pqxx::result r = txn.exec("EXPLAIN (SETTINGS, GENERIC_PLAN, FORMAT JSON) " + sql);
@@ -4214,6 +4625,10 @@ private:
       bool read_only = !plan_has_modify(plan);
       bool analyzed = false;
       std::string note;
+      // Caller settings that would shape a real execution. plan_as_role alone
+      // does not count: see analyze_budget.
+      const bool explicit_settings = settings.is_object() && !settings.empty();
+      json exec_budget;
 
       // --- Phase B: optionally execute, only once proven safe ---
       if (analyze) {
@@ -4224,6 +4639,12 @@ private:
           note = "not analyzed: the statement has $n placeholders and no params "
                  "were supplied, so only a generic plan could be produced; supply "
                  "params to get a real plan and enable ANALYZE";
+        } else if (explicit_settings &&
+                   !(exec_budget = analyze_budget(txn, plan)).value("allowed", false)) {
+          // Refused the way the other two are: the plan is still returned,
+          // analyzed stays false, and the note says why. The arithmetic goes
+          // into planning_environment so a refusal can be checked.
+          note = exec_budget.value("reason", std::string("not analyzed"));
         } else {
           std::string target = prepared.empty()
             ? sql : ("EXECUTE " + prepared + "(" + lits + ")");
@@ -4247,6 +4668,10 @@ private:
       };
       if (!note.empty())    out["note"] = note;
       if (!stats.is_null()) out["statement"] = stats;
+      if (!plan_env.is_null()) {
+        if (!exec_budget.is_null()) plan_env["execution_budget"] = exec_budget;
+        out["planning_environment"] = plan_env;
+      }
       return out;
 
     } catch (const pqxx::sql_error& e) {
@@ -5313,7 +5738,15 @@ private:
                  'owner',       spcowner::regrole::text,
                  'location',    COALESCE(NULLIF(pg_tablespace_location(oid), ''), '(default)'),
                  'options',     spcoptions,
-                 'description', COALESCE(obj_description(oid, 'pg_tablespace'), '')
+                 -- shobj_description, not obj_description. A tablespace is a
+                 -- SHARED object, so COMMENT ON TABLESPACE writes to
+                 -- pg_shdescription and obj_description() -- which reads
+                 -- pg_description -- returns null for every one of them.
+                 -- Verified on PostgreSQL 18: a commented tablespace gave
+                 -- NULL through obj_description and the comment through
+                 -- shobj_description. Every tablespace comment has been
+                 -- invisible here, reported as '' rather than as missing.
+                 'description', COALESCE(shobj_description(oid, 'pg_tablespace'), '')
                )
              )
       FROM pg_tablespace;
@@ -5393,6 +5826,19 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
+    // FOR TABLES IN SCHEMA is PostgreSQL 15. pg_publication_tables resolves
+    // the members either way, so the MEMBERS were never missing -- what was
+    // lost is the DECLARATION, and that decides what happens next: a table
+    // created later in a published schema joins the publication by itself,
+    // while one added to a table-list publication does not. Two publications
+    // with identical members today can behave differently tomorrow.
+    const std::string sch_pub = sess.has(Feature::PublicationSchemas)
+      ? ", 'schemas', COALESCE((SELECT JSONB_AGG(n.nspname ORDER BY n.nspname)"
+        "                         FROM pg_publication_namespace pn"
+        "                         JOIN pg_namespace n ON n.oid = pn.pnnspid"
+        "                        WHERE pn.pnpubid = p.oid), '[]'::jsonb)"
+      : "";
+
     // The same unbounded expansion listSchemas had, and it is worse here:
     // FOR ALL TABLES resolves through pg_publication_tables to every table in
     // the database, so a publication declared in one line expands to thousands
@@ -5413,7 +5859,7 @@ private:
                  'truncate',   p.pubtruncate,
                  'table_count', COALESCE(table_count, 0),
                  'tables',     COALESCE(tables, '[]'::jsonb),
-                 'tables_truncated', COALESCE(table_count, 0) > )") + std::to_string(kPublicationTableNames) + R"(
+                 'tables_truncated', COALESCE(table_count, 0) > )") + std::to_string(kPublicationTableNames) + sch_pub + R"(
                )
              )
       FROM pg_publication AS p
@@ -6469,17 +6915,24 @@ private:
   // THE RESET BRACKET IS NOT OPTIONAL. Measured against hypopg 1.4.3: a
   // hypothetical index lives in backend-local memory for the whole session and
   // is cleared by none of the things that would be expected to clear it --
-  // not ROLLBACK, not a new transaction, and not DISCARD ALL, which is exactly
-  // what PgBouncer issues as server_reset_query. Only hypopg_reset() removes
-  // it. Against a transaction-mode pooler that means one caller's hypothetical
-  // index would otherwise stay on the backend and silently reshape the next
-  // caller's plans -- a wrong answer with nothing to indicate it. So the reset
+  // not ROLLBACK, not a new transaction, and not DISCARD ALL, PgBouncer's
+  // default server_reset_query. Only hypopg_reset() removes it. Against a
+  // transaction-mode pooler that means one caller's hypothetical index would
+  // otherwise stay on the backend and silently reshape the next caller's
+  // plans -- a wrong answer with nothing to indicate it. The pooler cannot be
+  // asked to help: in transaction mode it runs no reset query at all unless
+  // server_reset_query_always is set (its manual's reasoning is that
+  // transaction-pooled connections "should not have any need for a reset
+  // query" -- true of core session state, false of memory an extension owns),
+  // and forcing that on does not clear hypopg either. Both measured through a
+  // real PgBouncer on 2026-09-03: two independent failures to catch it. So the reset
   // runs on the way in, which protects this call from whatever a previous one
   // left, and again on the way out through a scope guard that survives an
   // exception, which protects the next call from this one. Either alone would
   // do most of the job; both is cheap and neither depends on the other.
   const json evaluate_index(const std::string& sql, const json& create_defs,
-                            const json& hide_names) {
+                            const json& hide_names, const json& settings,
+                            const std::string& plan_as_role) {
     if (sql.empty()) throw std::runtime_error("sql is required");
     if (!create_defs.is_array() || !hide_names.is_array())
       throw std::runtime_error("create and hide must be arrays");
@@ -6492,6 +6945,30 @@ private:
 
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
+
+    // The same defect as explainQuery had, and worse here: the whole output is
+    // a before/after cost comparison, so an environment that does not match
+    // production makes BOTH halves answer a different question than the one
+    // asked. Applied for this transaction only, from the same allowlist.
+    json applied = json::object(), skipped = json::array();
+    bool role_exists = true;
+    if (!plan_as_role.empty()) {
+      json err = apply_role_settings(txn, plan_as_role, applied, skipped, role_exists);
+      if (!err.is_null() && !err.empty()) return err;
+    }
+    {
+      json err = apply_planner_settings(txn, settings, applied);
+      if (!err.is_null() && !err.empty()) return err;
+    }
+    json plan_env;
+    if (!applied.empty() || !plan_as_role.empty()) {
+      plan_env = json::object();
+      plan_env["applied"] = applied;
+      if (!plan_as_role.empty()) {
+        plan_env["from_role"] = plan_as_role;
+        plan_env["skipped_from_role"] = skipped;
+      }
+    }
 
     const std::string hypo = extension_schema(txn, "hypopg");
     if (hypo.empty())
@@ -6627,6 +7104,7 @@ private:
       {"indexes", indexes}
     };
     if (!hidden.empty()) out["hidden"] = hidden;
+    if (!plan_env.is_null()) out["planning_environment"] = plan_env;
     out["note"] = "Hypothetical indexes are planned against and never built. "
                   "The cost is the planner's estimate, not a measurement: it "
                   "says the plan would change, not how long it would take.";
@@ -6678,7 +7156,13 @@ private:
       " 'read_stats',   " + has_role("pg_read_all_stats")    + ","
       " 'read_settings'," + has_role("pg_read_all_settings") + ","
       " 'scan_tables',  " + has_role("pg_stat_scan_tables")  + ","
-      " 'read_data',    " + has_role("pg_read_all_data")     + ")";
+      " 'read_data',    " + has_role("pg_read_all_data")     + ","
+      // Asked of the view itself rather than inferred from a role: no
+      // predefined role grants it -- pg_monitor and pg_read_all_stats both
+      // lack it, verified on 18.6 -- so only the superuser or an explicit
+      // GRANT reads it, and only has_table_privilege sees an explicit GRANT.
+      " 'origin_status', has_table_privilege("
+      "     'pg_catalog.pg_replication_origin_status', 'SELECT'))";
 
     pqxx::result res = txn.exec(query);
     const json p = json::parse(res[0][0].as<std::string>());
@@ -6689,6 +7173,7 @@ private:
     const bool settings  = monitor || p.value("read_settings", false);
     const bool scan      = monitor || p.value("scan_tables", false);
     const bool data      = super  || p.value("read_data", false);
+    const bool origins   = super  || p.value("origin_status", false);
 
     // Extension presence is a different failure from missing privilege, and
     // conflating them would send an operator to the wrong fix. Checked here so
@@ -6739,6 +7224,28 @@ private:
       degrade("currentActivity", "the query text and some columns of backends "
                                  "belonging to other roles are hidden");
 
+    // replicationStats has two halves that fail differently, so the entry says
+    // which. pg_stat_replication restricts per ROW: without the stats role the
+    // senders are listed with most columns null, which reads like an idle
+    // replica. pg_replication_origin_status is refused outright to everyone but
+    // the superuser unless granted, and pg_monitor does not grant it -- so this
+    // is degraded for a monitoring role too, which the 4.3.0 counts missed.
+    if (!stats || !origins) {
+      std::string what;
+      if (!stats)
+        what = "the WAL senders are listed with most of their columns null -- "
+               "which reads like an idle replica rather than a permission "
+               "answer -- because pg_stat_replication restricts per row";
+      if (!origins)
+        what += std::string(what.empty() ? "" : "; and ") +
+                "replication origin progress is refused: "
+                "pg_replication_origin_status is readable only by the superuser "
+                "or a role granted SELECT on it, and pg_monitor does not include "
+                "it" + (stats ? ", so origins is an error while the senders are "
+                                "complete" : "");
+      degrade("replicationStats", what);
+    }
+
     // The three that read row data. Not "denied": privilege here is per object,
     // so a role without blanket read access may still hold SELECT on some
     // tables and none on others. Reporting these as unavailable would be as
@@ -6752,6 +7259,11 @@ private:
       degrade("explainQuery", "fails on any statement referencing a table this "
                               "role cannot SELECT");
     }
+
+    // roleDependencies has no entry, deliberately: since it reads pg_roles
+    // rather than pg_authid, everything it touches is world-readable and
+    // pg_identify_object checks no privilege, so a bare login role gets the
+    // whole answer.
 
     // Everything not named is fully available. Counting rather than listing:
     // the exceptions are the answer, and enumerating 53 working tool names
@@ -6944,6 +7456,578 @@ private:
     if (!res.empty() && !res[0][0].is_null())
       return json::parse(res[0][0].as<std::string>());
     return {};
+  }
+
+  // Partitioning, which nothing here read until 4.3.0. relkind 'p' was used in
+  // five places and only ever to print the words "partitioned table", so a
+  // parent's children, its key, its bounds and its default partition were all
+  // invisible -- while tableSize's own description told the caller to "measure
+  // the partitions", an instruction this server gave no way to follow.
+  //
+  // Cheap by construction: reltuples and relpages are catalog columns set by
+  // VACUUM and ANALYZE, so this opens no relation and takes no lock. The
+  // measured counterpart is listTableSizes on the schema holding the
+  // partitions, which is deliberately not folded in here -- a parent with
+  // three hundred children would be three hundred relation opens behind one
+  // innocent-looking call.
+  // What depends on a role, cluster-wide. checkRoleAccess answers "may this
+  // role use this object"; nothing answered the inverse, and the inverse is
+  // the whole of
+  //
+  //   ERROR:  role "x" cannot be dropped because some objects depend on it
+  //   DETAIL: 4 objects in database app
+  //
+  // -- a message that reports a count and refuses to name anything.
+  //
+  // pg_shdepend is shared across the cluster: one copy, not one per database.
+  // That is what makes the count cross-database and the names not. objid is
+  // only resolvable from the database it lives in, so entries for other
+  // databases are counted and named by database, never by object. Saying so is
+  // the point -- a tool that silently reported only the current database would
+  // answer "nothing depends on this role" to somebody about to DROP it.
+  const json role_dependencies(const std::string& role) {
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+
+    const std::string param_acl = sess.has(Feature::ParameterAcl)
+      ? "WHEN d.classid = 'pg_parameter_acl'::regclass "
+        "THEN (SELECT parname FROM pg_parameter_acl WHERE oid = d.objid)"
+      : "";
+
+    const std::string query = std::string(R"(
+      WITH d AS (
+        SELECT s.dbid, s.classid, s.objid, s.objsubid, s.deptype
+          FROM pg_shdepend AS s
+          -- pg_roles, never pg_authid. pg_authid has no public SELECT, so a
+          -- bare login role reading it gets "permission denied" and no answer
+          -- at all -- and that is the role most likely to be asking before a
+          -- DROP ROLE it does not itself have the privilege to run. The
+          -- refclassid comparison is a regclass literal and reads nothing.
+          JOIN pg_roles AS a ON a.oid = s.refobjid
+         WHERE a.rolname = $1
+           AND s.refclassid = 'pg_authid'::regclass
+      )
+      SELECT JSONB_BUILD_OBJECT(
+        'role', $1,
+        'exists', EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1),
+        'total', (SELECT count(*) FROM d),
+        -- deptype, spelled out. 'o' is the one that blocks DROP ROLE outright;
+        -- 'a' and 'r' are cleared by REASSIGN OWNED / DROP OWNED, and knowing
+        -- which is which is the difference between reassigning and hunting.
+        'by_kind', COALESCE((
+          SELECT JSONB_OBJECT_AGG(k, n) FROM (
+            SELECT CASE deptype WHEN 'o' THEN 'owner'
+                                WHEN 'a' THEN 'acl'
+                                WHEN 'i' THEN 'init_acl'
+                                WHEN 'r' THEN 'policy'
+                                WHEN 't' THEN 'tablespace'
+                                ELSE deptype::text END AS k,
+                   count(*) AS n
+              FROM d GROUP BY 1) AS x), '{}'::jsonb),
+        -- dbid 0 is a shared object (a database, a tablespace, another role).
+        'by_database', COALESCE((
+          SELECT JSONB_OBJECT_AGG(name, n) FROM (
+            SELECT CASE WHEN d.dbid = 0 THEN '(shared objects)'
+                        ELSE COALESCE(db.datname, '(dropped database ' || d.dbid || ')')
+                   END AS name,
+                   count(*) AS n
+              FROM d LEFT JOIN pg_database AS db ON db.oid = d.dbid
+             GROUP BY 1) AS y), '{}'::jsonb),
+        'resolvable_in_this_database',
+          (SELECT count(*) FROM d WHERE d.dbid IN (0, (SELECT oid FROM pg_database
+                                                        WHERE datname = current_database()))),
+        -- Names, for the rows this database can resolve. A row in another
+        -- database is a count above and nothing here, which is honest rather
+        -- than empty: connect there and ask again.
+        'objects', COALESCE((
+          SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                   'kind', c.relname,
+                   'name', CASE
+                             WHEN d.classid = 'pg_class'::regclass
+                               THEN (SELECT n.nspname || '.' || r.relname
+                                       FROM pg_class r JOIN pg_namespace n
+                                         ON n.oid = r.relnamespace WHERE r.oid = d.objid)
+                             WHEN d.classid = 'pg_proc'::regclass
+                               THEN (SELECT n.nspname || '.' || p.proname
+                                       FROM pg_proc p JOIN pg_namespace n
+                                         ON n.oid = p.pronamespace WHERE p.oid = d.objid)
+                             WHEN d.classid = 'pg_namespace'::regclass
+                               THEN (SELECT nspname FROM pg_namespace WHERE oid = d.objid)
+                             WHEN d.classid = 'pg_database'::regclass
+                               THEN (SELECT datname FROM pg_database WHERE oid = d.objid)
+                             WHEN d.classid = 'pg_tablespace'::regclass
+                               THEN (SELECT spcname FROM pg_tablespace WHERE oid = d.objid)
+                             -- pg_roles again: this branch is unreachable for
+                             -- most rows, and that does not help. Its condition
+                             -- is a column, not a constant, so the subselect
+                             -- stays in the range table and the permission
+                             -- check fires whether or not a row ever takes it.
+                             WHEN d.classid = 'pg_authid'::regclass
+                               THEN (SELECT rolname FROM pg_roles WHERE oid = d.objid)
+                             WHEN d.classid = 'pg_type'::regclass
+                               THEN (SELECT n.nspname || '.' || t.typname
+                                       FROM pg_type t JOIN pg_namespace n
+                                         ON n.oid = t.typnamespace WHERE t.oid = d.objid)
+                             -- GRANT SET ON PARAMETER records a shared
+                             -- dependency like any other grant, so these rows
+                             -- were already being COUNTED here and only the
+                             -- name was missing. pg_parameter_acl is
+                             -- PostgreSQL 15 and later.
+                             --
+                             -- Gated rather than guarded. to_regclass would
+                             -- keep the comparison safe on 14, but the branch
+                             -- also SELECTs from the catalog by name, and
+                             -- PostgreSQL parses the whole statement -- an
+                             -- unreachable branch still has to resolve. So the
+                             -- text is only emitted where the catalog exists.
+                             )" + param_acl + R"(
+                             -- Everything else through pg_identify_object, which
+                             -- names any class this database can resolve:
+                             -- 'p on public.t' for a policy, 'for role x in
+                             -- schema s on tables' for a default privilege, the
+                             -- oid for a large object, and the language, foreign
+                             -- server, subscription, extension or event trigger
+                             -- by name. The first version returned NULL for all
+                             -- of them -- including 'policy', the kind by_kind
+                             -- promotes as the difference between REASSIGN OWNED
+                             -- and DROP OWNED. It reads through the syscache and
+                             -- checks no privilege, so a bare role gets names
+                             -- too (verified on 18.6). The explicit branches
+                             -- above stay because their unquoted schema.name
+                             -- format is what callers already read.
+                             ELSE (pg_identify_object(d.classid, d.objid, 0)).identity
+                             END,
+                   'column', NULLIF(d.objsubid, 0),
+                   'dependency', CASE d.deptype WHEN 'o' THEN 'owner'
+                                                WHEN 'a' THEN 'acl'
+                                                WHEN 'i' THEN 'init_acl'
+                                                WHEN 'r' THEN 'policy'
+                                                WHEN 't' THEN 'tablespace'
+                                                ELSE d.deptype::text END)
+                 ORDER BY c.relname, d.objid)
+            FROM d JOIN pg_class AS c ON c.oid = d.classid
+           WHERE d.dbid IN (0, (SELECT oid FROM pg_database
+                                 WHERE datname = current_database()))), '[]'::jsonb));
+    )");
+
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{role});
+    if (!res.empty() && !res[0][0].is_null())
+      return json::parse(res[0][0].as<std::string>());
+    return {};
+  }
+
+  // ALTER DEFAULT PRIVILEGES, which decides what grants the NEXT object gets.
+  // checkRoleAccess answers about the objects that exist; this is the only
+  // thing that answers about the ones that do not yet, and it is the standing
+  // cause of "the new table isn't readable and every old one is" -- which
+  // presents as a broken grant and is a missing default.
+  const json default_privileges(const std::string& schema) {
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+
+    // A named schema that does not exist is an error, as it is in every other
+    // schema-taking tool. An empty list here would read as "no defaults are
+    // set", which is a real and different answer.
+    if (!schema.empty()) {
+      json missing = no_such_schema(txn, schema);
+      if (!missing.is_null()) return missing;
+    }
+
+    const std::string query = R"(
+      SELECT COALESCE(JSONB_AGG(JSONB_BUILD_OBJECT(
+               -- defaclnamespace = 0 is a "global" entry that overrides the
+               -- hard-wired defaults for the type; a non-zero one is per-schema
+               -- and its privileges are ADDED to the global ones. Two entries
+               -- for the same type are therefore cumulative, not conflicting.
+               'scope', CASE WHEN d.defaclnamespace = 0 THEN 'global' ELSE 'schema' END,
+               'schema', n.nspname,
+               'granted_by', pg_get_userbyid(d.defaclrole),
+               'object_type', CASE d.defaclobjtype
+                                WHEN 'r' THEN 'table'    WHEN 'S' THEN 'sequence'
+                                WHEN 'f' THEN 'function' WHEN 'T' THEN 'type'
+                                WHEN 'n' THEN 'schema'   WHEN 'L' THEN 'large object'
+                                ELSE d.defaclobjtype::text END,
+               'grants', COALESCE(g.grants, '{}'::jsonb))
+             ORDER BY d.defaclnamespace <> 0, n.nspname, d.defaclobjtype), '[]'::jsonb)
+        FROM pg_default_acl AS d
+        LEFT JOIN pg_namespace AS n ON n.oid = d.defaclnamespace
+        LEFT JOIN LATERAL (
+            SELECT JSONB_OBJECT_AGG(grantee, privs) AS grants
+              FROM (SELECT COALESCE(r.rolname, 'PUBLIC') AS grantee,
+                           JSONB_AGG(a.privilege_type ORDER BY a.privilege_type) AS privs
+                      FROM aclexplode(d.defaclacl) AS a
+                      LEFT JOIN pg_roles AS r ON r.oid = a.grantee
+                     GROUP BY COALESCE(r.rolname, 'PUBLIC')) AS s) AS g ON true
+       -- A named schema keeps the global entries too. Per-schema entries
+       -- are ADDED to the global ones, so "what will the next table in this
+       -- schema get" is both sets together; filtering the global ones out
+       -- answered half the question and presented it as the whole.
+       WHERE $1 = '' OR n.nspname = $1 OR d.defaclnamespace = 0;
+    )";
+
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
+    if (!res.empty() && !res[0][0].is_null())
+      return {{"default_privileges", json::parse(res[0][0].as<std::string>())}};
+    return {{"default_privileges", json::array()}};
+  }
+
+  // Large objects live in a catalog rather than in any user relation, so
+  // tableSize, listTableSizes and tableStats are all blind to them while
+  // diskUsage.databases counts their bytes. The signature is "the database
+  // grew and no table did", which triage-disk-space could not resolve: it
+  // would rank tables, find nothing, and stop.
+  //
+  // Counted and owned, never sized. The bytes live in pg_largeobject, which
+  // the documentation says is no longer publicly readable and directs callers
+  // here instead -- so a size sum is not reliably available to this server and
+  // is not attempted. Saying that is better than a number that is null on
+  // every server with a permission structure.
+  const json large_objects() {
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+
+    const std::string query = R"(
+      SELECT JSONB_BUILD_OBJECT(
+        'total', (SELECT count(*) FROM pg_largeobject_metadata),
+        'by_owner', COALESCE((
+          SELECT JSONB_OBJECT_AGG(owner, n) FROM (
+            SELECT pg_get_userbyid(lomowner) AS owner, count(*) AS n
+              FROM pg_largeobject_metadata GROUP BY 1) AS s), '{}'::jsonb),
+        -- An orphan is a large object no column references. Detecting that
+        -- exhaustively means knowing every oid/lo column in the schema, which
+        -- this server does not, so the count is reported and the method is
+        -- named rather than guessed at.
+        'note', 'Sizes are not reported: the bytes live in pg_largeobject, '
+                'which is not publicly readable, and the documentation directs '
+                'callers to pg_largeobject_metadata for the list instead. '
+                'A large object is unreferenced only if no column holds its '
+                'oid, which cannot be determined from the catalog alone -- '
+                'lo_unlink on a live oid loses data, so confirm against the '
+                'application before deleting anything.');
+    )";
+
+    pqxx::result res = txn.exec(query);
+    if (!res.empty() && !res[0][0].is_null())
+      return json::parse(res[0][0].as<std::string>());
+    return {};
+  }
+
+  // The publisher side, which nothing here read. replicationSlots reports what
+  // a slot RETAINS, in bytes; subscriptionStats cannot measure lag at all by
+  // construction (neither of its LSN columns references the publisher). So
+  // between the three tools this server had, "how far behind is this replica,
+  // in seconds" had no answer anywhere.
+  //
+  // pg_stat_replication is the only source of write_lag, flush_lag and
+  // replay_lag -- as INTERVALS, for physical standbys and logical subscribers
+  // alike -- beside sent_lsn against write/flush/replay_lsn.
+  //
+  // Runs on its own savepoint alongside the origin status, because the two
+  // fail independently: pg_stat_replication is security-restricted per row
+  // rather than refused, while the origin function can be refused outright.
+  const json replication_stats() {
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+    json out = json::object();
+
+    // Documented behaviour worth carrying, because it is the reading most
+    // likely to be misread: "If the standby server has entirely caught up with
+    // the sending server and there is no more WAL activity, the most recently
+    // measured lag times will continue to be displayed for a short time and
+    // then show NULL." A null lag on an idle replica is caught up, not broken,
+    // and a stale non-null one is the last measurement rather than the current
+    // state.
+    try {
+      pqxx::subtransaction sub{txn};
+      pqxx::result r = sub.exec(R"(
+        SELECT COALESCE(JSONB_OBJECT_AGG(key, obj), '{}'::jsonb) FROM (
+          -- Keyed by application_name AND pid, never by name alone. A
+          -- walreceiver's default application_name is the standby's
+          -- cluster_name, and Debian packaging sets that per major rather than
+          -- per host ('18/main' on every install); unpackaged builds all default
+          -- to 'walreceiver'. Two such standbys share a key, and
+          -- JSONB_OBJECT_AGG keeps one value per key -- so the tool whose
+          -- reason to exist is "which replica is behind" would silently lose
+          -- one of them. The pid is what pg_stat_replication itself is keyed by.
+          SELECT CASE WHEN COALESCE(application_name, '') = ''
+                      THEN 'pid ' || pid::text
+                      ELSE application_name || ' (pid ' || pid::text || ')' END AS key,
+                 JSONB_BUILD_OBJECT(
+                   'pid',              pid,
+                   'user',             usename,
+                   'application_name', application_name,
+                   'client_addr',      host(client_addr),
+                   'backend_start',    backend_start,
+                   'backend_xmin',     backend_xmin::text,
+                   'state',            state,
+                   'sync_state',       sync_state,
+                   'sync_priority',    sync_priority,
+                   'sent_lsn',         sent_lsn::text,
+                   'write_lsn',        write_lsn::text,
+                   'flush_lsn',        flush_lsn::text,
+                   'replay_lsn',       replay_lsn::text,
+                   'write_lag_s',      round(EXTRACT(EPOCH FROM write_lag)::numeric, 3),
+                   'flush_lag_s',      round(EXTRACT(EPOCH FROM flush_lag)::numeric, 3),
+                   'replay_lag_s',     round(EXTRACT(EPOCH FROM replay_lag)::numeric, 3),
+                   'reply_time',       reply_time,
+                   -- The byte gap between what this server can send and what
+                   -- this consumer has replayed. Complements the lag
+                   -- intervals: bytes say how much, seconds say how long.
+                   --
+                   -- On a primary that is pg_current_wal_lsn(). On a
+                   -- cascading standby pg_current_wal_lsn() raises, and the
+                   -- first version returned NULL there -- for exactly the
+                   -- server whose downstream replicas have no other byte
+                   -- reading. A cascading walsender sends up to the later of
+                   -- what it has received and what it has replayed (its
+                   -- GetStandbyFlushRecPtr), so that is the minuend. Verified
+                   -- on an 18 cascade with the leaf's replay paused: NULL
+                   -- before, 12970272 after, equal to sent_lsn - replay_lsn.
+                   'replay_behind_bytes',
+                     pg_wal_lsn_diff(
+                       CASE WHEN pg_is_in_recovery()
+                            THEN GREATEST(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn())
+                            ELSE pg_current_wal_lsn() END,
+                       replay_lsn)
+                 ) AS obj
+            FROM pg_stat_replication) AS s)");
+      out["replication"] = json::parse(r[0][0].as<std::string>());
+      sub.commit();
+    } catch (const pqxx::sql_error& e) {
+      out["replication"] = json{{"error", "could not read pg_stat_replication"},
+                                {"detail", e.what()}};
+    }
+
+    try {
+      pqxx::subtransaction sub{txn};
+      pqxx::result r = sub.exec(R"(
+        SELECT COALESCE(JSONB_OBJECT_AGG(external_id, JSONB_BUILD_OBJECT(
+                 'local_id',   local_id,
+                 'remote_lsn', remote_lsn::text,
+                 'local_lsn',  local_lsn::text)), '{}'::jsonb)
+          FROM pg_replication_origin_status)");
+      out["origins"] = json::parse(r[0][0].as<std::string>());
+      sub.commit();
+    } catch (const pqxx::sql_error& e) {
+      out["origins"] = json{{"error", "could not read pg_replication_origin_status"},
+                            {"hint", "reading replication origin progress needs the "
+                                     "superuser or a role granted SELECT on "
+                                     "pg_replication_origin_status. No predefined "
+                                     "role includes it -- pg_monitor and "
+                                     "pg_read_all_stats do not -- so a monitoring "
+                                     "role gets this error too. The senders above "
+                                     "are unaffected"},
+                            {"detail", e.what()}};
+    }
+
+    out["note"] =
+      "pg_stat_replication is security-restricted per row rather than refused: "
+      "a role without pg_read_all_stats or pg_monitor sees the sessions exist "
+      "and finds many columns null, which reads like an idle replica rather "
+      "than a permission answer -- call checkPrivileges. Lag columns revert to "
+      "NULL a short time after a standby has entirely caught up and WAL "
+      "activity stops, so a null lag on an idle replica means caught up, and a "
+      "non-null one on an idle replica is the last measurement rather than the "
+      "current state.";
+    return out;
+  }
+
+  const json list_partitions(const std::string& schema) {
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+
+    // rows and size_estimate are summed over LEAF partitions at any depth, and
+    // only over the ones that have been measured. Until 4.3.0's review both
+    // were a sum over direct children with GREATEST(reltuples, 0), which was
+    // wrong twice over: a never-analyzed partition (reltuples -1, which
+    // survives inserts) counted as empty, and a sub-partitioned child has no
+    // storage of its own, so every row held by its grandchildren was left out
+    // entirely. never_analyzed says how many leaves the sums could not see.
+    //
+    // The tree is walked through pg_inherits with a recursive CTE rather than
+    // pg_partition_tree(): the function takes AccessShareLock on every
+    // partition it visits, and this tool's promise is that it opens no
+    // relation and takes no lock.
+    const std::string query = R"(
+      WITH RECURSIVE parents AS (
+        SELECT c.oid, c.relname, p.partstrat
+          FROM pg_class AS c
+          JOIN pg_partitioned_table AS p ON p.partrelid = c.oid
+         WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
+           -- Only top-level parents: a sub-partitioned child is reported
+           -- under its own parent rather than twice.
+           AND NOT c.relispartition
+      ),
+      tree AS (
+        SELECT pr.oid AS root, i.inhrelid AS relid
+          FROM parents AS pr JOIN pg_inherits AS i ON i.inhparent = pr.oid
+        UNION ALL
+        SELECT t.root, i.inhrelid
+          FROM tree AS t JOIN pg_inherits AS i ON i.inhparent = t.relid
+      ),
+      leaves AS (
+        SELECT t.root,
+               count(*) AS n,
+               count(*) FILTER (WHERE l.reltuples < 0) AS never_analyzed,
+               sum(l.reltuples) FILTER (WHERE l.reltuples >= 0) AS rows,
+               -- relpages is set by the same VACUUM or ANALYZE as reltuples,
+               -- so a never-analyzed leaf's 0 means "not measured" too.
+               sum(l.relpages)  FILTER (WHERE l.reltuples >= 0) AS pages
+          FROM tree AS t JOIN pg_class AS l ON l.oid = t.relid
+         -- A partitioned child has no storage; its leaves hold the rows.
+         WHERE l.relkind <> 'p'
+         GROUP BY t.root
+      )
+      SELECT JSONB_OBJECT_AGG(parent, obj)
+        FROM (
+          SELECT pr.relname AS parent,
+                 JSONB_BUILD_OBJECT(
+                   'strategy', CASE pr.partstrat WHEN 'r' THEN 'range'
+                                                 WHEN 'l' THEN 'list'
+                                                 WHEN 'h' THEN 'hash'
+                                                 ELSE pr.partstrat::text END,
+                   'key', pg_get_partkeydef(pr.oid),
+                   'partitions', count(ch.oid),
+                   -- A default partition catches every row that matched no
+                   -- bound, so it is the difference between an insert that
+                   -- fails loudly and one that silently lands in the wrong
+                   -- place. Its row count is the finding, not its existence.
+                   'has_default',
+                     COALESCE(bool_or(pg_get_expr(ch.relpartbound, ch.oid) = 'DEFAULT'), false),
+                   'default_partition',
+                     max(ch.relname) FILTER (
+                       WHERE pg_get_expr(ch.relpartbound, ch.oid) = 'DEFAULT'),
+                   -- NULL when the default has never been analyzed, never 0
+                   -- and never -1. reltuples is -1 until the first VACUUM or
+                   -- ANALYZE, and stays -1 after rows arrive (verified on
+                   -- 18.6: two rows inserted, still -1). Clamping to 0 would
+                   -- report a default partition that is filling up as empty,
+                   -- and that is the one reading this field exists to catch.
+                   -- has_default separates "no default" from "not measured".
+                   'default_rows',
+                     (max(ch.reltuples) FILTER (
+                        WHERE pg_get_expr(ch.relpartbound, ch.oid) = 'DEFAULT'
+                          AND ch.reltuples >= 0))::bigint,
+                   'leaf_partitions', COALESCE(lv.n, 0),
+                   'never_analyzed',  COALESCE(lv.never_analyzed, 0),
+                   -- Over the measured leaves. NULL when there are leaves and
+                   -- none has been measured; 0 when there are no leaves at
+                   -- all, since a parent with no partitions holds nothing.
+                   'rows',
+                     CASE WHEN COALESCE(lv.n, 0) = 0 THEN 0 ELSE lv.rows::bigint END,
+                   'size_estimate',
+                     CASE WHEN COALESCE(lv.n, 0) = 0 THEN 0
+                          ELSE lv.pages::bigint * current_setting('block_size')::bigint END,
+                   -- A partition may itself be partitioned. Its leaves are
+                   -- counted above; partitionDetails on it names them.
+                   'sub_partitioned',
+                     count(ch.oid) FILTER (WHERE ch.relkind = 'p')
+                 ) AS obj
+            FROM parents AS pr
+            LEFT JOIN pg_inherits AS i  ON i.inhparent = pr.oid
+            LEFT JOIN pg_class    AS ch ON ch.oid = i.inhrelid
+            LEFT JOIN leaves      AS lv ON lv.root = pr.oid
+           GROUP BY pr.oid, pr.relname, pr.partstrat,
+                    lv.n, lv.never_analyzed, lv.rows, lv.pages) AS s;
+    )";
+
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
+    if (!res.empty() && !res[0][0].is_null())
+      return json::parse(res[0][0].as<std::string>());
+    json missing = no_such_schema(txn, schema);
+    return missing.is_null() ? json::object() : missing;
+  }
+
+  // One parent, every partition, with the readings that decide which one is
+  // the problem. The per-partition statistics already existed in
+  // pg_stat_user_tables -- autovacuum runs per partition, so a parent has no
+  // vacuum state of its own and bloat-and-vacuum-review was ranking a relation
+  // whose counters are always zero while the child that is behind went
+  // unlisted.
+  const json partition_details(const std::string& schema, const std::string& table) {
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+
+    const std::string query = std::string(R"(
+      SELECT JSONB_BUILD_OBJECT(
+        'table',    c.relname,
+        'strategy', CASE p.partstrat WHEN 'r' THEN 'range'
+                                     WHEN 'l' THEN 'list'
+                                     WHEN 'h' THEN 'hash'
+                                     ELSE p.partstrat::text END,
+        'key',      pg_get_partkeydef(c.oid),
+        'is_partition_of',
+          (SELECT pn.nspname || '.' || pc.relname
+             FROM pg_inherits pi
+             JOIN pg_class pc ON pc.oid = pi.inhparent
+             JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+            WHERE pi.inhrelid = c.oid),
+        )") + kCountersSince + R"(,
+        'partitions', COALESCE((
+          SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                   'name',    ch.relname,
+                   'schema',  chn.nspname,
+                   -- Verbatim. Parsing a bound generically is not possible --
+                   -- it carries whatever types the key columns have -- and a
+                   -- misparsed boundary is worse than an unparsed one. For a
+                   -- RANGE parent, comparing the highest upper bound here
+                   -- against now() is how to see that next period's partition
+                   -- was never created, which is the classic overnight failure.
+                   'bound',   pg_get_expr(ch.relpartbound, ch.oid),
+                   'is_default', pg_get_expr(ch.relpartbound, ch.oid) = 'DEFAULT',
+                   'is_partitioned', ch.relkind = 'p',
+                   -- NULL rather than 0 for a partition never analyzed, for
+                   -- the reason default_rows gives in listPartitions: -1 means
+                   -- "not measured" and survives inserts, so a clamp would
+                   -- call a filling partition empty. relpages is set by the
+                   -- same VACUUM or ANALYZE, so its 0 means the same thing and
+                   -- the size estimate goes null with it.
+                   'rows', CASE WHEN ch.reltuples < 0 THEN NULL
+                                ELSE ch.reltuples::bigint END,
+                   'size_estimate',
+                     CASE WHEN ch.reltuples < 0 THEN NULL
+                          ELSE ch.relpages::bigint * current_setting('block_size')::bigint END,
+                   'n_live_tup', s.n_live_tup,
+                   'n_dead_tup', s.n_dead_tup,
+                   'n_mod_since_analyze', s.n_mod_since_analyze,
+                   'n_ins_since_vacuum',  s.n_ins_since_vacuum,
+                   'seq_scan', s.seq_scan,
+                   'idx_scan', s.idx_scan,
+                   'last_vacuum',      s.last_vacuum,
+                   'last_autovacuum',  s.last_autovacuum,
+                   'last_analyze',     s.last_analyze,
+                   'last_autoanalyze', s.last_autoanalyze)
+                 ORDER BY pg_get_expr(ch.relpartbound, ch.oid) = 'DEFAULT', ch.relname)
+            FROM pg_inherits AS i
+            JOIN pg_class AS ch ON ch.oid = i.inhrelid
+            JOIN pg_namespace AS chn ON chn.oid = ch.relnamespace
+            LEFT JOIN pg_stat_user_tables AS s ON s.relid = ch.oid
+           WHERE i.inhparent = c.oid), '[]'::jsonb))
+        FROM pg_class AS c
+        JOIN pg_partitioned_table AS p ON p.partrelid = c.oid
+       WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
+         AND c.relname = $2;
+    )";
+
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, table});
+    if (!res.empty() && !res[0][0].is_null())
+      return json::parse(res[0][0].as<std::string>());
+
+    // Not partitioned and does not exist are different answers, and the first
+    // is the one a caller reaches by habit after listTables named the relation.
+    pqxx::result k = pqxx_exec(
+      txn, "SELECT c.relkind::text FROM pg_class c JOIN pg_namespace n "
+           "ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2",
+      pqxx::params{schema, table});
+    if (!k.empty())
+      return {{"error", "\"" + schema + "." + table + "\" is not a partitioned table"},
+              {"hint", "relkind is '" + k[0][0].as<std::string>() + "'; only a "
+                       "partitioned table (relkind 'p') has partitions. "
+                       "listPartitions names every partitioned table in a schema, "
+                       "and tableDetails describes an ordinary one."}};
+    return {{"error", "no such table: \"" + schema + "." + table + "\""},
+            {"hint", "listTables names every relation in a schema. Names are "
+                     "case sensitive here exactly as they are in the catalog."}};
   }
 
   const json list_table_stats(const std::string& schema) {
@@ -7367,6 +8451,10 @@ private:
       std::atomic<size_t> next{0};
       auto worker = [&]() {
         PostgresMCPServer w(registry_, cache_);
+        // explainQuery never sweeps, so no worker computes an execution
+        // budget today; copied anyway so one that does cannot fall back to
+        // the built-in ratios behind the operator's back.
+        w.budgets_ = budgets_;
         for (size_t i = next.fetch_add(1); i < members.size(); i = next.fetch_add(1)) {
           const std::string& m = members[i];
           // Reset first: a member that never connects must not inherit the

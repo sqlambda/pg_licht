@@ -9,7 +9,7 @@ Every channel below installs the manual page, so once installed:
 man pg_licht_mcp
 ```
 
-is the reference for configuration, connection strings, all 62 operations, and MCP client
+is the reference for configuration, connection strings, all 68 operations, and MCP client
 setup.
 
 ## Homebrew (macOS and Linux)
@@ -40,17 +40,28 @@ Download the latest release for your platform from the
 sudo apt install ./pg_licht_mcp-linux-x86_64-debian13.deb
 ```
 
-Use `apt install ./file.deb` rather than `dpkg -i` so apt resolves the declared `libpq5`
-dependency automatically. Installs `/usr/bin/pg_licht_mcp`, already on `PATH`.
+Use `apt install ./file.deb` rather than `dpkg -i` so apt resolves the dependencies
+automatically. They are derived from the binary at build time: `libpq5` 10 or later and the
+C and C++ runtimes. Debian's own `libpq5` satisfies them, so the PostgreSQL project's apt
+repository is not needed for this package. Installs `/usr/bin/pg_licht_mcp`, already on
+`PATH`.
 
 ### Rocky Linux / RHEL / Fedora / other dnf-based distros (`.rpm`)
 
+The package depends on `libpq5` from the PostgreSQL project's own repository (PGDG), not on
+the distribution's `libpq`. Enable that repository first, then install:
+
 ```bash
+sudo dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-$(uname -m)/pgdg-redhat-repo-latest.noarch.rpm
 sudo dnf install ./pg_licht_mcp-linux-x86_64-rocky9.rpm
 ```
 
-Same reasoning: `dnf install ./file.rpm` resolves the declared `libpq5` dependency, while
-`rpm -i` will not. Installs `/usr/bin/pg_licht_mcp`.
+`dnf install ./file.rpm` then resolves `libpq5` from PGDG's `pgdg-common` repository, while
+`rpm -i` will not resolve it at all. Without the repository, dnf stops with
+`nothing provides libpq5`. The repository command above is for EL 9; Fedora has its own
+PGDG repository package on the same site. If the distribution's `libpq` is already
+installed, `libpq5` replaces it: it provides the same library and satisfies the packages
+that depended on it. Installs `/usr/bin/pg_licht_mcp`.
 
 ### Generic tarball (any glibc-based Linux, or macOS)
 

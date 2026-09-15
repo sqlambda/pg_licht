@@ -1,5 +1,354 @@
 # Changelog
 
+## 4.3.0 (2026-09-15)
+
+Six new tools, from the twenty-four PostgreSQL catalogs this server did not
+read. Each closes a question the existing tools could only get halfway to, and
+one of them makes an instruction this server already gave finally executable.
+
+Sixty-eight operations. Measured on PostgreSQL 18: a bare login role runs 56 of
+them at full fidelity, a role with `pg_monitor` 63.
+
+### Added
+
+- **`listPartitions` and `partitionDetails`.** Nothing here read
+  `pg_partitioned_table` or `pg_inherits`. `relkind = 'p'` appeared in five
+  places and only ever printed the words "partitioned table", so a parent's
+  children, its key, its bounds and its default partition were all invisible —
+  while `tableSize`'s own description told the caller to *"measure the
+  partitions"*, an instruction there was no way to follow. That is why this is
+  the first item of the release: it makes existing advice executable rather than
+  adding a new answer.
+
+  `listPartitions` summarises every parent in a schema — strategy, key,
+  partition count, combined rows and size, and whether a `DEFAULT` partition
+  exists and how many rows it holds. It reads `reltuples` and `relpages`, which
+  are catalog columns, so it opens no relation and takes no lock. Measured sizes
+  are deliberately not folded in: a parent with three hundred children would be
+  three hundred relation opens behind an innocent-looking call.
+
+  `partitionDetails` carries the per-partition statistics, which is the point of
+  it. **Autovacuum runs per partition**, so a parent has no vacuum state of its
+  own — its `n_dead_tup` cannot move — and `bloat-and-vacuum-review` was ranking
+  a relation whose counters are permanently zero while the child that had fallen
+  behind went unlisted. The prompt now takes partitions from here and ranks
+  those.
+
+  Bounds are returned **verbatim, never parsed**. A bound carries whatever types
+  the key columns have, so parsing one generically is not possible and a
+  misparsed boundary is worse than an unparsed one. For a range parent, the
+  highest upper bound against `now()` is how to see that next period's partition
+  was never created — the classic overnight failure — and that is readable off
+  the text.
+
+  `default_rows` is the finding to look for: rows land in a `DEFAULT` partition
+  when they match no bound, so a growing default is a missing partition that has
+  not failed loudly *yet*. It is `null`, not `0`, until the default has been
+  analyzed: `reltuples` is `-1` until the first `VACUUM` or `ANALYZE` and stays
+  there after rows arrive, so a zero would call a filling default empty — the
+  one reading the field exists to catch. `partitionDetails` does the same for
+  each partition's `rows` and `size_estimate`.
+
+  The parent's `rows` and `size_estimate` are summed over **leaf** partitions
+  at any depth, and only over the ones that have been measured, with
+  `leaf_partitions` and `never_analyzed` beside them. A sub-partitioned child
+  has no storage of its own, so a sum over direct children leaves out every row
+  a level down, and a never-analyzed leaf is not empty. The tree is walked
+  through `pg_inherits` rather than `pg_partition_tree()`, which locks every
+  partition it visits.
+
+- **`roleDependencies`** — the inverse of `checkRoleAccess`. That tool answers
+  whether a role may *use* an object; nothing answered what depends *on* it,
+  which is the whole of
+
+  ```
+  ERROR:  role "x" cannot be dropped because some objects depend on it
+  DETAIL: 4 objects in database app
+  ```
+
+  — a message that reports a count and names nothing. `by_kind` separates
+  `owner`, which blocks `DROP ROLE` outright and is cleared by `REASSIGN OWNED`,
+  from `acl` and `policy`, which `DROP OWNED` clears; that distinction is the
+  fix, not a detail.
+
+  `pg_shdepend` is shared across the cluster, and that cuts both ways. The count
+  and the per-database breakdown cover **every** database. The names do not: an
+  object id resolves only from the database it lives in, so `objects` carries
+  this database and the shared catalogs while others appear as counts.
+  Reporting only what is resolvable would have answered *"nothing depends on
+  this role"* to somebody about to drop it.
+
+  Every row this database can resolve carries a name. Tables, functions,
+  schemas and types read as `schema.name`; every other class goes through
+  PostgreSQL's own `pg_identify_object`, so a policy reads as
+  `p on public.t` and a default privilege as
+  `for role x in schema s on tables`. That matters most for `policy`, the
+  kind `by_kind` separates out: a count with nothing to point at is the
+  `DROP ROLE` error message over again.
+
+  Reads `pg_roles`, never `pg_authid`, so a bare login role can ask. That is
+  the role most likely to be asking: the one that cannot run `DROP ROLE`
+  itself and wants to know what to hand the person who can.
+
+- **`defaultPrivileges`** — `ALTER DEFAULT PRIVILEGES`, which decides what
+  grants the **next** object gets. `checkRoleAccess` answers about the objects
+  that exist, and a correct answer today that is wrong for tomorrow's table is
+  the standing cause of "the new table is not readable and every old one is" —
+  which presents as a broken grant and is a missing default. Scope `global`
+  (`defaclnamespace = 0`) overrides the hard-wired defaults while per-schema
+  entries are *added* to them, so two entries for one type are cumulative rather
+  than conflicting, and `granted_by` is reported because a default applies only
+  to objects that role creates. Naming a `schema` therefore returns that
+  schema's entries **and** the global ones — both decide what the next table
+  there gets — and a schema that does not exist is an error rather than an
+  empty list that would read as "no defaults set".
+
+- **`largeObjects`** — growth no size tool can see. Large objects live in a
+  catalog rather than in any user relation, so `tableSize`, `listTableSizes` and
+  `tableStats` are all blind to them while `diskUsage.databases` counts their
+  bytes. The signature is *"the database grew and no table did"*, which
+  `triage-disk-space` could not resolve: it would rank tables, find nothing, and
+  stop.
+
+  Counted and owned, **never sized**. The bytes are in `pg_largeobject`, which
+  the documentation says is no longer publicly readable and directs callers away
+  from, so a size is not available here and is not invented. The prompt is told
+  not to propose `lo_unlink` from a count either: an object is unreferenced only
+  if no column holds its oid, which the catalog cannot answer, and unlinking a
+  live one loses data.
+
+- **`replicationStats`** — the publisher side, and the only source of lag as a
+  **time**. `replicationSlots` reports what a slot *retains*, in bytes;
+  `subscriptionStats` cannot measure lag at all, because neither of its LSN
+  columns references the publisher. So "how far behind is this replica, in
+  seconds" had no answer anywhere. Serves physical standbys and logical
+  subscribers alike, and both halves run on their own savepoint because they
+  fail differently.
+
+  The origin half needs the **superuser**. `pg_replication_origin_status` is
+  granted to no predefined role — `pg_monitor` and `pg_read_all_stats` both
+  lack it, verified on 18.6 — so a monitoring role gets complete senders and an
+  error for `origins`. `checkPrivileges` reports the tool as degraded for every
+  role that cannot read the view, naming which half falls short.
+
+  It sweeps a `replication_group` — one answer per member, since each has its
+  own senders — and refuses an `instance` sweep, since every database on one
+  postmaster sees the same ones.
+
+  Senders are keyed by `application_name` **plus pid**. A walreceiver's default
+  `application_name` is the standby's `cluster_name`, and Debian packaging sets
+  that per major rather than per host — `18/main` on every install — while
+  unpackaged builds all default to `walreceiver`. Two such standbys share a
+  name, and an object keyed by name alone keeps one of them, silently. The tool
+  whose reason to exist is "which replica is behind" cannot be allowed to lose
+  a replica.
+
+  `replay_behind_bytes` works on a **cascading standby** too. There
+  `pg_current_wal_lsn()` raises, so the gap is measured from the later of the
+  WAL the standby has received and replayed — which is what a cascading
+  walsender can send — rather than being null for exactly the server whose
+  downstream replicas have no other byte reading.
+
+  Two readings it states because both are routinely misread. The view is
+  security-restricted **per row** rather than refused, so a role without
+  `pg_read_all_stats` sees the senders exist with many columns null — which
+  looks like an idle replica and is a permission answer. And the lag columns
+  revert to `NULL` a short time after a standby has entirely caught up and WAL
+  activity stops, so a null lag on an idle replica means caught up, while a
+  non-null one there is the last measurement rather than the current state.
+
+- **`explainQuery` and `evaluateIndex` take `settings` and `plan_as_role`.**
+  4.2.1 made the mismatch visible — every `EXPLAIN` gained `SETTINGS`, so a plan
+  said what environment produced it, and `hostCapacity.overrides` said what
+  production uses. Neither removed it. `work_mem` alone changes the algorithm
+  rather than the cost: measured on PostgreSQL 18 over 400,000 rows with
+  identical statistics, one statement planned as `GroupAggregate` over a `Sort`
+  at 64kB and as `HashAggregate` at 512MB.
+
+  Three decisions carry the safety:
+
+  `set_config(name, value, is_local := true)` rather than a built `SET LOCAL`
+  string. It is a function call with bound parameters, so a value cannot escape
+  into SQL text at all, and `is_local` means the setting reverts when the
+  transaction ends — it cannot leak across a connection a pooler hands to
+  somebody else. That is the property that made the read-only guard
+  transaction-scoped rather than session-scoped, and the same reason. A test
+  asserts it by planning again afterwards and requiring the setting to be gone.
+
+  **An allowlist, not a denylist.** An arbitrary passthrough would let a caller
+  turn off `default_transaction_read_only`, remove `statement_timeout`, or
+  change `role` and `session_authorization` — three of this server's four safety
+  properties, handed away through a convenience argument. The set that changes a
+  plan is bounded and known, and every entry is `USERSET`. `enable_*` is
+  admitted by prefix, because every one of them is a planner toggle by
+  convention and new ones arrive most releases.
+
+  **An unknown name is refused and nothing is planned.** Silently dropping it
+  would return a plan the caller believes was built under an environment that
+  was never applied — the exact failure class 4.2.1 and 4.2.2 kept correcting,
+  reintroduced through the fix for it.
+
+  `search_path` is excluded even though it changes plans, because it does so by
+  changing *which objects the statement resolves to* rather than how they are
+  joined; planning against a different table than the caller meant is worse than
+  refusing, and the refusal says so. `plan_as_role` reads `pg_db_role_setting`
+  and applies only the planner half, listing what it skipped rather than
+  dropping it. A per-database entry (`ALTER ROLE ... IN DATABASE`) overrides
+  the role-wide one, which is the precedence the server itself gives them; the
+  entries are applied in that order so the last one applied is the one
+  production runs under. Each is applied on its own savepoint: a refused value
+  is reported under `skipped_from_role` and the rest still apply, rather than
+  one bad entry aborting the transaction and taking the plan with it.
+
+  `evaluateIndex` takes both for a reason of its own: its whole output is a
+  before/after cost comparison, so an environment that does not match production
+  makes **both halves** answer a different question.
+
+  **Executing under `settings` is budgeted by the declared host.** `analyze`
+  really runs the statement, and then `work_mem`, `hash_mem_multiplier` and the
+  parallelism knobs set the footprint of something that executes. The read-only
+  guard and the timeout bound what it writes and how long it runs, not what it
+  allocates: `work_mem` goes to 2TB per node and `hash_mem_multiplier` to 1000,
+  and one out-of-memory kill restarts every connection on the instance. So with
+  explicit `settings`, `analyze` executes only if the worst case the plan's own
+  memory limits permit — each sort-like node at `work_mem`, each hash node at
+  `work_mem × hash_mem_multiplier`, times the processes running it — fits in a
+  tenth of `host_ram_mb`, and the plan uses at most one parallel worker per four
+  `host_vcpus`. With no declared capacity, no settings change is executed at
+  all. Either way a refused plan is still returned, `analyzed` stays false, and
+  `planning_environment.execution_budget` carries the arithmetic. Capacity comes
+  from the connection, its `[instance:...]` section or the environment — never
+  from a tool argument, so a caller cannot raise its own limit. `plan_as_role`
+  on its own is not budgeted: it applies what that role already runs with.
+
+  The two ratios live in an optional **`budgets.ini`** — `memory_percent` and
+  `vcpus_per_worker` under `[analyze]`, 10 and 4 by default — read from
+  `$PG_LICHT_BUDGETS`, beside the connections file, or
+  `~/.config/pg_licht/budgets.ini`. It is strict: an unknown key or a value
+  out of range stops the server at startup, and a file other users can write
+  is refused, since a limit another user can edit is one they can raise.
+  `execution_budget` names the values and the file they came from.
+
+  `explain-and-fix` and `diagnose-slow-query` now plan twice and compare rather
+  than noting a caveat. It is the same shape as the generic-versus-custom
+  comparison they already make: two plans, one difference, and the difference is
+  the answer. Where they agree, the environment is ruled *out* instead of
+  carried.
+
+- **`listPublications` reports the schemas published via `FOR TABLES IN SCHEMA`**
+  (PostgreSQL 15+). The members were never missing —
+  `pg_publication_tables` resolves them either way — but the *declaration* was,
+  and it decides what happens next: a table created later in a published schema
+  joins the publication by itself, while one added to a table-list publication
+  does not. Two publications with identical members today can behave differently
+  tomorrow.
+
+- **`roleDependencies` names parameters granted with `GRANT SET ON PARAMETER`**
+  (PostgreSQL 15+). Those are shared dependencies like any other grant, so the
+  rows were already in the total and only the name was absent.
+
+- **A site, and an `llms.txt` generated from the binary.** llms.txt
+  (llmstxt.org) is how an agent that has not installed a tool yet learns what
+  it is, and it is found by URL path — so it needs a site, and this project had
+  none. The release workflow now publishes a minimal landing page, the man page
+  rendered to HTML, and `llms.txt` to https://sqlambda.github.io/pg_licht/
+  after each release. `llms.txt` is never written by hand:
+  `tools/generate-llms-txt.py` asks the shipped binary for its version, tools
+  and prompts over stdio, the same way a client does, and links each one to
+  its own entry in the manual — failing if any has no entry. It drives the
+  binary with a throwaway config so a developer's own connections file is
+  never read. The `llms_txt` ctest runs it on every build.
+
+  The landing page is an overview: one server for a whole fleet, read-only
+  enforced by PostgreSQL rather than by convention, and exactly what can and
+  cannot reach the caller. Its counts are filled in from the binary at build
+  time, and every other number on it was measured — the tool listing is the
+  same 135 KB with 1, 150 or 1,000 connections configured.
+
+  Beside it, an **HTML reference**: one page per tool and per prompt, 80 in
+  all, grouped by the manual's sections, in the shape of the PostgreSQL
+  manual's command pages — synopsis, description, parameters with required
+  and optional marked, output fields, where the answer varies, an example, and
+  related tools. Prompt pages carry the full text `prompts/get` returns.
+  `tools/gen-reference.py` builds it from the binary and the man page. The one
+  hand-written input is `tools/reference/examples.json`, whose examples are
+  **mocked** — invented values on a fictional database, nothing captured from
+  a real server — and each is validated against its tool's own input and
+  output schema, so a mock that drifts from its tool fails the build. Tools
+  that can return values from your data are marked on their page. The
+  `reference` ctest builds the whole site and checks that every tool has a
+  page and every internal link and anchor resolves; `llms.txt` entries now
+  link to these pages.
+
+- **The manual says exactly what can reach the caller.** A new subsection of
+  SECURITY CONSIDERATIONS, checked against the queries: pg_licht never writes
+  and never returns rows from your tables, but statement text
+  (`currentActivity`, `currentLocks`, `statementStats`, `explainQuery`),
+  column statistics (`tableStats`, `columnHistogram`), plans, definitions as
+  written, and settings such as a standby's `primary_conninfo` can carry
+  values, each limited further by PostgreSQL's own permissions. No behaviour
+  changes; this documents what 4.3.0 already does. Seven entries moved to the
+  manual section that matches what they answer, which the reference groups by.
+
+### Fixed
+
+- **Tablespace comments were never readable.** `listTablespaces` read its
+  description through `obj_description(oid, 'pg_tablespace')`. A tablespace is a
+  **shared** object, so `COMMENT ON TABLESPACE` writes to `pg_shdescription`,
+  and `obj_description()` reads `pg_description` — so every commented tablespace
+  has reported `''` since the tool existed. Not null, not missing: empty, which
+  reads as "no comment".
+
+  Verified on PostgreSQL 18 before changing anything: the same tablespace gave
+  `NULL` through `obj_description` and the comment through `shobj_description`.
+
+- **Tool descriptions ran into their scope note.** Every tool's description
+  gains a sentence saying where its answer varies — across databases, across
+  replicas — and 65 of the 68 descriptions ended without a full stop, so a
+  client read "…list for a schema A physical replica is byte-identical here".
+  The note is now its own sentence. Found by the `llms.txt` generator, which
+  splits descriptions into sentences.
+
+- **The `.deb` declares what the binary needs, derived rather than written.**
+  Its `Depends` was a hand-written, unversioned `libpq5` that named none of
+  the C++ runtime the binary also links. CPack now runs `dpkg-shlibdeps`,
+  which reads the binary's libraries and the symbols it uses: on the 4.2.2
+  binary that is `libc6 (>= 2.38), libgcc-s1 (>= 4.3), libpq5 (>= 10~~),
+  libstdc++6 (>= 14)`. Every libpq function called predates PostgreSQL 10, so
+  Debian's own `libpq5` satisfies it — verified by installing the 4.2.2 `.deb`
+  on plain Debian 13 — and the postgresql.org repository is not required.
+  The RPM is unchanged and deliberately names PGDG's `libpq5`.
+
+- **The RPM install instructions left out the repository it needs.** The package
+  requires `libpq5`, which is the PostgreSQL project's own (PGDG) package, not the
+  distribution's `libpq` — deliberately. INSTALL.md gave only
+  `dnf install ./file.rpm`, and on a stock Rocky Linux 9 that stops with
+  `nothing provides libpq5`. It now enables the PGDG repository first. Verified
+  against the 4.2.2 RPM in a Rocky Linux 9 container: with the repository it
+  installs `libpq5` from `pgdg-common` and runs, and where the distribution's
+  `libpq` was already installed, `libpq5` replaces it.
+
+### Compatibility
+
+Additive except for one corrected field.
+
+`listTablespaces.description` now returns the comment where one exists, having
+previously returned `''` for every tablespace. A caller that treated empty as
+"no comment" will start seeing text.
+
+Everything else adds. `listPublications` gains `schemas` on PostgreSQL 15 and
+later; `explainQuery` and `evaluateIndex` gain two optional input properties and
+a `planning_environment` key that appears only when one of them is used; the six
+new tools are new names. No existing tool's name or input schema changes and no
+key is removed.
+
+### Deliberately not built
+
+`pg_seclabel`, `pg_shseclabel` and `pg_init_privs`. Security labels are
+meaningful only with a label provider in use, and `init_privs` is extension
+bookkeeping. Neither has an operational question behind it, which is the bar
+this project sets for a new tool.
+
 ## 4.2.2 (2026-09-07)
 
 4.2.1 was exercised against a real 617 GB cluster — 24 schemas, 3,165 tables,
@@ -1470,10 +1819,13 @@ number that moves under it.
   forward.** A hypothetical index lives in backend-local memory for the whole
   session and is cleared by none of the things that would be expected to clear
   it — measured: not `ROLLBACK`, not a new transaction, and **not `DISCARD
-  ALL`**, which is exactly what PgBouncer issues as `server_reset_query`. Only
-  `hypopg_reset()` removes it. Behind a transaction-mode pooler that would
-  leave one caller's hypothetical index on the backend, silently reshaping the
-  next caller's plans. So `hypopg_reset()` runs on the way in, protecting this
+  ALL`**, PgBouncer's default `server_reset_query`. Only `hypopg_reset()`
+  removes it. Behind a transaction-mode pooler that would leave one caller's
+  hypothetical index on the backend, silently reshaping the next caller's
+  plans — and the pooler cannot be asked to help: in transaction mode it runs
+  no reset query at all unless `server_reset_query_always` is set, and forcing
+  that on does not clear hypopg either, because `DISCARD ALL` does not.
+  Measured end to end through a real PgBouncer, both ways. So `hypopg_reset()` runs on the way in, protecting this
   call from whatever a previous one left, and again on the way out through a
   scope guard that survives an exception. A test asserts a second call's
   baseline is unchanged — it can only fail behind the pooler, and passes

@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <unistd.h>
 #include <sstream>
+#include <filesystem>
 #include <fstream>
 #include <sys/stat.h>
 #if defined(__GNUC__) && !defined(__clang__)
@@ -261,6 +262,13 @@ protected:
       txn.exec("CREATE PUBLICATION grocery_users_pub FOR TABLE grocery.users");
 
       txn.exec("CREATE TYPE grocery.price_range AS RANGE (subtype = numeric)");
+
+      txn.exec("CREATE TABLE grocery.events (id bigint, at date NOT NULL, note text) PARTITION BY RANGE (at)");
+      txn.exec("CREATE TABLE grocery.events_2026_01 PARTITION OF grocery.events FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')");
+      txn.exec("CREATE TABLE grocery.events_2026_02 PARTITION OF grocery.events FOR VALUES FROM ('2026-02-01') TO ('2026-03-01')");
+      txn.exec("CREATE TABLE grocery.events_default PARTITION OF grocery.events DEFAULT");
+      txn.exec("INSERT INTO grocery.events VALUES (1,'2026-01-15','a'),(2,'2026-01-16','b'),(3,'2026-02-02','c'),(4,'2030-06-01','late')");
+      txn.exec("ANALYZE grocery.events");
 
       txn.exec("CREATE STATISTICS grocery.orders_stats (dependencies) ON user_id, amount FROM grocery.orders");
       txn.exec("COMMENT ON STATISTICS grocery.orders_stats IS 'user_id/amount correlation'");
@@ -1812,6 +1820,901 @@ TEST_F(PostgresMCPServerTest, AnUninferableParameterTypeExplainsItselfAndSaysPar
   EXPECT_NE(hint.find("WERE applied"), std::string::npos) << hint;
   EXPECT_NE(hint.find("normalization"), std::string::npos) << hint;
 }
+
+// relkind 'p' was used in five places and only ever to print the words
+// "partitioned table". tableSize's own description says "measure the
+// partitions" -- an instruction this server gave no way to follow until 4.3.0.
+TEST_F(PostgresMCPServerTest, ListPartitionsSummarisesAParentAndFlagsItsDefault) {
+  json r = srv->call_list_partitions("grocery");
+  ASSERT_TRUE(r.contains("events")) << r.dump(2);
+  auto& e = r["events"];
+  EXPECT_EQ(e["strategy"].get<std::string>(), "range");
+  EXPECT_NE(e["key"].get<std::string>().find("at"), std::string::npos) << e["key"];
+  EXPECT_EQ(e["partitions"].get<int>(), 3);
+  // The finding this exists for: rows that matched no bound landed in the
+  // default, which is a missing partition that has not failed loudly yet.
+  EXPECT_TRUE(e["has_default"].get<bool>()) << e.dump(2);
+  EXPECT_EQ(e["default_partition"].get<std::string>(), "events_default");
+  EXPECT_GT(e["default_rows"].get<long long>(), 0) << e.dump(2);
+  EXPECT_GE(e["rows"].get<long long>(), 4);
+  EXPECT_EQ(e["sub_partitioned"].get<int>(), 0);
+
+  // A partition is not a top-level parent and must not be listed twice.
+  EXPECT_FALSE(r.contains("events_2026_01")) << r.dump(2);
+}
+
+// reltuples is -1 until the first VACUUM or ANALYZE, and it stays -1 after
+// rows arrive. default_rows returned it raw, so a fresh default partition
+// reported -1 rows; the obvious clamp to 0 would have been worse, calling a
+// default that is filling up empty -- the one reading the field exists for.
+TEST_F(PostgresMCPServerTest, NeverAnalyzedPartitionsReportNullRowsNotZero) {
+  const std::string sch = "pna_" + std::to_string(getpid());
+  pqxx::connection c(test_url);
+  {
+    pqxx::nontransaction n(c);
+    n.exec("CREATE SCHEMA " + sch);
+    n.exec("CREATE TABLE " + sch + ".p (a int) PARTITION BY LIST (a)");
+    n.exec("CREATE TABLE " + sch + ".p_one PARTITION OF " + sch + ".p FOR VALUES IN (1)");
+    // autovacuum off so nothing analyzes behind the test's back.
+    n.exec("CREATE TABLE " + sch + ".p_def PARTITION OF " + sch + ".p DEFAULT"
+           " WITH (autovacuum_enabled = off)");
+    n.exec("INSERT INTO " + sch + ".p SELECT 7 FROM generate_series(1, 5)");
+  }
+
+  json lp = srv->call_list_partitions(sch);
+  ASSERT_TRUE(lp.contains("p")) << lp.dump(2);
+  EXPECT_TRUE(lp["p"]["has_default"].get<bool>());
+  // Five rows are in there. -1 was wrong, and 0 would have been wrong too.
+  EXPECT_TRUE(lp["p"]["default_rows"].is_null()) << lp["p"].dump(2);
+  // The same for the parent's sums: no leaf is measured, so there is no sum
+  // to report, and never_analyzed says why rather than a 0 that reads empty.
+  EXPECT_EQ(lp["p"]["leaf_partitions"].get<int>(), 2) << lp["p"].dump(2);
+  EXPECT_EQ(lp["p"]["never_analyzed"].get<int>(), 2) << lp["p"].dump(2);
+  EXPECT_TRUE(lp["p"]["rows"].is_null()) << lp["p"].dump(2);
+  EXPECT_TRUE(lp["p"]["size_estimate"].is_null()) << lp["p"].dump(2);
+
+  json pd = srv->call_partition_details(sch, "p");
+  ASSERT_TRUE(pd.contains("partitions")) << pd.dump(2);
+  for (const auto& part : pd["partitions"]) {
+    EXPECT_TRUE(part["rows"].is_null()) << part.dump(2);
+    EXPECT_TRUE(part["size_estimate"].is_null()) << part.dump(2);
+  }
+
+  {
+    pqxx::nontransaction n(c);
+    n.exec("ANALYZE " + sch + ".p_def");
+  }
+  json after = srv->call_list_partitions(sch);
+  ASSERT_TRUE(after["p"]["default_rows"].is_number()) << after["p"].dump(2);
+  EXPECT_EQ(after["p"]["default_rows"].get<long long>(), 5);
+  // One leaf measured, one not: a partial sum, and a count saying it is one.
+  EXPECT_EQ(after["p"]["rows"].get<long long>(), 5) << after["p"].dump(2);
+  EXPECT_EQ(after["p"]["never_analyzed"].get<int>(), 1) << after["p"].dump(2);
+
+  pqxx::nontransaction n(c);
+  n.exec("DROP SCHEMA " + sch + " CASCADE");
+}
+
+// A sub-partitioned child has no storage of its own: its rows are in its
+// children. listPartitions summed direct children only, so every row held a
+// level down was missing from the parent's count -- 100 of 300 here.
+TEST_F(PostgresMCPServerTest, PartitionRowCountsReachEveryLeaf) {
+  const std::string sch = "psub_" + std::to_string(getpid());
+  pqxx::connection c(test_url);
+  {
+    pqxx::nontransaction n(c);
+    n.exec("CREATE SCHEMA " + sch);
+    n.exec("CREATE TABLE " + sch + ".ev (at date, region int) PARTITION BY RANGE (at)");
+    n.exec("CREATE TABLE " + sch + ".ev_jan PARTITION OF " + sch + ".ev "
+           "FOR VALUES FROM ('2026-01-01') TO ('2026-02-01')");
+    n.exec("CREATE TABLE " + sch + ".ev_feb PARTITION OF " + sch + ".ev "
+           "FOR VALUES FROM ('2026-02-01') TO ('2026-03-01') PARTITION BY LIST (region)");
+    n.exec("CREATE TABLE " + sch + ".ev_feb_1 PARTITION OF " + sch + ".ev_feb FOR VALUES IN (1)");
+    n.exec("CREATE TABLE " + sch + ".ev_feb_2 PARTITION OF " + sch + ".ev_feb "
+           "FOR VALUES IN (2) WITH (autovacuum_enabled = off)");
+    n.exec("INSERT INTO " + sch + ".ev SELECT '2026-01-15', 1 FROM generate_series(1, 100)");
+    n.exec("INSERT INTO " + sch + ".ev SELECT '2026-02-15', 1 FROM generate_series(1, 200)");
+    n.exec("INSERT INTO " + sch + ".ev SELECT '2026-02-15', 2 FROM generate_series(1, 50)");
+    n.exec("ANALYZE " + sch + ".ev_jan");
+    n.exec("ANALYZE " + sch + ".ev_feb_1");
+  }
+
+  json r = srv->call_list_partitions(sch);
+  ASSERT_TRUE(r.contains("ev")) << r.dump(2);
+  const auto& e = r["ev"];
+  EXPECT_EQ(e["partitions"].get<int>(), 2) << e.dump(2);       // direct children
+  EXPECT_EQ(e["sub_partitioned"].get<int>(), 1) << e.dump(2);
+  EXPECT_EQ(e["leaf_partitions"].get<int>(), 3) << e.dump(2);  // jan, feb_1, feb_2
+  // jan and feb_1 are measured; feb_2 holds 50 rows and has never been.
+  EXPECT_EQ(e["rows"].get<long long>(), 300) << e.dump(2);
+  EXPECT_EQ(e["never_analyzed"].get<int>(), 1) << e.dump(2);
+  EXPECT_GT(e["size_estimate"].get<long long>(), 0) << e.dump(2);
+
+  pqxx::nontransaction n(c);
+  n.exec("DROP SCHEMA " + sch + " CASCADE");
+}
+
+TEST_F(PostgresMCPServerTest, PartitionDetailsCarriesBoundsAndPerPartitionVacuumState) {
+  json r = srv->call_partition_details("grocery", "events");
+  ASSERT_TRUE(r.contains("partitions")) << r.dump(2);
+  EXPECT_EQ(r["strategy"].get<std::string>(), "range");
+  ASSERT_TRUE(r.contains("counters_since"));
+  ASSERT_EQ(r["partitions"].size(), 3u) << r.dump(2);
+
+  bool saw_default = false, saw_january = false;
+  for (const auto& p : r["partitions"]) {
+    if (p["is_default"].get<bool>()) {
+      saw_default = true;
+      EXPECT_EQ(p["bound"].get<std::string>(), "DEFAULT");
+    } else if (p["name"].get<std::string>() == "events_2026_01") {
+      saw_january = true;
+      // Verbatim, not parsed: the bound carries whatever types the key
+      // columns have.
+      EXPECT_NE(p["bound"].get<std::string>().find("2026-01-01"), std::string::npos)
+          << p["bound"];
+      EXPECT_NE(p["bound"].get<std::string>().find("2026-02-01"), std::string::npos);
+    }
+    // The whole reason this tool exists: autovacuum runs per partition, so the
+    // vacuum state lives on the child and a parent has none of its own.
+    EXPECT_TRUE(p.contains("n_dead_tup")) << p.dump(2);
+    EXPECT_TRUE(p.contains("last_autovacuum"));
+    EXPECT_TRUE(p.contains("idx_scan"));
+    EXPECT_FALSE(p["is_partitioned"].get<bool>());
+  }
+  EXPECT_TRUE(saw_default) << r.dump(2);
+  EXPECT_TRUE(saw_january) << r.dump(2);
+}
+
+// Reaching for it after listTables named an ordinary relation is the habit
+// this error exists for; "not partitioned" and "does not exist" are different
+// answers.
+TEST_F(PostgresMCPServerTest, PartitionDetailsSeparatesNotPartitionedFromNotThere) {
+  json plain = srv->call_partition_details("grocery", "users");
+  ASSERT_TRUE(plain.contains("error")) << plain.dump(2);
+  EXPECT_NE(plain["error"].get<std::string>().find("not a partitioned table"),
+            std::string::npos);
+  EXPECT_NE(plain["hint"].get<std::string>().find("relkind"), std::string::npos);
+
+  json gone = srv->call_partition_details("grocery", "no_such_relation_here");
+  ASSERT_TRUE(gone.contains("error")) << gone.dump(2);
+  EXPECT_NE(gone["error"].get<std::string>().find("no such table"), std::string::npos);
+}
+
+// checkRoleAccess answers whether a role may USE an object. Nothing answered
+// the inverse, which is the whole of "role cannot be dropped because some
+// objects depend on it" -- a message that reports a count and names nothing.
+TEST_F(PostgresMCPServerTest, RoleDependenciesNamesWhatBlocksADropAndCountsWhatItCannotName) {
+  const std::string role = "licht_dep_" + std::to_string(getpid());
+  const std::string sch  = "dep_" + std::to_string(getpid());
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+    n.exec("CREATE ROLE \"" + role + "\"");
+  }
+  {
+    pqxx::connection owner(test_url);
+    pqxx::nontransaction n(owner);
+    n.exec("CREATE SCHEMA " + sch + " AUTHORIZATION \"" + role + "\"");
+    n.exec("CREATE TABLE " + sch + ".owned (a int)");
+    n.exec("ALTER TABLE " + sch + ".owned OWNER TO \"" + role + "\"");
+    n.exec("CREATE TABLE " + sch + ".granted (a int)");
+    n.exec("GRANT SELECT ON " + sch + ".granted TO \"" + role + "\"");
+    // Two classes the explicit branches do not cover, and which came back
+    // with a null name until pg_identify_object became the fallback. Both go
+    // with the schema, so the DROP SCHEMA CASCADE below cleans them up.
+    n.exec("CREATE POLICY licht_pol ON " + sch + ".granted TO \"" + role + "\" USING (true)");
+    n.exec("ALTER DEFAULT PRIVILEGES IN SCHEMA " + sch +
+           " GRANT SELECT ON TABLES TO \"" + role + "\"");
+  }
+
+  json r = srv->call_role_dependencies(role);
+  ASSERT_TRUE(r.contains("total")) << r.dump(2);
+  EXPECT_TRUE(r["exists"].get<bool>());
+  EXPECT_GE(r["total"].get<int>(), 3);
+  // owner blocks DROP ROLE outright and is cleared by REASSIGN OWNED; acl is
+  // cleared by DROP OWNED. Which is which decides the fix.
+  ASSERT_TRUE(r["by_kind"].contains("owner")) << r.dump(2);
+  EXPECT_GE(r["by_kind"]["owner"].get<int>(), 2);
+  EXPECT_TRUE(r["by_kind"].contains("acl")) << r.dump(2);
+
+  bool named_owned = false, named_granted = false;
+  for (const auto& o : r["objects"]) {
+    if (!o["name"].is_string()) continue;
+    const std::string nm = o["name"].get<std::string>();
+    if (nm == sch + ".owned")   { named_owned = true;   EXPECT_EQ(o["dependency"], "owner"); }
+    if (nm == sch + ".granted") { named_granted = true; EXPECT_EQ(o["dependency"], "acl"); }
+  }
+  EXPECT_TRUE(named_owned) << r["objects"].dump(2);
+  EXPECT_TRUE(named_granted) << r["objects"].dump(2);
+
+  // Every row this database can resolve carries a name. The policy is the one
+  // that matters: by_kind counts it as 'policy', which DROP OWNED clears, and
+  // a count with nothing to point at is the DROP ROLE error message again.
+  bool named_policy = false, named_default = false;
+  for (const auto& o : r["objects"]) {
+    ASSERT_TRUE(o["name"].is_string()) << "unnamed row: " << o.dump(2);
+    const std::string nm = o["name"].get<std::string>();
+    if (o["kind"] == "pg_policy") {
+      named_policy = true;
+      EXPECT_EQ(o["dependency"], "policy");
+      EXPECT_NE(nm.find("licht_pol"), std::string::npos) << nm;
+      EXPECT_NE(nm.find(sch + ".granted"), std::string::npos) << nm;
+    }
+    if (o["kind"] == "pg_default_acl") {
+      named_default = true;
+      EXPECT_NE(nm.find(sch), std::string::npos) << nm;
+    }
+  }
+  EXPECT_TRUE(named_policy) << r["objects"].dump(2);
+  EXPECT_TRUE(named_default) << r["objects"].dump(2);
+  EXPECT_GE(r["by_kind"].value("policy", 0), 1) << r["by_kind"].dump(2);
+
+  // A role nothing depends on is an answer, not an error.
+  json none = srv->call_role_dependencies("no_such_role_" + std::to_string(getpid()));
+  EXPECT_FALSE(none["exists"].get<bool>()) << none.dump(2);
+  EXPECT_EQ(none["total"].get<int>(), 0);
+
+  {
+    pqxx::connection owner(test_url);
+    pqxx::nontransaction n(owner);
+    n.exec("DROP SCHEMA " + sch + " CASCADE");
+  }
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+  }
+}
+
+// pg_authid has no public SELECT. The first version of this tool joined it,
+// and every non-superuser -- the role most likely to be asking before a DROP
+// ROLE it cannot itself run -- got "permission denied for table pg_authid" and
+// no answer. pg_roles carries everything this tool reads. The superuser test
+// above cannot see the difference, which is why this one exists.
+TEST_F(PostgresMCPServerTest, RoleDependenciesAnswersABareLoginRole) {
+  const std::string asker  = "licht_depask_" + std::to_string(getpid());
+  const std::string target = "licht_deptgt_" + std::to_string(getpid());
+  const std::string sch    = "depb_" + std::to_string(getpid());
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + asker + "\"");
+    n.exec("CREATE ROLE \"" + asker + "\" LOGIN");
+    n.exec("DROP ROLE IF EXISTS \"" + target + "\"");
+    n.exec("CREATE ROLE \"" + target + "\"");
+  }
+  {
+    pqxx::connection owner(test_url);
+    pqxx::nontransaction n(owner);
+    n.exec("CREATE SCHEMA " + sch + " AUTHORIZATION \"" + target + "\"");
+  }
+  const std::string url = std::regex_replace(
+      test_url, std::regex(R"(\buser\s*=\s*\S+)"), "") + " user=" + asker;
+
+  // Same two reasons this may be impossible here as the other restricted-role
+  // tests: peer auth refuses the login, or a forced-user pooler hands back the
+  // superuser's session whichever role was asked for.
+  bool usable = false;
+  try {
+    pqxx::connection probe(url);
+    pqxx::work t(probe);
+    usable = (t.exec("SELECT current_user")[0][0].as<std::string>() == asker);
+  } catch (const std::exception&) {
+  }
+
+  if (usable) {
+    PostgresMCPServer unpriv{url};
+    json r = unpriv.call_role_dependencies(target);
+    ASSERT_FALSE(r.contains("error")) << r.dump(2);
+    ASSERT_TRUE(r.contains("total")) << r.dump(2);
+    EXPECT_TRUE(r["exists"].get<bool>());
+    EXPECT_GE(r["total"].get<int>(), 1);
+    bool named = false;
+    for (const auto& o : r["objects"])
+      if (o["name"].is_string() && o["name"].get<std::string>() == sch) named = true;
+    EXPECT_TRUE(named) << r["objects"].dump(2);
+  }
+
+  {
+    pqxx::connection owner(test_url);
+    pqxx::nontransaction n(owner);
+    n.exec("DROP SCHEMA " + sch);
+  }
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + target + "\"");
+    n.exec("DROP ROLE IF EXISTS \"" + asker + "\"");
+  }
+  if (!usable) GTEST_SKIP() << "cannot log in as an unprivileged role here";
+}
+
+// The standing cause of "the new table is not readable and every old one is":
+// a missing default, which presents as a broken grant.
+TEST_F(PostgresMCPServerTest, DefaultPrivilegesReportWhatTheNextObjectWillGet) {
+  const std::string sch = "dacl_" + std::to_string(getpid());
+  // A global entry for a throwaway role, so the superuser the other tests run
+  // as keeps its hard-wired defaults.
+  const std::string grantor = "licht_dacl_" + std::to_string(getpid());
+  {
+    pqxx::connection owner(test_url);
+    pqxx::nontransaction n(owner);
+    n.exec("CREATE SCHEMA " + sch);
+    n.exec("ALTER DEFAULT PRIVILEGES IN SCHEMA " + sch + " GRANT SELECT ON TABLES TO PUBLIC");
+    n.exec("DROP ROLE IF EXISTS \"" + grantor + "\"");
+    n.exec("CREATE ROLE \"" + grantor + "\"");
+    n.exec("ALTER DEFAULT PRIVILEGES FOR ROLE \"" + grantor + "\" GRANT SELECT ON TABLES TO PUBLIC");
+  }
+  json r = srv->call_default_privileges(sch);
+  ASSERT_TRUE(r.contains("default_privileges")) << r.dump(2);
+  // Per-schema entries are ADDED to the global ones, so naming a schema must
+  // return both: the first version filtered the global entry out and answered
+  // half of "what will the next table here get".
+  const json* schema_entry = nullptr;
+  bool saw_global = false;
+  for (const auto& d : r["default_privileges"]) {
+    if (d["scope"] == "schema") {
+      EXPECT_EQ(d["schema"].get<std::string>(), sch) << d.dump(2);
+      schema_entry = &d;
+    }
+    if (d["scope"] == "global" && d["granted_by"] == grantor) saw_global = true;
+  }
+  EXPECT_TRUE(saw_global) << r.dump(2);
+  ASSERT_NE(schema_entry, nullptr) << r.dump(2);
+  auto& e = *schema_entry;
+  EXPECT_EQ(e["scope"].get<std::string>(), "schema");
+  EXPECT_EQ(e["schema"].get<std::string>(), sch);
+  EXPECT_EQ(e["object_type"].get<std::string>(), "table");
+  ASSERT_TRUE(e["grants"].contains("PUBLIC")) << e.dump(2);
+  // granted_by matters: a default applies only to objects the granting role
+  // creates, so the entry is inert for anybody else.
+  EXPECT_TRUE(e.contains("granted_by"));
+
+  // A schema that does not exist is an error, as everywhere else. An empty
+  // list would read as "no defaults are set", which is a different answer.
+  json gone = srv->call_default_privileges(sch + "_absent");
+  ASSERT_TRUE(gone.contains("error")) << gone.dump(2);
+  EXPECT_NE(gone["error"].get<std::string>().find("no such schema"), std::string::npos);
+  {
+    pqxx::connection owner(test_url);
+    pqxx::nontransaction n(owner);
+    n.exec("ALTER DEFAULT PRIVILEGES IN SCHEMA " + sch + " REVOKE SELECT ON TABLES FROM PUBLIC");
+    n.exec("DROP SCHEMA " + sch + " CASCADE");
+    n.exec("DROP OWNED BY \"" + grantor + "\"");
+    n.exec("DROP ROLE IF EXISTS \"" + grantor + "\"");
+  }
+}
+
+// Large objects live in a catalog, so every size tool here is blind to them --
+// "the database grew and no table did".
+TEST_F(PostgresMCPServerTest, LargeObjectsAreCountedAndDeliberatelyNotSized) {
+  json before = srv->call_large_objects();
+  ASSERT_TRUE(before.contains("total")) << before.dump(2);
+  const int n0 = before["total"].get<int>();
+
+  pqxx::connection owner(test_url);
+  long long oid = 0;
+  {
+    pqxx::nontransaction n(owner);
+    oid = n.query_value<long long>("SELECT lo_create(0)");
+  }
+  json after = srv->call_large_objects();
+  EXPECT_EQ(after["total"].get<int>(), n0 + 1) << after.dump(2);
+  EXPECT_FALSE(after["by_owner"].empty()) << after.dump(2);
+  // Sizes are absent on purpose rather than null: the bytes are in
+  // pg_largeobject, which is not publicly readable.
+  for (auto& [k, v] : after.items()) { (void)v; EXPECT_NE(k, "bytes"); }
+  EXPECT_NE(after["note"].get<std::string>().find("pg_largeobject"), std::string::npos);
+  {
+    pqxx::nontransaction n(owner);
+    n.exec("SELECT lo_unlink(" + std::to_string(oid) + ")");
+  }
+}
+
+// The only source of replication lag as a TIME. replicationSlots reports what
+// a slot retains in bytes; subscriptionStats cannot measure lag at all.
+TEST_F(PostgresMCPServerTest, ReplicationStatsReportsSendersAndOrigins) {
+  json r = srv->call_replication_stats();
+  ASSERT_TRUE(r.contains("replication")) << r.dump(2);
+  ASSERT_TRUE(r.contains("origins")) << r.dump(2);
+  ASSERT_TRUE(r.contains("note"));
+  // Each half is on its own savepoint, so one being refused leaves the other
+  // answered rather than failing the call.
+  EXPECT_TRUE(r["replication"].is_object());
+  EXPECT_TRUE(r["origins"].is_object());
+
+  // The harness runs a standby, so the primary has a sender to report.
+  if (std::getenv("STANDBY_URL") != nullptr && !r["replication"].contains("error")) {
+    ASSERT_FALSE(r["replication"].empty()) << r["replication"].dump(2);
+    for (auto& [name, s] : r["replication"].items()) {
+      // The key carries the pid. A walreceiver's default application_name is
+      // its cluster_name, which Debian sets per major rather than per host, so
+      // two standbys routinely share one -- and a name-only key would fold
+      // them into a single entry with nothing to say so.
+      EXPECT_NE(name.find("pid " + std::to_string(s["pid"].get<int>())),
+                std::string::npos) << name;
+      EXPECT_TRUE(s.contains("application_name")) << s.dump(2);
+      EXPECT_TRUE(s.contains("state")) << s.dump(2);
+      EXPECT_TRUE(s.contains("sent_lsn"));
+      EXPECT_TRUE(s.contains("replay_lag_s"));
+      EXPECT_TRUE(s.contains("replay_behind_bytes"));
+    }
+  }
+}
+
+// work_mem alone changes the ALGORITHM rather than the cost. Until 4.3.0 the
+// plan was always built in this server's session, which is not the one the
+// statement runs in.
+TEST_F(PostgresMCPServerTest, PlannerSettingsChangeThePlanAndAreReported) {
+  const std::string sql =
+      "SELECT id, count(*) FROM grocery.users GROUP BY id";
+
+  json small = srv->call_explain_query("", sql, json::array(), false, 0,
+                                       json{{"work_mem", "64kB"},
+                                            {"enable_hashagg", "off"}}, "");
+  ASSERT_TRUE(small.contains("planning_environment")) << small.dump(2);
+  EXPECT_EQ(small["planning_environment"]["applied"]["work_mem"], "64kB");
+  EXPECT_EQ(small["planning_environment"]["applied"]["enable_hashagg"], "off");
+  // EXPLAIN (SETTINGS) is the server's own account of what it planned under,
+  // so the two must agree -- that pairing is the whole point of 4.2.1's
+  // SETTINGS block plus this argument.
+  ASSERT_TRUE(small["plan"][0].contains("Settings")) << small["plan"][0].dump(2);
+  EXPECT_EQ(small["plan"][0]["Settings"]["enable_hashagg"], "off");
+
+  // ...and it really is local: a later call with no settings sees none of it.
+  json plain = srv->call_explain_query("", sql, json::array(), false, 0);
+  EXPECT_FALSE(plain.contains("planning_environment")) << plain.dump(2);
+  if (plain["plan"][0].contains("Settings")) {
+    EXPECT_FALSE(plain["plan"][0]["Settings"].contains("enable_hashagg"))
+        << "set_config(is_local) must not survive the transaction";
+  }
+}
+
+// An allowlist, not a denylist. An arbitrary passthrough would hand away
+// default_transaction_read_only, statement_timeout and role -- three of this
+// server's four safety properties -- through a convenience argument.
+TEST_F(PostgresMCPServerTest, OnlyPlannerSettingsAreAccepted) {
+  const std::string sql = "SELECT 1";
+  for (const auto& bad : {"default_transaction_read_only", "statement_timeout",
+                          "role", "session_authorization", "search_path"}) {
+    json r = srv->call_explain_query("", sql, json::array(), false, 0,
+                                     json{{bad, "x"}}, "");
+    ASSERT_TRUE(r.contains("error")) << bad << ": " << r.dump(2);
+    EXPECT_NE(r["error"].get<std::string>().find(bad), std::string::npos);
+    // Refused, not ignored: no plan comes back at all, because a plan labelled
+    // as built under an environment that was never applied is the failure this
+    // whole release keeps correcting.
+    EXPECT_FALSE(r.contains("plan")) << bad << ": " << r.dump(2);
+  }
+  // search_path is excluded on purpose and the refusal says why.
+  json sp = srv->call_explain_query("", sql, json::array(), false, 0,
+                                    json{{"search_path", "public"}}, "");
+  EXPECT_NE(sp["hint"].get<std::string>().find("resolves"), std::string::npos)
+      << sp["hint"];
+}
+
+// --- the execution budget: settings under analyze ---
+//
+// analyze EXECUTES, and then caller settings set the footprint of a statement
+// that really runs. Neither the read-only guard nor the timeout bounds memory,
+// so executing under explicit settings is bounded by the host capacity the
+// operator declared, and refused outright where none is declared.
+namespace {
+// A server over the test database with host capacity declared through the
+// environment, exactly as a single-DATABASE_URL deployment declares it. The
+// fixture clears these variables, and this restores that state before
+// returning, so no other test sees them.
+std::unique_ptr<PostgresMCPServer> server_with_capacity(const std::string& url,
+                                                        const char* ram_mb,
+                                                        const char* vcpus) {
+  ::setenv("PG_LICHT_HOST_RAM_MB", ram_mb, 1);
+  ::setenv("PG_LICHT_HOST_VCPUS", vcpus, 1);
+  auto reg = pglicht::ConnectionRegistry::from_url(url, "pg-licht-test");
+  ::unsetenv("PG_LICHT_HOST_RAM_MB");
+  ::unsetenv("PG_LICHT_HOST_VCPUS");
+  return std::make_unique<PostgresMCPServer>(std::move(reg));
+}
+
+// A table big enough for the planner to go parallel once the costs allow it,
+// and a sort to give the plan a node bounded by work_mem.
+struct BudgetTable {
+  std::string sch;
+  pqxx::connection c;
+  explicit BudgetTable(const std::string& url)
+      : sch("eb_" + std::to_string(getpid())), c(url) {
+    pqxx::nontransaction n(c);
+    n.exec("CREATE SCHEMA " + sch);
+    n.exec("CREATE TABLE " + sch + ".t AS SELECT g AS id, g % 97 AS k "
+           "FROM generate_series(1, 100000) AS g");
+    n.exec("ANALYZE " + sch + ".t");
+  }
+  ~BudgetTable() {
+    try { pqxx::nontransaction n(c); n.exec("DROP SCHEMA " + sch + " CASCADE"); }
+    catch (...) {}
+  }
+  std::string sort_sql() const { return "SELECT id FROM " + sch + ".t ORDER BY k"; }
+  std::string count_sql() const { return "SELECT count(*) FROM " + sch + ".t"; }
+};
+
+json parallel_settings() {
+  return json{{"max_parallel_workers_per_gather", "4"}, {"parallel_setup_cost", "0"},
+              {"parallel_tuple_cost", "0"}, {"min_parallel_table_scan_size", "0"}};
+}
+}  // namespace
+
+TEST_F(PostgresMCPServerTest, WithNoDeclaredCapacityNoSettingsAreExecuted) {
+  // The fixture's server declares no capacity.
+  BudgetTable t(test_url);
+  json r = srv->call_explain_query("", t.sort_sql(), json::array(), true, 5000,
+                                   json{{"work_mem", "4MB"}}, "");
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  // Planned under the settings, never executed under them.
+  EXPECT_FALSE(r["analyzed"].get<bool>()) << r.dump(2);
+  ASSERT_TRUE(r.contains("plan"));
+  EXPECT_NE(r["note"].get<std::string>().find("host_ram_mb"), std::string::npos) << r["note"];
+  const auto& b = r["planning_environment"]["execution_budget"];
+  EXPECT_FALSE(b["allowed"].get<bool>()) << b.dump(2);
+  EXPECT_TRUE(b["host"].empty()) << b.dump(2);
+
+  // Unchanged without settings: the connection's own environment runs.
+  json plain = srv->call_explain_query("", t.sort_sql(), json::array(), true, 5000);
+  EXPECT_TRUE(plain["analyzed"].get<bool>()) << plain.dump(2);
+
+  // plan_as_role alone is production's own environment, and is not budgeted.
+  const std::string role = "licht_eb_" + std::to_string(getpid());
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+    n.exec("CREATE ROLE \"" + role + "\"");
+    n.exec("ALTER ROLE \"" + role + "\" SET work_mem = '8MB'");
+  }
+  json as_role = srv->call_explain_query("", t.sort_sql(), json::array(), true, 5000,
+                                         json::object(), role);
+  EXPECT_TRUE(as_role["analyzed"].get<bool>()) << as_role.dump(2);
+  EXPECT_FALSE(as_role["planning_environment"].contains("execution_budget"))
+      << as_role["planning_environment"].dump(2);
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+  }
+}
+
+TEST_F(PostgresMCPServerTest, SettingsWithinTheDeclaredBudgetAreExecuted) {
+  BudgetTable t(test_url);
+  auto s = server_with_capacity(test_url, "8192", "16");
+  json r = s->call_explain_query("", t.sort_sql(), json::array(), true, 5000,
+                                 json{{"work_mem", "4MB"}}, "");
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  EXPECT_TRUE(r["analyzed"].get<bool>()) << r.dump(2);
+  const auto& b = r["planning_environment"]["execution_budget"];
+  EXPECT_TRUE(b["allowed"].get<bool>()) << b.dump(2);
+  EXPECT_EQ(b["host"]["source"], "environment") << b.dump(2);
+  // A tenth of 8192 MB.
+  EXPECT_EQ(b["memory_budget_bytes"].get<long long>(), 8192LL * 1048576 / 10);
+  EXPECT_GE(b["memory_nodes"].get<int>(), 1) << b.dump(2);
+  EXPECT_GE(b["worst_case_memory_bytes"].get<long long>(), 4LL * 1048576) << b.dump(2);
+  EXPECT_LE(b["worst_case_memory_bytes"].get<long long>(),
+            b["memory_budget_bytes"].get<long long>());
+}
+
+TEST_F(PostgresMCPServerTest, MemoryBeyondTheDeclaredBudgetIsPlannedButNotExecuted) {
+  BudgetTable t(test_url);
+  // A tenth of 1024 MB is about 102 MB; one sort at 1GB is past it.
+  auto s = server_with_capacity(test_url, "1024", "16");
+  json r = s->call_explain_query("", t.sort_sql(), json::array(), true, 5000,
+                                 json{{"work_mem", "1GB"}}, "");
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  EXPECT_FALSE(r["analyzed"].get<bool>()) << r.dump(2);
+  ASSERT_TRUE(r.contains("plan"));
+  EXPECT_NE(r["note"].get<std::string>().find("worst-case memory"), std::string::npos)
+      << r["note"];
+  const auto& b = r["planning_environment"]["execution_budget"];
+  EXPECT_FALSE(b["allowed"].get<bool>());
+  EXPECT_GE(b["worst_case_memory_bytes"].get<long long>(), 1024LL * 1048576) << b.dump(2);
+}
+
+TEST_F(PostgresMCPServerTest, WorkersBeyondTheDeclaredBudgetArePlannedButNotExecuted) {
+  BudgetTable t(test_url);
+  // Four vCPUs allow one worker; the settings make the planner ask for four.
+  auto small = server_with_capacity(test_url, "65536", "4");
+  json r = small->call_explain_query("", t.count_sql(), json::array(), true, 5000,
+                                     parallel_settings(), "");
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  const auto& b = r["planning_environment"]["execution_budget"];
+  ASSERT_GT(b["workers_planned"].get<int>(), 1)
+      << "the planner did not go parallel, so this test proves nothing: " << r["plan"].dump(2);
+  EXPECT_EQ(b["workers_budget"].get<int>(), 1);
+  EXPECT_FALSE(r["analyzed"].get<bool>()) << r.dump(2);
+  EXPECT_NE(r["note"].get<std::string>().find("parallel worker"), std::string::npos)
+      << r["note"];
+
+  // Sixteen vCPUs allow four, and the same call runs.
+  auto big = server_with_capacity(test_url, "65536", "16");
+  json ok = big->call_explain_query("", t.count_sql(), json::array(), true, 5000,
+                                    parallel_settings(), "");
+  EXPECT_TRUE(ok["analyzed"].get<bool>()) << ok.dump(2);
+}
+
+// --- budgets.ini: the ratios behind the execution budget ---
+namespace {
+// A file in a fresh directory with the given mode, removed with the directory.
+struct BudgetsFile {
+  std::string dir, path;
+  BudgetsFile(const std::string& body, mode_t mode = 0644) {
+    char tmpl[] = "/tmp/licht-budgets-XXXXXX";
+    dir = ::mkdtemp(tmpl);
+    path = dir + "/budgets.ini";
+    std::ofstream(path) << body;
+    ::chmod(path.c_str(), mode);
+  }
+  ~BudgetsFile() { std::filesystem::remove_all(dir); }
+};
+}  // namespace
+
+TEST(BudgetsTest, WithNoFileTheBuiltInRatiosApply) {
+  const auto b = pglicht::Budgets::load("");
+  EXPECT_EQ(b.analyze_memory_percent, 10);
+  EXPECT_EQ(b.analyze_vcpus_per_worker, 4);
+  EXPECT_EQ(b.source, "built-in defaults");
+}
+
+TEST(BudgetsTest, TheShippedExampleLoadsAndStatesTheDefaults) {
+  // The example documents the defaults; if either drifts, this says so. Its
+  // CONTENT is what is under test, so it is copied to a 0644 file first: a
+  // checkout's mode follows the umask, and a group-writable one is refused by
+  // design -- which AFileOthersCanWriteIsRefused covers.
+  std::ifstream in(PGLICHT_EXAMPLE_BUDGETS);
+  ASSERT_TRUE(in) << PGLICHT_EXAMPLE_BUDGETS;
+  std::stringstream body;
+  body << in.rdbuf();
+  BudgetsFile copy(body.str(), 0644);
+  const auto ex = pglicht::Budgets::load(copy.path);
+  const pglicht::Budgets def;
+  EXPECT_EQ(ex.analyze_memory_percent, def.analyze_memory_percent);
+  EXPECT_EQ(ex.analyze_vcpus_per_worker, def.analyze_vcpus_per_worker);
+}
+
+TEST(BudgetsTest, ReadsBothRatiosAndNamesTheFile) {
+  BudgetsFile f("; limits\n[analyze]\nmemory_percent = 25   ; a quarter\n"
+                "vcpus_per_worker = 2\n");
+  const auto b = pglicht::Budgets::load(f.path);
+  EXPECT_EQ(b.analyze_memory_percent, 25);
+  EXPECT_EQ(b.analyze_vcpus_per_worker, 2);
+  EXPECT_EQ(b.source, f.path);
+}
+
+TEST(BudgetsTest, AnythingItDoesNotUnderstandFailsAtStartup) {
+  // A typo that silently kept the default would leave the operator believing
+  // a limit is in force that is not.
+  for (const char* body : {
+         "[analyze]\nmemory_percent = 0\n",          // zero is no budget at all
+         "[analyze]\nmemory_percent = 101\n",        // more than the machine
+         "[analyze]\nmemory_percent = ten\n",
+         "[analyze]\nvcpus_per_worker = 0\n",        // would divide by zero
+         "[analyze]\nmemory_precent = 10\n",         // misspelt key
+         "[analyse]\nmemory_percent = 10\n",         // misspelt section
+         "memory_percent = 10\n",                    // outside any section
+       }) {
+    BudgetsFile f(body);
+    EXPECT_THROW(pglicht::Budgets::load(f.path), std::runtime_error) << body;
+  }
+  EXPECT_THROW(pglicht::Budgets::load("/nonexistent/budgets.ini"), std::runtime_error);
+}
+
+TEST(BudgetsTest, AFileOthersCanWriteIsRefused) {
+  // Limits another user can edit are limits another user can raise.
+  BudgetsFile f("[analyze]\nmemory_percent = 10\n", 0666);
+  try {
+    pglicht::Budgets::load(f.path);
+    ADD_FAILURE() << "a world-writable budgets file was accepted";
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("chmod go-w"), std::string::npos) << e.what();
+  }
+  // Readable by others is fine: it holds no credentials.
+  BudgetsFile ok("[analyze]\nmemory_percent = 10\n", 0644);
+  EXPECT_NO_THROW(pglicht::Budgets::load(ok.path));
+}
+
+TEST(BudgetsTest, ResolutionOrderIsEnvironmentThenBesideTheConfigThenHome) {
+  BudgetsFile beside("[analyze]\nmemory_percent = 20\n");
+  const std::string config = beside.dir + "/connections.ini";
+
+  char tmpl[] = "/tmp/licht-home-XXXXXX";
+  const std::string home = ::mkdtemp(tmpl);
+  std::filesystem::create_directories(home + "/.config/pg_licht");
+  std::ofstream(home + "/.config/pg_licht/budgets.ini") << "[analyze]\n";
+
+  using pglicht::Budgets;
+  EXPECT_EQ(Budgets::resolve_path("/explicit.ini", config, home), "/explicit.ini");
+  EXPECT_EQ(Budgets::resolve_path("", config, home), beside.path);
+  EXPECT_EQ(Budgets::resolve_path("", "/nowhere/connections.ini", home),
+            home + "/.config/pg_licht/budgets.ini");
+  EXPECT_EQ(Budgets::resolve_path("", "", "/nonexistent-home"), "");
+  std::filesystem::remove_all(home);
+}
+
+// The ratios move what executes, and the answer says which file set them.
+TEST_F(PostgresMCPServerTest, BudgetsFromTheFileChangeWhatIsExecuted) {
+  BudgetTable t(test_url);
+
+  // A 1GB sort against 1024 MB declared: refused at the built-in 10%...
+  auto s = server_with_capacity(test_url, "1024", "4");
+  json refused = s->call_explain_query("", t.sort_sql(), json::array(), true, 5000,
+                                       json{{"work_mem", "1GB"}}, "");
+  EXPECT_FALSE(refused["analyzed"].get<bool>()) << refused.dump(2);
+
+  // ...and executed once budgets.ini allows the whole of it.
+  BudgetsFile f("[analyze]\nmemory_percent = 100\nvcpus_per_worker = 1\n");
+  s->set_budgets(pglicht::Budgets::load(f.path));
+  json allowed = s->call_explain_query("", t.sort_sql(), json::array(), true, 5000,
+                                       json{{"work_mem", "1GB"}}, "");
+  EXPECT_TRUE(allowed["analyzed"].get<bool>()) << allowed.dump(2);
+  const auto& b = allowed["planning_environment"]["execution_budget"];
+  EXPECT_EQ(b["budgets"]["source"], f.path) << b.dump(2);
+  EXPECT_EQ(b["budgets"]["memory_percent"], 100);
+  EXPECT_EQ(b["memory_budget_bytes"].get<long long>(), 1024LL * 1048576);
+  EXPECT_NE(b["rule"].get<std::string>().find("100%"), std::string::npos) << b["rule"];
+
+  // One worker per vCPU: four planned workers now fit in four vCPUs.
+  json par = s->call_explain_query("", t.count_sql(), json::array(), true, 5000,
+                                   parallel_settings(), "");
+  EXPECT_EQ(par["planning_environment"]["execution_budget"]["workers_budget"].get<int>(), 4)
+      << par.dump(2);
+  EXPECT_TRUE(par["analyzed"].get<bool>()) << par.dump(2);
+}
+
+// The form the question is actually asked in: "why is it slow for the
+// application". Removes the step where a human copies values out of
+// hostCapacity.overrides by hand and gets one wrong.
+TEST_F(PostgresMCPServerTest, PlanAsRoleTakesThePlannerSettingsAndReportsTheRest) {
+  const std::string role = "licht_par_" + std::to_string(getpid());
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+    n.exec("CREATE ROLE \"" + role + "\"");
+    n.exec("ALTER ROLE \"" + role + "\" SET work_mem = '256MB'");
+    // Not a planner setting: it must be reported as skipped, never applied and
+    // never silently dropped.
+    n.exec("ALTER ROLE \"" + role + "\" SET statement_timeout = '7s'");
+  }
+
+  json r = srv->call_explain_query("", "SELECT 1", json::array(), false, 0,
+                                   json::object(), role);
+  ASSERT_TRUE(r.contains("planning_environment")) << r.dump(2);
+  auto& pe = r["planning_environment"];
+  EXPECT_EQ(pe["from_role"].get<std::string>(), role);
+  EXPECT_EQ(pe["applied"]["work_mem"], "256MB");
+
+  // A per-database entry overrides the role-wide one -- that is the precedence
+  // PostgreSQL gives ALTER ROLE ... IN DATABASE, and the first version of this
+  // applied the entries in text order, under which "work_mem=1GB" sorted before
+  // "work_mem=256MB" and the role-wide value won. 1GB is chosen because it
+  // sorts FIRST as text: the test fails under the old order and passes only
+  // when database-specific entries are applied last.
+  {
+    pqxx::connection c(test_url);
+    pqxx::nontransaction n(c);
+    const std::string db = n.exec("SELECT current_database()")[0][0].as<std::string>();
+    n.exec("ALTER ROLE \"" + role + "\" IN DATABASE \"" + db + "\" SET work_mem = '1GB'");
+  }
+  json db_r = srv->call_explain_query("", "SELECT 1", json::array(), false, 0,
+                                      json::object(), role);
+  ASSERT_TRUE(db_r.contains("planning_environment")) << db_r.dump(2);
+  EXPECT_EQ(db_r["planning_environment"]["applied"]["work_mem"], "1GB")
+      << db_r["planning_environment"].dump(2);
+  bool skipped_timeout = false;
+  for (const auto& sk : pe["skipped_from_role"])
+    if (sk["name"] == "statement_timeout") {
+      skipped_timeout = true;
+      EXPECT_EQ(sk["reason"], "not a planner setting");
+    }
+  EXPECT_TRUE(skipped_timeout) << pe.dump(2);
+
+  json gone = srv->call_explain_query("", "SELECT 1", json::array(), false, 0,
+                                      json::object(), role + "_absent");
+  ASSERT_TRUE(gone.contains("error")) << gone.dump(2);
+  EXPECT_NE(gone["error"].get<std::string>().find("no such role"), std::string::npos);
+
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+  }
+}
+
+// A refused set_config is an SQL error, and an SQL error aborts the
+// transaction. The first version caught it and carried on, so every later
+// setting and the EXPLAIN itself failed with "current transaction is aborted"
+// -- each reported as a refusal it was not. ALTER ROLE validates values as it
+// stores them, so the only way to plant a bad one is to write the catalog row.
+TEST_F(PostgresMCPServerTest, ARefusedRoleSettingDoesNotTakeThePlanDown) {
+  const std::string role = "licht_bad_" + std::to_string(getpid());
+  {
+    pqxx::connection c(test_url);
+    pqxx::nontransaction n(c);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+    n.exec("CREATE ROLE \"" + role + "\"");
+    // Role-wide entries are applied before this database's, so the bad value
+    // goes role-wide and the good one per database: the good one is then
+    // applied AFTER the failure, which is what the fix has to survive.
+    n.exec("ALTER ROLE \"" + role + "\" SET work_mem = '64MB'");
+    n.exec("UPDATE pg_db_role_setting SET setconfig = ARRAY['work_mem=bogus']"
+           " WHERE setdatabase = 0 AND setrole = "
+           "(SELECT oid FROM pg_roles WHERE rolname = " + n.quote(role) + ")");
+    const std::string db = n.exec("SELECT current_database()")[0][0].as<std::string>();
+    n.exec("ALTER ROLE \"" + role + "\" IN DATABASE \"" + db + "\" SET enable_seqscan = off");
+  }
+
+  json r = srv->call_explain_query("", "SELECT count(*) FROM grocery.users",
+                                   json::array(), false, 0, json::object(), role);
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  ASSERT_TRUE(r.contains("plan")) << r.dump(2);
+  auto& pe = r["planning_environment"];
+  EXPECT_EQ(pe["applied"]["enable_seqscan"], "off") << pe.dump(2);
+  EXPECT_FALSE(pe["applied"].contains("work_mem")) << pe.dump(2);
+  int refused = 0;
+  for (const auto& sk : pe["skipped_from_role"])
+    if (sk["reason"] == "the server refused the value") {
+      ++refused;
+      EXPECT_EQ(sk["name"], "work_mem");
+      EXPECT_EQ(sk["value"], "bogus");
+    }
+  // Exactly the one that was bad -- not it plus everything that came after.
+  EXPECT_EQ(refused, 1) << pe.dump(2);
+  // And the value applied inside its savepoint is still in force when the plan
+  // is built: RELEASE SAVEPOINT keeps a set_config(is_local) in the parent.
+  ASSERT_TRUE(r["plan"][0].contains("Settings")) << r["plan"][0].dump(2);
+  EXPECT_EQ(r["plan"][0]["Settings"]["enable_seqscan"], "off");
+
+  {
+    pqxx::connection c(test_url);
+    pqxx::nontransaction n(c);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+  }
+}
+
+// A tablespace is a SHARED object, so COMMENT ON TABLESPACE writes to
+// pg_shdescription. listTablespaces read it through obj_description(), which
+// reads pg_description, and therefore reported '' for every commented
+// tablespace since the tool existed -- silence that reads as "no comment".
+// Verified on PostgreSQL 18: obj_description gave NULL and shobj_description
+// gave the text for the same tablespace.
+TEST_F(PostgresMCPServerTest, TablespaceCommentsComeFromTheSharedCatalog) {
+  pqxx::connection c(test_url);
+  pqxx::nontransaction n(c);
+  // pg_default always exists and is the one tablespace every cluster has.
+  n.exec("COMMENT ON TABLESPACE pg_default IS 'licht test comment'");
+
+  json r = srv->call_tablespaces();
+  ASSERT_TRUE(r.contains("pg_default")) << r.dump(2);
+  EXPECT_EQ(r["pg_default"]["description"].get<std::string>(), "licht test comment")
+      << r["pg_default"].dump(2);
+
+  n.exec("COMMENT ON TABLESPACE pg_default IS NULL");
+}
+
+// FOR TABLES IN SCHEMA is PostgreSQL 15. The members were never missing --
+// pg_publication_tables resolves them either way -- but the DECLARATION was,
+// and it decides what happens next: a table created later in a published
+// schema joins by itself, one added to a table-list publication does not.
+TEST_F(PostgresMCPServerTest, PublicationsSayWhichSchemasArePublishedWholesale) {
+  pqxx::connection c(test_url);
+  if (c.server_version() < 150000) GTEST_SKIP() << "FOR TABLES IN SCHEMA is PostgreSQL 15+";
+  const std::string pub = "licht_pub_" + std::to_string(getpid());
+  {
+    pqxx::nontransaction n(c);
+    n.exec("CREATE PUBLICATION " + pub + " FOR TABLES IN SCHEMA grocery");
+  }
+  json r = srv->call_publications();
+  ASSERT_TRUE(r.contains(pub)) << r.dump(2);
+  ASSERT_TRUE(r[pub].contains("schemas")) << r[pub].dump(2);
+  std::vector<std::string> sch(r[pub]["schemas"].begin(), r[pub]["schemas"].end());
+  EXPECT_NE(std::find(sch.begin(), sch.end(), "grocery"), sch.end()) << r[pub].dump(2);
+  // The members are still resolved, which is what makes the declaration the
+  // only thing that was missing.
+  EXPECT_GT(r[pub]["table_count"].get<int>(), 0) << r[pub].dump(2);
+  {
+    pqxx::nontransaction n(c);
+    n.exec("DROP PUBLICATION " + pub);
+  }
+}
+
 
 // --- listOperators ---
 
@@ -4245,6 +5148,17 @@ TEST_F(PostgresMCPServerTest, EveryToolIsClassified) {
           d.find("each server's own") != std::string::npos ||
           d.find("Never runs across more than one connection") != std::string::npos;
       EXPECT_TRUE(classified) << name << " carries no scope note: " << d;
+      // And the note is a sentence of its own, not run into the one before.
+      for (const char* opener : {" This reading is instance-wide",
+                                 " A physical replica is byte-identical",
+                                 " The counters here are each server's own",
+                                 " Never runs across more than one connection"}) {
+        const auto at = d.find(opener);
+        if (at != std::string::npos && at > 0) {
+          EXPECT_TRUE(d[at - 1] == '.' || d[at - 1] == '!' || d[at - 1] == '?')
+              << name << " runs into its scope note: ..." << d.substr(at > 40 ? at - 40 : 0, 80);
+        }
+      }
     }
   }
 }
@@ -5547,9 +6461,12 @@ TEST_F(PostgresMCPServerTest, EvaluateIndexBuildsNothingAndKeepsTheGuard) {
 TEST_F(PostgresMCPServerTest, AHypotheticalIndexDoesNotLeakToTheNextCall) {
   // The reason the reset bracket exists. Measured against hypopg 1.4.3: a
   // hypothetical index survives ROLLBACK, survives into a new transaction, and
-  // survives DISCARD ALL -- which is exactly what PgBouncer issues as
-  // server_reset_query. Behind a transaction pooler that means one caller's
-  // hypothetical index would reshape the next caller's plans, silently.
+  // survives DISCARD ALL -- PgBouncer's default server_reset_query, which in
+  // transaction mode it does not even run unless server_reset_query_always is
+  // set, and which does not clear hypopg when it does run. Behind a
+  // transaction pooler that means one caller's hypothetical index would
+  // reshape the next caller's plans, silently, with nothing the pooler can be
+  // configured to do about it.
   //
   // A direct connection is fresh every call, so this can only ever fail behind
   // the pooler; it passes trivially otherwise rather than failing spuriously.
@@ -5804,6 +6721,37 @@ TEST_F(PostgresMCPServerTest, CheckPrivilegesReportsARestrictedRoleAccurately) {
     // pgstattuple is installed by the fixture, so this is a privilege denial
     // rather than an absent extension.
     EXPECT_TRUE(denied.count("tableBloat"));
+    // Both halves of replicationStats fall short for a bare role, and the
+    // entry names both.
+    EXPECT_TRUE(degraded.count("replicationStats"));
+    // roleDependencies reads only world-readable catalogs since it stopped
+    // joining pg_authid, so it must not appear at all.
+    EXPECT_FALSE(degraded.count("roleDependencies"));
+    EXPECT_FALSE(denied.count("roleDependencies"));
+
+    // A monitoring role is still degraded for replicationStats: no predefined
+    // role grants pg_replication_origin_status, pg_monitor included. The first
+    // version of the tool's own hint said otherwise.
+    {
+      pqxx::nontransaction n(*admin_conn);
+      n.exec("GRANT pg_monitor TO \"" + role + "\"");
+    }
+    PostgresMCPServer mon{url};
+    json m = mon.call_check_privileges();
+    bool rs_degraded = false;
+    for (const auto& d : m.value("degraded", json::array()))
+      if (d["tool"] == "replicationStats") {
+        rs_degraded = true;
+        const std::string what = d["what"].get<std::string>();
+        EXPECT_NE(what.find("origin"), std::string::npos) << what;
+        // With pg_monitor the senders are complete, so only origins is named.
+        EXPECT_EQ(what.find("columns null"), std::string::npos) << what;
+      }
+    EXPECT_TRUE(rs_degraded) << m.dump(2);
+    // And the origin half really is refused to it, as the entry says.
+    json rs = mon.call_replication_stats();
+    EXPECT_TRUE(rs["origins"].contains("error")) << rs.dump(2);
+    EXPECT_FALSE(rs["replication"].contains("error")) << rs.dump(2);
     EXPECT_NE(r["available"].get<size_t>(), r["tools"].get<size_t>());
     // The catalog is world-readable, so the great majority still works.
     EXPECT_GT(r["available"].get<size_t>(), r["tools"].get<size_t>() * 3 / 4);
@@ -5903,6 +6851,56 @@ std::string standby_url() {
   return u ? std::string(u) : std::string();
 }
 }  // namespace
+
+// A standby can be a sender too, and replay_behind_bytes has its own branch
+// for it: pg_current_wal_lsn() raises in recovery, so the minuend there is the
+// later of received and replayed WAL. The rig's standby has no replicas of its
+// own, so no row reaches the branch -- but the statement is planned and
+// type-checked in recovery, which is what this guards. The cascade itself was
+// verified by hand; see the comment on replay_behind_bytes.
+TEST(ReplicationStatsOnAStandby, RunsInRecoveryWithoutError) {
+  if (standby_url().empty())
+    GTEST_SKIP() << "no STANDBY_URL; run cpp/test/run-pooled-tests.sh";
+  PostgresMCPServer standby{standby_url()};
+  json r = standby.call_replication_stats();
+  ASSERT_TRUE(r.contains("replication")) << r.dump(2);
+  EXPECT_TRUE(r["replication"].is_object()) << r.dump(2);
+  EXPECT_FALSE(r["replication"].contains("error")) << r["replication"].dump(2);
+}
+
+// The rig streams a second standby off the first, so the first is a cascading
+// standby: in recovery and a WAL sender at once. replay_behind_bytes was NULL
+// there for every sender until it stopped using pg_current_wal_lsn(), which
+// raises in recovery -- exactly the server whose downstream replicas have no
+// other byte reading. This is the row the previous test could not reach.
+TEST(ReplicationStatsOnAStandby, ACascadingStandbyMeasuresItsSendersInBytes) {
+  const char* cascade = std::getenv("CASCADE_URL");
+  if (standby_url().empty() || cascade == nullptr)
+    GTEST_SKIP() << "no CASCADE_URL; run cpp/test/run-pooled-tests.sh";
+  PostgresMCPServer standby{standby_url()};
+  json r = standby.call_replication_stats();
+  ASSERT_TRUE(r["replication"].is_object()) << r.dump(2);
+  bool found = false;
+  for (auto& [key, s] : r["replication"].items()) {
+    if (s["application_name"] != "licht_cascade") continue;
+    found = true;
+    // Keyed by name and pid, so two cascades sharing a cluster_name could
+    // not fold into one entry.
+    EXPECT_NE(key.find("pid"), std::string::npos) << key;
+    ASSERT_TRUE(s["replay_behind_bytes"].is_number())
+        << "null on a cascading standby is the bug this guards: " << s.dump(2);
+    EXPECT_GE(s["replay_behind_bytes"].get<long long>(), 0) << s.dump(2);
+    EXPECT_EQ(s["state"], "streaming") << s.dump(2);
+  }
+  EXPECT_TRUE(found) << "the rig's cascade is not among the standby's senders: "
+                     << r["replication"].dump(2);
+
+  // And the cascade itself is a replica that sends nothing.
+  PostgresMCPServer leaf{std::string(cascade)};
+  json l = leaf.call_replication_stats();
+  EXPECT_TRUE(l["replication"].is_object()) << l.dump(2);
+  EXPECT_TRUE(l["replication"].empty()) << l["replication"].dump(2);
+}
 
 TEST(SessionRoleTest, ObservesTheReplicaSideOnAStandby) {
   if (standby_url().empty())
@@ -6527,6 +7525,27 @@ TEST_F(TopologyFixture, IndexToolsMaySweepAReplicationGroup) {
   json r = rpc_call(*s, "duplicateIndexes", {{"replication_group", "ha"}, {"schema", "grocery"}});
   ASSERT_FALSE(r.contains("error")) << r.dump(2);
   EXPECT_EQ(rpc_payload(r)["members"].size(), 2u);
+}
+
+// Every member of a replication group has its own WAL senders, a cascading
+// standby included, so this is the sweep replicationStats exists for. The
+// first scope row had it per_database and not per_server, which refused this
+// with "byte-identical across a replication group" -- false for senders.
+TEST_F(TopologyFixture, ReplicationStatsSweepsAReplicationGroupAndNotAnInstance) {
+  auto ha = server_from(ini_with("replication_group = ha\n") +
+                        section("twin", test_url, "replication_group = ha\n"));
+  json r = rpc_call(*ha, "replicationStats", {{"replication_group", "ha"}});
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  EXPECT_EQ(rpc_payload(r)["members"].size(), 2u);
+
+  // pg_stat_replication and the origins are instance-wide, so asking every
+  // database on one postmaster would repeat one answer.
+  auto inst = server_from(ini_with("instance = pg-01\n") +
+                          section("twin", test_url, "instance = pg-01\n"));
+  json i = rpc_call(*inst, "replicationStats", {{"instance", "pg-01"}});
+  ASSERT_TRUE(i.contains("error")) << i.dump(2);
+  EXPECT_NE(i["error"]["message"].get<std::string>().find("instance-wide"),
+            std::string::npos);
 }
 
 TEST_F(TopologyFixture, AGroupSweepCollapsesMembersThatWouldAnswerIdentically) {

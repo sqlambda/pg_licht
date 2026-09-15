@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pg_licht_mcp VERSION 4.2.2 LANGUAGES CXX)
+project(pg_licht_mcp VERSION 4.3.0 LANGUAGES CXX)
 
 # Standard bin/ and share/man/ layout, so `cmake --install` produces a tree that
 # can be dropped onto a prefix as-is: the release tarballs are staged this way,
@@ -57,7 +57,8 @@ if(BUILD_TESTING)
         PGLICHT_VERSION="${PROJECT_VERSION}"
         # The shipped example connections file, so a test can prove it still
         # parses rather than leaving it to rot alongside the parser.
-        PGLICHT_EXAMPLE_INI="${CMAKE_CURRENT_SOURCE_DIR}/test/connections.example.ini")
+        PGLICHT_EXAMPLE_INI="${CMAKE_CURRENT_SOURCE_DIR}/test/connections.example.ini"
+        PGLICHT_EXAMPLE_BUDGETS="${CMAKE_CURRENT_SOURCE_DIR}/test/budgets.example.ini")
     target_link_libraries(pg_licht_mcp_test
         PRIVATE
             GTest::gtest
@@ -90,6 +91,25 @@ if(BUILD_TESTING)
     add_test(NAME protocol_compat
              COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/protocol-compat.sh
                      $<TARGET_FILE:pg_licht_mcp>)
+
+    # llms.txt, generated from the binary as the release workflow does, so a
+    # tool without a man page entry -- or a generator broken by a change to
+    # tools/list -- fails here rather than at tag time. Needs mandoc to render
+    # the man page the entries link into, and python3 for the generator.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(MANDOC_EXECUTABLE AND Python3_Interpreter_FOUND)
+        add_test(NAME llms_txt
+                 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/llms-txt.sh
+                         $<TARGET_FILE:pg_licht_mcp>)
+        # The HTML reference and landing page, built as the release builds
+        # them: every mocked example checked against its tool's schema, every
+        # tool and prompt with a page, every internal link resolving.
+        add_test(NAME reference
+                 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/reference.sh
+                         $<TARGET_FILE:pg_licht_mcp>)
+    else()
+        message(STATUS "mandoc or python3 not found: skipping the llms_txt and reference tests")
+    endif()
 endif()
 
 message(STATUS "Using compiler: ${CMAKE_CXX_COMPILER} (${CMAKE_CXX_COMPILER_ID})")
@@ -102,11 +122,27 @@ set(CPACK_PACKAGE_VENDOR "sqlambda")
 set(CPACK_PACKAGE_CONTACT "https://github.com/sqlambda/pg_licht")
 set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/sqlambda/pg_licht")
 
-# libpqxx is linked statically and baked into the binary; libpq remains the
-# only shared runtime dependency.
-set(CPACK_DEBIAN_PACKAGE_DEPENDS "libpq5")
+# libpqxx is linked statically and baked into the binary; libpq, libstdc++,
+# libgcc and libc stay shared.
+#
+# The .deb's Depends is DERIVED, not declared: dpkg-shlibdeps reads the
+# binary's NEEDED entries and the symbols it actually uses, and turns them into
+# minimum versions from each library's symbols file. Measured on the 4.2.2
+# binary: libc6 (>= 2.38), libgcc-s1 (>= 4.3), libpq5 (>= 10~~),
+# libstdc++6 (>= 14). The hand-written "libpq5" it replaces was incomplete --
+# it named none of the C++ runtime -- and carried no version at all. Every libpq
+# function the binary calls predates PostgreSQL 10, so Debian's own libpq5
+# satisfies it and the postgresql.org repository is not required; a Depends
+# that demanded it would be a false dependency. Needs the `file` utility at
+# package time, which the release workflow installs.
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_DEBIAN_PACKAGE_SECTION "database")
 
+# The RPM names PGDG's libpq5 on purpose: the PostgreSQL project's own package
+# (standalone in pgdg-common, also provided by postgresqlNN-libs), never the
+# distribution's libpq. INSTALL.md says to enable that repository first. The
+# C++ runtime and libc requirements are added by rpmbuild's automatic
+# dependency scan, as is libpq.so.5()(64bit), which libpq5 provides.
 set(CPACK_RPM_PACKAGE_REQUIRES "libpq5")
 set(CPACK_RPM_PACKAGE_LICENSE "Apache-2.0")
 set(CPACK_RPM_PACKAGE_GROUP "Applications/Databases")

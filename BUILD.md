@@ -154,13 +154,33 @@ not duplicate it.
 
 - `.github/workflows/sanitizers.yml` — ASan/UBSan, TSan, Valgrind, and the pooled-connection
   job, each across PostgreSQL 14, 15, 16, 17, and 18.
+- `.github/workflows/sanitizers.yml` also builds with clang (`plain-clang`), so a warning
+  only clang raises fails under `-Werror`.
 - `.github/workflows/release.yml` — 7 build targets (Linux x86_64/arm64, Debian 13 deb,
   Rocky 9 rpm, macOS arm64). Tarballs are staged through `cmake --install`; deb and rpm are
   produced by CPack, which picks up the same install rules. libpqxx is pinned via
-  `PQXX_VERSION`.
+  `PQXX_VERSION`. The `.deb` Depends is derived by `dpkg-shlibdeps`; the `.rpm` requires
+  PGDG's `libpq5` by name.
+- `verify-packages` then installs every `.deb` on plain Debian 13 and every `.rpm` on Rocky
+  Linux 9 with PGDG enabled, runs the binary and finds the man page. The release waits for
+  it.
+- `site` builds the GitHub Pages site on every run: the landing page filled in from
+  `site/index.html`, the man page rendered by `mandoc -T html`, the HTML reference from
+  `tools/gen-reference.py`, and `llms.txt` from `tools/generate-llms-txt.py`, all from the
+  shipped binary. The reference fails if a mocked example in `tools/reference/examples.json`
+  no longer matches its tool's schema, or a tool has no man page section; `llms.txt` fails if
+  a tool or prompt has no man page entry. The `llms_txt` and `reference` ctests run the same
+  generators locally, and `reference` also checks every internal link.
+
+  Adding a tool therefore means three things beyond the code: an entry in a man page
+  OPERATIONS section, which gives it a category; a mocked example in
+  `tools/reference/examples.json`; and, if it can return values from user data, a line under
+  "What reaches the caller" in SECURITY CONSIDERATIONS.
 
 ## Release process
 
-Push a `v*` tag on `main`. The release workflow builds and uploads all seven artifacts,
-creates the GitHub release, and bumps the Homebrew tap formula (URL and sha256)
-automatically.
+Push a `v*` tag on `main`. The release workflow builds all seven artifacts, installs each
+package in its target distribution, creates the GitHub release, and bumps the Homebrew tap
+formula (URL and sha256) automatically. After the release succeeds, `deploy-site` publishes
+the site and `llms.txt` to https://sqlambda.github.io/pg_licht/, so both always describe a
+released version. Nothing about the site or `llms.txt` is edited by hand.

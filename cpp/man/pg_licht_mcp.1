@@ -1,7 +1,7 @@
 .\" Copyright (c) 2026 Daniel Cristian.
 .\" Licensed under the Apache License, Version 2.0; see LICENSE.
 .\"
-.Dd September 7, 2026
+.Dd September 15, 2026
 .Dt PG_LICHT_MCP 1
 .Os pg-licht
 .Sh NAME
@@ -372,6 +372,46 @@ replicas routinely run on smaller machines, and inheriting the primary's RAM
 would give every replica a confidently wrong
 .Va shared_buffers
 ratio.
+.Ss Budgets
+Limits
+.Nm
+applies to itself live in an optional
+.Pa budgets.ini .
+Today there is one: what
+.Ic explainQuery
+may execute when
+.Va analyze
+is combined with explicit
+.Va settings ,
+as shares of the host capacity declared for the connection.
+.Bd -literal -offset indent
+[analyze]
+memory_percent   = 10   ; worst-case plan memory, % of host_ram_mb
+vcpus_per_worker = 4    ; one parallel worker per this many host_vcpus
+.Ed
+.Pp
+Those are the built-in values, used when no file is found.
+.Va memory_percent
+takes 1 to 100 and
+.Va vcpus_per_worker
+1 to 1024.
+The first of these is read:
+.Ev PG_LICHT_BUDGETS ,
+which must then exist;
+.Pa budgets.ini
+in the same directory as the connections file in use; and
+.Pa ~/.config/pg_licht/budgets.ini .
+The last two are used only if they exist.
+.Pp
+The file is strict: an unknown section or key, or a value out of range, stops
+the server at startup rather than leaving a limit in force that the operator
+did not write.
+It holds no credentials and may be readable by anyone, but it must not be
+writable by anyone but its owner, since a file another user can edit is a limit
+another user can raise.
+Each refusal and each permitted run reports the values and the file they came
+from under
+.Va execution_budget .
 .Ss Resolution order
 The connection source is resolved in this order:
 .Bl -enum -width 2n
@@ -509,9 +549,6 @@ needs to know what works.
 Naming a grant in the hint of an operation that failed is diagnosis; listing
 grants beside every unavailable operation would be a standing recommendation to
 escalate privilege, which is not this server's to make.
-.El
-.Ss Schema exploration
-.Bl -tag -width Ds
 .It Ic checkRoleAccess Ar grantee Ar schema Ar object
 Whether one role holds privileges on one table, view, sequence, function or
 procedure, answered by
@@ -552,6 +589,52 @@ Enabled with no applicable permissive policy denies everything.
 Not to be confused with
 .Ic checkPrivileges ,
 which reports which of this server's own operations the connecting role can run.
+.It Ic roleDependencies Va role
+What depends on one role, from
+.Li pg_shdepend .
+.Va by_kind
+separates
+.Li owner ,
+which blocks
+.Sy DROP ROLE
+and is cleared by
+.Sy REASSIGN OWNED ,
+from
+.Li acl
+and
+.Li policy ,
+which
+.Sy DROP OWNED
+clears.
+.Pp
+.Li pg_shdepend
+is shared across the cluster, so the counts cover every database; an object id
+resolves only from the database it lives in, so
+.Va objects
+names this database and the shared catalogs while others appear as counts.
+Tables, functions, schemas and types are named as
+.Ar schema . Ns Ar name ;
+every other class, a policy or a default privilege included, by
+.Fn pg_identify_object ,
+so a policy reads as
+.Ql p on public.t .
+.It Ic defaultPrivileges Op Va schema
+.Sy ALTER DEFAULT PRIVILEGES
+entries: what grants the
+.Sy next
+object of each type will get.
+Scope
+.Li global
+overrides the hard-wired defaults; per-schema entries are added to them.
+A default applies only to objects created by
+.Va granted_by .
+Naming a
+.Va schema
+returns its entries and the global ones, since both decide what the next object
+there gets; a schema that does not exist is an error.
+.El
+.Ss Schema exploration
+.Bl -tag -width Ds
 .It Ic listSchemas
 All schemas with their table and view names and role grants.
 .It Ic listTables Ar schema
@@ -706,6 +789,68 @@ thousands of file-metadata calls.
 This is one of the operations worth raising
 .Va statement_timeout_ms
 for.
+.It Ic listPartitions Va schema
+Every partitioned table in a schema: strategy, partition key, partition count,
+the combined estimated rows and size of every leaf partition at any depth,
+whether a
+.Sy DEFAULT
+partition exists and how many rows it holds, and how many partitions are
+themselves partitioned.
+.Va default_rows
+is
+.Dv null ,
+not zero, when the default partition has never been analyzed:
+.Li reltuples
+stays at \-1 until then even after rows arrive, and
+.Va has_default
+says whether a default exists at all.
+.Va rows
+and
+.Va size_estimate
+cover only the leaves that have been analyzed;
+.Va never_analyzed
+says how many of the
+.Va leaf_partitions
+they could not see, and both are
+.Dv null
+when none has been measured.
+A sub-partitioned child holds no rows itself, so its leaves are what is summed.
+Reads
+.Li reltuples
+and
+.Li relpages ,
+so no relation is opened and no lock is taken.
+.Pp
+A growing default partition is the finding: rows land there when they match no
+bound, so it is a missing partition that has not failed loudly yet.
+.It Ic partitionDetails Va schema , Va table
+One parent and every partition: the bound expression verbatim, whether it is the
+.Sy DEFAULT ,
+whether it is itself partitioned, estimated rows and size, and the per-partition
+live and dead tuples, scan counters and vacuum and analyze timestamps.
+Rows and size are
+.Dv null
+for a partition that has never been analyzed, rather than a zero that would
+read as empty.
+.Pp
+Autovacuum runs per
+.Sy partition ,
+so a parent has no vacuum state of its own and ranking parents finds nothing
+while one child falls behind.
+Bounds are verbatim rather than parsed: a bound carries whatever types the key
+columns have, and a misparsed boundary is worse than an unparsed one.
+For a range parent, the highest upper bound against
+.Li now()
+says whether the next period's partition exists.
+.It Ic largeObjects
+How many large objects this database holds and who owns them.
+Large objects live in a catalog rather than a relation, so every size tool here
+is blind to them while
+.Ic diskUsage
+counts their bytes.
+No sizes: the bytes are in
+.Li pg_largeobject ,
+which is not publicly readable.
 .It Ic listFunctions Ar schema
 Functions and procedures in
 .Ar schema
@@ -914,6 +1059,36 @@ and 17 adds
 .Va invalidation_reason
 and
 .Va inactive_since .
+.It Ic replicationStats
+Every WAL sender on this server with state, sync state, the LSNs, the byte gap
+to replay \(em on a cascading standby measured from the WAL it has received
+\(em and
+.Va write_lag ,
+.Va flush_lag
+and
+.Va replay_lag
+in seconds \(em plus replication origin progress.
+The only source of replication lag as a
+.Sy time .
+Senders are keyed by
+.Va application_name
+plus pid: a walreceiver's default name is its
+.Va cluster_name ,
+which Debian sets per major rather than per host, so two standbys routinely
+share one and a name-only key would fold them into a single entry.
+.Pp
+Two readings that are routinely misread.
+The view is security restricted
+.Sy per row
+rather than refused, so a role without
+.Li pg_read_all_stats
+sees the senders exist with columns null, which looks like an idle replica and
+is a permission answer.
+And the lag columns revert to
+.Dv NULL
+a short time after a standby has entirely caught up and WAL activity stops, so a
+null lag there means caught up while a non-null one is the last measurement
+rather than the current state.
 .El
 .Ss Monitoring and statistics
 .Bl -tag -width Ds
@@ -1463,8 +1638,14 @@ cleared by neither
 .Ic ROLLBACK ,
 a new transaction, nor
 .Ic DISCARD ALL ,
-which is what PgBouncer issues as
+PgBouncer's default
 .Va server_reset_query .
+A transaction-mode pooler cannot be asked to help either: it runs no reset query
+at all unless
+.Va server_reset_query_always
+is set, and even then
+.Ic DISCARD ALL
+does not clear it.
 This operation therefore resets explicitly on the way in and on the way out, so
 that behind a transaction pooler one caller's hypothetical index cannot reshape
 the next caller's plans.
@@ -1473,6 +1654,19 @@ the next caller's plans.
 requires
 .Li hypopg
 1.4.0 or later, gated on the extension version.
+.Pp
+Takes
+.Va settings
+and
+.Va plan_as_role
+exactly as
+.Ic explainQuery
+does, and for a reason of its own: the whole output is a before/after cost
+comparison, so an environment that does not match production makes both halves
+answer a different question.
+Both plans are built under the same environment, and
+.Va planning_environment
+reports it.
 .It Ic tableBloat Ar schema Ar table Op Va exact
 Physical storage bloat for a table
 .Pq Li pgstattuple No or Li pgstattuple_approx :
@@ -1628,7 +1822,88 @@ Default
 .It Va timeout_ms
 Statement timeout in milliseconds, clamped to 100 through 30000.
 Defaults to 5000 for plan-only calls.
+.It Va settings
+Planner settings to apply for this plan only, as an object such as
+.Ql { "work_mem": "512MB" } .
+Applied with
+.Fn set_config "name" "value" "true" ,
+so they revert with the transaction and cannot leak to another session.
+Allowlisted to the settings that change a plan:
+.Va work_mem ,
+.Va hash_mem_multiplier ,
+the cost and parallelism knobs, every
+.Va enable_* ,
+the join-search limits,
+.Va constraint_exclusion ,
+.Va plan_cache_mode
+and the jit knobs.
+An unknown name is refused and nothing is planned, rather than ignored.
+.Va search_path
+is excluded on purpose: it changes which objects the statement resolves to
+rather than how they are joined.
+.Pp
+With
+.Va analyze
+the statement is executed under these settings only within a budget taken from
+the host capacity declared for the connection, as
+.Va host_ram_mb
+and
+.Va host_vcpus .
+The worst case the plan's memory limits permit must stay within a share of the
+declared RAM, 10% unless
+.Pa budgets.ini
+says otherwise: each sort-like node at
+.Va work_mem ,
+each hash node at
+.Va work_mem
+times
+.Va hash_mem_multiplier ,
+times the processes running it.
+The plan may use at most one parallel worker per four declared vCPUs, again
+unless
+.Pa budgets.ini
+says otherwise; see
+.Sx Budgets .
+With no declared capacity, no settings change is executed at all.
+A refused plan is still returned with
+.Va analyzed
+false, and
+.Va execution_budget
+under
+.Va planning_environment
+carries the arithmetic.
+The read-only guard and the timeout bound what the statement writes and how long
+it runs, but not what it allocates, and an out-of-memory kill of one backend
+restarts every connection on the instance.
+.It Va plan_as_role
+Plan under what this role carries in
+.Li pg_db_role_setting ,
+filtered to the same allowlist.
+A per-database entry
+.Pq Ic ALTER ROLE ... IN DATABASE
+overrides the role-wide one, as the server itself applies them.
+Entries that are not planner settings, such as
+.Va search_path
+or
+.Va statement_timeout ,
+are reported under
+.Va skipped_from_role
+rather than dropped silently.
+Explicit
+.Va settings
+win over what the role carries.
+On its own it is not held to the execution budget, because it applies what the
+role already runs with in production.
 .El
+.Pp
+When either is given the result carries
+.Va planning_environment ,
+saying what was applied and, for
+.Va plan_as_role ,
+what was skipped.
+The plan's own
+.Li Settings
+block reports what the server saw.
 .El
 .Ss Topology
 .Bl -tag -width Ds
@@ -2186,6 +2461,13 @@ Path to a connections INI file, consulted after
 .Fl -config
 and before
 .Pa ~/.config/pg_licht/connections.ini .
+.It Ev PG_LICHT_BUDGETS
+Path to a
+.Pa budgets.ini ,
+consulted before the one beside the connections file and
+.Pa ~/.config/pg_licht/budgets.ini .
+See
+.Sx Budgets .
 .It Ev PG_LICHT_HOST_RAM_MB
 Total host memory in megabytes, read by
 .Ic hostCapacity .
@@ -2234,6 +2516,11 @@ strings are passed through unchanged.
 .It Pa ~/.config/pg_licht/connections.ini
 Default connections file, used only if it exists.
 Must not be group- or world-accessible.
+.It Pa ~/.config/pg_licht/budgets.ini
+Default budgets file, used only if it exists and no
+.Pa budgets.ini
+sits beside the connections file.
+Must not be group- or world-writable.
 .It Pa ~/.pg_service.conf
 libpq service definitions, referenced by the
 .Va service
@@ -2572,13 +2859,14 @@ rather than succeed silently.
 .Pp
 That guard is deliberately transaction-scoped rather than session-scoped.
 Under a connection pooler in transaction mode, such as PgBouncer with
-.Li pool_mode = transaction
-and
-.Li server_reset_query = DISCARD ALL ,
-the server connection is returned to the pool at commit and its session state is
-wiped, so a
+.Li pool_mode = transaction ,
+the server connection is returned to the pool at commit and the next call may be
+handed a different one, so a
 .Ic SET
 issued once at startup silently stops applying to later calls.
+Whether the pooler also resets the connection it takes back
+.Pq Va server_reset_query , No which transaction mode skips by default
+changes nothing here: session state cannot be relied on either way.
 Transaction scope is the scope a pooler preserves.
 The setting cannot be pushed into the connection string either: PgBouncer
 rejects GUCs in the startup packet outright, which is why the
@@ -2591,3 +2879,78 @@ backend indefinitely.
 See
 .Sx The statement ceiling
 for the value and how to change it.
+.Ss What reaches the caller
+.Nm
+never writes, and it never returns rows from your tables.
+Every call is a read-only transaction, so nothing it runs can change data or
+schema.
+Two operations read a user table, and neither returns its rows:
+.Ic checkKey
+answers only whether a row with the given primary key exists, though that answer
+is itself a fact about the table; and
+.Ic explainQuery
+with
+.Va analyze
+executes a statement the caller supplied, only once its plan is proven not to
+write, and returns the plan with row counts and timings rather than the rows.
+.Pp
+Values that came from your data can still reach the caller, in these places:
+.Bl -tag -width Ds
+.It Ic currentActivity , currentLocks
+The text of statements other sessions are running now, exactly as sent,
+including any literal a
+.Ic WHERE
+clause or a statement carries \(em a password in
+.Ic ALTER ROLE ... PASSWORD
+among them.
+Statements of other roles are hidden unless the connecting role holds
+.Li pg_read_all_stats .
+.It Ic statementStats , explainQuery
+Statement text recorded by
+.Li pg_stat_statements ,
+in which the constants of a planned statement are replaced by
+.Ar $n
+placeholders: up to 500 characters in a list, whole when one queryid is named.
+Statements of other roles read
+.Ql <insufficient privilege>
+without
+.Li pg_read_all_stats .
+.It Ic tableStats , columnHistogram
+Column statistics from
+.Li pg_stats :
+the most common values with their frequencies, and histogram bounds, which are
+sample values from the column.
+PostgreSQL returns them only for columns the connecting role may
+.Ic SELECT .
+.It Ic explainQuery , evaluateIndex
+Plans, which repeat the literals of the statement the caller wrote.
+.It Ic functionDetails , tableDetails
+Definitions as written: function source, view definitions, column defaults,
+check constraints and policy expressions, carrying whatever literals were
+written into them.
+.It Ic serverSettings
+Setting values.
+For a role allowed to read superuser-only settings that includes a standby's
+.Va primary_conninfo ,
+which may contain a password.
+.El
+.Pp
+No operation returns a password
+.Nm
+itself holds:
+.Ic listConnections
+never returns one and never expands a service file,
+.Ic listForeignServers
+returns server options but never user mappings, and
+.Ic listSubscriptions
+omits each subscription's connection string.
+.Pp
+The connecting role decides the rest.
+A role without
+.Ic SELECT
+on a column gets none of its statistics, and a role without
+.Li pg_read_all_stats
+sees only its own statements.
+.Ic checkPrivileges
+reports what the current role can reach, so the narrowest role that answers the
+question is the one to connect as.

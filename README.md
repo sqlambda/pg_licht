@@ -32,8 +32,16 @@ those whose cost scales with the server rather than with the query —
 connection where such a scan is the point of the call. Reaching it is reported as the ceiling being reached, naming
 the value and the key to change, rather than as an error.
 
-Full rationale, including the guarded exception for `explainQuery`, is in the
-SECURITY CONSIDERATIONS section of `man pg_licht_mcp`.
+pg_licht never writes and never returns rows from your tables. Values from your data can
+still reach the caller in a few named places: live and recorded statement text
+(`currentActivity`, `currentLocks`, `statementStats`), column statistics (`tableStats`,
+`columnHistogram`), plans that repeat a statement's literals, definitions as written, and
+settings such as a standby's `primary_conninfo`. No password pg_licht itself holds is ever
+returned. Connect as the narrowest role that answers the question; `checkPrivileges`
+reports what it can reach.
+
+Full rationale, including the guarded exception for `explainQuery` and the complete list of
+what reaches the caller, is in the SECURITY CONSIDERATIONS section of `man pg_licht_mcp`.
 
 ## Quick start
 
@@ -137,7 +145,7 @@ for free space. The prompt leads with what makes the obvious response wrong:
 `VACUUM FULL` needs free space equal to the table and its indexes *before* it
 releases any, so it is not a disk-full action.
 
-Counts: 50 of 62 operations for a bare login role, 58 with `pg_monitor` — the
+Counts: 56 of 68 operations for a bare login role, 63 with `pg_monitor` — the
 `pg_ls_*` directory reads `diskUsage` uses are part of what that role grants.
 
 `triage-active-sessions` is for a server running more sessions at once than it
@@ -166,7 +174,7 @@ indexes and current lock waits can tell the two apart. **Completions** are offer
 
 ## Tools
 
-62 read-only operations, grouped as schema exploration, catalog search, cluster-wide
+68 read-only operations, grouped as schema exploration, catalog search, cluster-wide
 objects, extensibility and text search, foreign data and replication, monitoring and
 statistics, diagnostics and query planning, topology, and connections. Highlights include
 `tableDetails` (columns, indexes, constraints, foreign keys in both directions, triggers,
@@ -176,8 +184,9 @@ its `EXPLAIN` plan).
 
 `checkPrivileges` reports which of them the current role can actually use on a given
 connection. Most work for any role that can connect, since the catalog is world-readable:
-measured on PostgreSQL 18, a bare login role runs 50 of 62 at full fidelity, the monitoring
-role 58, and the ones that remain are those that read row data. Worth calling first
+measured on PostgreSQL 18, a bare login role runs 56 of 68 at full fidelity, the monitoring
+role 63. What remains for the monitoring role reads row data, apart from replication origin
+progress, which only the superuser can read. Worth calling first
 against an unfamiliar connection — a privilege-filtered answer is easy to mistake for an
 empty one, since `tableStats` on a role without `SELECT` returns columns with null
 statistics, exactly like a table that was never analyzed.
@@ -296,8 +305,8 @@ tool accepts depends on where its answer actually varies, and its input schema s
 | | varies across the databases of one instance | varies across members of a replication group |
 |---|---|---|
 | catalogs, `tableBloat`, the structure and size tools | yes | no — a physical replica is byte-identical |
-| `duplicateIndexes`, `indexBloat`, `tableIOStats`, `tableStats`, `listTableStats`, `subscriptionStats` | yes | **yes** — they carry `idx_scan`, or a worker of their own |
-| `currentActivity`, `currentLocks`, `statementStats`, buffer cache | no — instance-wide | yes |
+| `duplicateIndexes`, `indexBloat`, `tableIOStats`, `tableStats`, `listTableStats`, `partitionDetails`, `subscriptionStats` | yes | **yes** — they carry `idx_scan`, vacuum counters, or a worker of their own |
+| `currentActivity`, `currentLocks`, `statementStats`, `replicationStats`, buffer cache | no — instance-wide | yes |
 
 That middle row is the one worth knowing: an index that reads as unused on the primary may
 be carrying a replica's entire reporting workload, and only that replica's `idx_scan`
@@ -338,14 +347,33 @@ Or, with a single `DATABASE_URL`, via `PG_LICHT_HOST_RAM_MB` and `PG_LICHT_HOST_
 agent that inspects the host at run time can instead pass `ram_mb` and `vcpus` straight to
 the tool, which takes precedence over both.
 
+The declared figures also bound one thing that executes. `explainQuery` with `analyze` and
+explicit `settings` runs the statement under those settings only if the plan's worst-case
+memory fits in a tenth of `host_ram_mb` and it uses at most one parallel worker per four
+`host_vcpus`. With no declared capacity it runs under no settings change at all and returns
+the plan unexecuted. Both ratios can be changed in a `budgets.ini`:
+
+```ini
+[analyze]
+memory_percent   = 10   ; worst-case plan memory, % of host_ram_mb
+vcpus_per_worker = 4    ; one parallel worker per this many host_vcpus
+```
+
+It is read from `$PG_LICHT_BUDGETS`, from beside the connections file, or from
+`~/.config/pg_licht/budgets.ini`, in that order, and must not be writable by other users.
+An example is in [cpp/test/budgets.example.ini](cpp/test/budgets.example.ini). The read-only guard and the timeout do not bound memory, and one
+out-of-memory kill restarts every connection on the instance. The per-call `ram_mb` and
+`vcpus` arguments do not count here: a caller cannot raise its own limit.
+
 ## Documentation
 
 | | |
 |---|---|
-| `man pg_licht_mcp` | configuration, connection strings, all 62 operations, MCP client setup |
+| `man pg_licht_mcp` | configuration, connection strings, all 68 operations, MCP client setup |
 | [INSTALL.md](INSTALL.md) | Homebrew, deb, rpm, tarball, verifying, uninstalling |
 | [BUILD.md](BUILD.md) | building from source, tests, sanitizers, CI, release process |
 | [CHANGES.md](CHANGES.md) | changelog |
+| [sqlambda.github.io/pg_licht](https://sqlambda.github.io/pg_licht/) | overview, the [reference](https://sqlambda.github.io/pg_licht/reference/) with a page per tool and prompt, the manual as HTML, and [`llms.txt`](https://sqlambda.github.io/pg_licht/llms.txt) |
 
 Before installing, the manual page can be read straight from the source tree:
 

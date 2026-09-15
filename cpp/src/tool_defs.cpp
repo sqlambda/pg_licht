@@ -56,12 +56,18 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		    {"create", {{"type", "array"}, {"items", {{"type", "string"}}},
    		                {"description", "CREATE INDEX statements to plan against"}}},
    		    {"hide", {{"type", "array"}, {"items", {{"type", "string"}}},
-   		              {"description", "names of existing indexes to plan without"}}}
+   		              {"description", "names of existing indexes to plan without"}}},
+   		    {"settings", {{"type", "object"},
+   		                  {"description", "planner settings to apply for both halves of the comparison, e.g. {\"work_mem\": \"512MB\"}. Applied with set_config(is_local) so they revert with the transaction. Allowlisted; an unknown name is refused and nothing is planned"}}},
+   		    {"plan_as_role", {{"type", "string"},
+   		                      {"description", "compare under what this role carries in pg_db_role_setting. Both the before and the after plan use it, which is the point: an environment that does not match production makes both costs answer a different question"}}}
    		  }},
    		{"required", {"sql"}}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         return s.evaluate_index(a.str("sql", ""), a.arr("create"), a.arr("hide")); }},
+         json settings = a.contains("settings") ? a["settings"] : json::object();
+         return s.evaluate_index(a.str("sql", ""), a.arr("create"), a.arr("hide"),
+                                 settings, a.str("plan_as_role")); }},
       {"checkPrivileges",
        "report which tools the current role can actually use on this connection, and how the rest fall short. Most of this server works for any role that can connect, because the catalog is world-readable; what varies is the monitoring extras and whether the role can read table data. Call this first when working against an unfamiliar connection or a restricted role -- the alternative is discovering the limits tool by tool, and a privilege-filtered answer is easy to mistake for an empty one. Names no role memberships and no GRANT statements: what a caller needs is which tools work. This is about THIS server's operations for the CONNECTING role, and is not an object permission check -- for whether some other role may read a given table, view or function, and which rows row-level security then leaves it, use the check-role-access prompt. Tools absent from both lists are fully available",
        []() -> json { return {
@@ -82,6 +88,66 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
          return s.table_stats(a.str("schema", "public"), a.str("table", "")); }},
+      {"roleDependencies",
+       "return what depends on one role, cluster-wide, from pg_shdepend. checkRoleAccess answers whether a role may USE an object; this answers the inverse, which is the whole of \"role cannot be dropped because some objects depend on it\" -- a message that reports a count and names nothing. by_kind separates owner (which blocks DROP ROLE outright and is cleared by REASSIGN OWNED) from acl and policy (cleared by DROP OWNED), because that decides whether you reassign or hunt. Every row this database can resolve is named: tables, functions, schemas and types as schema.name, and every other class -- policies, default privileges, large objects, languages, foreign servers, subscriptions, parameters granted with GRANT SET ON PARAMETER -- by PostgreSQL's own pg_identify_object, so a policy reads as 'p on public.t'. IMPORTANT: pg_shdepend is shared across the cluster, so total and by_database cover EVERY database; but an object id is only resolvable from the database it lives in, so 'objects' names only those in this database and the shared catalogs. A row counted in another database is real and unnamed here -- connect there and ask again. Reporting only what this database can see would answer 'nothing depends on it' to somebody about to DROP the role",
+       []() -> json { return {
+   		{"type", "object"},
+   		{"properties", {
+   		    {"role", {{"type", "string"}, {"description", "role name to ask about"}}}
+   		  }},
+   		{"required", {"role"}}
+   	      }; },
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.role_dependencies(a.str("role")); }},
+      {"defaultPrivileges",
+       "return ALTER DEFAULT PRIVILEGES entries (pg_default_acl): what grants the NEXT object of each type will get, per granting role and per schema. checkRoleAccess answers about the objects that exist; this is the only thing that answers about the ones that do not yet, and it is the standing cause of \"the new table is not readable and every old one is\" -- which presents as a broken grant and is a missing default. scope 'global' (defaclnamespace = 0) overrides the hard-wired defaults for that object type; scope 'schema' entries are ADDED to the global ones, so two entries for one type are cumulative rather than conflicting. Note that defaults apply only to objects created by the granting role, which is why granted_by is reported beside every entry",
+       []() -> json { return {
+   		{"type", "object"},
+   		{"properties", {
+   		    {"schema", {{"type", "string"}, {"description", "restrict to one schema's entries plus the global ones, which apply there too because per-schema entries are added to them; omit for every entry. A schema that does not exist is an error"}}}
+   		  }}
+   	      }; },
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.default_privileges(a.str("schema")); }},
+      {"largeObjects",
+       "return how many large objects this database holds and who owns them (pg_largeobject_metadata). Large objects live in a catalog rather than in any user relation, so tableSize, listTableSizes and tableStats are all blind to them while diskUsage.databases counts their bytes -- the signature is \"the database grew and no table did\", which triage-disk-space could not otherwise resolve: it ranks tables, finds nothing, and stops. NO SIZES: the bytes are in pg_largeobject, which is not publicly readable and which the documentation directs callers away from, so a size sum is not reliably available here and is not invented. An unreferenced large object cannot be identified from the catalog alone either -- it is unreferenced only if no column holds its oid -- and lo_unlink on a live oid loses data, so confirm against the application before deleting",
+       []() -> json { return {
+   		{"type", "object"},
+   		{"properties", json::object()}
+   	      }; },
+       [](PostgresMCPServer& s, const Args&) -> json {
+         return s.large_objects(); }},
+      {"replicationStats",
+       "return every WAL sender on this server (pg_stat_replication) with its state, sync_state, sent/write/flush/replay LSNs, the byte gap to replay (on a cascading standby, measured from the WAL it has received), and write_lag/flush_lag/replay_lag as SECONDS -- plus replication origin progress. Senders are keyed by application_name plus pid, because a walreceiver's default application_name is its cluster_name and Debian sets that per major rather than per host, so two standbys routinely share one; a name-only key would fold them into a single entry. This is the only source of replication lag as a TIME: replicationSlots reports what a slot RETAINS in bytes, and subscriptionStats cannot measure lag at all because neither of its LSN columns references the publisher. Serves physical standbys and logical subscribers alike. Two readings that are routinely misread: the view is security-restricted PER ROW rather than refused, so a role without pg_read_all_stats sees the senders exist with many columns null, which looks like an idle replica rather than a permission answer; and the lag columns revert to NULL a short time after a standby has entirely caught up and WAL activity stops, so a null lag on an idle replica means caught up while a non-null one is the last measurement rather than the current state",
+       []() -> json { return {
+   		{"type", "object"},
+   		{"properties", json::object()}
+   	      }; },
+       [](PostgresMCPServer& s, const Args&) -> json {
+         return s.replication_stats(); }},
+      {"listPartitions",
+       "return every partitioned table in a schema with its partitioning strategy (range/list/hash), the partition key, how many partitions it has, the combined estimated row count and size of every leaf partition at any depth (a sub-partitioned child holds nothing itself), whether a DEFAULT partition exists and how many rows it holds, and how many partitions are themselves partitioned. rows and size_estimate cover only the leaves that have been analyzed, and never_analyzed says how many leaf_partitions they could not see; both are null when no leaf has been measured. default_rows is null, not 0, when the default partition has never been analyzed: reltuples stays -1 until then even after rows arrive, and has_default says whether a default exists at all. Reads reltuples and relpages from the catalog, so no relation is opened and no lock is taken -- for measured sizes call listTableSizes on the schema the partitions live in. A growing default partition is the finding to look for: rows land there when they match no bound, so it is a missing partition that has not failed loudly yet. Name a parent to partitionDetails for the per-partition bounds and vacuum state",
+       []() -> json { return {
+   		{"type", "object"},
+   		{"properties", {
+   		    {"schema", {{"type", "string"}}}
+   		  }},
+   		{"required", {"schema"}}
+   	      }; },
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.list_partitions(a.str("schema", "public")); }},
+      {"partitionDetails",
+       "return one partitioned table with every partition: its bound expression verbatim, whether it is the DEFAULT, whether it is itself partitioned, estimated rows and size (both null, not 0, for a partition never analyzed), and the per-partition live/dead tuples, scan counters and vacuum and analyze timestamps. Those statistics are the reason this exists: autovacuum runs per PARTITION, so a parent has no vacuum state of its own and ranking parents finds nothing while one child falls behind. Bounds are returned verbatim rather than parsed -- a bound carries whatever types the key columns have, and a misparsed boundary is worse than an unparsed one; for a RANGE parent, comparing the highest upper bound against now() is how to see that next period's partition was never created. counters_since says when the scan counters were last reset. Returns a clear error naming the relkind if the table exists but is not partitioned",
+       []() -> json { return {
+   		{"type", "object"},
+   		{"properties", {
+   		    {"table", {{"type", "string"}}},
+   		    {"schema", {{"type", "string"}}}
+   		  }},
+   		{"required", {"table", "schema"}}
+   	      }; },
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.partition_details(a.str("schema", "public"), a.str("table")); }},
       {"listTableStats",
        "return the statistics PostgreSQL keeps for every table in a schema: estimated row count, seq_scan and idx_scan counts, live and dead tuples, rows modified since the last analyze, rows inserted since the last vacuum, and the manual and automatic vacuum and analyze times as four separate fields (last_vacuum and last_analyze are the manual ones, exactly as in pg_stat_user_tables -- a recent last_vacuum beside a null last_autovacuum means the table is being kept alive by hand and autovacuum is not reaching it). Reads the catalog and the statistics collector only -- no relation is opened and no file is measured. Carries no per-column histograms; name one table to tableStats for those. size_estimate is relpages*block_size (the server's BLCKSZ, 8192 unless it was built otherwise) and is only as fresh as estimated_from says: for measured sizes call listTableSizes",
        []() -> json { return {
@@ -94,7 +160,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args& a) -> json {
          return s.list_table_stats(a.str("schema", "public")); }},
       {"tableSize",
-       "measure one table on disk: main fork, total table size including TOAST and the free space and visibility maps, index size, grand total, the TOAST relation and each index individually. COSTS MORE THAN IT LOOKS: these functions open the relation with AccessShareLock, so on a table an ALTER TABLE is rewriting the call waits behind AccessExclusiveLock until statement_timeout fires. Prefer size_estimate from tableStats, which is free, and call this when the estimate is too stale to act on. A partitioned table reports its own storage, which is zero -- measure the partitions",
+       "measure one table on disk: main fork, total table size including TOAST and the free space and visibility maps, index size, grand total, the TOAST relation and each index individually. COSTS MORE THAN IT LOOKS: these functions open the relation with AccessShareLock, so on a table an ALTER TABLE is rewriting the call waits behind AccessExclusiveLock until statement_timeout fires. Prefer size_estimate from tableStats, which is free, and call this when the estimate is too stale to act on. A partitioned table reports its own storage, which is zero -- measure the partitions, which partitionDetails names",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
@@ -106,7 +172,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args& a) -> json {
          return s.table_size(a.str("schema", "public"), a.str("table", "")); }},
       {"listTableSizes",
-       "measure every table in a schema on disk: table size, index size and grand total per relation. COSTS MORE THAN IT LOOKS, and more here than in tableSize: one relation is opened per table, each taking AccessShareLock, so a single table held under AccessExclusiveLock by an ALTER TABLE blocks the whole call rather than one row of it, and on a large schema this is thousands of file-metadata calls. Prefer size_estimate from listTableStats, which is free, and call this when the estimates are too stale to act on. Partitioned tables report their own storage, which is zero",
+       "measure every table in a schema on disk: table size, index size and grand total per relation. COSTS MORE THAN IT LOOKS, and more here than in tableSize: one relation is opened per table, each taking AccessShareLock, so a single table held under AccessExclusiveLock by an ALTER TABLE blocks the whole call rather than one row of it, and on a large schema this is thousands of file-metadata calls. Prefer size_estimate from listTableStats, which is free, and call this when the estimates are too stale to act on. Partitioned tables report their own storage, which is zero; listPartitions summarises them and partitionDetails names their partitions",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
@@ -237,7 +303,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args&) -> json {
          return s.foreign_servers(); }},
       {"listTablespaces",
-       "return cluster-wide tablespaces with owner, filesystem location, options, and description",
+       "return cluster-wide tablespaces with owner, filesystem location, options, and description. The description comes from pg_shdescription: a tablespace is a shared object, so COMMENT ON TABLESPACE does not land in pg_description and obj_description() cannot see it",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", json::object()}
@@ -264,7 +330,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args&) -> json {
          return s.event_triggers(); }},
       {"listPublications",
-       "return logical replication publications with owner, all-tables flag, per-operation flags (insert/update/delete/truncate), table_count, and up to 50 member table names. tables_truncated says when a publication carries more than the names shown -- a publication FOR ALL TABLES resolves to every table in the database, so the member list is unbounded by construction and the count is the figure that scales",
+       "return logical replication publications with owner, all-tables flag, per-operation flags (insert/update/delete/truncate), table_count, up to 50 member table names, and on PostgreSQL 15+ the schemas published wholesale via FOR TABLES IN SCHEMA. That declaration is not cosmetic: a table created later in a published schema joins the publication by itself, while one added to a table-list publication does not -- so two publications with identical members today can behave differently tomorrow. tables_truncated says when a publication carries more than the names shown -- a publication FOR ALL TABLES resolves to every table in the database, so the member list is unbounded by construction and the count is the figure that scales",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", json::object()}
@@ -712,7 +778,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args& a) -> json {
          return s.check_key(a.str("schema", "public"), a.str("table", ""), a.arr("values")); }},
       {"explainQuery",
-       "return the raw EXPLAIN (FORMAT JSON) plan for a statement, either recovered from pg_stat_statements by queryid (full untruncated text) or supplied directly as sql. Runs in a read-only transaction bounded by statement_timeout. Statements with $n placeholders are planned with GENERIC_PLAN unless concrete params are supplied, in which case the statement is PREPAREd and planned with real values. analyze:true runs EXPLAIN (ANALYZE, BUFFERS), which really executes the statement, and is honoured only after the plan is proven free of any ModifyTable node -- so data-modifying statements, including data-modifying CTEs, are never executed; it also requires an explicit timeout_ms. Returns the plan verbatim plus generic/analyzed/read_only flags and the pg_stat_statements row; no heuristics and no generated DDL, the plan is yours to interpret. Every plan carries a Settings block (EXPLAIN SETTINGS) naming the settings that differ from the built-in default, because the plan is built in THIS server's session and not in the one the statement really runs in -- work_mem alone can change the algorithm rather than the cost, turning a HashAggregate into a Sort plus GroupAggregate. Compare it against hostCapacity.overrides, which reports the per-role and per-database settings pg_settings cannot show: where they differ, this plan is not the plan production gets",
+       "return the raw EXPLAIN (FORMAT JSON) plan for a statement, either recovered from pg_stat_statements by queryid (full untruncated text) or supplied directly as sql. Runs in a read-only transaction bounded by statement_timeout. Statements with $n placeholders are planned with GENERIC_PLAN unless concrete params are supplied, in which case the statement is PREPAREd and planned with real values. analyze:true runs EXPLAIN (ANALYZE, BUFFERS), which really executes the statement, and is honoured only after the plan is proven free of any ModifyTable node -- so data-modifying statements, including data-modifying CTEs, are never executed; it also requires an explicit timeout_ms. Returns the plan verbatim plus generic/analyzed/read_only flags and the pg_stat_statements row; no heuristics and no generated DDL, the plan is yours to interpret. Every plan carries a Settings block (EXPLAIN SETTINGS) naming the settings that differ from the built-in default, because the plan is built in THIS server's session and not in the one the statement really runs in -- work_mem alone can change the algorithm rather than the cost, turning a HashAggregate into a Sort plus GroupAggregate. Compare it against hostCapacity.overrides, which reports the per-role and per-database settings pg_settings cannot show: where they differ, this plan is not the plan production gets -- and plan_as_role then plans it under what that role actually carries, so the difference between the two plans becomes the finding rather than a caveat. planning_environment reports what was applied and, for plan_as_role, what was skipped",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
@@ -735,7 +801,11 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		    {"timeout_ms", {
    			{"type", "integer"},
    			{"description", "statement_timeout for the explain, in milliseconds, clamped to [100, 30000]. Required when analyze is true; defaults to 5000 for plan-only calls"}
-   		      }}
+   		      }},
+   		    {"settings", {{"type", "object"},
+   		                  {"description", "planner settings to apply for this plan only, e.g. {\"work_mem\": \"512MB\"}. Applied with set_config(is_local) so they revert with the transaction and cannot leak to another session. Allowlisted to settings that change a PLAN; an unknown name is refused and nothing is planned, rather than ignored. With analyze the statement is EXECUTED under them only within a budget taken from the host capacity declared for this connection (host_ram_mb and host_vcpus): the worst case the plan's memory limits permit must stay within a share of RAM (10% unless budgets.ini says otherwise), and the plan may use at most one parallel worker per four vCPUs (likewise). With no declared capacity no settings change is executed at all. Either way a refused plan is still returned, analyzed stays false, and planning_environment.execution_budget carries the arithmetic. plan_as_role alone is not budgeted: it is what that role already runs with"}}},
+   		    {"plan_as_role", {{"type", "string"},
+   		                      {"description", "plan under what this role carries in pg_db_role_setting, filtered to planner settings. A per-database entry (ALTER ROLE ... IN DATABASE) overrides the role-wide one, as the server itself applies them. Non-planner entries such as search_path or statement_timeout are reported under skipped_from_role rather than dropped silently"}}}
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
@@ -753,7 +823,9 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
          json prms = a.contains("params") ? a["params"] : json::array();
          bool do_analyze = a.contains("analyze") ? a["analyze"].get<bool>() : false;
          int tmo = a.contains("timeout_ms") ? a["timeout_ms"].get<int>() : 0;
-         return s.explain_query(qid, sql, prms, do_analyze, tmo); }},
+         json settings = a.contains("settings") ? a["settings"] : json::object();
+         std::string as_role = a.str("plan_as_role");
+         return s.explain_query(qid, sql, prms, do_analyze, tmo, settings, as_role); }},
       {"verifyTopology",
        "connect to every configured connection and report what each server actually is: its role (primary or replica, from pg_is_in_recovery(), observed now rather than configured), its system identifier, database, address, port and version -- then check the declared topology against them. A physical replica carries the same system identifier as its primary forever, so the identifier alone cannot separate the two axes: same identifier with the same host and port is one instance, same identifier on different hosts is a replication group. Reports declarations the servers contradict, connections that share an identifier but are not declared together (an undeclared replica is where 'is this index used?' quietly gets the wrong answer), a replication group with no primary, and split brain. Logical replication cannot be verified this way and is reported as such rather than as a mismatch. Connects once per configured connection, sequentially, with a short connect timeout; a connection that fails is reported and does not abort the rest",
        []() -> json { return {

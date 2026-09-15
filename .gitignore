@@ -4,6 +4,11 @@ cpp/build_*/
 cpp/Testing/
 cpp/dist/
 
+# Python bytecode; tools/gen-reference.py imports generate-llms-txt.py, which
+# makes CPython write tools/__pycache__.
+__pycache__/
+*.pyc
+
 # IDE
 .vscode/
 .idea/

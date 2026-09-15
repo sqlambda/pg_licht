@@ -27,6 +27,11 @@ void usage(const char* argv0) {
     << "  4. $DATABASE_URL" << std::endl
     << "  5. argv[1]" << std::endl
     << std::endl
+    << "Budgets (budgets.ini), first found:" << std::endl
+    << "  1. $PG_LICHT_BUDGETS" << std::endl
+    << "  2. budgets.ini beside the connections file" << std::endl
+    << "  3. ~/.config/pg_licht/budgets.ini" << std::endl
+    << std::endl
     << "See pg_licht_mcp(1) for the full manual." << std::endl;
 }
 
@@ -70,13 +75,25 @@ int main(int argc, char *argv[]) {
   }
 
   try {
+    // Loaded here and only here, so a server built any other way -- the test
+    // fixture above all -- keeps the built-in limits and never reads a
+    // developer's own file. A bad file is fatal at startup, like a bad
+    // connections file.
+    const char* env_budgets = std::getenv("PG_LICHT_BUDGETS");
+    const char* home = std::getenv("HOME");
+    const pglicht::Budgets budgets = pglicht::Budgets::load(
+      pglicht::Budgets::resolve_path(env_budgets ? env_budgets : "", config_path,
+                                     home ? home : ""));
+
     if (!config_path.empty()) {
       auto registry = pglicht::ConnectionRegistry::from_ini(
         config_path, std::string("pg-licht-cpp/") + PGLICHT_VERSION);
       PostgresMCPServer server(std::move(registry));
+      server.set_budgets(budgets);
       server.run();
     } else {
       PostgresMCPServer server(db_url);
+      server.set_budgets(budgets);
       server.run();
     }
   } catch (const std::exception& e) {

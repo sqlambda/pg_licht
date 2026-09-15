@@ -1,0 +1,474 @@
+{
+  "_comment": "Mocked examples for the HTML reference. Every value here is invented: a fictional 'shop' database on fictional hosts. Nothing was captured from a real server. tools/gen-reference.py validates each example against the tool's own inputSchema and outputSchema from the binary, so a mock that no longer matches the tool fails the build instead of misleading a reader.",
+  "tools": {
+    "listSchemas": {
+      "arguments": {"connection": "shop_prod"},
+      "result": {
+        "shop": {"table_count": 3, "tables": ["customers", "order_items", "orders"], "tables_truncated": false, "roles": {"app_rw": ["USAGE"], "reporting": ["USAGE"]}},
+        "audit": {"table_count": 1, "tables": ["events"], "tables_truncated": false, "roles": {"auditor": ["USAGE"]}}
+      }
+    },
+    "listTables": {
+      "arguments": {"schema": "shop"},
+      "result": {
+        "orders": {"kind": "table", "description": "Customer purchase orders.", "reloptions": null, "columns": {"id": {"description": null, "index_count": 1}, "customer_id": {"description": null, "index_count": 1}, "status": {"description": "pending | paid | shipped", "index_count": 0}}, "index_count": 2, "constraint_count": 3},
+        "customers": {"kind": "table", "description": "", "reloptions": ["fillfactor=90"], "columns": {"id": {"description": null, "index_count": 1}, "email": {"description": null, "index_count": 1}}, "index_count": 2, "constraint_count": 2}
+      }
+    },
+    "tableDetails": {
+      "arguments": {"schema": "shop", "table": "orders"},
+      "result": {
+        "table": "shop.orders", "kind": "table", "description": "Customer purchase orders.",
+        "columns": {
+          "id": {"type": "bigint", "nullable": false, "default": "generated always as identity"},
+          "customer_id": {"type": "bigint", "nullable": false, "default": null},
+          "status": {"type": "text", "nullable": false, "default": "'pending'::text"},
+          "created_at": {"type": "timestamp with time zone", "nullable": false, "default": "now()"}
+        },
+        "primary_key": ["id"],
+        "indexes": {"orders_pkey": {"definition": "CREATE UNIQUE INDEX orders_pkey ON shop.orders USING btree (id)"}, "orders_customer_id_idx": {"definition": "CREATE INDEX orders_customer_id_idx ON shop.orders USING btree (customer_id)"}},
+        "constraints": {"orders_status_check": {"type": "check", "definition": "CHECK (status = ANY (ARRAY['pending'::text, 'paid'::text, 'shipped'::text]))"}},
+        "foreign_keys": {"orders_customer_id_fkey": {"columns": ["customer_id"], "references": "shop.customers(id)", "on_delete": "restrict"}},
+        "referenced_by": {"order_items_order_id_fkey": {"table": "shop.order_items", "columns": ["order_id"]}},
+        "triggers": {}, "rules": {}, "row_level_security": {"enabled": false, "forced": false}, "policies": {},
+        "roles": {"app_rw": ["SELECT", "INSERT", "UPDATE"], "reporting": ["SELECT"]}
+      }
+    },
+    "searchTables": {
+      "arguments": {"web_search": "invoice"},
+      "result": {
+        "shop.orders": {"kind": "table", "description": "Customer purchase orders; invoice number in invoice_no.", "columns": {"invoice_no": {"description": "Printed invoice number."}}}
+      }
+    },
+    "evaluateIndex": {
+      "arguments": {"sql": "SELECT id FROM shop.orders WHERE status = 'paid' AND created_at > now() - interval '1 day'", "create": ["CREATE INDEX ON shop.orders (status, created_at)"]},
+      "result": {
+        "statement": "SELECT id FROM shop.orders WHERE status = 'paid' AND created_at > now() - interval '1 day'",
+        "hypopg_version": "1.4.1",
+        "baseline": {"total_cost": 18420.5, "node_types": ["Seq Scan"]},
+        "hypothetical": {"total_cost": 42.18, "node_types": ["Index Scan"]},
+        "cost_ratio": 0.0023,
+        "indexes": [{"definition": "CREATE INDEX ON shop.orders USING btree (status, created_at)", "used": true}],
+        "hidden": null,
+        "note": "Hypothetical indexes are planned against and never built. The cost is the planner's estimate, not a measurement."
+      }
+    },
+    "checkPrivileges": {
+      "arguments": {"connection": "shop_prod"},
+      "result": {
+        "connection": "shop_prod", "role": "mcp_readonly", "tools": 68, "available": 60,
+        "degraded": [{"tool": "currentActivity", "what": "the query text and some columns of backends belonging to other roles are hidden"}],
+        "denied": [{"tool": "tableBloat", "reason": "the pgstattuple functions are restricted to roles permitted to run table-scanning monitoring functions"}]
+      }
+    },
+    "tableStats": {
+      "arguments": {"schema": "shop", "table": "orders"},
+      "result": {
+        "table": "shop.orders", "rows": 1204388, "size_estimate": 187351040,
+        "seq_scan": 41, "idx_scan": 9832117, "n_live_tup": 1204102, "n_dead_tup": 18344,
+        "n_mod_since_analyze": 22410, "n_ins_since_vacuum": 9120,
+        "columns": {"status": {"null_frac": 0.0, "n_distinct": 3, "most_common_vals": ["shipped", "paid", "pending"], "most_common_freqs": [0.71, 0.24, 0.05]}},
+        "indexes": {"orders_pkey": {"idx_scan": 9120004}, "orders_customer_id_idx": {"idx_scan": 712113}}
+      }
+    },
+    "roleDependencies": {
+      "arguments": {"role": "app_legacy"},
+      "result": {
+        "role": "app_legacy", "exists": true, "total": 4,
+        "by_kind": {"owner": 2, "acl": 1, "policy": 1},
+        "by_database": {"shop": 3, "reports": 1},
+        "resolvable_in_this_database": 3,
+        "objects": [
+          {"kind": "pg_class", "name": "shop.legacy_export", "column": null, "dependency": "owner"},
+          {"kind": "pg_proc", "name": "shop.rebuild_export", "column": null, "dependency": "owner"},
+          {"kind": "pg_policy", "name": "legacy_read on shop.orders", "column": null, "dependency": "policy"}
+        ]
+      }
+    },
+    "defaultPrivileges": {
+      "arguments": {"schema": "shop"},
+      "result": {
+        "default_privileges": [
+          {"scope": "global", "schema": null, "granted_by": "migrator", "object_type": "function", "grants": {"PUBLIC": ["EXECUTE"]}},
+          {"scope": "schema", "schema": "shop", "granted_by": "migrator", "object_type": "table", "grants": {"reporting": ["SELECT"]}}
+        ]
+      }
+    },
+    "largeObjects": {
+      "arguments": {},
+      "result": {"total": 1284, "by_owner": {"app_rw": 1280, "migrator": 4}, "note": "Sizes are not reported: the bytes live in pg_largeobject, which is not publicly readable."}
+    },
+    "replicationStats": {
+      "arguments": {"connection": "shop_prod"},
+      "result": {
+        "replication": {
+          "shop-replica-1 (pid 48211)": {"pid": 48211, "user": "replicator", "application_name": "shop-replica-1", "client_addr": "10.0.2.21", "state": "streaming", "sync_state": "async", "sent_lsn": "3A/1C0024F8", "write_lsn": "3A/1C0024F8", "flush_lsn": "3A/1C0024F8", "replay_lsn": "3A/1BFF1E20", "write_lag_s": 0.002, "flush_lag_s": 0.003, "replay_lag_s": 0.041, "replay_behind_bytes": 67160}
+        },
+        "origins": {"error": "could not read pg_replication_origin_status", "hint": "reading replication origin progress needs the superuser or a role granted SELECT on pg_replication_origin_status."},
+        "note": "pg_stat_replication is security-restricted per row rather than refused."
+      }
+    },
+    "listPartitions": {
+      "arguments": {"schema": "shop"},
+      "result": {
+        "events": {"strategy": "range", "key": "RANGE (created_at)", "partitions": 13, "has_default": true, "default_partition": "events_default", "default_rows": 412, "leaf_partitions": 13, "never_analyzed": 1, "rows": 88210442, "size_estimate": 14203342848, "sub_partitioned": 0}
+      }
+    },
+    "partitionDetails": {
+      "arguments": {"schema": "shop", "table": "events"},
+      "result": {
+        "table": "events", "strategy": "range", "key": "RANGE (created_at)", "is_partition_of": null, "counters_since": "2026-08-01T00:00:00Z",
+        "partitions": [
+          {"name": "events_2026_08", "schema": "shop", "bound": "FOR VALUES FROM ('2026-08-01 00:00:00+00') TO ('2026-09-01 00:00:00+00')", "is_default": false, "is_partitioned": false, "rows": 7340112, "size_estimate": 1182990336, "n_dead_tup": 20431, "last_autovacuum": "2026-09-02T03:11:40Z"},
+          {"name": "events_default", "schema": "shop", "bound": "DEFAULT", "is_default": true, "is_partitioned": false, "rows": 412, "size_estimate": 57344, "n_dead_tup": 0, "last_autovacuum": null}
+        ]
+      }
+    },
+    "listTableStats": {
+      "arguments": {"schema": "shop"},
+      "result": {
+        "orders": {"rows": 1204388, "size_estimate": 187351040, "seq_scan": 41, "idx_scan": 9832117, "n_dead_tup": 18344, "last_autovacuum": "2026-09-14T22:05:12Z"},
+        "customers": {"rows": 88213, "size_estimate": 13705216, "seq_scan": 12, "idx_scan": 1200443, "n_dead_tup": 211, "last_autovacuum": "2026-09-13T08:40:01Z"}
+      }
+    },
+    "tableSize": {
+      "arguments": {"schema": "shop", "table": "orders"},
+      "result": {"table": "shop.orders", "kind": "table", "main_size": 186300416, "size": 192848896, "indexes_size": 60489728, "total_size": 253338624, "indexes": {"orders_pkey": {"index_size": 27025408}, "orders_customer_id_idx": {"index_size": 33464320}}}
+    },
+    "listTableSizes": {
+      "arguments": {"schema": "shop"},
+      "result": {
+        "orders": {"kind": "table", "size": 192848896, "indexes_size": 60489728, "total_size": 253338624},
+        "customers": {"kind": "table", "size": 14032896, "indexes_size": 5226496, "total_size": 19259392}
+      }
+    },
+    "listFunctions": {
+      "arguments": {"schema": "shop"},
+      "result": {
+        "order_total(bigint)": {"description": "Sum of the order's line items.", "kind": "function", "language": "sql", "return_type": "numeric", "arguments": "p_order_id bigint", "volatility": "stable", "security_definer": false, "is_strict": true}
+      }
+    },
+    "functionDetails": {
+      "arguments": {"schema": "shop", "function": "order_total"},
+      "result": {
+        "order_total(bigint)": {"language": "sql", "return_type": "numeric", "source": "SELECT sum(quantity * unit_price) FROM shop.order_items WHERE order_id = p_order_id", "definition": "CREATE OR REPLACE FUNCTION shop.order_total(p_order_id bigint) RETURNS numeric LANGUAGE sql STABLE STRICT AS $function$ ... $function$", "roles": {"app_rw": ["EXECUTE"]}}
+      }
+    },
+    "searchFunctions": {
+      "arguments": {"web_search": "total"},
+      "result": {
+        "shop.order_total(bigint)": {"description": "Sum of the order's line items.", "kind": "function", "language": "sql", "return_type": "numeric"}
+      }
+    },
+    "listEnums": {
+      "arguments": {"schema": "shop"},
+      "result": {"payment_method": {"description": "How an order was paid.", "values": ["card", "transfer", "voucher"]}}
+    },
+    "enumDetails": {
+      "arguments": {"schema": "shop", "enum": "payment_method"},
+      "result": {"payment_method": {"description": "How an order was paid.", "values": ["card", "transfer", "voucher"], "columns": ["shop.orders.payment_method"]}}
+    },
+    "searchEnums": {
+      "arguments": {"web_search": "voucher"},
+      "result": {"payment_method": {"description": "How an order was paid.", "values": ["card", "transfer", "voucher"]}}
+    },
+    "listTypes": {
+      "arguments": {"schema": "shop"},
+      "result": {
+        "money_amount": {"kind": "domain", "description": "Non-negative amount with two decimals.", "base_type": "numeric(12,2)", "not_null": true, "default": null, "constraints": ["CHECK (VALUE >= 0)"]},
+        "address": {"kind": "composite", "description": null, "attributes": {"street": "text", "city": "text", "postcode": "text"}}
+      }
+    },
+    "typeDetails": {
+      "arguments": {"schema": "shop", "type": "money_amount"},
+      "result": {"money_amount": {"kind": "domain", "base_type": "numeric(12,2)", "not_null": true, "constraints": ["CHECK (VALUE >= 0)"], "columns": ["shop.order_items.unit_price"]}}
+    },
+    "listRoles": {
+      "arguments": {"pattern": "app"},
+      "result": {
+        "app_rw": {"kind": "login", "description": "Application read-write role.", "superuser": false, "inherit": true, "create_role": false, "create_db": false, "replication": false, "bypass_rls": false, "connection_limit": 200, "valid_until": null, "member_of": ["app_base"]}
+      }
+    },
+    "listForeignTables": {
+      "arguments": {"schema": "shop"},
+      "result": {"legacy_invoices": {"description": "Invoices still held in the old ERP.", "server": "erp", "fdw": "postgres_fdw", "options": ["schema_name=billing", "table_name=invoices"], "columns": ["id", "order_ref", "amount"]}}
+    },
+    "listForeignServers": {
+      "arguments": {},
+      "result": {"erp": {"fdw": "postgres_fdw", "owner": "migrator", "type": null, "version": null, "options": ["host=erp.internal.example", "port=5432", "dbname=erp"]}}
+    },
+    "listTablespaces": {
+      "arguments": {},
+      "result": {
+        "pg_default": {"owner": "postgres", "location": "(default)", "options": null, "description": ""},
+        "fast_nvme": {"owner": "postgres", "location": "/mnt/nvme/pg", "options": ["random_page_cost=1.1"], "description": "Hot partitions."}
+      }
+    },
+    "listCollations": {
+      "arguments": {"schema": "shop"},
+      "result": {"case_insensitive": {"provider": "icu", "collate": "und-u-ks-level2", "ctype": "und-u-ks-level2", "deterministic": false, "description": "Case-insensitive comparisons for emails."}}
+    },
+    "listEventTriggers": {
+      "arguments": {},
+      "result": {"audit_ddl": {"event": "ddl_command_end", "function": "audit.log_ddl()", "enabled": "origin", "tags": null, "owner": "postgres", "description": "Records every DDL statement."}}
+    },
+    "listPublications": {
+      "arguments": {},
+      "result": {"shop_cdc": {"owner": "migrator", "all_tables": false, "insert": true, "update": true, "delete": true, "truncate": false, "table_count": 2, "tables": ["shop.customers", "shop.orders"], "tables_truncated": false, "schemas": []}}
+    },
+    "listSubscriptions": {
+      "arguments": {},
+      "result": {"from_erp": {"owner": "migrator", "enabled": true, "publications": ["erp_invoices"], "slot_name": "from_erp", "synchronous_commit": "off", "binary": false, "stream": "parallel", "two_phase": "disabled", "disable_on_error": false, "origin": "any", "run_as_owner": false, "failover": false}}
+    },
+    "diskUsage": {
+      "arguments": {},
+      "result": {
+        "wal": {"files": 42, "bytes": 704643072},
+        "archive_status": {"archive_mode": "on", "ready": 0, "done": 3},
+        "temp_files": {"files": 1, "bytes": 268435456},
+        "log_files": {"logging_collector": true, "directory": "log", "files": 14, "bytes": 91231002},
+        "tablespaces": {"pg_default": {"location": "(default)", "bytes": 38402912256}},
+        "databases": {"shop": {"bytes": 36120010752}, "reports": {"bytes": 2282901504}},
+        "note": "Free space on the filesystem is not exposed by PostgreSQL and is not reported."
+      }
+    },
+    "columnHistogram": {
+      "arguments": {"schema": "shop", "table": "orders", "column": "created_at"},
+      "result": {
+        "schema": "shop", "table": "orders", "column": "created_at", "inherited": false,
+        "null_frac": 0.0, "avg_width": 8, "n_distinct": -0.98, "physical_order_correlation": 0.997,
+        "most_common_vals": null, "most_common_freqs": null,
+        "histogram_bounds": ["2025-09-15 00:02:11+00", "2026-01-04 11:40:09+00", "2026-05-20 08:12:55+00", "2026-09-14 23:58:40+00"],
+        "histogram_buckets": 3, "statistics_target": {"default": 100, "effective": 100}, "note": null
+      }
+    },
+    "checkRoleAccess": {
+      "arguments": {"grantee": "reporting", "schema": "shop", "object": "orders"},
+      "result": {
+        "role": {"name": "reporting", "exists": true, "can_login": true, "superuser": false, "inherits": true, "bypass_rls": false, "member_of": []},
+        "object": {"schema": "shop", "name": "orders", "kind": "table", "owner": "migrator", "is_owner": false},
+        "database_access": {"connect": true},
+        "schema_access": {"usage": true, "create": false},
+        "privileges": {"SELECT": true, "INSERT": false, "UPDATE": false, "DELETE": false},
+        "columns": {},
+        "row_level_security": {"enabled": false, "forced": false, "applies_to_role": false, "policies": []},
+        "overloads": null,
+        "note": "SELECT is granted directly, and row-level security is not enabled, so every row is readable."
+      }
+    },
+    "subscriptionStats": {
+      "arguments": {},
+      "result": {
+        "from_erp": {"apply_error_count": 0, "sync_error_count": 1, "stats_reset": null, "workers": [{"worker_type": "apply", "pid": 51102, "leader_pid": null, "relation": null, "msg_age_s": 0.4, "latest_end_time": "2026-09-15T10:02:11Z"}], "tables": {"total": 3, "ready": 3, "not_ready": []}}
+      }
+    },
+    "listLanguages": {
+      "arguments": {},
+      "result": {"plpgsql": {"owner": "postgres", "trusted": true, "procedural": true, "handler": "plpgsql_call_handler", "description": "PL/pgSQL procedural language"}}
+    },
+    "listExtendedStatistics": {
+      "arguments": {"schema": "shop"},
+      "result": {"orders_city_postcode": {"table": "shop.customers", "columns": ["city", "postcode"], "kinds": ["ndistinct", "dependencies"], "built": true, "built_kinds": ["ndistinct", "dependencies"], "built_for_inherited": false, "description": null}}
+    },
+    "listOperators": {
+      "arguments": {"schema": "shop"},
+      "result": {"=(money_amount,money_amount)": {"left_type": "money_amount", "right_type": "money_amount", "result_type": "boolean", "function": "shop.money_amount_eq", "description": null}}
+    },
+    "listOperatorClasses": {
+      "arguments": {"schema": "shop"},
+      "result": {"money_amount_ops (btree)": {"access_method": "btree", "input_type": "money_amount", "default": true, "description": null}}
+    },
+    "listAccessMethods": {
+      "arguments": {},
+      "result": {"btree": {"type": "index", "handler": "bthandler", "description": "b-tree index access method"}, "heap": {"type": "table", "handler": "heap_tableam_handler", "description": "heap table access method"}}
+    },
+    "listCasts": {
+      "arguments": {},
+      "result": {"money_amount->numeric": {"source": "money_amount", "target": "numeric", "context": "implicit", "method": "binary", "function": null}}
+    },
+    "listTextSearchConfigs": {
+      "arguments": {"schema": "shop"},
+      "result": {"product_search": {"parser": "pg_catalog.default", "description": "English stemming with unaccent.", "mappings": {"asciiword": ["unaccent", "english_stem"]}}}
+    },
+    "listSequences": {
+      "arguments": {"schema": "shop"},
+      "result": {"invoice_no_seq": {"data_type": "bigint", "start": 100000, "increment": 1, "min": 1, "max": 9223372036854775807, "cycle": false, "owned_by": "shop.orders.invoice_no", "last_value": 482211}}
+    },
+    "listExtensions": {
+      "arguments": {},
+      "result": {"pg_stat_statements": {"version": "1.11", "schema": "extensions", "relocatable": true, "description": "track planning and execution statistics of all SQL statements executed"}, "hypopg": {"version": "1.4.1", "schema": "extensions", "relocatable": true, "description": "Hypothetical indexes for PostgreSQL"}}
+    },
+    "databaseSize": {
+      "arguments": {"connection": "shop_prod"},
+      "result": {"database": "shop", "size": 36120010752}
+    },
+    "serverSettings": {
+      "arguments": {"pattern": "work_mem"},
+      "result": {
+        "Resource Usage / Memory": {
+          "work_mem": {"setting": "32768", "unit": "kB", "short_desc": "Sets the maximum memory to be used for query workspaces.", "context": "user", "vartype": "integer", "source": "configuration file", "pending_restart": false},
+          "maintenance_work_mem": {"setting": "524288", "unit": "kB", "short_desc": "Sets the maximum memory to be used for maintenance operations.", "context": "user", "vartype": "integer", "source": "configuration file", "pending_restart": false}
+        }
+      }
+    },
+    "currentActivity": {
+      "arguments": {"min_duration_s": 5},
+      "result": {
+        "51877": {"database": "shop", "user": "app_rw", "application_name": "checkout-api", "client_addr": "10.0.4.17", "backend_type": "client backend", "state": "active", "wait_event_type": "Lock", "wait_event": "transactionid", "query_duration_s": 12.402, "xact_duration_s": 12.44, "query_id": "-6203381990422871044", "query": "UPDATE shop.orders SET status = $1 WHERE id = $2"}
+      }
+    },
+    "currentLocks": {
+      "arguments": {},
+      "result": {
+        "locks": [
+          {"pid": 51877, "chain_depth": 1, "lock_type": "transactionid", "relation": null, "mode": "ShareLock", "granted": false, "wait_start": "2026-09-15T10:04:20Z", "blocked_by": [51702], "user": "app_rw", "application_name": "checkout-api", "query": "UPDATE shop.orders SET status = $1 WHERE id = $2"},
+          {"pid": 51702, "chain_depth": 0, "lock_type": "transactionid", "relation": null, "mode": "ExclusiveLock", "granted": true, "wait_start": null, "blocked_by": [], "user": "batch", "application_name": "nightly-reconcile", "query": "COMMIT"}
+        ]
+      }
+    },
+    "replicationSlots": {
+      "arguments": {},
+      "result": {"from_erp_slot": {"slot_type": "logical", "plugin": "pgoutput", "database": "shop", "temporary": false, "active": false, "active_pid": null, "inactive_since": "2026-09-14T02:10:00Z", "wal_status": "extended", "retained_wal_bytes": 9123840512, "safe_wal_size": 1024000000, "conflicting": false, "invalidation_reason": null}}
+    },
+    "databaseStats": {
+      "arguments": {},
+      "result": {"shop": {"numbackends": 84, "xact_commit": 902211408, "xact_rollback": 120442, "blks_read": 81220331, "blks_hit": 99201844221, "temp_files": 211, "temp_bytes": 90211332096, "deadlocks": 3, "checksum_failures": null, "stats_reset": "2026-08-01T00:00:00Z"}}
+    },
+    "statementStats": {
+      "arguments": {"limit": 2},
+      "result": {
+        "statements": [
+          {"query_id": "-6203381990422871044", "query": "UPDATE shop.orders SET status = $1 WHERE id = $2", "calls": 18244102, "total_exec_ms": 9120441.2, "mean_exec_ms": 0.5, "rows": 18244102, "shared_blks_hit": 91220103, "shared_blks_read": 12033, "user": "app_rw", "database": "shop"},
+          {"query_id": "3301928477102934411", "query": "SELECT id, status FROM shop.orders WHERE customer_id = $1 ORDER BY created_at DESC LIMIT $2", "calls": 4410233, "total_exec_ms": 3120982.7, "mean_exec_ms": 0.71, "rows": 88204660, "shared_blks_hit": 402211093, "shared_blks_read": 440112, "user": "app_rw", "database": "shop"}
+        ],
+        "info": {"dealloc": 0, "stats_reset": "2026-08-01T00:00:00Z"}
+      }
+    },
+    "wraparoundStatus": {
+      "arguments": {"limit": 1},
+      "result": {
+        "databases": {"shop": {"xid_age": 182004412, "xid_percent_of_freeze_max_age": 91.0, "xid_percent_of_wraparound_limit": 8.5, "mxid_age": 1204, "mxid_percent_of_freeze_max_age": 0.0}},
+        "limits": {"autovacuum_freeze_max_age": 200000000, "wraparound_limit": 2144483647, "wraparound_warn_limit": 2104483647},
+        "tables": [{"schema": "shop", "name": "events_2025_09", "kind": "table", "toast_for": null, "xid_age": 182004410, "freeze_max_age": 200000000, "size": 1182990336, "last_autovacuum": "2026-06-01T04:12:00Z"}]
+      }
+    },
+    "progressStats": {
+      "arguments": {},
+      "result": {
+        "vacuum": [{"pid": 60221, "database": "shop", "relation": "shop.orders", "phase": "scanning heap", "heap_blks_total": 23000, "heap_blks_scanned": 11040, "scanned_percent": 48.0, "elapsed_s": 94.2}],
+        "analyze": [], "create_index": [], "cluster": [], "copy": [], "basebackup": []
+      }
+    },
+    "ioStats": {
+      "arguments": {"backend_type": "client backend", "object": "relation", "context": "normal"},
+      "result": {
+        "io": [{"backend_type": "client backend", "object": "relation", "context": "normal", "reads": 8120331, "read_time_ms": null, "writes": 12044, "extends": 30211, "hits": 99012003321, "evictions": 40221, "fsyncs": 0, "hit_percent": 99.99, "stats_reset": "2026-08-01T00:00:00Z"}]
+      }
+    },
+    "checkpointStats": {
+      "arguments": {},
+      "result": {
+        "source": "pg_stat_checkpointer",
+        "checkpointer": {"checkpoints_timed": 1402, "checkpoints_requested": 38, "timed_percent": 97.4, "write_time_ms": 88203311, "sync_time_ms": 120442, "buffers_written": 20331022, "checkpoints_per_hour": 12.1},
+        "bgwriter": {"buffers_clean": 402211, "maxwritten_clean": 12, "buffers_alloc": 88201122},
+        "backend_io": {"writes": 12044, "fsyncs": 0},
+        "wal": {"wal_records": 902211044, "wal_fpi": 20331022, "wal_bytes": 1802201133056, "wal_buffers_full": 44},
+        "settings": {"checkpoint_timeout": "5min", "max_wal_size": "8GB"}
+      }
+    },
+    "tableIOStats": {
+      "arguments": {"schema": "shop", "limit": 1},
+      "result": {"shop.orders": {"heap_blks_read": 402211, "heap_blks_hit": 1802201133, "heap_hit_percent": 99.98, "idx_blks_read": 12033, "idx_blks_hit": 902211044, "idx_hit_percent": 99.99, "seq_scan": 41, "idx_scan": 9832117}}
+    },
+    "hostCapacity": {
+      "arguments": {"connection": "shop_prod"},
+      "result": {
+        "host": {"ram_mb": 65536, "ram_bytes": 68719476736, "vcpus": 16, "source": "config file"},
+        "server": {"version": "18.6", "database": "shop"},
+        "settings": {"shared_buffers": {"setting": "2097152", "unit": "8kB", "bytes": 17179869184}, "work_mem": {"setting": "32768", "unit": "kB", "bytes": 33554432}, "max_connections": {"setting": "300"}},
+        "derived": {"shared_buffers_percent_of_ram": 25.0, "work_mem_times_max_connections_percent_of_ram": 14.6, "max_parallel_workers_per_vcpu": 0.5}
+      }
+    },
+    "duplicateIndexes": {
+      "arguments": {"schema": "shop"},
+      "result": {
+        "identical": [],
+        "redundant": [{"table": "shop.orders", "index": "orders_customer_id_idx", "definition": "CREATE INDEX orders_customer_id_idx ON shop.orders USING btree (customer_id)", "size": 33464320, "idx_scan": 712113, "covered_by": "orders_customer_created_idx", "covered_by_definition": "CREATE INDEX orders_customer_created_idx ON shop.orders USING btree (customer_id, created_at)", "reason": "a leading prefix of a wider index"}]
+      }
+    },
+    "tableBloat": {
+      "arguments": {"schema": "shop", "table": "orders"},
+      "result": {"method": "pgstattuple_approx", "exact": false, "table_len": 192848896, "scanned_percent": 3.1, "approx_tuple_count": 1204102, "dead_tuple_count": 18344, "dead_tuple_percent": 1.4, "approx_free_space": 12033024, "approx_free_percent": 6.2}
+    },
+    "indexBloat": {
+      "arguments": {"schema": "shop", "index": "orders_pkey"},
+      "result": {"schema": "shop", "index": "orders_pkey", "table": "orders", "access_method": "btree", "index_size": 27025408, "idx_scan": 9120004, "tree_level": 2, "leaf_pages": 3280, "internal_pages": 18, "empty_pages": 0, "deleted_pages": 12, "avg_leaf_density": 88.4, "leaf_fragmentation": 3.2}
+    },
+    "checkKey": {
+      "arguments": {"schema": "shop", "table": "orders", "values": [482211]},
+      "result": {"exists": true}
+    },
+    "explainQuery": {
+      "arguments": {"sql": "SELECT id, status FROM shop.orders WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 20", "params": [88213]},
+      "result": {
+        "plan": [{"Plan": {"Node Type": "Limit", "Startup Cost": 0.43, "Total Cost": 72.18, "Plan Rows": 20, "Plans": [{"Node Type": "Index Scan", "Index Name": "orders_customer_created_idx", "Relation Name": "orders", "Index Cond": "(customer_id = '88213'::bigint)", "Plan Rows": 41}]}, "Settings": {"work_mem": "32MB"}}],
+        "generic": false, "analyzed": false, "read_only": true, "timeout_ms": 5000, "source": "sql",
+        "sql": "SELECT id, status FROM shop.orders WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 20"
+      }
+    },
+    "verifyTopology": {
+      "arguments": {},
+      "result": {
+        "connections": [
+          {"connection": "shop_prod", "role": "primary", "system_identifier": "7412203311020332211", "database": "shop", "server_addr": "10.0.2.10", "server_port": 5432, "server_version": "18.6"},
+          {"connection": "shop_replica_1", "role": "replica", "system_identifier": "7412203311020332211", "database": "shop", "server_addr": "10.0.2.21", "server_port": 5432, "server_version": "18.6"}
+        ],
+        "findings": []
+      }
+    },
+    "bufferCacheSummary": {
+      "arguments": {},
+      "result": {"buffers_used": 2011204, "buffers_unused": 85948, "buffers_dirty": 1204, "buffers_pinned": 12, "usagecount_avg": 3.1, "shared_buffers_blocks": 2097152, "block_size_bytes": 8192, "shared_buffers_bytes": 17179869184, "usage_counts": [{"usage_count": 5, "buffers": 1102233, "dirty": 402, "pinned": 4}]}
+    },
+    "bufferCacheContents": {
+      "arguments": {"limit": 2},
+      "result": {
+        "shop.orders": {"kind": "table", "buffers": 402211, "percent_of_shared_buffers": 19.2, "percent_of_relation": 17.1, "usage_count_avg": 4.2},
+        "shop.orders_pkey": {"kind": "index", "buffers": 3300, "percent_of_shared_buffers": 0.2, "percent_of_relation": 100.0, "usage_count_avg": 5.0}
+      }
+    },
+    "listTopology": {
+      "arguments": {},
+      "result": {
+        "instances": [{"name": "pg-shop-01", "source": "declared", "connections": ["shop_prod", "reports_prod"]}],
+        "replication_groups": [{"name": "shop-ha", "connections": ["shop_prod", "shop_replica_1"]}],
+        "groups": [{"name": "fleet", "connections": ["shop_prod", "shop_replica_1", "reports_prod"]}],
+        "unlabelled": []
+      }
+    },
+    "listConnections": {
+      "arguments": {},
+      "result": {
+        "connections": [
+          {"name": "shop_prod", "default": true, "service": "shop_prod_ro", "instance": "pg-shop-01", "replication_group": "shop-ha", "group": ["fleet"]},
+          {"name": "shop_replica_1", "default": false, "host": "10.0.2.21", "port": "5432", "dbname": "shop", "user": "mcp_readonly", "replication_group": "shop-ha", "group": ["fleet"]},
+          {"name": "reports_prod", "default": false, "service": "reports_ro", "instance": "pg-shop-01", "group": ["fleet"]}
+        ]
+      }
+    }
+  },
+  "prompts": {
+    "diagnose-slow-query": {"arguments": {"query_id": "3301928477102934411"}},
+    "triage-lock-contention": {"arguments": {"connection": "shop_prod"}},
+    "diagnose-deadlock": {"arguments": {"deadlock_log": "ERROR:  deadlock detected\nDETAIL:  Process 51877 waits for ShareLock on transaction 9021144; blocked by process 51702.\nProcess 51702 waits for ShareLock on transaction 9021139; blocked by process 51877.", "connection": "shop_prod"}},
+    "triage-active-sessions": {"arguments": {"connection": "shop_prod"}},
+    "bloat-and-vacuum-review": {"arguments": {"schema": "shop"}},
+    "triage-disk-space": {"arguments": {"connection": "shop_prod"}},
+    "buffer-cache-review": {"arguments": {"connection": "shop_prod"}},
+    "capacity-check": {"arguments": {"connection": "shop_prod"}},
+    "replication-slot-review": {"arguments": {"connection": "shop_prod"}},
+    "plan-schema-change": {"arguments": {"change": "ALTER TABLE shop.orders ADD COLUMN invoice_no bigint", "schema": "shop", "table": "orders"}},
+    "check-role-access": {"arguments": {"role": "reporting", "object": "shop.orders", "privilege": "SELECT"}},
+    "explain-and-fix": {"arguments": {"sql": "SELECT id, status FROM shop.orders WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 20", "params": "[88213]", "schema": "shop"}}
+  }
+}

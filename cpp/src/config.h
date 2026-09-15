@@ -691,4 +691,118 @@ private:
   }
 };
 
+
+// Limits pg_licht applies to itself, from budgets.ini.
+//
+// Today that is one budget: what an EXPLAIN ANALYZE under caller-supplied
+// planner settings may use, as shares of the host capacity declared for the
+// connection (see analyze_budget in server.h). The defaults below are the
+// ratios 4.3.0 shipped with; the file exists so an operator can move them
+// without a rebuild.
+//
+//   [analyze]
+//   memory_percent   = 10   ; worst-case plan memory, % of host_ram_mb
+//   vcpus_per_worker = 4    ; one parallel worker per this many host_vcpus
+//
+// Strict, like the connections file: an unknown section or key, or a value out
+// of range, fails at startup. A typo that silently kept the default would leave
+// the operator believing a limit is in force that is not.
+struct Budgets {
+  int analyze_memory_percent = 10;
+  int analyze_vcpus_per_worker = 4;
+  std::string source = "built-in defaults";
+
+  // Which file to read, or "" for the built-in defaults. Pure, so the order is
+  // testable without touching the environment:
+  //   1. $PG_LICHT_BUDGETS, which must then exist
+  //   2. budgets.ini beside the connections file in use
+  //   3. ~/.config/pg_licht/budgets.ini
+  // 2 and 3 are honoured only when the file exists.
+  static std::string resolve_path(const std::string& env_path,
+                                  const std::string& config_path,
+                                  const std::string& home) {
+    auto exists = [](const std::string& p) {
+      struct stat st {};
+      return !p.empty() && ::stat(p.c_str(), &st) == 0;
+    };
+    if (!env_path.empty()) return env_path;
+    if (!config_path.empty()) {
+      const auto slash = config_path.rfind('/');
+      const std::string beside =
+          (slash == std::string::npos ? std::string(".") : config_path.substr(0, slash)) +
+          "/budgets.ini";
+      if (exists(beside)) return beside;
+    }
+    if (!home.empty()) {
+      const std::string def = home + "/.config/pg_licht/budgets.ini";
+      if (exists(def)) return def;
+    }
+    return "";
+  }
+
+  static Budgets load(const std::string& path) {
+    Budgets b;
+    if (path.empty()) return b;
+
+    struct stat st {};
+    if (::stat(path.c_str(), &st) != 0)
+      throw std::runtime_error("cannot read budgets file: " + path);
+    // Holds no credentials, so it may be readable. It must not be WRITABLE by
+    // anyone but its owner: these are limits, and a file another user can
+    // edit is a limit another user can raise.
+    if (st.st_mode & 0022)
+      throw std::runtime_error(
+        "budgets file " + path + " is group/world writable, so another user "
+        "could raise its limits. Run: chmod go-w " + path);
+
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("cannot open budgets file: " + path);
+
+    std::string line, section;
+    size_t lineno = 0;
+    while (std::getline(in, line)) {
+      lineno++;
+      const std::string where = path + ":" + std::to_string(lineno);
+      // Comments may follow a value, as in the example above.
+      const auto semi = line.find_first_of(";#");
+      std::string t = detail::trim(semi == std::string::npos ? line : line.substr(0, semi));
+      if (t.empty()) continue;
+      if (t[0] == '[') {
+        const auto close = t.find(']');
+        if (close == std::string::npos)
+          throw std::runtime_error(where + ": unterminated section header");
+        section = detail::trim(t.substr(1, close - 1));
+        if (section != "analyze")
+          throw std::runtime_error(where + ": unknown section [" + section +
+                                   "]; budgets.ini has only [analyze]");
+        continue;
+      }
+      const auto eq = t.find('=');
+      if (eq == std::string::npos)
+        throw std::runtime_error(where + ": expected key = value");
+      if (section.empty())
+        throw std::runtime_error(where + ": key outside a section; put it under [analyze]");
+      const std::string key = detail::trim(t.substr(0, eq));
+      const std::string val = detail::trim(t.substr(eq + 1));
+      if (key == "memory_percent") {
+        const long long v = detail::positive_int(val, where + " memory_percent");
+        if (v > 100)
+          throw std::runtime_error(where + " memory_percent: " + val +
+                                   " is more than the whole of host_ram_mb; 1 to 100");
+        b.analyze_memory_percent = static_cast<int>(v);
+      } else if (key == "vcpus_per_worker") {
+        const long long v = detail::positive_int(val, where + " vcpus_per_worker");
+        if (v > 1024)
+          throw std::runtime_error(where + " vcpus_per_worker: " + val + " is out of range; 1 to 1024");
+        b.analyze_vcpus_per_worker = static_cast<int>(v);
+      } else {
+        throw std::runtime_error(where + ": unknown key \"" + key + "\" in [analyze]; "
+                                 "expected memory_percent or vcpus_per_worker");
+      }
+    }
+    b.source = path;
+    return b;
+  }
+};
+
 }  // namespace pglicht

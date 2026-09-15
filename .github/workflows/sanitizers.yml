@@ -45,6 +45,16 @@ jobs:
             sanitizer: ADDRESS_UNDEFINED
           - config: thread
             sanitizer: THREAD
+          # A second front end: clang's diagnostics differ from g++'s, and
+          # SafetyFlags.cmake builds with -Werror, so a warning only clang
+          # raises fails here. It builds its own libpqxx too, and caches it
+          # separately: its first run failed at link because clang mangles
+          # constrained templates differently from the g++-built library it was
+          # handed. Not on the critical path. Build-only: no downstream job
+          # consumes its binary, so it is not uploaded.
+          - config: plain-clang
+            sanitizer: NONE
+            cxx: clang++
 
     steps:
       - uses: actions/checkout@v4
@@ -67,15 +77,20 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/pqxx
-          key: pqxx-${{ env.PQXX_VERSION }}-${{ runner.os }}-${{ runner.arch }}-libpq-${{ env.LIBPQ_VERSION }}
+          # The compiler is part of the key: clang and g++ mangle constrained
+          # templates differently, so clang code cannot link a g++-built
+          # libpqxx (undefined pqxx::internal::to_string_float<...> at link).
+          key: pqxx-${{ env.PQXX_VERSION }}-${{ runner.os }}-${{ runner.arch }}-libpq-${{ env.LIBPQ_VERSION }}-${{ matrix.cxx || 'gcc' }}
 
       - name: Build libpqxx
         if: steps.pqxx.outputs.cache-hit != 'true'
         run: |
           curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
+          # Built by the same compiler as pg_licht, for the reason in the key.
           cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON \
-            -DCMAKE_INSTALL_PREFIX="$HOME/pqxx"
+            -DCMAKE_INSTALL_PREFIX="$HOME/pqxx" \
+            ${{ matrix.cxx && format('-DCMAKE_CXX_COMPILER={0}', matrix.cxx) || '' }}
           cmake --build /tmp/libpqxx-build
           cmake --install /tmp/libpqxx-build
 
@@ -84,9 +99,12 @@ jobs:
           # lib64 as well as lib: CMake picks the directory, not this workflow.
           echo "PKG_CONFIG_PATH=$HOME/pqxx/lib/pkgconfig:$HOME/pqxx/lib64/pkgconfig" >> "$GITHUB_ENV"
           export PKG_CONFIG_PATH="$HOME/pqxx/lib/pkgconfig:$HOME/pqxx/lib64/pkgconfig"
+          # Only plain-clang names a compiler; the others keep CMake's default.
           cmake -S cpp -B cpp/build \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DPGLICHT_SANITIZER=${{ matrix.sanitizer }}
+            -DPGLICHT_SANITIZER=${{ matrix.sanitizer }} \
+            ${{ matrix.cxx && format('-DCMAKE_CXX_COMPILER={0}', matrix.cxx) || '' }}
+          grep -E '^CMAKE_CXX_COMPILER:' cpp/build/CMakeCache.txt
           cmake --build cpp/build --target pg_licht_mcp_test
 
       # Neither needs a database nor varies by PostgreSQL version, so they run
@@ -95,14 +113,15 @@ jobs:
       # two environment switches do -- end to end against the real binary,
       # because both switches are read once per process and cannot be toggled
       # from inside the gtest suite.
-      - name: Lint the man page and check the response-shape contract
-        if: matrix.config == 'plain'
+      - name: Lint the man page, check the response-shape contract, build the site
+        if: matrix.sanitizer == 'NONE'
         working-directory: cpp/build
         run: |
           cmake --build . --target pg_licht_mcp
-          ctest -R "manpage_lint|protocol_compat" --output-on-failure
+          ctest -R "manpage_lint|protocol_compat|llms_txt|reference" --output-on-failure
 
       - uses: actions/upload-artifact@v4
+        if: matrix.config != 'plain-clang'
         with:
           name: test-binary-${{ matrix.config }}
           path: cpp/build/pg_licht_mcp_test
