@@ -7586,6 +7586,65 @@ json rpc_payload(const json& response) {
 
 }  // namespace
 
+// roleDependencies takes an argument called `role`, and dispatch read every
+// `role` as the sweep filter: it was validated against "primary"/"replica" and
+// refused before the tool saw it, so the tool could not be called AT ALL over
+// the protocol -- for any value -- while tools/list advertised the argument as
+// required. Found by driving every tool over a real MCP session; invisible to
+// the suite because every other test reaches the query method directly.
+TEST_F(PostgresMCPServerTest, AToolsOwnRoleArgumentReachesIt) {
+  const std::string absent = "no_such_role_" + std::to_string(getpid());
+  json r = rpc_call(*srv, "roleDependencies", {{"role", absent}});
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  json p = rpc_payload(r);
+  EXPECT_EQ(p["role"], absent) << p.dump(2);
+  EXPECT_FALSE(p["exists"].get<bool>());
+  EXPECT_EQ(p["total"].get<int>(), 0);
+
+  // And the published schema still describes the tool's argument rather than
+  // the sweep filter, which is the half that made the conflict invisible.
+  for (const auto& t : srv->call_tools_list()) {
+    if (t.value("name", "") != "roleDependencies") continue;
+    const auto& props = t["inputSchema"]["properties"];
+    ASSERT_TRUE(props.contains("role")) << t.dump(2);
+    EXPECT_EQ(props["role"]["description"], "role name to ask about");
+  }
+}
+
+// The preventive half: every tool, called the way a client calls it, with the
+// arguments the reference examples already carry. Those are validated against
+// each tool's input schema when the reference is generated, so this costs
+// almost nothing and would have caught the defect above on the day it shipped.
+// A tool may legitimately answer with an error here -- the examples name a
+// fictional database -- but never with -32602, which means the server refused
+// the arguments rather than the objects.
+TEST_F(PostgresMCPServerTest, EveryToolAcceptsItsOwnDocumentedArguments) {
+  std::ifstream in(PGLICHT_REFERENCE_EXAMPLES);
+  ASSERT_TRUE(in) << PGLICHT_REFERENCE_EXAMPLES;
+  json examples = json::parse(in);
+  ASSERT_FALSE(examples["tools"].empty());
+
+  size_t called = 0;
+  for (const auto& t : srv->call_tools_list()) {
+    const std::string name = t.value("name", "");
+    auto ex = examples["tools"].find(name);
+    if (ex == examples["tools"].end()) continue;
+    json args = ex->value("arguments", json::object());
+    // The target selectors name a connection this registry does not hold;
+    // this test is about each tool's OWN arguments.
+    for (const char* k : {"connection", "instance", "replication_group", "group"})
+      args.erase(k);
+    json r = rpc_call(*srv, name, args);
+    called++;
+    if (r.contains("error")) {
+      EXPECT_NE(r["error"].value("code", 0), -32602)
+          << name << " refused its own documented arguments: " << r["error"].dump();
+    }
+  }
+  EXPECT_EQ(called, srv->call_tools_list().size())
+      << "a tool has no example in tools/reference/examples.json";
+}
+
 TEST_F(TopologyFixture, ASingleConnectionCallCarriesNoSweepEnvelope) {
   // The whole release rests on this: naming one connection must behave exactly
   // as it did in 3.1.1, envelope and all.
