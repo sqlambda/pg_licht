@@ -2072,7 +2072,13 @@ private:
                             "label. Members that would answer identically for "
                             "this tool are collapsed and reported under "
                             "'skipped'"}};
-          if (sc.per_server)
+          // Never over a property the tool declares itself. roleDependencies
+          // takes a `role` of its own -- the role to ask about -- and writing
+          // the sweep filter over it would publish a schema describing an
+          // argument the tool does not have. One rule, enforced here and in
+          // dispatch: a tool's own argument wins, and such a tool cannot be
+          // narrowed by role.
+          if (sc.per_server && !tool["inputSchema"]["properties"].contains("role"))
             tool["inputSchema"]["properties"]["role"] = json{
               {"type", "string"},
               {"description", "with replication_group or group, sweep only "
@@ -2121,6 +2127,19 @@ private:
   }
 
   // explainQuery aside, any tool that touches a database can be swept.
+  // Whether a tool declares an argument called `role` of its own, which makes
+  // that name the tool's rather than the sweep filter's. Read off the tool's
+  // own input schema so the two places that care cannot drift apart.
+  static bool tool_declares_role(const std::string& name) {
+    for (const auto& d : tool_defs()) {
+      if (name != d.name) continue;
+      const json schema = d.input_schema();
+      return schema.contains("properties") && schema["properties"].is_object() &&
+             schema["properties"].contains("role");
+    }
+    return false;
+  }
+
   static bool tool_name_is_sweepable(const std::string& name) {
     return name != "explainQuery" && name != "evaluateIndex";
   }
@@ -8767,7 +8786,16 @@ private:
 	const std::string want_instance = str_arg("instance");
 	const std::string want_repl     = str_arg("replication_group");
 	const std::string want_group    = str_arg("group");
-	const std::string want_role     = str_arg("role");
+	// `role` is the sweep filter for every tool that does not declare an
+	// argument of its own by that name -- and roleDependencies does: the
+	// role to ask about. Read as the filter it was validated against
+	// "primary"/"replica" and refused before the tool ever saw it, so that
+	// tool could not be called at all over the protocol, for any value,
+	// while its published schema advertised the argument as required.
+	// A tool that owns `role` therefore cannot be narrowed by role; the
+	// schema generator applies the same rule from the other side.
+	const std::string want_role     = tool_declares_role(tool_name)
+					    ? std::string{} : str_arg("role");
 
 	std::vector<std::string> given;
 	if (!want_conn.empty())     given.push_back("connection");

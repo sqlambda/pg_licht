@@ -200,6 +200,12 @@ set to
 or
 .Ql replica
 narrows a sweep to one side.
+An operation that takes a
+.Va role
+argument of its own \(em
+.Ic roleDependencies ,
+where it names the role to ask about \(em keeps it: the tool's argument wins,
+and such an operation cannot be narrowed by role.
 .Pp
 A sweep is sequential \(em the server is a single-threaded loop \(em so its
 width is wall-clock time.

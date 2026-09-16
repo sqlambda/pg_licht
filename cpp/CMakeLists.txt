@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pg_licht_mcp VERSION 4.3.1 LANGUAGES CXX)
+project(pg_licht_mcp VERSION 4.3.2 LANGUAGES CXX)
 
 # Standard bin/ and share/man/ layout, so `cmake --install` produces a tree that
 # can be dropped onto a prefix as-is: the release tarballs are staged this way,
@@ -58,7 +58,10 @@ if(BUILD_TESTING)
         # The shipped example connections file, so a test can prove it still
         # parses rather than leaving it to rot alongside the parser.
         PGLICHT_EXAMPLE_INI="${CMAKE_CURRENT_SOURCE_DIR}/test/connections.example.ini"
-        PGLICHT_EXAMPLE_BUDGETS="${CMAKE_CURRENT_SOURCE_DIR}/test/budgets.example.ini")
+        PGLICHT_EXAMPLE_BUDGETS="${CMAKE_CURRENT_SOURCE_DIR}/test/budgets.example.ini"
+        # The reference's example call for every tool, so a test can drive each
+        # one through real dispatch with the arguments the documentation shows.
+        PGLICHT_REFERENCE_EXAMPLES="${CMAKE_CURRENT_SOURCE_DIR}/../tools/reference/examples.json")
     target_link_libraries(pg_licht_mcp_test
         PRIVATE
             GTest::gtest

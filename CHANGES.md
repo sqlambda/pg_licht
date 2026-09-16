@@ -1,5 +1,34 @@
 # Changelog
 
+## 4.3.2 (2026-09-16)
+
+### Fixed
+
+- **`roleDependencies` could not be called at all.** It takes an argument named
+  `role` — the role to ask about — and `role` is also the sweep filter that
+  narrows a fan-out to a primary or a replica. Dispatch read every `role` as
+  the filter, validated it against `primary`/`replica` and refused it before
+  the tool saw it, so the tool answered nothing for any value while
+  `tools/list` advertised the argument as required. It has been unusable over
+  the protocol since it shipped in 4.3.0.
+
+  The rule is now one rule, applied from both sides: **a tool's own argument
+  wins.** Dispatch treats `role` as the sweep filter only for tools that do not
+  declare one, reading that off the tool's own input schema; the schema
+  generator no longer writes the filter's `role` over a property the tool
+  declares. A tool that owns `role` cannot be narrowed by role, which the
+  manual now says.
+
+  The suite missed it because every test reached the query method directly
+  rather than through a `tools/call`, and the published schema was self-
+  consistent, so nothing short of a real call could see the conflict. Two tests
+  close that: one calls `roleDependencies` over JSON-RPC and checks the
+  argument arrives, and one drives **every** tool through dispatch with the
+  arguments its reference example already carries, failing on `-32602`. The
+  examples are validated against each tool's schema when the reference is
+  built, so the second test costs almost nothing and covers every tool added
+  from here on.
+
 ## 4.3.1 (2026-09-15)
 
 ### Added
