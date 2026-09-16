@@ -200,12 +200,22 @@ set to
 or
 .Ql replica
 narrows a sweep to one side.
-An operation that takes a
+.Va connection ,
+.Va instance ,
+.Va replication_group ,
+.Va group
+and
 .Va role
-argument of its own \(em
-.Ic roleDependencies ,
-where it names the role to ask about \(em keeps it: the tool's argument wins,
-and such an operation cannot be narrowed by role.
+are read by
+.Nm
+itself out of a call's arguments.
+An operation that declares an argument of its own by one of those names keeps
+it \(em
+.Ic roleDependencies
+takes a
+.Va role ,
+naming the role to ask about \(em and cannot be targeted by that selector.
+The tool's argument wins, in the published schema and in the call alike.
 .Pp
 A sweep is sequential \(em the server is a single-threaded loop \(em so its
 width is wall-clock time.

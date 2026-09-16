@@ -50,6 +50,21 @@ ref = os.path.join(site, "reference")
 missing = [n for n in names if not os.path.isfile(os.path.join(ref, f"{n}.html"))]
 assert not missing, f"no reference page for: {missing}"
 
+# Every required argument must be documented on its tool's own page. The
+# generator files the shared arguments (connection, the sweep selectors) under
+# one heading on the index, and a tool whose own argument happens to share one
+# of those names had it filed there too -- so its page said "None of its own"
+# while the schema marked it required. That is the third place the name `role`
+# collided; this invariant catches the next one whatever it is called.
+undocumented = []
+for t in res[2]["tools"]:
+    page = open(os.path.join(ref, f"{t['name']}.html"), encoding="utf-8").read()
+    for arg in t["inputSchema"].get("required", []):
+        if not re.search(r"<dt>%s[ <]" % re.escape(arg), page):
+            undocumented.append(f"{t['name']}.{arg}")
+assert not undocumented, ("required arguments missing from their tool's page: "
+                          + ", ".join(undocumented))
+
 # Every file in the site, by its path relative to the site root.
 files = set()
 for d, _, fs in os.walk(site):

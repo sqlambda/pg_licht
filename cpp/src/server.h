@@ -706,6 +706,29 @@ public:
   const json call_topology(const std::string& pattern) { return topology(pattern); }
   const json call_verify_topology() { return verify_topology(); }
   const json call_check_privileges() { return check_privileges(); }
+
+  // Whether a tool declares an argument of its own by this name.
+  //
+  // This server reads five names out of a call's arguments before the tool
+  // sees them -- connection, instance, replication_group, group and role --
+  // and a tool that declares one of them would have it consumed here and
+  // never receive it. roleDependencies declares `role`, and could not be
+  // called at all until 4.3.2. Both the dispatcher and the schema generator
+  // ask this question per name, so a tool's own argument wins everywhere.
+  //
+  // Public because it is the rule itself rather than an implementation
+  // detail, and a test asserts it holds for every tool and every selector.
+  static bool tool_declares(const std::string& name, const char* arg) {
+    for (const auto& d : tool_defs()) {
+      if (name != d.name) continue;
+      // The tool's OWN schema, before the selectors are added to it: asking
+      // the published schema would always answer yes.
+      const json schema = d.input_schema();
+      return schema.contains("properties") && schema["properties"].is_object() &&
+             schema["properties"].contains(arg);
+    }
+    return false;
+  }
   const json call_evaluate_index(const std::string& sql, const json& create_defs,
                                  const json& hide_names) {
     return evaluate_index(sql, create_defs, hide_names, json::object(), "");
@@ -2044,8 +2067,18 @@ private:
       // A test asserts the table covers every tool.
       const ToolScope sc = it == tool_scopes().end() ? ToolScope{} : it->second;
 
+      // A selector is only ever ADDED, never written over a property the tool
+      // declares itself: publishing this server's meaning for an argument the
+      // tool defined would describe something the tool does not have.
+      // roleDependencies takes a `role` of its own -- the role to ask about --
+      // and dispatch applies the same rule from the other side.
+      auto add_selector = [&tool, &name](const char* key, json prop) {
+        if (!tool_declares(name, key))
+          tool["inputSchema"]["properties"][key] = std::move(prop);
+      };
+
       if (!sc.registry) {
-        tool["inputSchema"]["properties"]["connection"] = conn_prop;
+        add_selector("connection", conn_prop);
 
         // The sweep arguments are advertised only where they are eligible, so
         // the schema itself teaches the rule and the -32602 is only a backstop.
@@ -2056,34 +2089,28 @@ private:
         // gating it would hide the feature from exactly the clients that exist.
         if (tool_name_is_sweepable(name)) {
           if (sc.per_database)
-            tool["inputSchema"]["properties"]["instance"] = json{
+            add_selector("instance", json{
               {"type", "string"},
               {"description", "run against every database of this instance (see "
-                              "listTopology) and return one result per member"}};
+                              "listTopology) and return one result per member"}});
           if (sc.per_server)
-            tool["inputSchema"]["properties"]["replication_group"] = json{
+            add_selector("replication_group", json{
               {"type", "string"},
               {"description", "run against every member of this replication group "
                               "and return one result per member. The counters here "
-                              "are each server's own, so the answer is their sum"}};
-          tool["inputSchema"]["properties"]["group"] = json{
+                              "are each server's own, so the answer is their sum"}});
+          add_selector("group", json{
             {"type", "string"},
             {"description", "run against every connection carrying this group "
                             "label. Members that would answer identically for "
                             "this tool are collapsed and reported under "
-                            "'skipped'"}};
-          // Never over a property the tool declares itself. roleDependencies
-          // takes a `role` of its own -- the role to ask about -- and writing
-          // the sweep filter over it would publish a schema describing an
-          // argument the tool does not have. One rule, enforced here and in
-          // dispatch: a tool's own argument wins, and such a tool cannot be
-          // narrowed by role.
-          if (sc.per_server && !tool["inputSchema"]["properties"].contains("role"))
-            tool["inputSchema"]["properties"]["role"] = json{
+                            "'skipped'"}});
+          if (sc.per_server)
+            add_selector("role", json{
               {"type", "string"},
               {"description", "with replication_group or group, sweep only "
                               "members whose observed role is \"primary\" or "
-                              "\"replica\". Observed per call, never configured"}};
+                              "\"replica\". Observed per call, never configured"}});
         }
       }
 
@@ -2130,16 +2157,6 @@ private:
   // Whether a tool declares an argument called `role` of its own, which makes
   // that name the tool's rather than the sweep filter's. Read off the tool's
   // own input schema so the two places that care cannot drift apart.
-  static bool tool_declares_role(const std::string& name) {
-    for (const auto& d : tool_defs()) {
-      if (name != d.name) continue;
-      const json schema = d.input_schema();
-      return schema.contains("properties") && schema["properties"].is_object() &&
-             schema["properties"].contains("role");
-    }
-    return false;
-  }
-
   static bool tool_name_is_sweepable(const std::string& name) {
     return name != "explainQuery" && name != "evaluateIndex";
   }
@@ -8782,20 +8799,26 @@ private:
 	  return arguments.contains(k) && arguments[k].is_string()
 	    ? arguments[k].get<std::string>() : std::string{};
 	};
-	const std::string want_conn     = str_arg("connection");
-	const std::string want_instance = str_arg("instance");
-	const std::string want_repl     = str_arg("replication_group");
-	const std::string want_group    = str_arg("group");
-	// `role` is the sweep filter for every tool that does not declare an
-	// argument of its own by that name -- and roleDependencies does: the
-	// role to ask about. Read as the filter it was validated against
-	// "primary"/"replica" and refused before the tool ever saw it, so that
-	// tool could not be called at all over the protocol, for any value,
-	// while its published schema advertised the argument as required.
-	// A tool that owns `role` therefore cannot be narrowed by role; the
-	// schema generator applies the same rule from the other side.
-	const std::string want_role     = tool_declares_role(tool_name)
-					    ? std::string{} : str_arg("role");
+	// A target selector belongs to this server only where the tool has not
+	// declared an argument by that name. roleDependencies declares `role` --
+	// the role to ask about -- and reading it as the sweep filter validated
+	// it against "primary"/"replica" and refused it before the tool saw it,
+	// so the tool could not be called at all over the protocol, for any
+	// value, while its published schema advertised the argument as required.
+	//
+	// Asked of every selector rather than of `role` alone: the same trap is
+	// set for `connection`, `instance`, `replication_group` and `group`, and
+	// the next tool to name an argument after one of them would be swallowed
+	// just as silently. A tool that declares a selector cannot be targeted by
+	// it; the schema generator applies the same rule from the other side.
+	auto selector = [&](const char* k) {
+	  return tool_declares(tool_name, k) ? std::string{} : str_arg(k);
+	};
+	const std::string want_conn     = selector("connection");
+	const std::string want_instance = selector("instance");
+	const std::string want_repl     = selector("replication_group");
+	const std::string want_group    = selector("group");
+	const std::string want_role     = selector("role");
 
 	std::vector<std::string> given;
 	if (!want_conn.empty())     given.push_back("connection");

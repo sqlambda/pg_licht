@@ -1,5 +1,40 @@
 # Changelog
 
+## 4.3.3 (2026-09-16)
+
+### Fixed
+
+- **The reference page for `roleDependencies` said it takes no arguments of
+  its own.** The generator files the shared arguments — `connection` and the
+  sweep selectors — under one heading on the index rather than repeating them
+  on sixty-eight pages, and it recognised them by name. That tool's own
+  required `role` matched the sweep filter's name, so it was stripped from the
+  page's Parameters section and re-listed as an argument every tool takes,
+  with the filter's meaning. A reader was told a required argument did not
+  exist.
+
+  This is the same collision 4.3.2 fixed in the dispatcher and the schema
+  generator, in a third place that fix did not reach, and it is the same rule
+  again: a tool's own argument wins. `role` counts as the sweep filter only
+  where the server publishes `replication_group` beside it, which is exactly
+  where the filter exists.
+
+  Rather than fix one name a third time, the reference test now asserts a
+  general invariant: **every required argument of every tool appears on that
+  tool's page.** Whatever name collides next, the build fails instead of
+  publishing a page that contradicts the schema.
+
+- **The guard 4.3.2 added is now general.** That fix recognised `role` by
+  name, but this server reads five names out of a call's arguments before the
+  tool sees them — `connection`, `instance`, `replication_group`, `group` and
+  `role` — and any of them would have been swallowed the same way. No tool
+  collides with the other four today, so nothing was broken; the guard was
+  simply one name wide where the rule is five. Dispatch and the schema
+  generator now both ask, per name, whether the tool declared an argument of
+  its own, and a tool that did keeps it: it cannot be targeted by that
+  selector, and its own description is what gets published. A tool added later
+  that names an argument `group` works without anyone remembering why.
+
 ## 4.3.2 (2026-09-16)
 
 ### Fixed

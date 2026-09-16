@@ -44,6 +44,22 @@ _spec.loader.exec_module(LLMS)
 # rather than on all sixty-five pages.
 COMMON_ARGS = ("connection", "instance", "replication_group", "group", "role")
 
+
+def common_args(props):
+    """Which of the shared arguments this tool actually carries.
+
+    `role` is the sweep filter only for a tool the server publishes
+    `replication_group` for -- it adds the two together, for per_server tools.
+    Anywhere else a `role` property is the tool's own argument, as
+    roleDependencies has, and belongs in Parameters rather than being filed
+    under "arguments every tool takes". Same rule the server applies in
+    dispatch and when building the schema: a tool's own argument wins.
+    """
+    shared = [k for k in COMMON_ARGS if k in props]
+    if "replication_group" not in props and "role" in shared:
+        shared.remove("role")
+    return shared
+
 # The sentence tools/list appends to a description saying where the answer
 # varies. Split off into its own section on each page.
 SCOPE_OPENERS = ("This reading is instance-wide", "A physical replica is byte-identical",
@@ -319,7 +335,8 @@ def crumb(category, prev_name, next_name, man_html):
 def tool_page(t, category, siblings, prev_name, next_name, example, exposed, man_html):
     props = t["inputSchema"].get("properties", {})
     required = set(t["inputSchema"].get("required", []))
-    own = [k for k in props if k not in COMMON_ARGS]
+    shared = common_args(props)
+    own = [k for k in props if k not in shared]
     own.sort(key=lambda k: (k not in required, k))
     sweeps = [k for k in ("instance", "replication_group", "group") if k in props]
     body, scope = split_scope(t.get("description", ""))
@@ -365,7 +382,7 @@ def tool_page(t, category, siblings, prev_name, next_name, example, exposed, man
         h.append('</dl>')
     else:
         h.append('<p>None of its own.</p>')
-    common = [k for k in COMMON_ARGS if k in props]
+    common = shared
     if common:
         h.append('<p class="note">Also accepts '
                  + ", ".join(f"<code>{E(k)}</code>" for k in common)
@@ -473,7 +490,13 @@ def index_page(version, tools, prompts, categories, cat_of, prompt_order, expose
              'that are byte-identical.</dd>'
              '<dt>role <span class="tag">optional</span></dt><dd>With a sweep, only '
              'members observed right now to be <code>primary</code> or <code>replica</code>.</dd>'
-             '</dl>')
+             '</dl>'
+             '<p class="note">These five names are read by the server itself, out of the '
+             'arguments of every call. A tool that declares an argument of its own by one '
+             'of those names keeps it &mdash; <code>roleDependencies</code> takes a '
+             '<code>role</code>, naming the role to ask about &mdash; and cannot be '
+             'targeted by that selector. The tool\'s argument wins, in its published '
+             'schema and in the call alike.</p>')
 
     for c, ts in by_cat.items():
         h.append(f'<h2 id="{E(slug(c))}">{E(c)}</h2>')
