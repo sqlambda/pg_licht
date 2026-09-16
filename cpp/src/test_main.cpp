@@ -7611,6 +7611,38 @@ TEST_F(PostgresMCPServerTest, AToolsOwnRoleArgumentReachesIt) {
   }
 }
 
+// The rule generalised: this server reads five names out of a tool call's
+// arguments for its own purposes, and any of them would be swallowed the way
+// `role` was. The predicate is asked per name, so the trap is disarmed for all
+// five rather than for the one that sprang it.
+TEST_F(PostgresMCPServerTest, ADeclaredArgumentBeatsEveryTargetSelector) {
+  // The only collision that exists today, and the schema keeps the tool's
+  // meaning rather than this server's.
+  EXPECT_TRUE(PostgresMCPServer::tool_declares("roleDependencies", "role"));
+  EXPECT_FALSE(PostgresMCPServer::tool_declares("roleDependencies", "connection"));
+
+  // Nothing else collides, which is what makes this a guard rather than a fix:
+  // if a tool later declares one of these, dispatch passes it through and the
+  // published schema keeps the tool's description, with no code change.
+  for (const auto& t : srv->call_tools_list()) {
+    const std::string name = t.value("name", "");
+    for (const char* sel : {"connection", "instance", "replication_group", "group", "role"}) {
+      const bool declared = PostgresMCPServer::tool_declares(name, sel);
+      if (!declared) continue;
+      EXPECT_EQ(name, "roleDependencies")
+          << name << " declares \"" << sel << "\"; that is allowed, but say so here "
+          << "so the next reader knows it is deliberate";
+      // Whatever declares it, the published schema must describe the TOOL's
+      // argument: the selector's own text would document a different thing.
+      const auto& prop = t["inputSchema"]["properties"][sel];
+      EXPECT_EQ(prop["description"].get<std::string>().find("run against every"),
+                std::string::npos) << name << "." << sel << ": " << prop.dump();
+      EXPECT_EQ(prop["description"].get<std::string>().find("sweep only"),
+                std::string::npos) << name << "." << sel << ": " << prop.dump();
+    }
+  }
+}
+
 // The preventive half: every tool, called the way a client calls it, with the
 // arguments the reference examples already carry. Those are validated against
 // each tool's input schema when the reference is generated, so this costs
