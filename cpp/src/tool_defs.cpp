@@ -25,7 +25,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args& a) -> json {
          return s.tables(a.str("schema", "public")); }},
       {"tableDetails",
-       "return the structure of one table: columns with types, defaults, storage and compression, primary key, indexes, constraints, foreign keys, inbound foreign keys (referenced_by), triggers, rules, row-level security, policies and privileges. Structure only -- it changes when someone issues DDL and not otherwise, and it returns no sample column values. For row counts, scan counters, dead tuples, vacuum times and the pg_stats column histograms call tableStats; for measured on-disk sizes call tableSize",
+       "return the structure of one table: columns with types, defaults, storage and compression, primary key, indexes with their definition and whether each is valid, constraints, foreign keys, inbound foreign keys (referenced_by), triggers with their enabled state, rules, row-level security, policies and privileges. Two of those say when an object is not doing what its definition suggests: an index with valid false is what a failed CREATE INDEX CONCURRENTLY leaves behind -- it occupies disk and is maintained on every write while the planner never uses it -- and a trigger with enabled 'disabled' still has its full definition, since ALTER TABLE ... DISABLE TRIGGER changes no text. 'replica' and 'always' are the session_replication_role states. Structure only -- it changes when someone issues DDL and not otherwise, and it returns no sample column values. For row counts, scan counters, dead tuples, vacuum times and the pg_stats column histograms call tableStats; for measured on-disk sizes call tableSize",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
@@ -855,21 +855,25 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
            ? a["limit"].get<int>() : 20;
          return s.buffer_cache_contents(limit); }},
       {"listTopology",
-       "return the configured topology: which connections share an instance (one postmaster, so they share shared_buffers, WAL, autovacuum workers and disk), which belong to the same replication_group (a primary and its replicas, holding the same data on different servers), and which carry each operator group label. Reads the config file only and opens no database connection, so it is cheap to call before deciding how wide a sweep to run. An instance whose source is \"inferred\" was derived from an identical host and port rather than declared, and is a hint for grouping output, not evidence of shared memory. Roles are not here: primary or replica is observed per call, never configured -- use verifyTopology",
+       "return the configured topology: which connections share an instance (one postmaster, so they share shared_buffers, WAL, autovacuum workers and disk), which belong to the same replication_group (a primary and its replicas, holding the same data on different servers), and which carry each operator group label. Reads the config file only and opens no database connection, so it is cheap to call before deciding how wide a sweep to run. An instance whose source is \"inferred\" was derived from an identical host and port rather than declared, and is a hint for grouping output, not evidence of shared memory. Roles are not here: primary or replica is observed per call, never configured -- use verifyTopology. Pass 'pattern' to narrow it: a case-insensitive substring matched against each topology name AND its member connection names, so \"where does billing_prod live\" and \"show me the ha group\" are the same argument. A pattern that matches nothing returns empty lists rather than an error",
        []() -> json { return {
    		{"type", "object"},
-   		{"properties", json::object()}
+   		{"properties", {
+   		    {"pattern", {{"type", "string"}, {"description", "case-insensitive substring of an instance, replication_group or group name, or of a connection name belonging to one"}}}
+   		  }}
    	      }; },
-       [](PostgresMCPServer& s, const Args&) -> json {
-         return s.topology(); }},
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.topology(a.str("pattern")); }},
       {"listConnections",
-       "return the configured database connections by name, with the libpq service name or host/port/dbname/user for each, its instance, replication_group and group labels where configured, and which is the default; passwords are never returned and a service file is never expanded. Pass a name as the 'connection' argument of any other tool to run that tool against that database. See listTopology for the same labels indexed the other way round, by topology name rather than by connection",
+       "return the configured database connections by name, with the libpq service name or host/port/dbname/user for each, its instance, replication_group and group labels where configured, and which is the default; passwords are never returned and a service file is never expanded. Pass a name as the 'connection' argument of any other tool to run that tool against that database. See listTopology for the same labels indexed the other way round, by topology name rather than by connection. Pass 'pattern' to narrow the list: a case-insensitive substring matched against the connection name AND its instance, replication_group and group labels. That is how to find one connection on a registry holding hundreds -- this answer carries every configured connection otherwise, and it has no cursor. A pattern that matches nothing returns an empty list rather than an error",
        []() -> json { return {
    		{"type", "object"},
-   		{"properties", json::object()}
+   		{"properties", {
+   		    {"pattern", {{"type", "string"}, {"description", "case-insensitive substring of the connection name or of its instance, replication_group or group label"}}}
+   		  }}
    	      }; },
-       [](PostgresMCPServer& s, const Args&) -> json {
-         return s.connections(); }},
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.connections(a.str("pattern")); }},
     };
     return defs;
   }

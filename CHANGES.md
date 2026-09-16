@@ -1,5 +1,45 @@
 # Changelog
 
+## 4.3.1 (2026-09-15)
+
+### Added
+
+- **`pattern` on `listConnections` and `listTopology`.** One pg_licht answers
+  for a whole fleet, and the two tools that read the registry answered with all
+  of it: `listConnections` returns every configured connection in one payload,
+  roughly 400 bytes each, with no cursor and no cap — 59 kB at 150 connections,
+  400 kB at 1,000. `pattern` is the same argument `listRoles` and
+  `serverSettings` already take, a case-insensitive substring, applied here
+  against the in-memory registry rather than pushed into SQL.
+
+  It matches **labels as well as names**, which is the half a name-only filter
+  would miss: `listConnections` matches the connection name and its `instance`,
+  `replication_group` and `group` labels, so one group answers with the
+  connections in it however they are named. `listTopology` matches each
+  topology name **and** its member connection names, so "where does
+  billing_prod live" and "show me the ha group" are one argument.
+
+  A pattern that matches nothing returns an empty list rather than an error.
+  The registry is configuration: asking about a connection that is not
+  configured is a fair question with an empty answer.
+
+### Fixed
+
+- **`tableDetails` showed a disabled trigger as though it were live, and an
+  invalid index as though it were usable.** Both fail in the direction that
+  reads as healthy, the class 4.2.1 named. A trigger keeps its whole
+  definition when it is switched off, since `ALTER TABLE ... DISABLE TRIGGER`
+  changes no text, and only `tgenabled` moves; every trigger now carries
+  `enabled`, one of `enabled`, `disabled`, `replica` or `always` — the last two
+  being the `session_replication_role` states, which is how a trigger is off
+  for the application and on for a replication apply worker. An index left
+  behind by a failed `CREATE INDEX CONCURRENTLY` keeps its definition too,
+  while occupying disk, being maintained on every write and never being used by
+  the planner; every index now carries `valid`. `duplicateIndexes` has read
+  `indisvalid` since it existed, so the two tools disagreed about the same
+  index. Reported on every object rather than only the bad ones, because a
+  field that appears only when something is wrong reads as fine when absent.
+
 ## 4.3.0 (2026-09-15)
 
 Six new tools, from the twenty-four PostgreSQL catalogs this server did not
