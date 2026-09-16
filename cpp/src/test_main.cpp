@@ -7098,6 +7098,84 @@ TEST_F(TopologyFixture, ListTopologyCarriesInstanceCapacity) {
   EXPECT_EQ(t["instances"][0]["host_vcpus"], 16);
 }
 
+namespace {
+std::vector<std::string> connection_names(const json& envelope) {
+  std::vector<std::string> out;
+  for (const auto& c : envelope["connections"]) out.push_back(c["name"].get<std::string>());
+  return out;
+}
+}  // namespace
+
+// A registry can hold hundreds of connections, and listConnections has no
+// cursor: it answers with every one of them, about 400 bytes each. 'pattern'
+// is how to ask for one without carrying the rest into the answer.
+TEST_F(TopologyFixture, ListConnectionsNarrowsByPattern) {
+  auto s = server_from(ini_with(
+      "instance = pg-shop\nreplication_group = shop-ha\ngroup = fleet\n"
+      "[billing]\nhost = h2\nport = 5432\ndbname = billing\n"
+      "instance = pg-billing\ngroup = fleet\n"
+      "[shop_replica]\nhost = h3\nport = 5432\ndbname = shop\n"
+      "replication_group = shop-ha\n"));
+
+  EXPECT_EQ(connection_names(s->call_connections()).size(), 3u);
+  EXPECT_EQ(connection_names(s->call_connections("")).size(), 3u);
+
+  // By connection name, and case-insensitively.
+  EXPECT_EQ(connection_names(s->call_connections("billing")),
+            (std::vector<std::string>{"billing"}));
+  EXPECT_EQ(connection_names(s->call_connections("BILL")),
+            (std::vector<std::string>{"billing"}));
+
+  // By label, which is the half a name-only filter would miss: the group
+  // holds two connections whose names share nothing.
+  EXPECT_EQ(connection_names(s->call_connections("shop-ha")),
+            (std::vector<std::string>{"default", "shop_replica"}));
+  EXPECT_EQ(connection_names(s->call_connections("fleet")),
+            (std::vector<std::string>{"default", "billing"}));
+
+  // Configuration, not a lookup that can fail: no match is an empty list.
+  json none = s->call_connections("no-such-thing");
+  EXPECT_TRUE(none["connections"].empty()) << none.dump(2);
+  EXPECT_FALSE(none.contains("error"));
+}
+
+TEST_F(TopologyFixture, ListTopologyNarrowsByPattern) {
+  auto s = server_from(ini_with(
+      "instance = pg-shop\nreplication_group = shop-ha\ngroup = fleet\n"
+      "[billing]\nhost = h2\nport = 5432\ndbname = billing\n"
+      "instance = pg-billing\ngroup = fleet\n"
+      "[lonely]\ndbname = lonely\n"));
+  EXPECT_EQ(s->call_topology()["instances"].size(), 2u);
+
+  // By topology name.
+  json shop = s->call_topology("shop");
+  ASSERT_EQ(shop["instances"].size(), 1u) << shop.dump(2);
+  EXPECT_EQ(shop["instances"][0]["name"], "pg-shop");
+  ASSERT_EQ(shop["replication_groups"].size(), 1u);
+  EXPECT_EQ(shop["replication_groups"][0]["name"], "shop-ha");
+  EXPECT_TRUE(shop["groups"].empty()) << shop["groups"].dump(2);
+  EXPECT_TRUE(shop["unlabelled"].empty());
+
+  // By member connection name: "where does billing live" keeps the instance
+  // it belongs to and the group it is in, neither of which is called billing.
+  json member = s->call_topology("billing");
+  ASSERT_EQ(member["instances"].size(), 1u) << member.dump(2);
+  EXPECT_EQ(member["instances"][0]["name"], "pg-billing");
+  ASSERT_EQ(member["groups"].size(), 1u) << member["groups"].dump(2);
+  EXPECT_EQ(member["groups"][0]["name"], "fleet");
+
+  // An unlabelled connection is still findable by its own name.
+  json lonely = s->call_topology("lonely");
+  ASSERT_EQ(lonely["unlabelled"].size(), 1u) << lonely.dump(2);
+  EXPECT_EQ(lonely["unlabelled"][0], "lonely");
+  EXPECT_TRUE(lonely["instances"].empty());
+
+  json none = s->call_topology("no-such-thing");
+  EXPECT_TRUE(none["instances"].empty());
+  EXPECT_TRUE(none["groups"].empty());
+  EXPECT_TRUE(none["unlabelled"].empty());
+}
+
 TEST_F(TopologyFixture, ListConnectionsCarriesTopologyLabels) {
   auto s = server_from(ini_with(
       "instance = pg-01\nreplication_group = ha\ngroup = prod, billing\n"));

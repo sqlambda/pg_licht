@@ -1907,7 +1907,7 @@ block reports what the server saw.
 .El
 .Ss Topology
 .Bl -tag -width Ds
-.It Ic listTopology
+.It Ic listTopology Op Va pattern
 Every instance, replication group and group with its members, plus the
 connections carrying no label at all.
 Reads the configuration file and opens no database connection.
@@ -1919,6 +1919,19 @@ was derived from a shared host and port rather than declared.
 Takes no
 .Va connection
 argument.
+.Pp
+.Bl -tag -width "pattern" -compact
+.It Va pattern
+Case-insensitive substring, matched against each topology name
+.Sy and
+against the connection names belonging to it, so
+.Ql where does billing_prod live
+and
+.Ql show me the ha group
+are the same argument.
+An unlabelled connection is matched by its own name.
+A pattern matching nothing returns empty lists rather than an error.
+.El
 .It Ic verifyTopology
 Connects to every configured connection and reports what each server actually
 is: its role, system identifier, database, address, port and version.
@@ -1947,7 +1960,7 @@ argument.
 .El
 .Ss Connections
 .Bl -tag -width Ds
-.It Ic listConnections
+.It Ic listConnections Op Va pattern
 The configured database connections by name, with the libpq
 .Va service
 name or host, port, dbname, and user for each, and which is the default.
@@ -1963,6 +1976,21 @@ and
 are the only operations that do not take a
 .Va connection
 argument.
+.Pp
+.Bl -tag -width "pattern" -compact
+.It Va pattern
+Case-insensitive substring, matched against the connection name
+.Sy and
+against its
+.Va instance ,
+.Va replication_group
+and
+.Va group
+labels.
+This answer carries every configured connection otherwise and has no cursor,
+so on a registry holding hundreds this is how to ask for one.
+A pattern matching nothing returns an empty list rather than an error.
+.El
 .El
 .Sh OUTPUT FORMAT
 A client that negotiated MCP revision
