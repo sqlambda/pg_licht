@@ -6845,11 +6845,20 @@ private:
                        WHERE attnum > 0
                          AND attrelid = c.oid
                          AND NOT attisdropped) _lat29 ON true
-      LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(indexname,
-                          JSONB_BUILD_OBJECT('definition', indexdef)) AS indexes
-                         FROM pg_indexes AS i
-                         WHERE i.schemaname = $1
-                           AND i.tablename = c.relname) _lat30 ON true
+      -- Built from pg_index rather than the pg_indexes view, which carries the
+      -- definition and nothing about the index's state. indisvalid is false on
+      -- an index CREATE INDEX CONCURRENTLY failed to finish: it still occupies
+      -- disk and is still maintained on every write, and the planner never
+      -- uses it. Reported on every index rather than only when false, because
+      -- a field that appears only in the bad case reads as "fine" when absent
+      -- -- the same reason duplicateIndexes has carried it since it existed.
+      LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(ic.relname,
+                          JSONB_BUILD_OBJECT(
+                            'definition', pg_get_indexdef(i.indexrelid),
+                            'valid',      i.indisvalid)) AS indexes
+                         FROM pg_index AS i
+                         JOIN pg_class AS ic ON ic.oid = i.indexrelid
+                         WHERE i.indrelid = c.oid) _lat30 ON true
       LEFT JOIN LATERAL (SELECT JSONB_AGG(a.attname ORDER BY array_position(pk.conkey, a.attnum)) AS primary_key
                          FROM pg_constraint pk
                          JOIN pg_attribute a ON a.attrelid = pk.conrelid AND a.attnum = ANY(pk.conkey)
@@ -6897,7 +6906,19 @@ private:
                                           ]::text[], ' OR '),
                            'when',        CASE WHEN t.tgqual IS NOT NULL
                                             THEN (regexp_match(pg_get_triggerdef(t.oid), 'WHEN [(](.+)[)] EXECUTE'))[1]
-                                            ELSE NULL END)) AS triggers
+                                            ELSE NULL END,
+                           -- Without this a disabled trigger is indistinguishable
+                           -- from a live one: the definition is unchanged by
+                           -- ALTER TABLE ... DISABLE TRIGGER, only tgenabled is.
+                           -- 'replica' and 'always' are the session_replication_role
+                           -- states, which is how a trigger can be off for the
+                           -- application and on for a replication apply worker.
+                           'enabled',     CASE t.tgenabled
+                                            WHEN 'O' THEN 'enabled'
+                                            WHEN 'D' THEN 'disabled'
+                                            WHEN 'R' THEN 'replica'
+                                            WHEN 'A' THEN 'always'
+                                            ELSE t.tgenabled::text END)) AS triggers
                          FROM   pg_trigger AS t
                          JOIN   pg_proc AS p ON p.oid = t.tgfoid
                          JOIN   pg_language AS l ON l.oid = p.prolang

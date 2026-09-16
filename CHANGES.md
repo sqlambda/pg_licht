@@ -23,6 +23,23 @@
   The registry is configuration: asking about a connection that is not
   configured is a fair question with an empty answer.
 
+### Fixed
+
+- **`tableDetails` showed a disabled trigger as though it were live, and an
+  invalid index as though it were usable.** Both fail in the direction that
+  reads as healthy, the class 4.2.1 named. A trigger keeps its whole
+  definition when it is switched off, since `ALTER TABLE ... DISABLE TRIGGER`
+  changes no text, and only `tgenabled` moves; every trigger now carries
+  `enabled`, one of `enabled`, `disabled`, `replica` or `always` — the last two
+  being the `session_replication_role` states, which is how a trigger is off
+  for the application and on for a replication apply worker. An index left
+  behind by a failed `CREATE INDEX CONCURRENTLY` keeps its definition too,
+  while occupying disk, being maintained on every write and never being used by
+  the planner; every index now carries `valid`. `duplicateIndexes` has read
+  `indisvalid` since it existed, so the two tools disagreed about the same
+  index. Reported on every object rather than only the bad ones, because a
+  field that appears only when something is wrong reads as fine when absent.
+
 ## 4.3.0 (2026-09-15)
 
 Six new tools, from the twenty-four PostgreSQL catalogs this server did not
