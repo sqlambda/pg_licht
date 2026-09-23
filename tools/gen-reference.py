@@ -498,6 +498,32 @@ def index_page(version, tools, prompts, categories, cat_of, prompt_order, expose
              'targeted by that selector. The tool\'s argument wins, in its published '
              'schema and in the call alike.</p>')
 
+    # Which tools take each is read from their schemas, not written here, so
+    # the lists cannot fall behind a tool that gains one.
+    def takers(arg):
+        names = sorted(t["name"] for t in tools
+                       if arg in t["inputSchema"].get("properties", {}))
+        return ", ".join(f'<a href="{E(n)}.html"><code>{E(n)}</code></a>' for n in names)
+    h.append('<h2 id="matching">Arguments that match by a string</h2>')
+    h.append('<p>Two arguments narrow an answer by a string, and they match differently.</p>')
+    h.append('<dl class="params">'
+             '<dt>pattern</dt><dd>A literal, case-insensitive substring of a name. There are '
+             'no wildcards: <code>_</code> and <code>%</code> match themselves, so '
+             '<code>user_</code> finds <code>user_x</code> and not <code>users</code>, and '
+             'nothing is stemmed. Taken by ' + takers("pattern") + '.</dd>'
+             '<dt>web_search</dt><dd>Full-text search, not a substring: PostgreSQL\'s '
+             '<code>websearch_to_tsquery</code> in English. Words are stemmed, so '
+             '<code>order</code> finds <code>orders</code>; names are split into words at '
+             'underscores and capitals, so <code>customer_id</code> contributes '
+             '<code>customer</code>; <code>"a phrase"</code>, <code>or</code> and '
+             '<code>-word</code> work; a fragment of a word matches nothing &mdash; use a '
+             'listing\'s <code>pattern</code> for that. Taken by ' + takers("web_search") +
+             ', each of which says what it searches.</dd>'
+             '</dl>'
+             f'<p class="note">The full rules are under <a href="{E(man_html)}'
+             '#Matching:_pattern_and_web_search">Matching: pattern and web_search</a> '
+             'in the manual.</p>')
+
     for c, ts in by_cat.items():
         h.append(f'<h2 id="{E(slug(c))}">{E(c)}</h2>')
         h.append('<div class="table-wrap"><table><tr><th>Tool</th><th>What it answers</th></tr>')
