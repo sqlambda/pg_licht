@@ -8028,6 +8028,35 @@ TEST_F(PostgresMCPServerTest, SchemaWideListingsNarrowByPattern) {
   EXPECT_TRUE(srv->call_functions("grocery", "no_function_is_called_this").empty());
 }
 
+// "Contains" means contains. Through the first 4.4 build the SQL was ILIKE
+// '%x%', where `_` matches any character: "user_" matched "users", and a CI
+// run failed when "_42" matched every schema of a test whose process id held
+// a 42. Underscores are in most PostgreSQL names, so they must be literal.
+TEST_F(PostgresMCPServerTest, APatternIsALiteralSubstringNotAWildcard) {
+  const std::string sch = "lit" + std::to_string(getpid());
+  pqxx::connection c(test_url);
+  {
+    pqxx::work w(c);
+    w.exec("CREATE SCHEMA " + sch);
+    w.exec("CREATE TABLE " + sch + ".users (id int)");
+    w.exec("CREATE TABLE " + sch + ".user_x (id int)");
+    w.exec("CREATE TABLE " + sch + ".pct_100 (id int)");
+    w.commit();
+  }
+  auto names = [](const json& r) {
+    std::set<std::string> n;
+    for (auto& [k, v] : r.items()) { (void)v; n.insert(k); }
+    return n;
+  };
+  EXPECT_EQ(names(srv->call_tables(sch, "user_")), std::set<std::string>{"user_x"});
+  EXPECT_EQ(names(srv->call_tables(sch, "USER_")), std::set<std::string>{"user_x"});
+  EXPECT_TRUE(srv->call_tables(sch, "%").empty()) << "% must not match everything";
+  EXPECT_EQ(names(srv->call_list_table_stats(sch, "t_1")), std::set<std::string>{"pct_100"});
+
+  pqxx::nontransaction n(c);
+  n.exec("DROP SCHEMA " + sch + " CASCADE");
+}
+
 // The invariant behind the payload guard. A refusal is only useful if the
 // caller can do something about it, and a tool whose answer grows with the
 // schema but declares nothing to narrow it turns the guard into a dead end.
@@ -8036,7 +8065,9 @@ TEST_F(PostgresMCPServerTest, SchemaWideListingsNarrowByPattern) {
 // So: build such a schema, call every schema-wide tool over the protocol under
 // the real default limit, and fail on any refusal that names no way forward.
 TEST_F(PostgresMCPServerTest, NoSchemaWideAnswerIsRefusedWithoutAWayToNarrowIt) {
-  const std::string sch = "wide_" + std::to_string(getpid());
+  // No underscore before the pid: the narrowing below uses "_42", and a
+  // pid starting with 42 would otherwise put it in every schema's name.
+  const std::string sch = "wide" + std::to_string(getpid());
   pqxx::connection c(test_url);
   {
     pqxx::work w(c);

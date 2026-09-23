@@ -1132,8 +1132,12 @@ private:
                      "library may need a newer package first)"}};
   }
 
-  // Case-insensitive substring, the rule `pattern` already means on listRoles
-  // and serverSettings. Those push it into SQL as ILIKE '%x%'; these two tools
+  // Case-insensitive substring, the rule `pattern` means everywhere here. In
+  // SQL it is strpos(lower(name), lower($n)) > 0, not ILIKE '%x%': in ILIKE a
+  // `_` matches any character and `%` any run of them, so a pattern of
+  // "user_" also matched "users" -- and underscores are in most PostgreSQL
+  // names. Found when a test narrowing tenant schemas by "_42" matched every
+  // schema whenever the test's process id contained 42. These two tools
   // answer from the in-memory registry, so the same rule is applied here
   // instead of by PostgreSQL.
   static bool pattern_matches(const std::string& haystack, const std::string& needle) {
@@ -2407,7 +2411,7 @@ private:
       WHERE nspname NOT LIKE 'pg_%'
         AND nspname <> 'information_schema'
         AND table_count > 0
-        AND ($1 = '' OR nspname ILIKE '%' || $1 || '%');
+        AND ($1 = '' OR strpos(lower(nspname), lower($1)) > 0);
     )";
 
     pqxx::result res = pqxx_exec(txn, query, pqxx::params{pattern});
@@ -2463,7 +2467,7 @@ private:
                          WHERE conrelid = c.oid) _lat5 ON true
       WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
         AND c.relkind IN ('r', 'p', 'm', 'v')
-        AND ($2 = '' OR c.relname ILIKE '%' || $2 || '%');
+        AND ($2 = '' OR strpos(lower(c.relname), lower($2)) > 0);
     )";
 
     pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, pattern});
@@ -2584,7 +2588,7 @@ private:
       JOIN   pg_language AS l ON l.oid = p.prolang
       WHERE  p.pronamespace = $1::regnamespace
         AND  p.prokind IN ('f', 'p')
-        AND ($2 = '' OR p.proname ILIKE '%' || $2 || '%');
+        AND ($2 = '' OR strpos(lower(p.proname), lower($2)) > 0);
     )";
 
     pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, pattern});
@@ -2700,7 +2704,7 @@ private:
               @@ websearch_to_tsquery('english', $1)
          OR TO_TSVECTOR('english', COALESCE(p.prosrc, ''))
               @@ websearch_to_tsquery('english', $1)
-         OR l.lanname ILIKE '%' || $1 || '%'
+         OR strpos(lower(l.lanname), lower($1)) > 0
          OR p.oid IN (SELECT tgfoid FROM pg_trigger
                       WHERE NOT tgisinternal
                         AND to_tsvector('english', tgname) @@ websearch_to_tsquery('english', $1))
@@ -2754,7 +2758,7 @@ private:
                  ) ORDER BY name
                ) AS settings
         FROM pg_settings
-        WHERE ($1 = '' OR name ILIKE '%' || $1 || '%' OR category ILIKE '%' || $1 || '%')
+        WHERE ($1 = '' OR strpos(lower(name), lower($1)) > 0 OR strpos(lower(category), lower($1)) > 0)
           AND ($2 OR source <> 'default' OR setting IS DISTINCT FROM boot_val)
         GROUP BY category
       ) s;
@@ -6377,7 +6381,7 @@ private:
              LEFT JOIN LATERAL (
                  SELECT count(*) AS n_memberships
                    FROM pg_auth_members AS m0 WHERE m0.member = r0.oid) _m ON true
-             WHERE ($1 = '' OR r0.rolname ILIKE '%' || $1 || '%')
+             WHERE ($1 = '' OR strpos(lower(r0.rolname), lower($1)) > 0)
              ORDER BY (r0.rolsuper OR r0.rolcreaterole OR r0.rolcreatedb
                        OR r0.rolreplication OR r0.rolbypassrls
                        OR NOT r0.rolinherit OR r0.rolconnlimit <> -1
@@ -7478,7 +7482,7 @@ private:
           LIMIT 1
       ) owned ON true
       WHERE ps.schemaname = $1
-        AND ($2 = '' OR ps.sequencename ILIKE '%' || $2 || '%');
+        AND ($2 = '' OR strpos(lower(ps.sequencename), lower($2)) > 0);
     )";
 
     pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, pattern});
@@ -8879,7 +8883,7 @@ private:
       LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
       WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
         AND c.relkind IN ('r', 'p', 'm', 'v')
-        AND ($2 = '' OR c.relname ILIKE '%' || $2 || '%');
+        AND ($2 = '' OR strpos(lower(c.relname), lower($2)) > 0);
     )";
 
     pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, pattern});
@@ -8960,7 +8964,7 @@ private:
       FROM pg_class AS c
       WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
         AND c.relkind IN ('r', 'p', 'm', 'v')
-        AND ($2 = '' OR c.relname ILIKE '%' || $2 || '%');
+        AND ($2 = '' OR strpos(lower(c.relname), lower($2)) > 0);
     )";
 
     pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, pattern});

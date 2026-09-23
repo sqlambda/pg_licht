@@ -125,6 +125,16 @@
 
 ### Fixed
 
+- **`pattern` treated `_` and `%` as wildcards.** Every `pattern` is
+  documented as a case-insensitive substring, and on `listRoles` and
+  `serverSettings` it was `ILIKE '%x%'`, where `_` matches any character: a
+  pattern of `user_` also matched `users`, and underscores are in most
+  PostgreSQL names. All of them, the new ones included, are now a literal
+  substring. Found by CI on this release's first run, where a test
+  narrowing tenant schemas by `_42` matched every schema whenever the job's
+  process id contained 42; an independent review had flagged it and it was
+  wrongly waved through as consistent with the existing tools.
+
 - **The sanitizer and valgrind jobs skipped every extension-backed test.**
   They ran against stock `postgres:NN` service containers, which have no
   hypopg and preload nothing, so `evaluateIndex`, the `queryid` path and all
