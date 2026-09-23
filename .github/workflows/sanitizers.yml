@@ -11,6 +11,13 @@ on:
 # will look at. Only pull_request runs are cancelled: a push to main or a tag
 # must finish, because its result is what the branch protection and the release
 # read.
+# Least privilege for every job that does not say otherwise: checkout needs to
+# read the repository, and artifacts and caches use the runner's own token,
+# not GITHUB_TOKEN. A job-level block replaces this one entirely, which is how
+# the jobs that publish get more.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -118,7 +125,7 @@ jobs:
         working-directory: cpp/build
         run: |
           cmake --build . --target pg_licht_mcp
-          ctest -R "manpage_lint|protocol_compat|llms_txt|reference" --output-on-failure
+          ctest -R "manpage_lint|protocol_compat|llms_txt|reference|cli_" --output-on-failure
 
       - uses: actions/upload-artifact@v4
         if: matrix.config != 'plain-clang'
@@ -157,10 +164,15 @@ jobs:
       # nothing here is compiled.
       #
       # These jobs talk to the stock postgres:NN image, which carries contrib
-      # but not hypopg, so the evaluateIndex tests skip here and are covered by
-      # the pooled job instead -- which is also the only place their pooling
-      # behaviour means anything.
+      # and nothing else, and preloads nothing. The step below installs hypopg
+      # and the three shared-memory extensions into it and preloads them with
+      # pg_stat_statements, so the code behind evaluateIndex, the queryid path
+      # and the four preload-backed tools runs under the sanitizers too rather
+      # than being skipped. Their pooling behaviour is still the pooled job's.
       - uses: actions/checkout@v4
+
+      - name: Preload the extensions in the service container
+        run: .github/scripts/prepare-service-postgres.sh ${{ job.services.postgres.id }}
 
       - name: Install runtime dependencies
         run: .github/scripts/apt-pgdg.sh libpq5
@@ -175,6 +187,9 @@ jobs:
         env:
           DATABASE_URL: "host=localhost port=5432 user=postgres password=postgres dbname=postgres"
           ASAN_OPTIONS: detect_leaks=1
+          # Installed above on purpose, so a skip would mean something broke.
+          PGLICHT_REQUIRE_HYPOPG: "1"
+          PGLICHT_REQUIRE_PRELOAD_EXTENSIONS: "1"
         run: |
           chmod +x pg_licht_mcp_test   # artifacts do not preserve the mode bit
           ./pg_licht_mcp_test
@@ -204,6 +219,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # As in the sanitizer jobs: without it the extension-backed code is
+      # skipped rather than checked for leaks.
+      - name: Preload the extensions in the service container
+        run: .github/scripts/prepare-service-postgres.sh ${{ job.services.postgres.id }}
+
       - name: Install runtime dependencies
         run: .github/scripts/apt-pgdg.sh libpq5 valgrind
 
@@ -219,6 +239,8 @@ jobs:
         working-directory: cpp/build
         env:
           DATABASE_URL: "host=localhost port=5432 user=postgres password=postgres dbname=postgres"
+          PGLICHT_REQUIRE_HYPOPG: "1"
+          PGLICHT_REQUIRE_PRELOAD_EXTENSIONS: "1"
         run: |
           chmod +x pg_licht_mcp_test
           valgrind --error-exitcode=99 --leak-check=full --track-origins=yes \
@@ -228,8 +250,9 @@ jobs:
   # transaction mode (server_reset_query=DISCARD ALL) -- the deployment a
   # session-scoped read-only guard silently fails on. The script provisions its
   # own throwaway cluster, a streaming standby and a pooler, so no service
-  # container is used here; it also preloads pg_stat_statements, exercising the
-  # queryid path that the service-container jobs above skip.
+  # container is used here. The service-container jobs above preload the same
+  # extensions, so what is left only here is what needs a pooler, a standby or
+  # a subscriber.
   pooled:
     name: pooled-pg${{ matrix.pg }}
     needs: build
@@ -260,7 +283,11 @@ jobs:
         # One line on purpose: this is a plain scalar, where a trailing
         # backslash is not a continuation -- YAML folds the lines with a space
         # and the backslash reaches the shell as an argument.
-        run: .github/scripts/apt-pgdg.sh libpq5 postgresql-${{ matrix.pg }} postgresql-${{ matrix.pg }}-hypopg pgbouncer
+        #
+        # pg_wait_sampling, pg_stat_kcache and pg_qualstats are third-party
+        # too, and need shared_preload_libraries, which only this job's own
+        # cluster sets -- the rig preloads each one it finds installed.
+        run: .github/scripts/apt-pgdg.sh libpq5 postgresql-${{ matrix.pg }} postgresql-${{ matrix.pg }}-hypopg postgresql-${{ matrix.pg }}-pg-wait-sampling postgresql-${{ matrix.pg }}-pg-stat-kcache postgresql-${{ matrix.pg }}-pg-qualstats pgbouncer
 
       - uses: actions/download-artifact@v4
         with:
@@ -277,6 +304,8 @@ jobs:
           # it, so a skip means something broke rather than something is
           # missing. Turn the skip into a failure.
           PGLICHT_REQUIRE_HYPOPG: "1"
+          # Same reasoning for the three preload extensions installed above.
+          PGLICHT_REQUIRE_PRELOAD_EXTENSIONS: "1"
         run: |
           chmod +x cpp/build/pg_licht_mcp_test
           cpp/test/run-pooled-tests.sh

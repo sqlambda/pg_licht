@@ -954,6 +954,33 @@ TEST_F(PostgresMCPServerTest, SearchFunctionsByTriggerName) {
   EXPECT_TRUE(found);
 }
 
+// PostgreSQL's own functions were 97-99% of a typical answer, and enough of
+// them pushed one past what a client accepts -- losing the database's own
+// functions with the built-ins that buried them.
+TEST_F(PostgresMCPServerTest, SearchFunctionsLeavesOutPostgresOwnUnlessAsked) {
+  auto system_hits = [](const json& r) {
+    size_t n = 0;
+    for (auto& [k, v] : r.items()) {
+      (void)v;
+      if (k.rfind("pg_catalog.", 0) == 0 || k.rfind("information_schema.", 0) == 0) n++;
+    }
+    return n;
+  };
+  EXPECT_EQ(system_hits(srv->call_search_functions("count")), 0u);
+  EXPECT_GT(system_hits(srv->call_search_functions("count", "", true)), 0u);
+  // Naming a system schema is asking for its functions.
+  EXPECT_GT(system_hits(srv->call_search_functions("count", "pg_catalog", false)), 0u);
+
+  json grocery = srv->call_search_functions("count", "grocery", false);
+  ASSERT_FALSE(grocery.empty()) << grocery.dump(2);
+  for (auto& [k, v] : grocery.items()) {
+    (void)v;
+    EXPECT_EQ(k.rfind("grocery.", 0), 0u) << k;
+  }
+  json gone = srv->call_search_functions("count", "no_such_schema_here", false);
+  ASSERT_TRUE(gone.contains("error")) << gone.dump(2);
+}
+
 // --- tableDetails trigger enhancement test ---
 
 TEST_F(PostgresMCPServerTest, TableDetailsIncludesTriggers) {
@@ -1965,6 +1992,35 @@ TEST_F(PostgresMCPServerTest, PartitionDetailsCarriesBoundsAndPerPartitionVacuum
   EXPECT_TRUE(saw_january) << r.dump(2);
 }
 
+// A day-partitioned table outgrew what a client accepts, so the list is capped
+// -- and the DEFAULT partition, which sorts last by name, is the one a cap
+// must never cut: a growing default is the finding this tool exists for.
+TEST_F(PostgresMCPServerTest, PartitionDetailsCapsTheListButKeepsTheDefault) {
+  json all = srv->call_partition_details("grocery", "events");
+  ASSERT_TRUE(all.contains("partitions")) << all.dump(2);
+  EXPECT_EQ(all["partition_count"].get<int>(), 3);
+  EXPECT_FALSE(all["partitions_truncated"].get<bool>());
+  EXPECT_EQ(all["order_by"], "name");
+  // By name the DEFAULT partition stays last, as it always has.
+  EXPECT_TRUE(all["partitions"].back()["is_default"].get<bool>()) << all.dump(2);
+
+  json one = srv->call_partition_details("grocery", "events", 1, "");
+  ASSERT_EQ(one["partitions"].size(), 1u) << one.dump(2);
+  EXPECT_TRUE(one["partitions"][0]["is_default"].get<bool>()) << one.dump(2);
+  EXPECT_EQ(one["partition_count"].get<int>(), 3);
+  EXPECT_TRUE(one["partitions_truncated"].get<bool>());
+
+  json two = srv->call_partition_details("grocery", "events", 2, "oldest_vacuum");
+  ASSERT_EQ(two["partitions"].size(), 2u) << two.dump(2);
+  EXPECT_EQ(two["order_by"], "oldest_vacuum");
+  bool kept = false;
+  for (const auto& p : two["partitions"]) kept = kept || p["is_default"].get<bool>();
+  EXPECT_TRUE(kept) << two.dump(2);
+
+  EXPECT_THROW(srv->call_partition_details("grocery", "events", 5, "bound; DROP TABLE x"),
+               std::runtime_error);
+}
+
 // Reaching for it after listTables named an ordinary relation is the habit
 // this error exists for; "not partitioned" and "does not exist" are different
 // answers.
@@ -2495,6 +2551,7 @@ TEST(BudgetsTest, WithNoFileTheBuiltInRatiosApply) {
   const auto b = pglicht::Budgets::load("");
   EXPECT_EQ(b.analyze_memory_percent, 10);
   EXPECT_EQ(b.analyze_vcpus_per_worker, 4);
+  EXPECT_EQ(b.payload_max_kb, 0);   // off until measured against a client
   EXPECT_EQ(b.source, "built-in defaults");
 }
 
@@ -2512,6 +2569,7 @@ TEST(BudgetsTest, TheShippedExampleLoadsAndStatesTheDefaults) {
   const pglicht::Budgets def;
   EXPECT_EQ(ex.analyze_memory_percent, def.analyze_memory_percent);
   EXPECT_EQ(ex.analyze_vcpus_per_worker, def.analyze_vcpus_per_worker);
+  EXPECT_EQ(ex.payload_max_kb, def.payload_max_kb);
 }
 
 TEST(BudgetsTest, ReadsBothRatiosAndNamesTheFile) {
@@ -2534,11 +2592,23 @@ TEST(BudgetsTest, AnythingItDoesNotUnderstandFailsAtStartup) {
          "[analyze]\nmemory_precent = 10\n",         // misspelt key
          "[analyse]\nmemory_percent = 10\n",         // misspelt section
          "memory_percent = 10\n",                    // outside any section
+         "[payload]\nmax_kb = -1\n",
+         "[payload]\nmax_kb = 1048577\n",           // past the documented ceiling
+         "[payload]\nmax_bytes = 96\n",             // wrong key for the section
+         "[payload]\nmemory_percent = 10\n",        // right key, wrong section
        }) {
     BudgetsFile f(body);
     EXPECT_THROW(pglicht::Budgets::load(f.path), std::runtime_error) << body;
   }
   EXPECT_THROW(pglicht::Budgets::load("/nonexistent/budgets.ini"), std::runtime_error);
+}
+
+TEST(BudgetsTest, PayloadLimitIsReadAndZeroTurnsItOff) {
+  BudgetsFile f("[analyze]\nmemory_percent = 10\n\n[payload]\nmax_kb = 256\n");
+  EXPECT_EQ(pglicht::Budgets::load(f.path).payload_max_kb, 256);
+  // 0 is the one value positive_int refuses that means something here.
+  BudgetsFile off("[payload]\nmax_kb = 0\n");
+  EXPECT_EQ(pglicht::Budgets::load(off.path).payload_max_kb, 0);
 }
 
 TEST(BudgetsTest, AFileOthersCanWriteIsRefused) {
@@ -6449,6 +6519,325 @@ TEST_F(PostgresMCPServerTest, ReuseSurvivesWhateverTheTransportIs) {
   EXPECT_TRUE(srv->call_table_stats("grocery", "users").contains("rows"));
 }
 
+// --- pg_wait_sampling, pg_stat_kcache, pg_qualstats ---
+//
+// All three keep their counters in shared memory and so need
+// shared_preload_libraries, which cpp/test/run-pooled-tests.sh sets and the
+// stock postgres Docker image does not. The suite therefore works out, per
+// extension, whether it is usable here, and each test skips when its
+// extension is not -- unless PGLICHT_REQUIRE_PRELOAD_EXTENSIONS is set, which
+// the pooled CI job does because it installs them on purpose, and where a skip
+// would mean something broke while looking like something merely absent.
+class PreloadExtTest : public ::testing::Test {
+protected:
+  static pqxx::connection* admin;
+  static PostgresMCPServer* srv;
+  static std::string dbname;
+  static std::string url;
+  static std::set<std::string> usable;   // extensions answering from shared memory
+  static bool hypopg;
+
+  // A constant no statistic of ours would contain by accident, so finding it
+  // anywhere in an answer means a constant leaked.
+  static constexpr const char* kSecret = "424242";
+
+  static void SetUpTestSuite() {
+    const char* env_url = std::getenv("DATABASE_URL");
+    if (!env_url) return;
+    std::string base = env_url;
+    dbname = "pg_licht_preload_" + std::to_string(getpid());
+    try {
+      admin = new pqxx::connection(base);
+      {
+        pqxx::nontransaction n(*admin);
+        n.exec("CREATE DATABASE \"" + dbname + "\"");
+      }
+      std::regex dbname_re(R"(\bdbname\s*=\s*\S+)");
+      url = std::regex_search(base, dbname_re)
+        ? std::regex_replace(base, dbname_re, "dbname=" + dbname)
+        : base + " dbname=" + dbname;
+
+      pqxx::connection c(url);
+      {
+        pqxx::work t(c);
+        t.exec("CREATE SCHEMA extensions");
+        t.exec("CREATE TABLE public.orders (id bigint GENERATED ALWAYS AS IDENTITY "
+               "PRIMARY KEY, customer_id int NOT NULL, amount numeric NOT NULL)");
+        t.exec("INSERT INTO public.orders (customer_id, amount) "
+               "SELECT g % 500, g % 97 FROM generate_series(1, 20000) AS g");
+        t.exec("ANALYZE public.orders");
+        t.commit();
+      }
+      // One transaction each: CREATE EXTENSION fails outright where the
+      // package is absent, and a failure must not take the others with it.
+      // pg_stat_kcache requires pg_stat_statements, so that goes first.
+      for (const char* ext : {"pg_stat_statements", "pg_stat_kcache", "pg_wait_sampling",
+                              "pg_qualstats", "hypopg"}) {
+        try {
+          pqxx::work t(c);
+          t.exec(std::string("CREATE EXTENSION ") + ext + " SCHEMA extensions");
+          t.commit();
+        } catch (const std::exception&) {}
+      }
+
+      // The workload, from a session of its own so the extensions record it
+      // as another backend's. sample_rate is user-settable, and 1 makes
+      // pg_qualstats record every statement instead of one in max_connections.
+      {
+        pqxx::connection w(url);
+        pqxx::nontransaction n(w);
+        try { n.exec("SET pg_qualstats.sample_rate = 1"); } catch (const std::exception&) {}
+        for (int i = 0; i < 20; i++) {
+          n.exec("SELECT count(*) FROM public.orders WHERE customer_id = " +
+                 std::string(kSecret));
+          n.exec("SELECT count(*) FROM public.orders WHERE amount > 90");
+        }
+        // A misestimate on purpose: rows the statistics have never seen, so
+        // the planner expects next to none and gets thousands.
+        n.exec("ALTER TABLE public.orders SET (autovacuum_enabled = off)");
+        n.exec("INSERT INTO public.orders (customer_id, amount) "
+               "SELECT 1, 12345 FROM generate_series(1, 5000)");
+        for (int i = 0; i < 3; i++)
+          n.exec("SELECT count(*) FROM public.orders WHERE amount = 12345");
+        // Long enough for pg_wait_sampling's 10 ms collector to see it.
+        n.exec("SELECT pg_sleep(0.3)");
+      }
+
+      srv = new PostgresMCPServer(url);
+      auto ok = [](const json& r) { return !r.contains("error"); };
+      if (ok(srv->call_wait_event_profile())) usable.insert("pg_wait_sampling");
+      if (ok(srv->call_statement_kernel_stats())) usable.insert("pg_stat_kcache");
+      if (ok(srv->call_predicate_stats())) usable.insert("pg_qualstats");
+      {
+        pqxx::work t(c);
+        hypopg = !t.exec("SELECT 1 FROM pg_extension WHERE extname = 'hypopg'").empty();
+      }
+    } catch (const std::exception&) {
+      // Most likely no CREATE DATABASE here; every test below then skips.
+    }
+  }
+
+  static void TearDownTestSuite() {
+    delete srv; srv = nullptr;
+    if (admin) {
+      try {
+        pqxx::nontransaction n(*admin);
+        n.exec("DROP DATABASE IF EXISTS \"" + dbname + "\" WITH (FORCE)");
+      } catch (const std::exception&) {}
+      delete admin; admin = nullptr;
+    }
+  }
+
+  // Whether a test may run against `ext`, failing instead of skipping where
+  // the extensions are required.
+  static bool have(const std::string& ext) {
+    if (srv && usable.count(ext)) return true;
+    if (std::getenv("PGLICHT_REQUIRE_PRELOAD_EXTENSIONS"))
+      ADD_FAILURE() << "PGLICHT_REQUIRE_PRELOAD_EXTENSIONS is set but " << ext
+                    << " is not usable here (installed and preloaded?)";
+    return false;
+  }
+};
+
+pqxx::connection* PreloadExtTest::admin = nullptr;
+PostgresMCPServer* PreloadExtTest::srv = nullptr;
+std::string PreloadExtTest::dbname;
+std::string PreloadExtTest::url;
+std::set<std::string> PreloadExtTest::usable;
+bool PreloadExtTest::hypopg = false;
+
+// The profile is summed, not returned raw -- one row per pid, event and
+// queryid grows for as long as the server runs -- and a sample count is only
+// a time once multiplied by the collector's period, so both must agree.
+TEST_F(PreloadExtTest, WaitEventProfileTurnsSamplesIntoTime) {
+  if (!have("pg_wait_sampling")) GTEST_SKIP() << "pg_wait_sampling is not usable here";
+  json r = srv->call_wait_event_profile();
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  EXPECT_EQ(r["group_by"], "event");
+  EXPECT_EQ(r["preloaded"], true);
+  const long long period = r["settings"]["profile_period_ms"].get<long long>();
+  ASSERT_GT(period, 0);
+  ASSERT_FALSE(r["events"].empty()) << r.dump(2);
+  bool slept = false;
+  for (const auto& e : r["events"]) {
+    EXPECT_FALSE(e.contains("query_id")) << "group_by=event keeps no query_id";
+    EXPECT_EQ(e["estimated_ms"].get<long long>(), e["samples"].get<long long>() * period);
+    // Idle background processes are left out by default.
+    EXPECT_NE(e["event_type"], "Activity") << e.dump();
+    if (e["event_type"] == "Timeout" && e["event"] == "PgSleep") slept = true;
+  }
+  EXPECT_TRUE(slept) << "the seeded pg_sleep was not sampled: " << r.dump(2);
+  EXPECT_GE(r["excluded_idle_samples"].get<long long>(), 0);
+}
+
+TEST_F(PreloadExtTest, WaitEventProfileByQueryJoinsToStatementStats) {
+  if (!have("pg_wait_sampling")) GTEST_SKIP() << "pg_wait_sampling is not usable here";
+  json r = srv->call_wait_event_profile("query", "", 500);
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  std::string sleeper;
+  for (const auto& e : r["events"]) {
+    ASSERT_TRUE(e.contains("query_id"));
+    // A queryid is text, never a number a client could round.
+    EXPECT_TRUE(e["query_id"].is_string() || e["query_id"].is_null()) << e.dump();
+    if (e["event"] == "PgSleep" && e["query_id"].is_string()) sleeper = e["query_id"];
+  }
+  if (sleeper.empty()) GTEST_SKIP() << "profile_queries is off here, so no queryid was kept";
+  json one = srv->call_wait_event_profile("query", sleeper, 500);
+  ASSERT_FALSE(one["events"].empty());
+  for (const auto& e : one["events"]) EXPECT_EQ(e["query_id"], sleeper);
+  EXPECT_THROW(srv->call_wait_event_profile("pid"), std::runtime_error);
+  EXPECT_THROW(srv->call_wait_event_profile("", "12; DROP TABLE x"), std::runtime_error);
+}
+
+// Read from the pg_stat_kcache() function, per queryid -- not the view of the
+// same name, which is summed per database and carries no queryid at all.
+TEST_F(PreloadExtTest, StatementKernelStatsIsPerStatementAndJoinsPgStatStatements) {
+  if (!have("pg_stat_kcache")) GTEST_SKIP() << "pg_stat_kcache is not usable here";
+  json r = srv->call_statement_kernel_stats(500);
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  EXPECT_EQ(r["order_by"], "exec_cpu_time");
+  EXPECT_GT(r["block_size"].get<int>(), 0);
+  ASSERT_FALSE(r["statements"].empty());
+  std::string counted;
+  for (const auto& s : r["statements"]) {
+    ASSERT_TRUE(s["query_id"].is_string()) << s.dump();
+    for (const char* phase : {"exec", "plan"}) {
+      for (const char* k : {"user_time_s", "system_time_s", "reads_bytes", "writes_bytes",
+                            "minflts", "majflts", "nvcsws", "nivcsws"})
+        EXPECT_TRUE(s[phase].contains(k)) << phase << "." << k;
+      // Always zero on Linux, so deliberately not reported.
+      EXPECT_FALSE(s[phase].contains("nswaps"));
+      EXPECT_FALSE(s[phase].contains("nsignals"));
+    }
+    // The suite connects as the role that ran the workload, so nothing is
+    // hidden and the pg_stat_statements side must be there.
+    if (s["calls"].is_number() && s["calls"].get<long long>() >= 20) counted = s["query_id"];
+  }
+  ASSERT_FALSE(counted.empty()) << "no statement joined to pg_stat_statements: " << r.dump(2);
+  json one = srv->call_statement_kernel_stats(500, counted);
+  ASSERT_FALSE(one["statements"].empty());
+  for (const auto& s : one["statements"]) EXPECT_EQ(s["query_id"], counted);
+  EXPECT_THROW(srv->call_statement_kernel_stats(5, "", "calls; DROP TABLE x"),
+               std::runtime_error);
+}
+
+// The guarantee that makes this tool admissible at all: pg_qualstats records
+// every predicate's literal, and none of it may reach the caller.
+TEST_F(PreloadExtTest, PredicateStatsNeverReturnsAConstant) {
+  if (!have("pg_qualstats")) GTEST_SKIP() << "pg_qualstats is not usable here";
+  // Only a real check if the constant is there to leak: the extension must
+  // have recorded it, or the assertion below passes vacuously.
+  {
+    pqxx::connection c(url);
+    pqxx::work t(c);
+    const bool recorded = !t.exec(
+      std::string("SELECT 1 FROM extensions.pg_qualstats() WHERE constvalue LIKE '%") +
+      kSecret + "%'").empty();
+    if (!recorded) GTEST_SKIP() << "pg_qualstats.track_constants is off, so there is no "
+                                   "constant here to leak";
+  }
+  json r = srv->call_predicate_stats(500);
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  EXPECT_EQ(r["preloaded"], true);
+  EXPECT_EQ(r.dump().find(kSecret), std::string::npos) << r.dump(2);
+  bool seen = false;
+  for (const auto& p : r["predicates"]) {
+    if (p["predicate"] == "orders.customer_id = ?") {
+      seen = true;
+      EXPECT_EQ(p["evaluated_as"], "filter");
+      EXPECT_EQ(p["relation"], "orders");
+      EXPECT_EQ(p["column"], "customer_id");
+      EXPECT_GT(p["filtered"].get<long long>(), 0);
+      EXPECT_GT(p["filtered_pct"].get<double>(), 90.0);
+      ASSERT_FALSE(p["query_ids"].empty());
+      EXPECT_TRUE(p["query_ids"][0].is_string());
+    }
+  }
+  EXPECT_TRUE(seen) << r.dump(2);
+  EXPECT_THROW(srv->call_predicate_stats(5, "", "constvalue"), std::runtime_error);
+}
+
+// What the documentation says the ratio means, checked rather than asserted:
+// the factor by which the row estimate missed. 5,000 rows the statistics have
+// never seen, against a planner expecting almost none.
+TEST_F(PreloadExtTest, PredicateStatsReportsAMisestimateAsTheFactorItMissedBy) {
+  if (!have("pg_qualstats")) GTEST_SKIP() << "pg_qualstats is not usable here";
+  json r = srv->call_predicate_stats(500, "", "err_estimate_ratio");
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  bool seen = false;
+  for (const auto& p : r["predicates"]) {
+    if (p["predicate"] != "orders.amount = ?") continue;
+    seen = true;
+    ASSERT_TRUE(p["max_err_estimate_ratio"].is_number()) << p.dump();
+    EXPECT_GT(p["max_err_estimate_ratio"].get<double>(), 10.0) << p.dump();
+    EXPECT_GT(p["mean_err_estimate_num"].get<double>(), 1000.0) << p.dump();
+  }
+  ASSERT_TRUE(seen) << r.dump(2);
+  // And the ranking puts it first: nothing NaN or infinite can outrank it.
+  EXPECT_EQ(r["predicates"][0]["predicate"], "orders.amount = ?") << r.dump(2);
+}
+
+// Advisor suggests, evaluateIndex tests, neither builds: the suggestion must
+// be something evaluateIndex accepts, and nothing may exist afterwards.
+TEST_F(PreloadExtTest, SuggestIndexesFeedsEvaluateIndexAndBuildsNothing) {
+  if (!have("pg_qualstats")) GTEST_SKIP() << "pg_qualstats is not usable here";
+  json r = srv->call_suggest_indexes(1, 1);
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
+  EXPECT_EQ(r.dump().find(kSecret), std::string::npos) << r.dump(2);
+  std::string ddl, qid;
+  for (const auto& i : r["indexes"]) {
+    EXPECT_EQ(i["ddl"].get<std::string>().rfind("CREATE INDEX ON ", 0), 0u) << i.dump();
+    for (const auto& q : i["query_ids"]) EXPECT_TRUE(q.is_string());
+    if (i["ddl"].get<std::string>().find("(customer_id)") != std::string::npos) {
+      ddl = i["ddl"];
+      if (!i["query_ids"].empty()) qid = i["query_ids"][0];
+    }
+  }
+  ASSERT_FALSE(ddl.empty()) << "no suggestion for the filtered column: " << r.dump(2);
+  {
+    pqxx::connection c(url);
+    pqxx::work t(c);
+    EXPECT_EQ(t.exec("SELECT 1 FROM pg_indexes WHERE tablename = 'orders' "
+                     "AND indexdef LIKE '%(customer_id)%'").size(), 0u);
+  }
+  EXPECT_THROW(srv->call_suggest_indexes(1, 101), std::runtime_error);
+  EXPECT_THROW(srv->call_suggest_indexes(1, 1, json::array({1})), std::runtime_error);
+
+  if (!hypopg || qid.empty()) GTEST_SKIP() << "hypopg is not installed here";
+  json plan = srv->call_explain_query(qid, "", json::array(), false, 0);
+  std::string sql;
+  if (plan.contains("sql")) {
+    sql = plan["sql"];
+  } else {
+    // 14 and 15: a recovered statement keeps its $n placeholders and only
+    // 16's GENERIC_PLAN can plan it, so the caller substitutes a value --
+    // which is what the documentation tells them to do, and is checked here
+    // rather than skipped.
+    ASSERT_TRUE(plan.contains("statement")) << plan.dump(2);
+    EXPECT_NE(plan["hint"].get<std::string>().find("GENERIC_PLAN"), std::string::npos);
+    sql = std::regex_replace(plan["statement"]["query"].get<std::string>(),
+                             std::regex(R"(\$[0-9]+)"), "1");
+  }
+  json e = srv->call_evaluate_index(sql, json::array({ddl}), json::array());
+  ASSERT_FALSE(e.contains("error")) << e.dump(2);
+  ASSERT_EQ(e["indexes"].size(), 1u);
+  EXPECT_TRUE(e["indexes"][0]["used"].is_boolean());
+}
+
+TEST_F(PreloadExtTest, CheckPrivilegesDoesNotDenyAUsableExtension) {
+  if (!srv) GTEST_SKIP() << "no database here";
+  json r = srv->call_check_privileges();
+  const std::map<std::string, std::string> owner = {
+    {"waitEventProfile", "pg_wait_sampling"}, {"statementKernelStats", "pg_stat_kcache"},
+    {"predicateStats", "pg_qualstats"}, {"suggestIndexes", "pg_qualstats"}};
+  for (const auto& d : r.value("denied", json::array())) {
+    auto it = owner.find(d["tool"]);
+    if (it != owner.end()) {
+      EXPECT_EQ(usable.count(it->second), 0u) << d.dump() << " though it answers here";
+    }
+  }
+}
+
 // --- evaluateIndex (hypopg) ---
 
 namespace {
@@ -7585,6 +7974,175 @@ json rpc_payload(const json& response) {
 }
 
 }  // namespace
+
+// An answer past what a client accepts was dropped whole, and the caller saw
+// nothing -- not even that asking for less would have worked. The guard turns
+// that into an error naming the arguments that narrow THIS tool, and leaves
+// alone both a small answer and a tool's own error.
+TEST_F(PostgresMCPServerTest, AnAnswerOverThePayloadLimitIsRefusedWithAWayToAskForLess) {
+  PostgresMCPServer s(test_url);
+  BudgetsFile tight("[payload]\nmax_kb = 1\n");
+  s.set_budgets(pglicht::Budgets::load(tight.path));
+
+  json big = rpc_payload(rpc_call(s, "serverSettings", {{"all", true}}));
+  ASSERT_TRUE(big.contains("error")) << big.dump(2).substr(0, 400);
+  EXPECT_NE(big["error"].get<std::string>().find("over the 1 KB"), std::string::npos) << big;
+  // The hint names what serverSettings declares to narrow it...
+  EXPECT_NE(big["hint"].get<std::string>().find("pattern"), std::string::npos) << big;
+  EXPECT_GT(big["bytes"].get<long long>(), 1024);
+
+  // ...and never a required argument, which names the object rather than
+  // shrinking the answer.
+  json parts = rpc_payload(rpc_call(s, "partitionDetails",
+                                    {{"schema", "grocery"}, {"table", "events"}}));
+  ASSERT_TRUE(parts.contains("error")) << parts.dump(2);
+  EXPECT_NE(parts["hint"].get<std::string>().find("limit"), std::string::npos);
+  EXPECT_EQ(parts["hint"].get<std::string>().find("table"), std::string::npos) << parts;
+
+  // A tool's own error passes through untouched.
+  json own = rpc_payload(rpc_call(s, "listTables", {{"schema", "no_such_schema_here"}}));
+  EXPECT_NE(own["error"].get<std::string>().find("no such schema"), std::string::npos) << own;
+
+  BudgetsFile off("[payload]\nmax_kb = 0\n");
+  s.set_budgets(pglicht::Budgets::load(off.path));
+  json whole = rpc_payload(rpc_call(s, "serverSettings", {{"all", true}}));
+  EXPECT_FALSE(whole.contains("error")) << "max_kb = 0 must turn the guard off";
+
+  // And off is the default: a server given no budgets.ini refuses nothing.
+  PostgresMCPServer fresh(test_url);
+  json dflt = rpc_payload(rpc_call(fresh, "serverSettings", {{"all", true}}));
+  EXPECT_FALSE(dflt.contains("error")) << "the guard must be off unless configured";
+}
+
+TEST_F(PostgresMCPServerTest, SchemaWideListingsNarrowByPattern) {
+  // Case-insensitive substring of the object's name, as on listRoles.
+  json t = srv->call_tables("grocery", "USER");
+  ASSERT_FALSE(t.empty()) << t.dump(2);
+  for (auto& [k, v] : t.items()) {
+    (void)v;
+    EXPECT_NE(k.find("user"), std::string::npos) << k;
+  }
+  EXPECT_TRUE(srv->call_tables("grocery", "no_table_is_called_this").empty());
+  EXPECT_LT(srv->call_list_table_stats("grocery", "orders").size(),
+            srv->call_list_table_stats("grocery", "").size());
+  EXPECT_LT(srv->call_list_table_sizes("grocery", "orders").size(),
+            srv->call_list_table_sizes("grocery", "").size());
+  EXPECT_TRUE(srv->call_sequences("grocery", "no_sequence_is_called_this").empty());
+  json f = srv->call_functions("grocery", "user_count");
+  ASSERT_FALSE(f.empty()) << f.dump(2);
+  EXPECT_TRUE(srv->call_functions("grocery", "no_function_is_called_this").empty());
+}
+
+// "Contains" means contains. Through the first 4.4 build the SQL was ILIKE
+// '%x%', where `_` matches any character: "user_" matched "users", and a CI
+// run failed when "_42" matched every schema of a test whose process id held
+// a 42. Underscores are in most PostgreSQL names, so they must be literal.
+TEST_F(PostgresMCPServerTest, APatternIsALiteralSubstringNotAWildcard) {
+  const std::string sch = "lit" + std::to_string(getpid());
+  pqxx::connection c(test_url);
+  {
+    pqxx::work w(c);
+    w.exec("CREATE SCHEMA " + sch);
+    w.exec("CREATE TABLE " + sch + ".users (id int)");
+    w.exec("CREATE TABLE " + sch + ".user_x (id int)");
+    w.exec("CREATE TABLE " + sch + ".pct_100 (id int)");
+    w.commit();
+  }
+  auto names = [](const json& r) {
+    std::set<std::string> n;
+    for (auto& [k, v] : r.items()) { (void)v; n.insert(k); }
+    return n;
+  };
+  EXPECT_EQ(names(srv->call_tables(sch, "user_")), std::set<std::string>{"user_x"});
+  EXPECT_EQ(names(srv->call_tables(sch, "USER_")), std::set<std::string>{"user_x"});
+  EXPECT_TRUE(srv->call_tables(sch, "%").empty()) << "% must not match everything";
+  EXPECT_EQ(names(srv->call_list_table_stats(sch, "t_1")), std::set<std::string>{"pct_100"});
+
+  pqxx::nontransaction n(c);
+  n.exec("DROP SCHEMA " + sch + " CASCADE");
+}
+
+// The invariant behind the payload guard. A refusal is only useful if the
+// caller can do something about it, and a tool whose answer grows with the
+// schema but declares nothing to narrow it turns the guard into a dead end.
+// That is how 4.4 nearly shipped: listTables and listTableStats answered 194
+// and 294 KB on a schema of 1,000 relations, with no argument to ask for less.
+// So: build such a schema, call every schema-wide tool over the protocol under
+// the real default limit, and fail on any refusal that names no way forward.
+TEST_F(PostgresMCPServerTest, NoSchemaWideAnswerIsRefusedWithoutAWayToNarrowIt) {
+  // No underscore before the pid: the narrowing below uses "_42", and a
+  // pid starting with 42 would otherwise put it in every schema's name.
+  const std::string sch = "wide" + std::to_string(getpid());
+  pqxx::connection c(test_url);
+  {
+    pqxx::work w(c);
+    w.exec("CREATE SCHEMA " + sch);
+    // An identity column gives each table a sequence too; a function each
+    // stands in for an extension installed into the schema.
+    w.exec("DO $$ BEGIN FOR i IN 1..1000 LOOP "
+           "EXECUTE format('CREATE TABLE " + sch + ".t_%s (id bigint GENERATED ALWAYS "
+           "AS IDENTITY PRIMARY KEY, name text NOT NULL, created_at timestamptz)', i); "
+           "EXECUTE format('CREATE FUNCTION " + sch + ".f_%s(a int) RETURNS int "
+           "LANGUAGE sql IMMUTABLE AS ''SELECT a + 1''', i); END LOOP; END $$");
+    // And a schema-per-tenant database, which the first version of this test
+    // did not cover. Sized to cross the limit on purpose -- 300 schemas of
+    // five tables with realistic names -- since one short table per schema
+    // is ~90 bytes an entry and never reached it, which a mutation check
+    // (listSchemas' pattern hidden, and the test still passing) found.
+    w.exec("DO $$ BEGIN FOR i IN 1..300 LOOP "
+           "EXECUTE format('CREATE SCHEMA " + sch + "_tenant_%s', i); "
+           "FOR j IN 1..5 LOOP EXECUTE format('CREATE TABLE " + sch + "_tenant_%s."
+           "customer_subscription_billing_history_archive_%s (id int)', i, j); END LOOP; "
+           "END LOOP; END $$");
+    w.commit();
+  }
+  // The guard is off by default, so this sets the value it was designed
+  // around; the invariant is about what happens when an operator turns it on.
+  PostgresMCPServer s(test_url);
+  BudgetsFile limit("[payload]\nmax_kb = 96\n");
+  s.set_budgets(pglicht::Budgets::load(limit.path));
+
+  size_t called = 0, refused = 0;
+  for (const auto& t : s.call_tools_list()) {
+    const json& in = t["inputSchema"];
+    const json req = in.value("required", json::array());
+    // Everything whose answer can grow with the database: told only which
+    // schema, told nothing at all, or told only a search term -- a broad one.
+    json args;
+    if (req == json::array({"schema"})) args = {{"schema", sch}};
+    else if (req == json::array({"web_search"})) args = {{"web_search", "t"}};
+    else if (req.empty()) args = json::object();
+    else continue;
+    const std::string name = t["name"];
+    json resp = rpc_call(s, name, args);
+    // explainQuery needs one of queryid or sql, which a schema cannot say is
+    // required; called with neither it rightly refuses, and that is not this
+    // test's subject.
+    if (resp["result"].value("isError", false)) continue;
+    json r = rpc_payload(resp);
+    called++;
+    if (!r.contains("error") || !r.contains("bytes")) continue;   // not the guard
+    refused++;
+    const std::string hint = r["hint"];
+    EXPECT_EQ(hint.find("no argument that narrows"), std::string::npos)
+        << name << " is refused on a 1,000-relation schema with no way to ask for less: "
+        << hint;
+    // And the way it names must actually work.
+    if (in["properties"].contains("pattern")) {
+      json narrowed_args = args;
+      narrowed_args["pattern"] = "_42";
+      json narrowed = rpc_payload(rpc_call(s, name, narrowed_args));
+      EXPECT_FALSE(narrowed.contains("error")) << name << ": " << narrowed.dump().substr(0, 300);
+    }
+  }
+  EXPECT_GE(called, 10u) << "the schema-wide tools were not found";
+  EXPECT_GT(refused, 0u) << "nothing reached the limit, so this proved nothing";
+
+  pqxx::nontransaction n(c);
+  n.exec("DROP SCHEMA " + sch + " CASCADE");
+  n.exec("DO $$ BEGIN FOR i IN 1..300 LOOP "
+         "EXECUTE format('DROP SCHEMA " + sch + "_tenant_%s CASCADE', i); END LOOP; END $$");
+}
 
 // roleDependencies takes an argument called `role`, and dispatch read every
 // `role` as the sweep filter: it was validated against "primary"/"replica" and

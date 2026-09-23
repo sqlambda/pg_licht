@@ -6,24 +6,27 @@
 auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
     static const std::vector<ToolDef> defs = {
       {"listSchemas",
-       "return schema list with basic summaries: table_count, up to 25 table names, and role grants per schema. tables_truncated says when a schema holds more than the names shown -- listTables is the tool that names every relation in one schema, and it takes one schema at a time so its size stays bounded by the caller",
+       "return schema list with basic summaries: table_count, up to 25 table names, and role grants per schema. tables_truncated says when a schema holds more than the names shown -- listTables is the tool that names every relation in one schema. pattern narrows to schemas whose name contains it: a schema-per-tenant database passes 100 KB of answer at around 140 schemas",
        []() -> json { return {
    		{"type", "object"},
-   		{"properties", json::object()}
+   		{"properties", {
+   		    {"pattern", {{"type", "string"}, {"description", "only schemas whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed"}}}
+   		  }}
    	      }; },
-       [](PostgresMCPServer& s, const Args&) -> json {
-         return s.schemas(); }},
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.schemas(a.str("pattern")); }},
       {"listTables",
        "return the structure of every table, view and materialised view in a schema: kind, comment, storage options, columns and their per-column index counts, index count and constraint count. Structure only -- it changes when someone issues DDL and not otherwise. For row counts, scan counters, dead tuples and vacuum times call listTableStats; for measured on-disk sizes call listTableSizes",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
-   		    {"schema", {{"type", "string"}}}
+   		    {"schema", {{"type", "string"}}},
+   		    {"pattern", {{"type", "string"}, {"description", "only relations whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed. On a large schema the whole list is more than a model should read at once"}}}
    		  }},
    		{"required", {"schema"}}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         return s.tables(a.str("schema", "public")); }},
+         return s.tables(a.str("schema", "public"), a.str("pattern")); }},
       {"tableDetails",
        "return the structure of one table: columns with types, defaults, storage and compression, primary key, indexes with their definition and whether each is valid, constraints, foreign keys, inbound foreign keys (referenced_by), triggers with their enabled state, rules, row-level security, policies and privileges. Two of those say when an object is not doing what its definition suggests: an index with valid false is what a failed CREATE INDEX CONCURRENTLY leaves behind -- it occupies disk and is maintained on every write while the planner never uses it -- and a trigger with enabled 'disabled' still has its full definition, since ALTER TABLE ... DISABLE TRIGGER changes no text. 'replica' and 'always' are the session_replication_role states. Structure only -- it changes when someone issues DDL and not otherwise, and it returns no sample column values. For row counts, scan counters, dead tuples, vacuum times and the pg_stats column histograms call tableStats; for measured on-disk sizes call tableSize",
        []() -> json { return {
@@ -41,7 +44,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
-   		    {"web_search", {{"type", "string"}}}
+   		    {"web_search", {{"type", "string"}, {"description", "full-text search, not a substring: websearch_to_tsquery syntax in English, so words are stemmed (users finds user), \"a phrase\" in double quotes must match in order, or between words means either, and -word excludes. A fragment of a word does not match. Matched against table and schema names split into words at underscores and capitals, the table's comment, its columns' names and comments, the grantee roles, and the names, comments and values of enum types its columns use. To match part of a table name, use listTables with pattern"}}}
    		  }},
    		{"required", {"web_search"}}
    	      }; },
@@ -68,6 +71,33 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
          json settings = a.contains("settings") ? a["settings"] : json::object();
          return s.evaluate_index(a.str("sql", ""), a.arr("create"), a.arr("hide"),
                                  settings, a.str("plan_as_role")); }},
+      {"predicateStats",
+       "return the WHERE and JOIN predicates pg_qualstats has sampled in this database, one entry per relation, column, operator and way of evaluating it: how often it ran, how many rows it was evaluated against, how many it filtered out, and how far the planner's selectivity estimate was from what happened. evaluated_as \"filter\" is a predicate applied to rows after they were fetched -- a high filtered_pct there is rows read only to be thrown away, which is what an index would avoid; \"index\" means an index already serves it. mean_err_estimate_ratio is the factor by which the planner's row estimate missed -- 166 when 60 rows were expected and 10,000 arrived -- and 0 when it did not miss; mean_err_estimate_num is the same miss in rows. A large factor is the planner misjudging selectivity, which ANALYZE, a larger statistics target or extended statistics (listExtendedStatistics) fixes and an index does not. NEVER returns a constant: a predicate reads table.column op ?, and pg_qualstats' constvalue column and example-query functions are not read. query_ids joins to statementStats, at most 10 per predicate with queries giving the full count. pg_qualstats samples one query in pg_qualstats.sample_rate (by default 1/max_connections), so counts are samples rather than totals. Requires pg_qualstats in shared_preload_libraries. Without it the extension does not fail -- it silently reports only the calling session's own predicates -- so this tool detects that from the extension's own settings, which any role can read, and refuses rather than return an empty answer that looks like a real one",
+       []() -> json { return {
+   		{"type", "object"},
+   		{"properties", {
+   		    {"limit", {{"type", "integer"}, {"description", "how many predicates to return. Defaults to 20, at most 500"}}},
+   		    {"query_id", {{"type", "string"}, {"description", "only predicates of this statement, as a decimal string from statementStats"}}},
+   		    {"order_by", {{"type", "string"},
+   		                  {"description", "ranking: filtered (default, rows removed), execution_count, occurrences, or err_estimate_ratio (the planner's worst selectivity misestimate)"}}}
+   		  }}
+   	      }; },
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.predicate_stats(a.num("limit", 20), a.str("query_id"), a.str("order_by")); }},
+      {"suggestIndexes",
+       "return index suggestions from pg_qualstats' own index advisor for this database: each is a complete CREATE INDEX statement with the query_ids of the statements it would serve, plus not_indexable, the predicates that filter heavily but use an operator no access method supports, which an index cannot fix. Nothing is built: the advisor only reads pg_qualstats. A suggestion is a hypothesis, not a result -- pass its ddl to evaluateIndex's create, with a statement from explainQuery or statementStats for one of its query_ids, to see whether the planner would actually use it. On PostgreSQL 14 and 15 a statement recovered from pg_stat_statements keeps its $n placeholders, which only 16's EXPLAIN (GENERIC_PLAN) can plan, so substitute representative values before passing it. The advisor considers filter predicates averaging at least min_filter rows removed per execution and removing at least min_selectivity percent of the rows they see; lower both on a small or quiet database. Constants are never returned, as with predicateStats. Requires pg_qualstats 2.1 or later, the first whose advisor names the statements each suggestion serves, in shared_preload_libraries, and refuses rather than advise from an empty sample when it is installed without it",
+       []() -> json { return {
+   		{"type", "object"},
+   		{"properties", {
+   		    {"min_filter", {{"type", "integer"}, {"description", "average rows a predicate must remove per execution to be considered. Defaults to 1000"}}},
+   		    {"min_selectivity", {{"type", "integer"}, {"description", "percentage of evaluated rows a predicate must remove to be considered, 0 to 100. Defaults to 30"}}},
+   		    {"forbidden_am", {{"type", "array"}, {"items", {{"type", "string"}}},
+   		                      {"description", "access methods never to suggest, e.g. [\"hash\"]"}}}
+   		  }}
+   	      }; },
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.suggest_indexes(a.bignum("min_filter", 1000), a.bignum("min_selectivity", 30),
+                                  a.arr("forbidden_am")); }},
       {"checkPrivileges",
        "report which tools the current role can actually use on this connection, and how the rest fall short. Most of this server works for any role that can connect, because the catalog is world-readable; what varies is the monitoring extras and whether the role can read table data. Call this first when working against an unfamiliar connection or a restricted role -- the alternative is discovering the limits tool by tool, and a privilege-filtered answer is easy to mistake for an empty one. Names no role memberships and no GRANT statements: what a caller needs is which tools work. This is about THIS server's operations for the CONNECTING role, and is not an object permission check -- for whether some other role may read a given table, view or function, and which rows row-level security then leaves it, use the check-role-access prompt. Tools absent from both lists are fully available",
        []() -> json { return {
@@ -137,28 +167,33 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args& a) -> json {
          return s.list_partitions(a.str("schema", "public")); }},
       {"partitionDetails",
-       "return one partitioned table with every partition: its bound expression verbatim, whether it is the DEFAULT, whether it is itself partitioned, estimated rows and size (both null, not 0, for a partition never analyzed), and the per-partition live/dead tuples, scan counters and vacuum and analyze timestamps. Those statistics are the reason this exists: autovacuum runs per PARTITION, so a parent has no vacuum state of its own and ranking parents finds nothing while one child falls behind. Bounds are returned verbatim rather than parsed -- a bound carries whatever types the key columns have, and a misparsed boundary is worse than an unparsed one; for a RANGE parent, comparing the highest upper bound against now() is how to see that next period's partition was never created. counters_since says when the scan counters were last reset. Returns a clear error naming the relkind if the table exists but is not partitioned",
+       "return one partitioned table with every partition: its bound expression verbatim, whether it is the DEFAULT, whether it is itself partitioned, estimated rows and size (both null, not 0, for a partition never analyzed), and the per-partition live/dead tuples, scan counters and vacuum and analyze timestamps. Those statistics are the reason this exists: autovacuum runs per PARTITION, so a parent has no vacuum state of its own and ranking parents finds nothing while one child falls behind. Bounds are returned verbatim rather than parsed -- a bound carries whatever types the key columns have, and a misparsed boundary is worse than an unparsed one; for a RANGE parent, comparing the highest upper bound against now() is how to see that next period's partition was never created. counters_since says when the scan counters were last reset. Returns a clear error naming the relkind if the table exists but is not partitioned. At most limit partitions are returned, 100 by default, with partition_count and partitions_truncated beside them: on a table partitioned by day each partition costs about 400 bytes, so three years of them is ~430 KB. To find the partition falling behind, rank with order_by=dead_tuples or oldest_vacuum rather than reading them by name",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
    		    {"table", {{"type", "string"}}},
-   		    {"schema", {{"type", "string"}}}
+   		    {"schema", {{"type", "string"}}},
+   		    {"limit", {{"type", "integer"}, {"description", "at most this many partitions, 100 by default and at most 10000. partition_count and partitions_truncated say how many there are; the DEFAULT partition is always kept"}}},
+   		    {"order_by", {{"type", "string"},
+   		                  {"description", "which partitions are kept and in what order: name (default, the DEFAULT partition last), dead_tuples, mod_since_analyze, oldest_vacuum (never-vacuumed first), or size"}}}
    		  }},
    		{"required", {"table", "schema"}}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         return s.partition_details(a.str("schema", "public"), a.str("table")); }},
+         return s.partition_details(a.str("schema", "public"), a.str("table"),
+                                    a.num("limit", 100), a.str("order_by")); }},
       {"listTableStats",
        "return the statistics PostgreSQL keeps for every table in a schema: estimated row count, seq_scan and idx_scan counts, live and dead tuples, rows modified since the last analyze, rows inserted since the last vacuum, and the manual and automatic vacuum and analyze times as four separate fields (last_vacuum and last_analyze are the manual ones, exactly as in pg_stat_user_tables -- a recent last_vacuum beside a null last_autovacuum means the table is being kept alive by hand and autovacuum is not reaching it). Reads the catalog and the statistics collector only -- no relation is opened and no file is measured. Carries no per-column histograms; name one table to tableStats for those. size_estimate is relpages*block_size (the server's BLCKSZ, 8192 unless it was built otherwise) and is only as fresh as estimated_from says: for measured sizes call listTableSizes",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
-   		    {"schema", {{"type", "string"}}}
+   		    {"schema", {{"type", "string"}}},
+   		    {"pattern", {{"type", "string"}, {"description", "only relations whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed. On a large schema the whole list is more than a model should read at once"}}}
    		  }},
    		{"required", {"schema"}}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         return s.list_table_stats(a.str("schema", "public")); }},
+         return s.list_table_stats(a.str("schema", "public"), a.str("pattern")); }},
       {"tableSize",
        "measure one table on disk: main fork, total table size including TOAST and the free space and visibility maps, index size, grand total, the TOAST relation and each index individually. COSTS MORE THAN IT LOOKS: these functions open the relation with AccessShareLock, so on a table an ALTER TABLE is rewriting the call waits behind AccessExclusiveLock until statement_timeout fires. Prefer size_estimate from tableStats, which is free, and call this when the estimate is too stale to act on. A partitioned table reports its own storage, which is zero -- measure the partitions, which partitionDetails names",
        []() -> json { return {
@@ -176,23 +211,25 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
-   		    {"schema", {{"type", "string"}}}
+   		    {"schema", {{"type", "string"}}},
+   		    {"pattern", {{"type", "string"}, {"description", "only relations whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed. On a large schema the whole list is more than a model should read at once"}}}
    		  }},
    		{"required", {"schema"}}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         return s.list_table_sizes(a.str("schema", "public")); }},
+         return s.list_table_sizes(a.str("schema", "public"), a.str("pattern")); }},
       {"listFunctions",
        "return function and procedure list for a schema",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
-   		    {"schema", {{"type", "string"}}}
+   		    {"schema", {{"type", "string"}}},
+   		    {"pattern", {{"type", "string"}, {"description", "only functions whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed. On a large schema the whole list is more than a model should read at once"}}}
    		  }},
    		{"required", {"schema"}}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         return s.functions(a.str("schema", "public")); }},
+         return s.functions(a.str("schema", "public"), a.str("pattern")); }},
       {"functionDetails",
        "return detailed function or procedure info including source and trigger usage",
        []() -> json { return {
@@ -206,16 +243,19 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args& a) -> json {
          return s.function_detail(a.str("schema", "public"), a.str("function", "")); }},
       {"searchFunctions",
-       "search functions and procedures by name, source, language, trigger name, or description",
+       "search functions and procedures by name, source, language, trigger name, or description. PostgreSQL's own functions in pg_catalog and information_schema are left out unless include_system is true or one of those schemas is named: they were 97-99% of a typical answer, and enough of them to bury the database's own functions",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
-   		    {"web_search", {{"type", "string"}}}
+   		    {"web_search", {{"type", "string"}, {"description", "full-text search, not a substring: websearch_to_tsquery syntax in English, so words are stemmed (users finds user), \"a phrase\" in double quotes must match in order, or between words means either, and -word excludes. A fragment of a word does not match. Matched against function names split into words at underscores and capitals, their source code and descriptions, and the names of triggers that call them -- plus the language name as a literal substring, so plpgsql is found by sql. To match part of a function name, use listFunctions with pattern"}}},
+   		    {"schema", {{"type", "string"}, {"description", "only functions in this schema"}}},
+   		    {"include_system", {{"type", "boolean"}, {"description", "also search pg_catalog and information_schema. Defaults to false"}}}
    		  }},
    		{"required", {"web_search"}}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         return s.search_functions(a.str("web_search", "")); }},
+         return s.search_functions(a.str("web_search", ""), a.str("schema"),
+                                   a.flag("include_system", false)); }},
       {"listEnums",
        "return enum type list for a schema with their values and descriptions",
        []() -> json { return {
@@ -244,7 +284,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
-   		    {"web_search", {{"type", "string"}}}
+   		    {"web_search", {{"type", "string"}, {"description", "full-text search, not a substring: websearch_to_tsquery syntax in English, so words are stemmed (users finds user), \"a phrase\" in double quotes must match in order, or between words means either, and -word excludes. A fragment of a word does not match. Matched against enum type names split into words at underscores and capitals, their comments and their values"}}}
    		  }},
    		{"required", {"web_search"}}
    	      }; },
@@ -278,7 +318,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
-   		    {"pattern", {{"type", "string"}, {"description", "case-insensitive substring of the role name"}}}
+   		    {"pattern", {{"type", "string"}, {"description", "only roles whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed"}}}
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
@@ -466,12 +506,13 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
-   		    {"schema", {{"type", "string"}}}
+   		    {"schema", {{"type", "string"}}},
+   		    {"pattern", {{"type", "string"}, {"description", "only sequences whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed. On a large schema the whole list is more than a model should read at once"}}}
    		  }},
    		{"required", {"schema"}}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         return s.sequences(a.str("schema", "public")); }},
+         return s.sequences(a.str("schema", "public"), a.str("pattern")); }},
       {"listExtensions",
        "return installed PostgreSQL extensions with version, schema, relocatable flag, and description",
        []() -> json { return {
@@ -493,7 +534,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
-   		    {"pattern", {{"type", "string"}, {"description", "case-insensitive substring of the setting name or category"}}},
+   		    {"pattern", {{"type", "string"}, {"description", "only settings whose name or category contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed"}}},
    		    {"all", {{"type", "boolean"}, {"description", "include settings still at their built-in default; defaults to false"}}}
    		  }}
    	      }; },
@@ -596,6 +637,35 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
          long long min_calls = a.contains("min_calls") && a["min_calls"].is_number_integer()
            ? a["min_calls"].get<long long>() : 0;
          return s.statement_stats(limit, qid, ord, min_calls); }},
+      {"waitEventProfile",
+       "return what this instance has spent its time waiting on, from pg_wait_sampling's accumulated profile: one entry per wait event (or per query_id and wait event with group_by=\"query\"), with its sample count, its percent of the samples counted (the idle ones below are not), and estimated_ms. currentActivity is a single sample of what is waiting now; this is the answer to what the server has been waiting on -- IO/DataFileRead dominating and LWLock/WALWrite dominating are opposite stories that look identical in a throughput figure. samples are collector ticks, every profile_period_ms per backend, so estimated_ms is backend-time summed over all backends rather than wall-clock time, and the counts accumulate from the last reset or server start: this server never resets them, so a window is the difference between two readings. Activity samples -- background processes idling in their main loops -- are excluded unless include_idle is true and counted in excluded_idle_samples. Client/ClientRead is kept, and it includes idle connections waiting for their next statement, so on a pooled server it measures connections times time as much as anything. An entry whose event_type and event are null is a backend sampled while not waiting at all -- running, which usually means on CPU -- and on a busy server it is often the largest entry. query_id is null for samples with no statement, and every query_id is 0 (so null) when pg_wait_sampling.profile_queries is off. Requires pg_wait_sampling in shared_preload_libraries, and says so as an error when it is installed without it; preloaded is null only when neither shared_preload_libraries nor the extension's own settings could tell",
+       []() -> json { return {
+   		{"type", "object"},
+   		{"properties", {
+   		    {"group_by", {{"type", "string"}, {"enum", {"event", "query"}},
+   		                  {"description", "\"event\" (default) sums every backend and statement per wait event; \"query\" keeps query_id, to join to statementStats"}}},
+   		    {"query_id", {{"type", "string"}, {"description", "only samples taken while this statement ran, as a decimal string from statementStats"}}},
+   		    {"limit", {{"type", "integer"}, {"description", "how many entries to return, most-sampled first. Defaults to 30, at most 500"}}},
+   		    {"include_idle", {{"type", "boolean"}, {"description", "keep the Activity samples of background processes idling in their main loops. Defaults to false"}}}
+   		  }}
+   	      }; },
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.wait_event_profile(a.str("group_by"), a.str("query_id"),
+                                     a.num("limit", 30), a.flag("include_idle", false)); }},
+      {"statementKernelStats",
+       "return what the operating system measured each tracked statement costing, from pg_stat_kcache: CPU time split into user and system, bytes actually read from and written to storage, page faults, and context switches, separately for planning and execution, per query_id. PostgreSQL's own counters cannot see this: a shared_blks_read in statementStats is a request to the kernel, answered from its page cache or from the device, and only exec.reads_bytes says which -- compare it with shared_blks_read times block_size, both returned here. A high nivcsws (involuntary context switches) is CPU contention; majflts is memory pressure reaching disk. Counters are cumulative from stats_since or the last reset. query_id joins to statementStats and explainQuery; for a role without pg_read_all_stats, pg_stat_statements hides the queryid of other roles' statements, so their calls, total_exec_ms and shared_blks_read are null while the kernel counters stay complete. Requires pg_stat_kcache in shared_preload_libraries after pg_stat_statements, at version 2.2 or later",
+       []() -> json { return {
+   		{"type", "object"},
+   		{"properties", {
+   		    {"limit", {{"type", "integer"}, {"description", "how many statements to return. Defaults to 20, at most 500"}}},
+   		    {"query_id", {{"type", "string"}, {"description", "only this statement, as a decimal string from statementStats. One entry per user, database and nesting level, so it can match more than one row"}}},
+   		    {"order_by", {{"type", "string"},
+   		                  {"description", "ranking: exec_cpu_time (default, user plus system), plan_cpu_time, exec_reads, exec_writes, exec_majflts, or exec_nivcsws"}}}
+   		  }}
+   	      }; },
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.statement_kernel_stats(a.num("limit", 20), a.str("query_id"),
+                                         a.str("order_by")); }},
       {"wraparoundStatus",
        "return transaction id and multixact wraparound headroom: age(datfrozenxid) and age(datminmxid) for every database, the oldest tables by age(relfrozenxid) including TOAST tables (often the relation actually holding the horizon back), each xid and multixact age as a percentage of the effective freeze_max_age and of the limit at which the cluster stops accepting write transactions, plus the per-table freeze storage parameters and last vacuum times. That limit is 2144483647, not 2^31: PostgreSQL refuses new transaction ids three million short of wraparound, and warns in the log forty million short of it -- wraparound_warn_limit and xids_until_warn_limit carry the earlier one, which is the threshold an operator has usually already seen fire. Two alarms live in these numbers and only one is an emergency: past autovacuum_freeze_max_age PostgreSQL forces an anti-wraparound vacuum, which is loud maintenance working as designed, while approaching the wraparound limit ends in the server refusing writes -- xid_percent_of_freeze_max_age against xid_percent_of_wraparound_limit tells them apart and xids_until_wraparound_limit is the budget. Recovery does NOT need single-user mode: the documentation says plainly that stopping the postmaster is neither necessary nor desirable, and the fix is a plain database-wide VACUUM in normal multi-user mode. Not VACUUM FULL, which needs an xid of its own and will fail; not VACUUM FREEZE, which does more than the minimum needed to restore service. Past vacuum_failsafe_age VACUUM takes extraordinary measures -- and it is any VACUUM, not only autovacuum: the cost-based delay stops being applied, non-essential work such as index vacuuming is bypassed, AND the Buffer Access Strategy is disabled so the vacuum is free to use all of shared_buffers. That third effect is why the cache looks wrecked during one, which bufferCacheSummary will show and nothing else explains. Default 1.6 billion, silently raised to no less than 105% of autovacuum_freeze_max_age. Rank tables by relfrozenxid age rather than size, since the oldest object sets the horizon however small it is, and read toast_for -- a TOAST table is frequently the offender and carries nobody's name. If the age will not fall, vacuum is not the problem: nothing can be frozen past the oldest transaction still visible to something, so more workers and a manual VACUUM FREEZE achieve nothing while the horizon is held. Four things hold it -- a replication slot (replicationSlots), a long-running transaction (currentActivity.backend_xmin), a standby with hot_standby_feedback, and a prepared transaction, which is invisible in pg_stat_activity and not read by this server: query pg_prepared_xacts directly when nothing else explains it",
        []() -> json { return {
@@ -859,7 +929,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
-   		    {"pattern", {{"type", "string"}, {"description", "case-insensitive substring of an instance, replication_group or group name, or of a connection name belonging to one"}}}
+   		    {"pattern", {{"type", "string"}, {"description", "a literal, case-insensitive substring of an instance, replication_group or group name, or of a connection name belonging to one; _ and % match themselves and nothing is stemmed"}}}
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
@@ -869,7 +939,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
-   		    {"pattern", {{"type", "string"}, {"description", "case-insensitive substring of the connection name or of its instance, replication_group or group label"}}}
+   		    {"pattern", {{"type", "string"}, {"description", "a literal, case-insensitive substring of the connection name or of its instance, replication_group or group label; _ and % match themselves and nothing is stemmed"}}}
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {

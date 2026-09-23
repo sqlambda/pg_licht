@@ -694,15 +694,19 @@ private:
 
 // Limits pg_licht applies to itself, from budgets.ini.
 //
-// Today that is one budget: what an EXPLAIN ANALYZE under caller-supplied
-// planner settings may use, as shares of the host capacity declared for the
-// connection (see analyze_budget in server.h). The defaults below are the
-// ratios 4.3.0 shipped with; the file exists so an operator can move them
-// without a rebuild.
+// Two budgets. What an EXPLAIN ANALYZE under caller-supplied planner settings
+// may use, as shares of the host capacity declared for the connection (see
+// analyze_budget in server.h) -- the defaults are the ratios 4.3.0 shipped
+// with. And how large one answer may be before it is refused with a hint
+// naming the arguments that narrow it (see payload_guard in server.h). The
+// file exists so an operator can move either without a rebuild.
 //
 //   [analyze]
 //   memory_percent   = 10   ; worst-case plan memory, % of host_ram_mb
 //   vcpus_per_worker = 4    ; one parallel worker per this many host_vcpus
+//
+//   [payload]
+//   max_kb = 0              ; largest answer returned whole; 0, the default, is off
 //
 // Strict, like the connections file: an unknown section or key, or a value out
 // of range, fails at startup. A typo that silently kept the default would leave
@@ -710,6 +714,12 @@ private:
 struct Budgets {
   int analyze_memory_percent = 10;
   int analyze_vcpus_per_worker = 4;
+  // Off by default. The limit that matters is the client's, counted in
+  // tokens, and how many bytes of these answers make a token has not been
+  // measured against a real client -- so a byte default would be a guess,
+  // and a guess set too low refuses answers a client would have taken. An
+  // operator who knows their client's limit sets it.
+  long long payload_max_kb = 0;
   std::string source = "built-in defaults";
 
   // Which file to read, or "" for the built-in defaults. Pure, so the order is
@@ -772,18 +782,32 @@ struct Budgets {
         if (close == std::string::npos)
           throw std::runtime_error(where + ": unterminated section header");
         section = detail::trim(t.substr(1, close - 1));
-        if (section != "analyze")
+        if (section != "analyze" && section != "payload")
           throw std::runtime_error(where + ": unknown section [" + section +
-                                   "]; budgets.ini has only [analyze]");
+                                   "]; budgets.ini has [analyze] and [payload]");
         continue;
       }
       const auto eq = t.find('=');
       if (eq == std::string::npos)
         throw std::runtime_error(where + ": expected key = value");
       if (section.empty())
-        throw std::runtime_error(where + ": key outside a section; put it under [analyze]");
+        throw std::runtime_error(where + ": key outside a section; put it under "
+                                 "[analyze] or [payload]");
       const std::string key = detail::trim(t.substr(0, eq));
       const std::string val = detail::trim(t.substr(eq + 1));
+      if (section == "payload") {
+        if (key != "max_kb")
+          throw std::runtime_error(where + ": unknown key \"" + key + "\" in [payload]; "
+                                   "expected max_kb");
+        // 0 is meaningful here -- it turns the guard off -- so it is accepted
+        // before positive_int, which refuses it.
+        const long long v = val == "0" ? 0 : detail::positive_int(val, where + " max_kb");
+        if (v > 1048576)
+          throw std::runtime_error(where + " max_kb: " + val + " is out of range; "
+                                   "0 (off) to 1048576");
+        b.payload_max_kb = v;
+        continue;
+      }
       if (key == "memory_percent") {
         const long long v = detail::positive_int(val, where + " memory_percent");
         if (v > 100)

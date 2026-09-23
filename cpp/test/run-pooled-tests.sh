@@ -99,11 +99,34 @@ trap cleanup EXIT
 echo "--- initdb (superuser: pglicht, trust auth) @ PostgreSQL $("$PG_BINDIR/initdb" --version | grep -oE '[0-9]+' | head -1)"
 "$PG_BINDIR/initdb" -D "$PGDATA" -U pglicht --auth=trust -E UTF8 >/dev/null
 
+# pg_stat_statements is contrib and always there. The three shared-memory
+# extensions behind waitEventProfile, statementKernelStats, predicateStats and
+# suggestIndexes are third-party packages, and preloading a library that is not
+# installed stops the postmaster from starting at all -- so each is preloaded
+# only when its library is present for this major. Their tests skip otherwise,
+# except in CI, where PGLICHT_REQUIRE_PRELOAD_EXTENSIONS makes a skip a failure.
+# pg_stat_kcache must come after pg_stat_statements.
+# pg_config knows where this major's libraries are; it ships with the server
+# on PGDG layouts but not everywhere, so fall back to the Debian/PGDG layout.
+if [ -x "$PG_BINDIR/pg_config" ]; then
+  PG_LIBDIR="$("$PG_BINDIR/pg_config" --pkglibdir)"
+else
+  PG_LIBDIR="$(dirname "$PG_BINDIR")/lib"
+fi
+PRELOAD="pg_stat_statements"
+for lib in pg_stat_kcache pg_wait_sampling pg_qualstats; do
+  [ -f "$PG_LIBDIR/$lib.so" ] && PRELOAD="$PRELOAD,$lib"
+done
+
 cat >> "$PGDATA/postgresql.conf" <<CONF
 port = $PG_PORT
 listen_addresses = '127.0.0.1'
 unix_socket_directories = '$work'
-shared_preload_libraries = 'pg_stat_statements'
+shared_preload_libraries = '$PRELOAD'
+# pg_qualstats samples one statement in max_connections by default, which
+# makes what a test sees a matter of chance. The GUC is ignored when the
+# library is not loaded.
+pg_qualstats.sample_rate = 1
 # For the logical subscriber below. Set before pg_basebackup so the standby
 # inherits it and the two clusters stay byte-comparable.
 wal_level = logical
@@ -111,7 +134,7 @@ fsync = off
 full_page_writes = off
 CONF
 
-echo "--- start postgres on $PG_PORT (pg_stat_statements preloaded)"
+echo "--- start postgres on $PG_PORT (preloaded: $PRELOAD)"
 "$PG_BINDIR/pg_ctl" -D "$PGDATA" -l "$PGDATA/pg.log" -w start >/dev/null
 "$PG_BINDIR/createdb" -h 127.0.0.1 -p "$PG_PORT" -U pglicht pglicht
 

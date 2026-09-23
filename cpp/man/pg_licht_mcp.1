@@ -1,7 +1,7 @@
 .\" Copyright (c) 2026 Daniel Cristian.
 .\" Licensed under the Apache License, Version 2.0; see LICENSE.
 .\"
-.Dd September 15, 2026
+.Dd September 22, 2026
 .Dt PG_LICHT_MCP 1
 .Os pg-licht
 .Sh NAME
@@ -12,7 +12,7 @@
 .Op Fl c Ar file.ini
 .Op Ar database_url
 .Nm
-.Fl h
+.Fl h | Fl V
 .Sh DESCRIPTION
 .Nm
 is a Model Context Protocol server that exposes the PostgreSQL system catalog to
@@ -40,7 +40,17 @@ See
 .Sx CONFIGURATION .
 .It Fl h , Fl -help
 Print a usage summary and the connection resolution order, then exit.
+.It Fl V , Fl -version
+Print the version on standard output, then exit.
+The same string is reported to MCP clients as
+.Va serverInfo.version .
 .El
+.Pp
+Any other argument beginning with
+.Ql -
+is refused with exit status 2.
+No connection string begins with one, and through 4.3.3 an unknown option was
+taken for the connection string instead.
 .Pp
 A single positional
 .Ar database_url
@@ -393,24 +403,47 @@ Limits
 .Nm
 applies to itself live in an optional
 .Pa budgets.ini .
-Today there is one: what
+There are two: what
 .Ic explainQuery
 may execute when
 .Va analyze
 is combined with explicit
 .Va settings ,
-as shares of the host capacity declared for the connection.
+as shares of the host capacity declared for the connection; and how large one
+answer may be.
 .Bd -literal -offset indent
 [analyze]
 memory_percent   = 10   ; worst-case plan memory, % of host_ram_mb
 vcpus_per_worker = 4    ; one parallel worker per this many host_vcpus
+
+[payload]
+max_kb = 0              ; largest answer returned whole; 0, the default, is off
 .Ed
 .Pp
 Those are the built-in values, used when no file is found.
 .Va memory_percent
-takes 1 to 100 and
+takes 1 to 100,
 .Va vcpus_per_worker
-1 to 1024.
+1 to 1024, and
+.Va max_kb
+0 to 1048576.
+.Pp
+With
+.Va max_kb
+set, an answer larger than that many kilobytes, as the compact JSON a client
+receives, is refused with an error whose hint names the arguments that
+operation declares to make its answer smaller, and for a sweep, that fewer
+members would.
+It is off by default, and it is a ceiling an operator chooses rather than a
+protection against loss: Claude Code moves a tool result over its own limit
+.Po
+.Ev MAX_MCP_OUTPUT_TOKENS ,
+25,000 tokens by default
+.Pc
+into a file the model reads back, so such an answer reaches it either way.
+The limit is in bytes, not tokens, and how many bytes of these answers make a
+token has not been measured, so set it from what a client is observed to
+accept.
 The first of these is read:
 .Ev PG_LICHT_BUDGETS ,
 which must then exist;
@@ -472,7 +505,7 @@ Arguments shown as
 are required.
 .Ss Extension schemas
 Operations backed by an extension
-.Pq Ic statementStats , Ic explainQuery , Ic tableBloat No and Ic indexBloat
+.Pq Ic statementStats , Ic explainQuery , Ic tableBloat , Ic indexBloat , Ic waitEventProfile , Ic statementKernelStats , Ic predicateStats No and Ic suggestIndexes
 locate its objects through
 .Li pg_extension
 and reference them schema-qualified.
@@ -506,6 +539,74 @@ is running is picked up on the next call.
 An extension that is absent is reported as not installed, with the hint naming
 the setup steps; see
 .Sx DIAGNOSTICS .
+.Ss Matching: pattern and web_search
+Two arguments narrow an answer by a string, and they match differently.
+.Bl -tag -width "web_search"
+.It Va pattern
+A literal, case-insensitive substring of a name.
+There are no wildcards:
+.Ql _
+and
+.Ql %
+match themselves, so
+.Ql user_
+finds
+.Li user_x
+and not
+.Li users .
+Nothing is stemmed or split into words.
+Taken by
+.Ic listSchemas , listTables , listTableStats , listTableSizes ,
+.Ic listFunctions , listSequences , listRoles , serverSettings ,
+.Ic listConnections
+and
+.Ic listTopology .
+.It Va web_search
+Full-text search, not a substring: PostgreSQL's
+.Fn websearch_to_tsquery
+with the English configuration.
+Words are stemmed, so
+.Ql order
+finds
+.Li orders ;
+names are split into words at underscores and capitals before they are
+indexed, so
+.Li customer_id
+contributes
+.Ql customer ;
+a phrase in double quotes must match in order,
+.Ql or
+between words means either, and
+.Ql -word
+excludes.
+A fragment of a word matches nothing: to find part of a name, use a listing's
+.Va pattern
+instead.
+Taken by
+.Ic searchTables , searchFunctions
+and
+.Ic searchEnums ,
+which each say what they search.
+.Ic searchFunctions
+also matches the language name as a literal substring, so
+.Ql sql
+finds
+.Li plpgsql
+functions.
+.El
+.Pp
+Through 4.3.3,
+.Va pattern
+on
+.Ic listRoles
+and
+.Ic serverSettings
+was an
+.Li ILIKE ,
+where
+.Ql _
+matches any character; it is now the literal substring its description always
+said it was.
 .Ss Privileges
 .Bl -tag -width Ds
 .It Ic checkPrivileges
@@ -516,14 +617,21 @@ Most of this server works for any role that can connect, because the catalog is
 world-readable.
 Measured on PostgreSQL 18: a bare
 .Ic LOGIN
-role with no grants runs 50 of the 62 operations at full fidelity, the
-monitoring role takes that to 54, and the three that remain are exactly the
-three that read row data \(em the
+role with no grants runs 59 of the 72 operations at full fidelity when every
+extension is present, and the monitoring role takes that to 67.
+What remains for the monitoring role is the three that read row data \(em the
 .Ic tableStats
 column histograms,
 .Ic checkKey
 and
-.Ic explainQuery .
+.Ic explainQuery
+\(em plus
+.Ic evaluateIndex ,
+which plans against tables and so needs
+.Ic SELECT
+on them, and the replication-origin half of
+.Ic replicationStats ,
+which no predefined role can read.
 .Pp
 Worth calling first against an unfamiliar connection or a restricted role.
 The alternative is discovering the limits one operation at a time, and the
@@ -651,13 +759,25 @@ there gets; a schema that does not exist is an error.
 .El
 .Ss Schema exploration
 .Bl -tag -width Ds
-.It Ic listSchemas
-All schemas with their table and view names and role grants.
-.It Ic listTables Ar schema
+.It Ic listSchemas Op Va pattern
+All schemas with their table count, up to 25 table and view names with
+.Va tables_truncated
+saying when there are more, and role grants.
+.Va pattern ,
+when given, keeps only the schemas whose name contains it, case-insensitively:
+each schema is up to about 0.7 kB, so a schema-per-tenant database outgrows the
+.Sx Budgets
+payload limit at around 140 schemas.
+.It Ic listTables Ar schema Op Va pattern
 Structure of the tables and views in
 .Ar schema :
 kind, description, per-table reloptions, columns (name, description, per-column
 index count), and index and constraint counts.
+.Va pattern ,
+when given, keeps only the relations whose name contains it, case-insensitively.
+On a schema of a thousand relations the whole answer is two to three times the
+.Sx Budgets
+payload limit, measured, and without it the refusal would have nothing to suggest.
 Full index and constraint definitions live in
 .Ic tableDetails ,
 not here; this operation is deliberately light for browsing a schema.
@@ -784,10 +904,12 @@ filters on
 so a role without
 .Ic SELECT
 on the column gets nulls rather than data.
-.It Ic listTableStats Ar schema
+.It Ic listTableStats Ar schema Op Va pattern
 The same statistics for every table in
 .Ar schema ,
 without the per-column histograms.
+.Va pattern ,
+when given, keeps only the tables whose name contains it, case-insensitively.
 Name one table to
 .Ic tableStats
 for those.
@@ -817,9 +939,11 @@ from
 which is free, and call this when the estimate is too stale to act on.
 A partitioned table reports its own storage, which is zero; measure the
 partitions.
-.It Ic listTableSizes Ar schema
+.It Ic listTableSizes Ar schema Op Va pattern
 Measured table, index, and total size for every relation in
 .Ar schema .
+.Va pattern ,
+when given, keeps only the relations whose name contains it, case-insensitively.
 The lock caveat above applies with more force here: one relation is opened per
 table, so a single table under
 .Sy AccessExclusiveLock
@@ -862,8 +986,8 @@ so no relation is opened and no lock is taken.
 .Pp
 A growing default partition is the finding: rows land there when they match no
 bound, so it is a missing partition that has not failed loudly yet.
-.It Ic partitionDetails Va schema , Va table
-One parent and every partition: the bound expression verbatim, whether it is the
+.It Ic partitionDetails Va schema , Va table Op Va limit , Va order_by
+One parent and its partitions: the bound expression verbatim, whether it is the
 .Sy DEFAULT ,
 whether it is itself partitioned, estimated rows and size, and the per-partition
 live and dead tuples, scan counters and vacuum and analyze timestamps.
@@ -881,6 +1005,28 @@ columns have, and a misparsed boundary is worse than an unparsed one.
 For a range parent, the highest upper bound against
 .Li now()
 says whether the next period's partition exists.
+.Pp
+At most
+.Va limit
+partitions are returned, 100 by default and at most 10,000, with
+.Va partition_count
+and
+.Va partitions_truncated
+beside them: each costs about 400 bytes, so a table partitioned by day for three
+years is about 430 kB.
+.Va order_by
+decides which are kept and in what order:
+.Va name
+(the default),
+.Va dead_tuples , mod_since_analyze , oldest_vacuum
+(never vacuumed first), or
+.Va size .
+The partition falling behind is found by ranking, not by reading names.
+The
+.Sy DEFAULT
+partition is always kept, since a growing default is a missing partition that
+has not failed loudly yet, and by name it sorts last \(em where a cap would cut
+it.
 .It Ic largeObjects
 How many large objects this database holds and who owns them.
 Large objects live in a catalog rather than a relation, so every size tool here
@@ -890,13 +1036,15 @@ counts their bytes.
 No sizes: the bytes are in
 .Li pg_largeobject ,
 which is not publicly readable.
-.It Ic listFunctions Ar schema
+.It Ic listFunctions Ar schema Op Va pattern
 Functions and procedures in
 .Ar schema
 with kind, language, return type, arguments, volatility,
 .Va security_definer ,
 and
 .Va is_strict .
+.Va pattern ,
+when given, keeps only the functions whose name contains it, case-insensitively.
 .It Ic functionDetails Ar schema Ar function
 Source code, full definition, arguments, volatility, trigger usage, and role
 grants.
@@ -917,7 +1065,7 @@ name.
 .It Ic typeDetails Ar schema Ar type
 Attributes, constraints, or subtype of a composite type, domain, or range type,
 and which columns use it.
-.It Ic listSequences Ar schema
+.It Ic listSequences Ar schema Op Va pattern
 Sequences in
 .Ar schema
 with data type, range, increment, cycle, cache size, current value, and owning
@@ -926,6 +1074,8 @@ table and column for
 and
 .Ic IDENTITY
 columns.
+.Va pattern ,
+when given, keeps only the sequences whose name contains it, case-insensitively.
 .It Ic listExtendedStatistics Ar schema
 Extended statistics objects
 .Pq Ic CREATE STATISTICS
@@ -937,8 +1087,11 @@ description.
 .Ss Catalog search
 .Bl -tag -width Ds
 .It Ic searchTables Ar web_search
-Full-text search across table and schema names, descriptions, column names and
-descriptions, enum values used by columns, and role names.
+Full-text search, as described in
+.Sx Matching: pattern and web_search ,
+across table and schema names, the table's comment, column names and comments,
+the names, comments and values of enum types its columns use, and the roles
+granted on it.
 Returns the same fields as
 .Ic listTables
 plus
@@ -950,11 +1103,28 @@ Name a match to
 or
 .Ic tableSize
 for those.
-.It Ic searchFunctions Ar web_search
-Full-text search across function names, source code, language, trigger names,
-and descriptions.
+.It Ic searchFunctions Ar web_search Op Va schema , Va include_system
+Full-text search, as described in
+.Sx Matching: pattern and web_search ,
+across function names, source code, trigger names and descriptions, and the
+language name as a literal substring.
+PostgreSQL's own functions, in
+.Li pg_catalog
+and
+.Li information_schema ,
+are left out unless
+.Va include_system
+is true or one of those schemas is named as
+.Va schema :
+they were 97 to 99 percent of a typical answer, and enough of them to bury the
+database's own functions.
+A
+.Va schema
+that does not exist is an error rather than an empty answer.
 .It Ic searchEnums Ar web_search
-Full-text search across enum names, values, and descriptions.
+Full-text search, as described in
+.Sx Matching: pattern and web_search ,
+across enum names, values, and descriptions.
 .El
 .Ss Cluster-wide objects
 .Bl -tag -width Ds
@@ -1283,6 +1453,133 @@ Ignore statements called fewer times than this, to keep one-off maintenance
 queries out of a
 .Va mean_exec_time
 ranking.
+.El
+.It Ic waitEventProfile Op Va group_by , Va query_id , Va limit , Va include_idle
+What the instance has spent its time waiting on, from the accumulated profile of
+.Li pg_wait_sampling ,
+one entry per wait event with its sample count, its percent of the samples counted, and
+.Va estimated_ms .
+.Ic currentActivity
+is one sample of what is waiting now; this is what the server has been waiting
+on, which a single sample cannot say.
+.Li IO/DataFileRead
+dominating and
+.Li LWLock/WALWrite
+dominating are opposite stories that look identical in a throughput figure.
+.Pp
+A sample is one backend seen in one wait at one tick of the collector, every
+.Va settings.profile_period_ms ,
+so
+.Va estimated_ms
+is backend time summed over every backend, not wall-clock time.
+The counts accumulate from the last reset or server start, and
+.Nm
+never resets them: a window is the difference between two readings.
+An entry whose
+.Va event_type
+and
+.Va event
+are null is a backend sampled while not waiting at all \(em running, which
+usually means on CPU.
+.Li Client/ClientRead
+includes idle connections waiting for their next statement, so on a pooled
+server it measures connections times time as much as anything.
+.Pp
+Requires
+.Li pg_wait_sampling
+at version 1.1 or later, in
+.Va shared_preload_libraries .
+.Bl -tag -width "include_idle" -compact
+.It Va group_by
+.Dq event
+(the default) sums every backend and statement per wait event;
+.Dq query
+keeps
+.Va query_id ,
+to join to
+.Ic statementStats .
+.Va query_id
+is null for samples with no statement, and always null when
+.Va pg_wait_sampling.profile_queries
+is off.
+.It Va query_id
+Only samples taken while this statement ran.
+.It Va limit
+Entries to return, most-sampled first.
+Defaults to 30, at most 500.
+.It Va include_idle
+Keep the
+.Li Activity
+samples of background processes idling in their main loops, which are left out
+by default and counted in
+.Va excluded_idle_samples .
+On a quiet server they outnumber everything else.
+.El
+.It Ic statementKernelStats Op Va limit , Va query_id , Va order_by
+What the operating system measured each tracked statement costing, from
+.Li pg_stat_kcache :
+user and system CPU time, bytes actually read from and written to storage, page
+faults and context switches, separately for planning and execution, per
+.Va query_id .
+.Pp
+PostgreSQL cannot see this itself.
+A
+.Va shared_blks_read
+is a request to the kernel, which may answer it from its page cache or from the
+device;
+.Va exec.reads_bytes
+is what came off storage.
+Compare it with
+.Va shared_blks_read
+times
+.Va block_size ,
+both returned.
+A high
+.Va nivcsws
+(involuntary context switches) is CPU contention;
+.Va majflts
+is memory pressure reaching the disk.
+.Pp
+Read from the
+.Fn pg_stat_kcache
+function, which is per statement \(em not the view of the same name, which is
+summed per database \(em and joined to
+.Li pg_stat_statements
+through
+.Fn pg_stat_statements false ,
+which skips the query text file.
+.Va nswaps , msgsnds , msgrcvs
+and
+.Va nsignals
+are not reported: Linux does not maintain them, so they are always zero.
+For a role without
+.Li pg_read_all_stats ,
+.Li pg_stat_statements
+hides the queryid of other roles' statements, so their
+.Va calls , total_exec_ms
+and
+.Va shared_blks_read
+are null beside kernel counters that are complete.
+.Pp
+Requires
+.Li pg_stat_kcache
+at version 2.2 or later, in
+.Va shared_preload_libraries
+after
+.Li pg_stat_statements .
+.Bl -tag -width "query_id" -compact
+.It Va limit
+Statements to return.
+Defaults to 20, at most 500.
+.It Va query_id
+Only this statement; one entry per user, database and nesting level, so it can
+match more than one.
+.It Va order_by
+.Va exec_cpu_time
+(the default, user plus system),
+.Va plan_cpu_time , exec_reads , exec_writes , exec_majflts ,
+or
+.Va exec_nivcsws .
 .El
 .It Ic progressStats Op Va pid , Va relation
 Every long-running maintenance command currently reporting progress:
@@ -1706,6 +2003,125 @@ answer a different question.
 Both plans are built under the same environment, and
 .Va planning_environment
 reports it.
+.It Ic predicateStats Op Va limit , Va query_id , Va order_by
+The
+.Li WHERE
+and join predicates
+.Li pg_qualstats
+has sampled in this database, one entry per relation, column, operator and way
+of evaluating it: how often it ran, how many rows it was evaluated against, how
+many it filtered out, and how far the planner's row estimate missed.
+.Pp
+.Va evaluated_as
+.Dq filter
+is a predicate applied to rows after they were fetched, so a high
+.Va filtered_pct
+is rows read only to be thrown away \(em what an index would avoid.
+.Dq index
+means an index already serves it.
+.Va mean_err_estimate_ratio
+is the factor by which the planner's estimate missed \(em 166 when 60 rows were
+expected and 10,000 arrived \(em and 0 when it did not;
+.Va mean_err_estimate_num
+is the same miss in rows.
+A large factor is fixed by
+.Li ANALYZE ,
+a larger statistics target or extended statistics, not by an index.
+.Pp
+No constant is ever returned.
+A predicate reads
+.Ql table.column op ? ,
+the form the extension's own advisor uses;
+.Li pg_qualstats
+records every predicate's literal in
+.Va constvalue ,
+and neither that column nor
+.Fn pg_qualstats_example_query
+is read.
+.Va query_ids
+holds at most ten per predicate, with
+.Va queries
+the full count.
+.Li pg_qualstats
+samples one statement in
+.Va pg_qualstats.sample_rate ,
+by default one in
+.Va max_connections ,
+so counts are samples rather than totals.
+.Pp
+Requires
+.Li pg_qualstats
+at version 2.0 or later, in
+.Va shared_preload_libraries .
+Without the preload the extension does not fail: it reports only the calling
+session's own predicates.
+That is detected from the extension's own settings, which any role can read,
+and refused, rather than returned as an empty answer that looks like a real
+one.
+.Bl -tag -width "query_id" -compact
+.It Va limit
+Predicates to return.
+Defaults to 20, at most 500.
+.It Va query_id
+Only predicates of this statement.
+.It Va order_by
+.Va filtered
+(the default, rows removed),
+.Va execution_count , occurrences ,
+or
+.Va err_estimate_ratio ,
+the worst misestimate.
+.El
+.It Ic suggestIndexes Op Va min_filter , Va min_selectivity , Va forbidden_am
+Index suggestions from
+.Fn pg_qualstats_index_advisor
+for this database: each a complete
+.Li CREATE INDEX
+statement with the
+.Va query_ids
+of the statements it would serve, and
+.Va not_indexable ,
+the predicates that filter heavily but use an operator no access method
+supports.
+.Pp
+Nothing is built; the advisor only reads
+.Li pg_qualstats .
+A suggestion is a hypothesis.
+Pass its
+.Va ddl
+to
+.Ic evaluateIndex
+as
+.Va create ,
+with the statement
+.Ic explainQuery
+recovers for one of its
+.Va query_ids ,
+to see whether the planner would use it.
+On PostgreSQL 14 and 15 that statement keeps its
+.Ar $n
+placeholders, which only 16's
+.Ql "EXPLAIN (GENERIC_PLAN)"
+can plan; substitute representative values first.
+Constants are never returned, as with
+.Ic predicateStats .
+Requires
+.Li pg_qualstats
+2.1 or later, the first whose advisor names the statements each suggestion
+serves, preloaded as for
+.Ic predicateStats ,
+and refuses in the same case.
+.Bl -tag -width "min_selectivity" -compact
+.It Va min_filter
+Average rows a predicate must remove per execution to be considered.
+Defaults to 1000; lower it on a small or quiet database.
+.It Va min_selectivity
+Percentage of evaluated rows a predicate must remove, 0 to 100.
+Defaults to 30.
+.It Va forbidden_am
+Access methods never to suggest, such as
+.Li hash .
+.El
 .It Ic tableBloat Ar schema Ar table Op Va exact
 Physical storage bloat for a table
 .Pq Li pgstattuple No or Li pgstattuple_approx :
@@ -2118,7 +2534,7 @@ capability is declared, so there is no mechanism by which it could.
 Anything read from a live catalog is hinted at one minute.
 This matters most for
 .Ic tools/list ,
-which is roughly 93 kB once 62 operations carry descriptions, annotations,
+which is roughly 150 kB once 72 operations carry descriptions, annotations,
 titles and output schemas, and which a client would otherwise re-fetch whenever
 it needed the list.
 .Pp
@@ -2607,7 +3023,7 @@ Grok Build MCP client configuration.
 .Nm
 exits non-zero when no connection source is given, when the configuration file
 cannot be parsed or has unsafe permissions, or when the default connection
-cannot be reached at startup.
+cannot be reached at startup, and with status 2 on an unknown option.
 .Sh EXAMPLES
 .Ss Standalone
 Run against a single database given by the environment:
@@ -2735,6 +3151,45 @@ by
 .Ic tableBloat
 and
 .Ic indexBloat .
+.It Sy ... is installed but not in shared_preload_libraries
+.Li pg_wait_sampling , pg_stat_kcache
+and
+.Li pg_qualstats
+keep their counters in shared memory, which exists only when the library is
+preloaded, and
+.Li CREATE EXTENSION
+succeeds without it.
+Affects
+.Ic waitEventProfile , statementKernelStats , predicateStats
+and
+.Ic suggestIndexes .
+The hint names the setting, and for
+.Li pg_stat_kcache
+that it must follow
+.Li pg_stat_statements .
+.It Sy ... is too old for this tool
+The extension predates the columns the operation reads:
+.Li pg_wait_sampling
+1.1,
+.Li pg_stat_kcache
+2.2,
+.Li pg_qualstats
+2.0, or for
+.Ic suggestIndexes
+2.1.
+Run
+.Ql "ALTER EXTENSION ... UPDATE" .
+.It Sy ...'s answer is N KB, over the M KB this server returns whole
+The answer was larger than
+.Va max_kb
+in the
+.Sx Budgets
+file allows.
+The hint names the arguments that make this operation's answer smaller.
+Every schema-wide listing and every search has one; a single object that is
+simply large \(em a very wide table, a huge function body, a very large plan
+\(em has none, and the hint says so.
+Raise the limit, or set it to 0, which is the default, when a larger answer is wanted.
 .It Sy permission denied for ...
 Every
 .Li pgstattuple
@@ -2812,6 +3267,32 @@ which reads the view and is available in every version of the extension.
 reads the view, which exists in every version the extension has had.
 Both need a role with
 .Li pg_monitor .
+.Pp
+The three shared-memory extensions are gated the same way, on their own
+version rather than the server's, because each is packaged separately for every
+major:
+.Ic waitEventProfile
+needs
+.Li pg_wait_sampling
+1.1, the first with a
+.Va queryid
+in its profile;
+.Ic statementKernelStats
+needs
+.Li pg_stat_kcache
+2.2, the first to split planning from execution, and reports
+.Va stats_since
+from 2.3;
+.Ic predicateStats
+needs
+.Li pg_qualstats
+2.0, and
+.Ic suggestIndexes
+2.1, before which the advisor returned bare strings rather than suggestions
+with the statements they serve.
+An older installation is reported as out of date, with the
+.Ql "ALTER EXTENSION ... UPDATE"
+that fixes it.
 .Pp
 Elsewhere, a field is simply omitted where the underlying column does not
 exist, and normalized where it was renamed.
@@ -3011,6 +3492,18 @@ never returns one and never expands a service file,
 returns server options but never user mappings, and
 .Ic listSubscriptions
 omits each subscription's connection string.
+.Pp
+Nor does any operation return a constant recorded by
+.Li pg_qualstats ,
+which keeps the literal of every predicate it samples.
+.Ic predicateStats
+and
+.Ic suggestIndexes
+read neither its
+.Va constvalue
+column nor its example-query functions, and render a predicate as
+.Ql table.column op ? ,
+which is why neither appears in the list above.
 .Pp
 The connecting role decides the rest.
 A role without

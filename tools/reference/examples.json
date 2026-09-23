@@ -53,6 +53,34 @@
         "note": "Hypothetical indexes are planned against and never built. The cost is the planner's estimate, not a measurement."
       }
     },
+    "predicateStats": {
+      "arguments": {"limit": 2},
+      "result": {
+        "predicates": [
+          {"predicate": "shop.orders.status = ?", "relation": "shop.orders", "column": "status", "operator": "=", "join": false, "evaluated_as": "filter", "occurrences": 41022, "execution_count": 1840220331, "filtered": 1801992101, "filtered_pct": 97.9, "filtered_per_call": 43927, "mean_err_estimate_ratio": 1.4, "max_err_estimate_ratio": 3.1, "mean_err_estimate_num": 212.5, "queries": 2, "query_ids": ["-8811029349218800117", "5520184417300021190"]},
+          {"predicate": "shop.orders.customer_id = ?", "relation": "shop.orders", "column": "customer_id", "operator": "=", "join": false, "evaluated_as": "index", "occurrences": 44102, "execution_count": 882046, "filtered": 0, "filtered_pct": 0.0, "filtered_per_call": 0, "mean_err_estimate_ratio": 0, "max_err_estimate_ratio": 0, "mean_err_estimate_num": 0, "queries": 1, "query_ids": ["3301928477102934411"]}
+        ],
+        "order_by": "filtered",
+        "settings": {"sample_rate": "0.01", "enabled": "on", "max": "1000"},
+        "preloaded": true,
+        "extension_version": "2.1.4"
+      }
+    },
+    "suggestIndexes": {
+      "arguments": {},
+      "result": {
+        "indexes": [
+          {"ddl": "CREATE INDEX ON shop.orders USING btree (status)", "query_ids": ["-8811029349218800117", "5520184417300021190"]}
+        ],
+        "not_indexable": [
+          {"predicate": "shop.customers.email ~~* ?", "query_ids": ["7719203348810222904"]}
+        ],
+        "min_filter": 1000,
+        "min_selectivity": 30,
+        "preloaded": true,
+        "extension_version": "2.1.4"
+      }
+    },
     "checkPrivileges": {
       "arguments": {"connection": "shop_prod"},
       "result": {
@@ -118,6 +146,7 @@
       "arguments": {"schema": "shop", "table": "events"},
       "result": {
         "table": "events", "strategy": "range", "key": "RANGE (created_at)", "is_partition_of": null, "counters_since": "2026-08-01T00:00:00Z",
+        "partition_count": 2, "partitions_truncated": false, "order_by": "name",
         "partitions": [
           {"name": "events_2026_08", "schema": "shop", "bound": "FOR VALUES FROM ('2026-08-01 00:00:00+00') TO ('2026-09-01 00:00:00+00')", "is_default": false, "is_partitioned": false, "rows": 7340112, "size_estimate": 1182990336, "n_dead_tup": 20431, "last_autovacuum": "2026-09-02T03:11:40Z"},
           {"name": "events_default", "schema": "shop", "bound": "DEFAULT", "is_default": true, "is_partitioned": false, "rows": 412, "size_estimate": 57344, "n_dead_tup": 0, "last_autovacuum": null}
@@ -342,6 +371,36 @@
           {"query_id": "3301928477102934411", "query": "SELECT id, status FROM shop.orders WHERE customer_id = $1 ORDER BY created_at DESC LIMIT $2", "calls": 4410233, "total_exec_ms": 3120982.7, "mean_exec_ms": 0.71, "rows": 88204660, "shared_blks_hit": 402211093, "shared_blks_read": 440112, "user": "app_rw", "database": "shop"}
         ],
         "info": {"dealloc": 0, "stats_reset": "2026-08-01T00:00:00Z"}
+      }
+    },
+    "waitEventProfile": {
+      "arguments": {"limit": 5},
+      "result": {
+        "group_by": "event",
+        "total_samples": 184220,
+        "excluded_idle_samples": 2210934,
+        "events": [
+          {"event_type": "IO", "event": "DataFileRead", "samples": 71802, "percent": 38.98, "estimated_ms": 718020},
+          {"event_type": null, "event": null, "samples": 52310, "percent": 28.4, "estimated_ms": 523100},
+          {"event_type": "LWLock", "event": "WALWrite", "samples": 30114, "percent": 16.35, "estimated_ms": 301140},
+          {"event_type": "Client", "event": "ClientRead", "samples": 18402, "percent": 9.99, "estimated_ms": 184020},
+          {"event_type": "Lock", "event": "transactionid", "samples": 6120, "percent": 3.32, "estimated_ms": 61200}
+        ],
+        "settings": {"profile_period_ms": 10, "profile_queries": "top", "profile_pid": "on"},
+        "preloaded": true,
+        "extension_version": "1.1"
+      }
+    },
+    "statementKernelStats": {
+      "arguments": {"limit": 1, "order_by": "exec_reads"},
+      "result": {
+        "statements": [
+          {"query_id": "3301928477102934411", "top": true, "user": "app_rw", "database": "shop", "calls": 4410233, "total_exec_ms": 3120982.7, "shared_blks_read": 440112, "exec": {"user_time_s": 1840.2, "system_time_s": 402.7, "reads_bytes": 412090368, "writes_bytes": 0, "minflts": 1220931, "majflts": 12, "nvcsws": 901223, "nivcsws": 44102}, "plan": {"user_time_s": 88.1, "system_time_s": 4.2, "reads_bytes": 0, "writes_bytes": 0, "minflts": 20331, "majflts": 0, "nvcsws": 0, "nivcsws": 310}, "stats_since": "2026-08-01T00:00:00Z"}
+        ],
+        "order_by": "exec_reads",
+        "block_size": 8192,
+        "preloaded": true,
+        "extension_version": "2.3.2"
       }
     },
     "wraparoundStatus": {

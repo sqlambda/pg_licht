@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pg_licht_mcp VERSION 4.3.3 LANGUAGES CXX)
+project(pg_licht_mcp VERSION 4.4.0 LANGUAGES CXX)
 
 # Standard bin/ and share/man/ layout, so `cmake --install` produces a tree that
 # can be dropped onto a prefix as-is: the release tarballs are staged this way,
@@ -86,6 +86,17 @@ if(BUILD_TESTING)
     else()
         message(STATUS "mandoc not found: skipping the manpage_lint test")
     endif()
+
+    # The command line. --version must print the version this was built as,
+    # and an unknown option must be refused rather than taken for a connection
+    # string -- which is what --version itself was through 4.3.3, starting a
+    # server that exited silently. Neither touches a database.
+    add_test(NAME cli_version COMMAND $<TARGET_FILE:pg_licht_mcp> --version)
+    set_tests_properties(cli_version PROPERTIES
+        PASS_REGULAR_EXPRESSION "^pg_licht_mcp ${PROJECT_VERSION}\n$")
+    add_test(NAME cli_unknown_option COMMAND $<TARGET_FILE:pg_licht_mcp> --no-such-option)
+    set_tests_properties(cli_unknown_option PROPERTIES
+        PASS_REGULAR_EXPRESSION "unknown option: --no-such-option")
 
     # The response-shape contract, end to end against the real binary. Both
     # switches it covers are read once per process from the environment, so

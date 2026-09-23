@@ -1,5 +1,170 @@
 # Changelog
 
+## 4.4.0 (2026-09-22)
+
+### Added
+
+- **Four tools for three extensions that keep their counters in shared
+  memory**, all keyed by the same `query_id` as `statementStats`, so the four
+  answers join into one explanation of a statement.
+  - `waitEventProfile` reads `pg_wait_sampling`'s accumulated profile: what
+    the instance has spent its time waiting on, which a single
+    `currentActivity` sample cannot say. The raw profile has one row per pid,
+    event and queryid and grows for as long as the server runs, so it is summed
+    per event, or per `query_id` and event. Sample counts come with the
+    collector's period, so they can be read as backend time. Background
+    processes idling in their main loops are left out by default: on a quiet
+    server they outnumbered every real sample by more than a hundred to one.
+  - `statementKernelStats` reads `pg_stat_kcache`: CPU time and the bytes
+    actually read from and written to storage, per statement, planning and
+    execution separately. A `shared_blks_read` is a request to the kernel,
+    which may answer it from its page cache; this is what came off the device.
+    Read from the `pg_stat_kcache()` function, which is per queryid — the view
+    of the same name is summed per database and has no queryid at all.
+  - `predicateStats` reads `pg_qualstats`: which predicates filter the most
+    rows, whether an index serves them, and by what factor the planner's row
+    estimate missed.
+  - `suggestIndexes` returns `pg_qualstats`' own index advisor's suggestions,
+    each a complete `CREATE INDEX` statement that goes straight into
+    `evaluateIndex`: the advisor suggests, `evaluateIndex` tests, neither
+    builds anything. It needs `pg_qualstats` 2.1: before it the advisor
+    returned bare strings, which would have read as suggestions with a null
+    `ddl`. On PostgreSQL 14 and 15 the statement recovered for a `query_id`
+    keeps its `$n` placeholders, which only 16 can plan, so values go in
+    first.
+
+  **No constant is ever returned.** `pg_qualstats` records the literal of
+  every predicate it samples; neither its `constvalue` column nor its
+  example-query functions are read, and a predicate reads
+  `table.column op ?`. The test suite seeds a distinctive literal and fails
+  if it appears anywhere in either answer.
+
+- **Installed but not preloaded is reported, not answered empty.** All three
+  extensions need `shared_preload_libraries`, and `CREATE EXTENSION` succeeds
+  without it. Two then raise errors; `pg_qualstats` does not — it silently
+  reports only the calling session's own predicates, an empty answer that
+  looks like a real one. Each tool now refuses with the fix in its hint. The
+  check works for any role: besides `shared_preload_libraries`, which only a
+  superuser or `pg_read_all_settings` can read, it asks each extension's own
+  settings, which declare a non-user-settable context only when the library
+  was genuinely preloaded.
+
+- `checkPrivileges` denies the four when their extension is absent, and
+  when it is installed but not preloaded wherever that can be told from its
+  session: always for a role that can read `shared_preload_libraries`, and
+  for any other role once the library has been loaded in that backend. Before
+  then it says nothing rather than guess, and the tools themselves still
+  refuse. It reports `statementKernelStats` as degraded for a role without
+  `pg_read_all_stats`: `pg_stat_statements` hides the queryid of other roles'
+  statements, so the join to their call counts comes back null.
+
+- **A payload cap, off by default.** With `max_kb` set in a new `[payload]`
+  section of `budgets.ini`, an answer larger than it is refused with `{error,
+  hint}`, the hint naming the arguments that make that tool's answer smaller
+  (never its required ones, which name the object rather than shrink it), and
+  for a sweep that fewer members would. It is a ceiling an operator chooses,
+  not protection against loss: Claude Code moves a tool result over its own
+  limit (`MAX_MCP_OUTPUT_TOKENS`, 25,000 tokens by default) into a file the
+  model reads back. It shipped off because the limit is in bytes and how many
+  bytes of these answers make a token has not been measured, and because at
+  the 96 KB first proposed it refused fleet sweeps: `statementStats` answers
+  ~19 KB a server, so a sweep of six was refused whole.
+
+  **What it cannot help with.** With a cap set, one object that is simply large — a very wide
+  table in `tableDetails`, a huge function body in `functionDetails`, a very
+  large plan — has nothing to narrow, and is refused with a hint that says so
+  and points at `max_kb`. Before 4.4 such an answer reached a client whose own
+  limit was larger; now it reaches none until the limit is raised. Every
+  schema-wide or search answer does have a way to narrow, and a test builds a
+  1,000-relation, 300-schema database to hold that.
+
+- **`pg_licht_mcp --version`** prints the version and exits.
+
+- **`diagnose-slow-query` and `triage-active-sessions` use the new tools**
+  where the extensions are installed: what a statement's time went on and
+  what it waited on before reading its plan, whether a misestimate is typical
+  across executions, the advisor's candidate index before `evaluateIndex`,
+  and the accumulated wait profile beside the single `currentActivity`
+  sample.
+
+- **`pattern` on `listSchemas`, `listTables`, `listTableStats`,
+  `listTableSizes`, `listSequences` and `listFunctions`**, a case-insensitive substring of the
+  object's name, as on `listRoles`. Found by measuring every tool against the
+  new guard before release: on a schema of 1,000 relations `listTables`
+  answered 194 KB and `listTableStats` 294 KB, and with nothing to narrow by,
+  a capped server's refusal would have been a dead end. `listSchemas` is up to
+  0.7 KB a schema, which a schema-per-tenant database crosses at around 140. A test now builds such a
+  schema and fails if any schema-wide tool is refused without a way to ask for
+  less.
+
+### Changed
+
+- **`searchFunctions` leaves out PostgreSQL's own functions** in
+  `pg_catalog` and `information_schema` unless `include_system` is true or
+  one of those schemas is named. Measured on 18, they were 97–99% of a
+  typical answer; on a real database the answer reached 126 KB, most of it
+  PostgreSQL's own. A new `schema`
+  argument narrows further, and a schema that does not exist is an error. The
+  shape is unchanged; a search for a built-in needs the flag.
+
+- **`partitionDetails` returns at most 100 partitions by default**, with
+  `partition_count` and `partitions_truncated` beside them and `limit` to
+  change it. Each partition is about 400 bytes: one real table answered 185 KB,
+  and three years of daily partitions is ~430 KB. `order_by` — `name` (the
+  default), `dead_tuples`, `mod_since_analyze`, `oldest_vacuum` or `size` —
+  decides which are kept, since the partition autovacuum is failing is found
+  by ranking rather than by name. The `DEFAULT` partition is always kept: by
+  name it sorts last, exactly where a cap would cut it, and a growing default
+  is what the tool exists to show.
+
+- **An unknown command-line option is refused** with exit status 2. Through
+  4.3.3 any argument other than `--config` or `--help` was taken for the
+  connection string, so `--version` started a server that read stdin and
+  exited silently — which looks like success.
+
+- **Both workflows default to `permissions: contents: read`**, closing seven
+  CodeQL `actions/missing-workflow-permissions` alerts. The jobs that publish
+  keep the job-level grants they already declared.
+
+### Fixed
+
+- **`pattern` treated `_` and `%` as wildcards.** Every `pattern` is
+  documented as a case-insensitive substring, and on `listRoles` and
+  `serverSettings` it was `ILIKE '%x%'`, where `_` matches any character: a
+  pattern of `user_` also matched `users`, and underscores are in most
+  PostgreSQL names. All of them, the new ones included, are now a literal
+  substring. Found by CI on this release's first run, where a test
+  narrowing tenant schemas by `_42` matched every schema whenever the job's
+  process id contained 42; an independent review had flagged it and it was
+  wrongly waved through as consistent with the existing tools.
+
+- **Which argument is a substring and which is full-text is now written
+  down everywhere.** `pattern` (ten tools) is a literal substring;
+  `web_search` (`searchTables`, `searchFunctions`, `searchEnums`) is
+  full-text search, stemmed, with names split into words -- so a fragment of
+  a word matches nothing there. The three `web_search` arguments had no
+  description at all. Each argument now says which it is, the manual has a
+  Matching section and the README a table, and the reference test fails if a
+  tool taking either is missing from any of them.
+
+- **The sanitizer and valgrind jobs skipped every extension-backed test.**
+  They ran against stock `postgres:NN` service containers, which have no
+  hypopg and preload nothing, so `evaluateIndex`, the `queryid` path and all
+  four new tools ran only in the pooled job, never under AddressSanitizer,
+  ThreadSanitizer or valgrind — while the site said the suite ran under all
+  three. A step now installs the extensions into the running container,
+  preloads them and restarts it, and both jobs fail rather than skip when one
+  is missing. Two traps found by rehearsing it against real `postgres:14` and
+  `postgres:18` containers first: `ALTER SYSTEM SET shared_preload_libraries
+  = 'a,b'` sets one library named `a,b` and the postmaster will not start, and
+  before 15 `ALTER SYSTEM` refuses a setting of an extension not yet loaded.
+
+- **The manual's privilege counts were four releases stale.** It said a bare
+  role runs 50 of 62 operations and a monitoring role 54, and that only the
+  three row-reading tools remained for the latter. Re-measured on PostgreSQL
+  18: 59 of 72 and 67 of 72, and the monitoring role also lacks
+  `evaluateIndex` and replication origin progress.
+
 ## 4.3.3 (2026-09-16)
 
 ### Fixed

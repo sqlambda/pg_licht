@@ -11,13 +11,19 @@
   ships with. Every claim below is about pg_licht itself and was measured, not
   assumed; where a number is written by hand, the source of it is noted beside
   it in this comment block:
-    - tool listing size vs connection count: 135 KB with 1, 150 and 1,000
-      configured connections; startup 51-62 ms (2026-09-15)
-    - 56 and 63 of 68: checkPrivileges as a bare and a pg_monitor role on
-      PostgreSQL 18 (2026-09-10)
+    - tool listing size vs connection count: 152,519 bytes with 1, 150 and
+      1,000 configured connections, 72 tools, on MCP 2025-06-18; startup
+      26-36 ms, debug build (2026-09-22; was 135 KB and 51-62 ms at 68 tools,
+      2026-09-15)
+    - 59 and 67 of 72: checkPrivileges as a bare and a pg_monitor role on
+      PostgreSQL 18 with every extension present (2026-09-22)
     - sweeps: at most 32 members per call (kMaxSweepMembers), 16 at a time
       (kSweepConcurrency); at most 32 idle connections kept warm (kMaxIdle),
       all in cpp/src/server.h
+    - payload cap: off by default (Budgets::payload_max_kb = 0 in
+      cpp/src/config.h); Claude Code's own limit, MAX_MCP_OUTPUT_TOKENS =
+      25,000 tokens with results over it moved to a file, is from
+      code.claude.com/docs/en/mcp (checked 2026-09-22)
 -->
 <style>
   :root {
@@ -172,8 +178,9 @@
       </div>
     </div>
     <p class="fine">Measured with 1, 150 and 1,000 configured connections. One caveat worth
-    knowing: <code>listConnections</code> returns every connection in one answer, roughly
-    400 bytes each, so on a very large fleet prefer naming the connection you want.</p>
+    knowing: <code>listConnections</code> is roughly 400 bytes a connection, so on a large
+    fleet ask for the ones you want with <code>pattern</code>. <code>listConnections</code>
+    and <code>listTopology</code> both take one, matched against names and labels.</p>
   </section>
 
   <section id="safe">
@@ -199,7 +206,7 @@
         whole suite runs through a real PgBouncer on every change.</p></div>
       <div class="feature"><h3>Honest about privileges</h3>
         <p><code>checkPrivileges</code> says which tools the connecting role can really use:
-        56 of 68 for a bare login role, 63 with <code>pg_monitor</code>.</p></div>
+        59 of 72 for a bare login role, 67 with <code>pg_monitor</code>.</p></div>
     </div>
   </section>
 
@@ -217,6 +224,10 @@
           (<code>checkKey</code>) or a plan with row counts (<code>explainQuery</code>).</li>
           <li>Returns a password it holds, a user mapping's options, or a subscription's
           connection string.</li>
+          <li>Returns a constant <code>pg_qualstats</code> recorded. It keeps the literal of
+          every predicate it samples; <code>predicateStats</code> and
+          <code>suggestIndexes</code> read <code>table.column = ?</code>, and a test fails
+          the build if a seeded literal ever appears in either.</li>
         </ul>
       </div>
       <div class="exposed">
@@ -243,6 +254,18 @@
       <div class="feature"><h3>Guided investigations</h3>
         <p>{{PROMPTS}} prompts walk the assistant through slow queries, lock contention,
         deadlocks, bloat, disk space, replication slots and schema changes, tool by tool.</p></div>
+      <div class="feature"><h3>Beyond what PostgreSQL measures</h3>
+        <p>Where <code>pg_wait_sampling</code>, <code>pg_stat_kcache</code> and
+        <code>pg_qualstats</code> are installed: what the server has been waiting on, the CPU
+        and real disk reads behind each statement, which predicates throw rows away, and the
+        index that would serve them &mdash; all joined on the <code>query_id</code>
+        <code>statementStats</code> reports, and each suggestion ready to test with
+        <code>evaluateIndex</code> without building it.</p></div>
+      <div class="feature"><h3>Answers you can cap</h3>
+        <p>The listings and searches that grow with a database take a <code>pattern</code> or
+        a narrower search, and the largest answers narrow themselves by default. Set a cap in
+        <code>budgets.ini</code> and an answer past it is refused with the arguments that
+        make it smaller, rather than returned.</p></div>
       <div class="feature"><h3>Topology aware</h3>
         <p>Label connections by instance and replication group. Roles are observed on each
         call, never configured, and <code>verifyTopology</code> checks the labels against the
@@ -269,6 +292,12 @@
     <ul class="cats">
 {{CATEGORY_LIST}}
     </ul>
+    <p class="fine">Two arguments narrow an answer by a string. The listings take
+    <code>pattern</code>, a literal substring of a name: <code>user_</code> finds
+    <code>user_x</code>, not <code>users</code>. The three search tools take
+    <code>web_search</code>, full-text search over names, comments and source, where
+    <code>order</code> finds <code>orders</code> but <code>ord</code> finds nothing.
+    <a href="reference/index.html#matching">Which tool takes which</a>.</p>
   </section>
 
   <section id="install">
