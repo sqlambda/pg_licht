@@ -145,7 +145,7 @@ for free space. The prompt leads with what makes the obvious response wrong:
 `VACUUM FULL` needs free space equal to the table and its indexes *before* it
 releases any, so it is not a disk-full action.
 
-Counts: 56 of 68 operations for a bare login role, 63 with `pg_monitor` — the
+Counts: 59 of 72 operations for a bare login role, 67 with `pg_monitor` — the
 `pg_ls_*` directory reads `diskUsage` uses are part of what that role grants.
 
 `triage-active-sessions` is for a server running more sessions at once than it
@@ -174,7 +174,7 @@ indexes and current lock waits can tell the two apart. **Completions** are offer
 
 ## Tools
 
-68 read-only operations, grouped as schema exploration, catalog search, cluster-wide
+72 read-only operations, grouped as schema exploration, catalog search, cluster-wide
 objects, extensibility and text search, foreign data and replication, monitoring and
 statistics, diagnostics and query planning, topology, and connections. Highlights include
 `tableDetails` (columns, indexes, constraints, foreign keys in both directions, triggers,
@@ -184,9 +184,9 @@ its `EXPLAIN` plan).
 
 `checkPrivileges` reports which of them the current role can actually use on a given
 connection. Most work for any role that can connect, since the catalog is world-readable:
-measured on PostgreSQL 18, a bare login role runs 56 of 68 at full fidelity, the monitoring
-role 63. What remains for the monitoring role reads row data, apart from replication origin
-progress, which only the superuser can read. Worth calling first
+measured on PostgreSQL 18 with every extension present, a bare login role runs 59 of 72 at
+full fidelity, the monitoring role 67. What remains for the monitoring role reads row data or
+plans against it, apart from replication origin progress, which only the superuser can read. Worth calling first
 against an unfamiliar connection — a privilege-filtered answer is easy to mistake for an
 empty one, since `tableStats` on a role without `SELECT` returns columns with null
 statistics, exactly like a table that was never analyzed.
@@ -197,6 +197,19 @@ building it, `hide` plans without an existing one — which is how to ask whethe
 safe to drop. Nothing is built, nothing is locked, and the statement is never executed. It
 reports whether the planner actually *used* each index, which is the answer a cost figure
 hides.
+
+Three optional extensions that keep their counters in shared memory, all keyed by the same
+`query_id` as `statementStats`, each get a tool. `waitEventProfile` reads
+[pg_wait_sampling](https://github.com/postgrespro/pg_wait_sampling): what the instance has
+spent its time waiting on, which a single `currentActivity` sample cannot say.
+`statementKernelStats` reads [pg_stat_kcache](https://github.com/powa-team/pg_stat_kcache):
+the CPU time and the bytes actually read from storage per statement, which is how a page
+cache hit and a device read stop looking alike. `predicateStats` and `suggestIndexes` read
+[pg_qualstats](https://github.com/powa-team/pg_qualstats): which predicates filter the most
+rows, and the extension's own index advisor, whose `CREATE INDEX` suggestions go straight into
+`evaluateIndex`. pg_qualstats records the literal of every predicate it samples; neither tool
+ever returns one. All three need `shared_preload_libraries`, and the tools say so rather than
+answer empty when a library is installed without it.
 
 Tables are covered by three tools rather than one, split by what the answer costs and how
 fast it goes stale:
@@ -305,8 +318,8 @@ tool accepts depends on where its answer actually varies, and its input schema s
 | | varies across the databases of one instance | varies across members of a replication group |
 |---|---|---|
 | catalogs, `tableBloat`, the structure and size tools | yes | no — a physical replica is byte-identical |
-| `duplicateIndexes`, `indexBloat`, `tableIOStats`, `tableStats`, `listTableStats`, `partitionDetails`, `subscriptionStats` | yes | **yes** — they carry `idx_scan`, vacuum counters, or a worker of their own |
-| `currentActivity`, `currentLocks`, `statementStats`, `replicationStats`, buffer cache | no — instance-wide | yes |
+| `duplicateIndexes`, `indexBloat`, `tableIOStats`, `tableStats`, `listTableStats`, `partitionDetails`, `subscriptionStats`, `predicateStats`, `suggestIndexes` | yes | **yes** — they carry `idx_scan`, vacuum counters, a worker of their own, or predicates each server sampled from its own queries |
+| `currentActivity`, `currentLocks`, `statementStats`, `statementKernelStats`, `waitEventProfile`, `replicationStats`, buffer cache | no — instance-wide | yes |
 
 That middle row is the one worth knowing: an index that reads as unused on the primary may
 be carrying a replica's entire reporting workload, and only that replica's `idx_scan`
@@ -365,11 +378,29 @@ An example is in [cpp/test/budgets.example.ini](cpp/test/budgets.example.ini). T
 out-of-memory kill restarts every connection on the instance. The per-call `ram_mb` and
 `vcpus` arguments do not count here: a caller cannot raise its own limit.
 
+The same file bounds how large one answer may be. Past `max_kb` — 96 by default, under the
+roughly 25,000-token limit at which a client such as Claude Code drops a tool result whole —
+an answer is refused with a hint naming the arguments that make that tool's answer smaller,
+instead of reaching the client and vanishing there. `0` turns it off.
+
+```ini
+[payload]
+max_kb = 96
+```
+
+The tools known to outgrow it narrow themselves now: `searchFunctions` leaves out
+PostgreSQL's own functions unless `include_system` is set, `partitionDetails` returns at most
+100 partitions — ranked with `order_by`, and always keeping the `DEFAULT` one — with
+`partition_count` and `partitions_truncated` beside them, and `listSchemas`, `listTables`,
+`listTableStats`, `listTableSizes`, `listSequences` and `listFunctions` take a `pattern`.
+What it cannot help with is one object that is simply large — a very wide table, a huge
+function body, a very large plan: that is refused with a hint pointing at `max_kb`.
+
 ## Documentation
 
 | | |
 |---|---|
-| `man pg_licht_mcp` | configuration, connection strings, all 68 operations, MCP client setup |
+| `man pg_licht_mcp` | configuration, connection strings, all 72 operations, MCP client setup |
 | [INSTALL.md](INSTALL.md) | Homebrew, deb, rpm, tarball, verifying, uninstalling |
 | [BUILD.md](BUILD.md) | building from source, tests, sanitizers, CI, release process |
 | [CHANGES.md](CHANGES.md) | changelog |

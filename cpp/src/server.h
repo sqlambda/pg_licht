@@ -7,7 +7,9 @@
 #include <chrono>
 #include <functional>
 #include <limits>
+#include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -551,7 +553,11 @@ public:
 
   // Test-accessible query methods
   const json call_schemas() { return schemas(); }
+  const json call_schemas(const std::string& pattern) { return schemas(pattern); }
   const json call_tables(const std::string& schema) { return tables(schema); }
+  const json call_tables(const std::string& schema, const std::string& pattern) {
+    return tables(schema, pattern);
+  }
   const json call_search(const std::string& web_search) { return search(web_search); }
   const json call_table(const std::string& schema, const std::string& table_name) {
     return table(schema, table_name);
@@ -560,6 +566,9 @@ public:
     return table_stats(schema, table_name);
   }
   const json call_list_table_stats(const std::string& schema) { return list_table_stats(schema); }
+  const json call_list_table_stats(const std::string& schema, const std::string& pattern) {
+    return list_table_stats(schema, pattern);
+  }
   const json call_list_partitions(const std::string& schema) { return list_partitions(schema); }
   const json call_role_dependencies(const std::string& r) { return role_dependencies(r); }
   const json call_default_privileges() { return default_privileges(""); }
@@ -569,15 +578,29 @@ public:
   const json call_partition_details(const std::string& sc, const std::string& t) {
     return partition_details(sc, t);
   }
+  const json call_partition_details(const std::string& sc, const std::string& t, int limit,
+                                    const std::string& order_by) {
+    return partition_details(sc, t, limit, order_by);
+  }
   const json call_table_size(const std::string& schema, const std::string& table_name) {
     return table_size(schema, table_name);
   }
   const json call_list_table_sizes(const std::string& schema) { return list_table_sizes(schema); }
+  const json call_list_table_sizes(const std::string& schema, const std::string& pattern) {
+    return list_table_sizes(schema, pattern);
+  }
   const json call_functions(const std::string& schema) { return functions(schema); }
+  const json call_functions(const std::string& schema, const std::string& pattern) {
+    return functions(schema, pattern);
+  }
   const json call_function_detail(const std::string& schema, const std::string& func_name) {
     return function_detail(schema, func_name);
   }
   const json call_search_functions(const std::string& web_search) { return search_functions(web_search); }
+  const json call_search_functions(const std::string& web_search, const std::string& schema,
+                                   bool include_system) {
+    return search_functions(web_search, schema, include_system);
+  }
   const json call_enums(const std::string& schema) { return enums(schema); }
   const json call_enum_detail(const std::string& schema, const std::string& enum_name) {
     return enum_detail(schema, enum_name);
@@ -610,6 +633,9 @@ public:
   const json call_casts() { return casts(); }
   const json call_text_search_configs(const std::string& schema) { return text_search_configs(schema); }
   const json call_sequences(const std::string& schema) { return sequences(schema); }
+  const json call_sequences(const std::string& schema, const std::string& pattern) {
+    return sequences(schema, pattern);
+  }
   const json call_extensions() { return extensions(); }
   const json call_database_size() { return database_size(); }
   const json call_server_settings() { return server_settings("", false); }
@@ -629,6 +655,23 @@ public:
   const json call_statement_stats(int limit, const std::string& query_id,
                                   const std::string& order_by, long long min_calls) {
     return statement_stats(limit, query_id, order_by, min_calls);
+  }
+  const json call_wait_event_profile(const std::string& group_by = "",
+                                     const std::string& query_id = "",
+                                     int limit = 30, bool include_idle = false) {
+    return wait_event_profile(group_by, query_id, limit, include_idle);
+  }
+  const json call_statement_kernel_stats(int limit = 20, const std::string& query_id = "",
+                                         const std::string& order_by = "") {
+    return statement_kernel_stats(limit, query_id, order_by);
+  }
+  const json call_predicate_stats(int limit = 20, const std::string& query_id = "",
+                                  const std::string& order_by = "") {
+    return predicate_stats(limit, query_id, order_by);
+  }
+  const json call_suggest_indexes(long long min_filter = 1000, long long min_selectivity = 30,
+                                  const json& forbidden_am = json::array()) {
+    return suggest_indexes(min_filter, min_selectivity, forbidden_am);
   }
   const json call_table_bloat(const std::string& schema, const std::string& table_name, bool exact) {
     return table_bloat(schema, table_name, exact);
@@ -718,6 +761,21 @@ public:
   //
   // Public because it is the rule itself rather than an implementation
   // detail, and a test asserts it holds for every tool and every selector.
+  // Whether the tool requires `arg`. Such an argument names what the answer
+  // is about rather than how much of it to return, so the payload guard does
+  // not offer it as a way to ask for less.
+  static bool tool_requires(const std::string& name, const char* arg) {
+    for (const auto& d : tool_defs()) {
+      if (name != d.name) continue;
+      const json schema = d.input_schema();
+      if (!schema.contains("required") || !schema["required"].is_array()) return false;
+      for (const auto& r : schema["required"])
+        if (r.is_string() && r.get<std::string>() == arg) return true;
+      return false;
+    }
+    return false;
+  }
+
   static bool tool_declares(const std::string& name, const char* arg) {
     for (const auto& d : tool_defs()) {
       if (name != d.name) continue;
@@ -982,6 +1040,96 @@ private:
                "TO <role>; (or grant EXECUTE on the function directly)"},
       {"detail", detail}
     };
+  }
+
+  // --- The shared_preload_libraries extensions ----------------------------
+  //
+  // pg_wait_sampling, pg_stat_kcache and pg_qualstats all keep their counters
+  // in shared memory, which exists only when the library is preloaded. CREATE
+  // EXTENSION succeeds without that, so "installed" is not enough -- and the
+  // three do not fail alike when it is missing. pg_stat_kcache raises "must
+  // be loaded via shared_preload_libraries" and pg_wait_sampling "shared
+  // memory wasn't initialized yet", but pg_qualstats raises nothing: it falls
+  // back to the stats of the current backend, which from this server's own
+  // session is an empty answer that looks exactly like a real one. So each of
+  // these tools says whether the library is preloaded, rather than leaving
+  // an empty result to be read as "nothing happened".
+
+  // The installed version, "" when the extension is absent. Unlike the
+  // schema this is not cached: ALTER EXTENSION ... UPDATE is the fix these
+  // tools' hints name, and a cached version would keep refusing after it.
+  std::string extension_version(pqxx::work& txn, const std::string& extname) {
+    pqxx::result r = pqxx_exec(
+      txn, "SELECT extversion FROM pg_extension WHERE extname = $1",
+      pqxx::params{extname});
+    return r.empty() || r[0][0].is_null() ? std::string{} : r[0][0].as<std::string>();
+  }
+
+
+  // Whether the library is preloaded: true, false, or null when it cannot be
+  // told from this session.
+  //
+  // shared_preload_libraries answers it outright, but only for a superuser or
+  // pg_read_all_settings -- pg_settings omits the row for anyone else rather
+  // than masking it. So the library's own settings are asked as well, which
+  // any role can read. Each of these three declares one setting that is not
+  // user-settable (verified on 18: pg_wait_sampling.profile_period is sighup,
+  // pg_stat_kcache.track superuser, pg_qualstats.max postmaster), and a
+  // preloaded library defines it in every backend. A placeholder -- the name
+  // set in postgresql.conf with nothing loaded -- is always context 'user',
+  // and so is pg_qualstats.max when the library was loaded lazily by calling
+  // it without the preload, which is exactly the case that returns only this
+  // backend's own statistics. Absent means not loaded in this backend: not
+  // preloaded, or a version that renamed the setting, which is why that is
+  // null rather than false.
+  static json preload_state(pqxx::work& txn, const std::string& lib,
+                            const std::string& probe_setting) {
+    pqxx::result r = pqxx_exec(txn, R"(
+      SELECT (SELECT (SELECT COALESCE(bool_or(regexp_replace(btrim(x, ' "'), '^.*/|\.so$', '', 'g') = $1), false)
+                      FROM unnest(string_to_array(s.setting, ',')) AS x)
+              FROM pg_settings AS s WHERE s.name = 'shared_preload_libraries'),
+             (SELECT context FROM pg_settings WHERE name = $2))",
+      pqxx::params{lib, probe_setting});
+    if (!r[0][0].is_null()) return r[0][0].as<bool>();
+    if (!r[0][1].is_null()) return r[0][1].as<std::string>() != "user";
+    return nullptr;
+  }
+
+  // The runtime error each of these raises when not preloaded, recognised by
+  // its text: none carries a SQLSTATE of its own, so the message is all there
+  // is to go on.
+  static bool is_not_preloaded(const pqxx::sql_error& e) {
+    const std::string w = e.what();
+    return w.find("shared_preload_libraries") != std::string::npos ||
+           w.find("wasn't initialized") != std::string::npos;
+  }
+
+  static std::string preload_hint(const std::string& lib, bool after_pgss) {
+    return "Add '" + lib + "' to shared_preload_libraries in postgresql.conf" +
+           (after_pgss ? ", after 'pg_stat_statements'" : "") +
+           ", restart PostgreSQL, then run: CREATE EXTENSION " + lib + ";";
+  }
+
+  static json preload_missing(const std::string& lib, bool after_pgss) {
+    return {{"error", lib + " is not installed"},
+            {"hint", preload_hint(lib, after_pgss)}};
+  }
+
+  static json not_preloaded(const std::string& lib, bool after_pgss,
+                            const std::string& detail) {
+    json out = {{"error", lib + " is installed but not in shared_preload_libraries, "
+                          "so it has no shared memory to report from"},
+                {"hint", preload_hint(lib, after_pgss)}};
+    if (!detail.empty()) out["detail"] = detail;
+    return out;
+  }
+
+  static json too_old(const std::string& lib, const std::string& have,
+                      const std::string& need) {
+    return {{"error", lib + " " + have + " is too old for this tool; " + need +
+                      " or later is required"},
+            {"hint", "Run: ALTER EXTENSION " + lib + " UPDATE; (the installed "
+                     "library may need a newer package first)"}};
   }
 
   // Case-insensitive substring, the rule `pattern` already means on listRoles
@@ -1395,6 +1543,10 @@ private:
       {"replicationSlots",      {false, true,  false, false}},
       {"serverSettings",        {false, true,  false, false}},
       {"statementStats",        {false, true,  false, false}},
+      // Shared memory, like pg_stat_statements: the whole instance from any
+      // database, each server its own.
+      {"waitEventProfile",      {false, true,  false, false}},
+      {"statementKernelStats",  {false, true,  false, false}},
       // Shared catalogs, and replicated verbatim.
       {"listRoles",             {false, false, false, false}},
       {"listTablespaces",       {false, false, false, false}},
@@ -1441,6 +1593,12 @@ private:
       // the same statistics. Like explainQuery it is never swept: the same
       // statement is rarely valid in another database.
       {"evaluateIndex",         {true,  false, false, false}},
+      // pg_qualstats is instance-wide shared memory too, but its relations
+      // are oids that resolve only in the database that recorded them, so
+      // both tools answer for the current database -- and each server
+      // samples its own queries, so a replica's predicates are its own.
+      {"predicateStats",        {true,  true,  false, false}},
+      {"suggestIndexes",        {true,  true,  false, false}},
       {"tableBloat",            {true,  false, false, false}},
       {"typeDetails",           {true,  false, false, false}},
       // 4.0.0 moved these three off the per_server row below. They were only
@@ -1924,9 +2082,11 @@ private:
       {"bufferCacheContents",    schema_map("schema-qualified relation name", "its buffered pages and usage counts")},
 
       // --- fixed shapes ---
-      {"partitionDetails",       schema_fixed("One partitioned table and every partition it has.",
+      {"partitionDetails",       schema_fixed("One partitioned table and its partitions, at most `limit` of them.",
                                    {{"table", "string"}, {"strategy", "string"}, {"key", "string"},
                                     {"is_partition_of", "string"}, {"counters_since", "string"},
+                                    {"partition_count", "integer"},
+                                    {"partitions_truncated", "boolean"}, {"order_by", "string"},
                                     {"partitions", "array"}})},
       {"tableDetails",           schema_fixed("One table's structure.",
                                    {{"table", "string"}, {"kind", "string"}, {"description", "string"},
@@ -1991,6 +2151,17 @@ private:
       {"tableBloat",             schema_fixed("Physical storage bloat for one table.", {})},
       {"indexBloat",             schema_fixed("Physical statistics for one index, per access method.", {})},
       {"bufferCacheSummary",     schema_fixed("Shared buffer occupancy across the instance.", {})},
+      {"waitEventProfile",       schema_fixed("Accumulated wait-event samples from pg_wait_sampling.",
+                                   {{"total_samples", "number"}, {"events", "array"},
+                                    {"settings", "object"}, {"group_by", "string"}})},
+      {"statementKernelStats",   schema_fixed("Per-statement CPU and storage I/O from pg_stat_kcache.",
+                                   {{"statements", "array"}, {"order_by", "string"},
+                                    {"block_size", "integer"}})},
+      {"predicateStats",         schema_fixed("Per-predicate statistics from pg_qualstats, without constants.",
+                                   {{"predicates", "array"}, {"order_by", "string"},
+                                    {"settings", "object"}})},
+      {"suggestIndexes",         schema_fixed("Index suggestions from pg_qualstats' index advisor.",
+                                   {{"indexes", "array"}, {"not_indexable", "array"}})},
     };
     return m;
   }
@@ -2199,7 +2370,10 @@ private:
     };
   }
 
-  const json schemas() {
+  // `pattern` narrows to schemas whose name contains it, as on listTables. A
+  // schema-per-tenant database is ~0.7 KB a schema here, so past ~140 of them
+  // the whole list is over the payload limit.
+  const json schemas(const std::string& pattern = "") {
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
@@ -2232,10 +2406,11 @@ private:
                                GROUP BY COALESCE(r.rolname, 'PUBLIC')) sub) _lat2 ON true
       WHERE nspname NOT LIKE 'pg_%'
         AND nspname <> 'information_schema'
-        AND table_count > 0;
+        AND table_count > 0
+        AND ($1 = '' OR nspname ILIKE '%' || $1 || '%');
     )";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{pattern});
 
     if (!res.empty() && !res[0][0].is_null()) {
       std::string pgsql_schemas = res[0][0].as<std::string>();
@@ -2251,7 +2426,12 @@ private:
   // left changes only when someone issues DDL, which is what lets the tool be
   // classified per_database and refuse a replication-group sweep: a physical
   // replica would return these bytes verbatim.
-  const json tables(const std::string& schema) {
+  // `pattern` narrows to relations whose name contains it, case-insensitively
+  // -- the rule it has on listRoles and serverSettings. Measured on 18: a
+  // schema of ~1,000 relations answered listTables at 194 KB and
+  // listTableStats at 294 KB, over the payload guard's 96 KB, and without an
+  // argument to narrow by, the guard's refusal would have been a dead end.
+  const json tables(const std::string& schema, const std::string& pattern = "") {
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
@@ -2282,10 +2462,11 @@ private:
                          FROM pg_constraint
                          WHERE conrelid = c.oid) _lat5 ON true
       WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
-        AND c.relkind IN ('r', 'p', 'm', 'v');
+        AND c.relkind IN ('r', 'p', 'm', 'v')
+        AND ($2 = '' OR c.relname ILIKE '%' || $2 || '%');
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, pattern});
 
     if (!res.empty() && !res[0][0].is_null()) {
       std::string pgsql_tables = res[0][0].as<std::string>();
@@ -2379,7 +2560,9 @@ private:
     }
   }
 
-  const json functions(const std::string& schema) {
+  // `pattern` as on listTables, on the function name -- one extension
+  // installed into a schema can put a thousand functions in it.
+  const json functions(const std::string& schema, const std::string& pattern = "") {
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
@@ -2400,10 +2583,11 @@ private:
       FROM   pg_proc AS p
       JOIN   pg_language AS l ON l.oid = p.prolang
       WHERE  p.pronamespace = $1::regnamespace
-        AND  p.prokind IN ('f', 'p');
+        AND  p.prokind IN ('f', 'p')
+        AND ($2 = '' OR p.proname ILIKE '%' || $2 || '%');
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, pattern});
 
     if (!res.empty() && !res[0][0].is_null()) {
       std::string pgsql_functions = res[0][0].as<std::string>();
@@ -2466,7 +2650,14 @@ private:
     }
   }
 
-  const json search_functions(const std::string& web_search) {
+  // PostgreSQL's own functions are left out unless include_system is set.
+  // Measured on 18: a search for "array" returned 111 hits of which 110 were
+  // in pg_catalog or information_schema, 99% of the bytes -- and on a real
+  // database the answer reached 126 KB, past what a client accepts, so the
+  // user's own functions were lost along with the built-ins that buried them.
+  // The shape is unchanged; only which functions are eligible.
+  const json search_functions(const std::string& web_search, const std::string& schema = "",
+                              bool include_system = false) {
     if (web_search.empty()) {
       return {};
     }
@@ -2498,6 +2689,11 @@ private:
           WHERE  t.tgfoid = p.oid AND NOT t.tgisinternal
       ) _lat14 ON true
       WHERE  p.prokind IN ('f', 'p')
+        AND ($2 = '' OR p.pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2))
+        -- Naming a system schema is asking for its functions.
+        AND ($3 OR $2 IN ('pg_catalog', 'information_schema')
+             OR p.pronamespace NOT IN ('pg_catalog'::regnamespace,
+                                          'information_schema'::regnamespace))
         AND (
             TO_TSVECTOR('english',
               REGEXP_REPLACE(REGEXP_REPLACE(p.proname, '_', ' ', 'g'), '([[:upper:]])', ' \1', 'g'))
@@ -2515,14 +2711,19 @@ private:
         );
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{web_search});
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{web_search, schema, include_system});
 
     if (!res.empty() && !res[0][0].is_null()) {
       std::string pgsql_functions = res[0][0].as<std::string>();
       return json::parse(pgsql_functions);
-    } else {
-      return {};
     }
+    // An empty map is the answer for "nothing matched"; a schema that does not
+    // exist is a different answer, and the one a typo produces.
+    if (!schema.empty()) {
+      json missing = no_such_schema(txn, schema);
+      if (!missing.empty()) return missing;
+    }
+    return {};
   }
 
   // By default only settings that differ from their built-in default, which is
@@ -2883,6 +3084,35 @@ private:
     }
   }
 
+  // A queryid is a signed 64-bit integer, passed as a decimal string so it
+  // survives a client that parses JSON numbers as doubles. Checked here rather
+  // than left to the ::bigint cast, whose error would read as a server fault.
+  static void check_query_id(const std::string& query_id) {
+    if (query_id.empty()) return;
+    bool ok = query_id.size() <= 20;
+    for (size_t i = 0; ok && i < query_id.size(); i++) {
+      if (i == 0 && query_id[i] == '-') { ok = query_id.size() > 1; continue; }
+      if (!std::isdigit(static_cast<unsigned char>(query_id[i]))) ok = false;
+    }
+    if (!ok) throw std::runtime_error("query_id must be a decimal integer string");
+  }
+
+  // A ranking column from a fixed table, so nothing caller-supplied reaches
+  // the SQL text. An unknown name is refused with the accepted list.
+  static const std::string& pick_ordering(const std::map<std::string, std::string>& m,
+                                          const std::string& asked,
+                                          const std::string& fallback,
+                                          std::string& key) {
+    key = asked.empty() ? fallback : asked;
+    auto it = m.find(key);
+    if (it == m.end()) {
+      std::string valid;
+      for (const auto& [k, v] : m) { (void)v; valid += (valid.empty() ? "" : ", ") + k; }
+      throw std::runtime_error("unknown order_by \"" + asked + "\"; valid values are: " + valid);
+    }
+    return it->second;
+  }
+
   const json statement_stats(int limit, const std::string& query_id,
                              const std::string& order_by, long long min_calls) {
     // The sort column cannot be a bind parameter, so it is resolved through a
@@ -2907,14 +3137,7 @@ private:
                                "\"; valid values are: " + valid);
     }
 
-    if (!query_id.empty()) {
-      bool ok = query_id.size() <= 20;
-      for (size_t i = 0; ok && i < query_id.size(); i++) {
-        if (i == 0 && query_id[i] == '-') { ok = query_id.size() > 1; continue; }
-        if (!std::isdigit(static_cast<unsigned char>(query_id[i]))) ok = false;
-      }
-      if (!ok) throw std::runtime_error("query_id must be a decimal integer string");
-    }
+    check_query_id(query_id);
 
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
@@ -3014,6 +3237,447 @@ private:
         forget_extension_schema("pg_stat_statements");
         return pgss_missing();
       }
+      throw;
+    }
+  }
+
+  // The catch the four preload-backed tools share. A library that was never
+  // preloaded, or whose objects vanished after the schema was resolved, is an
+  // answer; null means "not one of those", and the caller rethrows.
+  json preload_ext_failure(const pqxx::sql_error& e, const std::string& lib,
+                           bool after_pgss) {
+    // statementKernelStats reads pg_stat_statements too, and its "must be
+    // loaded" error is about that library, not the one the tool is named for.
+    if (is_not_preloaded(e) && std::string(e.what()).find("pg_stat_statements") != std::string::npos)
+      return not_preloaded("pg_stat_statements", false, e.what());
+    if (is_not_preloaded(e)) return not_preloaded(lib, after_pgss, e.what());
+    if (e.sqlstate() == "42P01" || e.sqlstate() == "42883") {
+      forget_extension_schema(lib);
+      return preload_missing(lib, after_pgss);
+    }
+    return nullptr;
+  }
+
+  // A double from one of these extensions, rounded, or null when it is not a
+  // finite number. The estimate-error ratios can be NaN or infinite, and
+  // jsonb refuses both, which would fail the whole answer over one row.
+  static std::string finite(const std::string& expr, int digits) {
+    return "CASE WHEN (" + expr + ") IS NULL OR (" + expr + ") = 'NaN'::float8"
+           " OR (" + expr + ") IN ('Infinity'::float8, '-Infinity'::float8)"
+           " THEN NULL ELSE ROUND((" + expr + ")::numeric, " + std::to_string(digits) + ") END";
+  }
+
+  // --- pg_wait_sampling: what the instance spent its time waiting on ------
+  //
+  // currentActivity is a sample of what is waiting now; this is the profile
+  // the collector has accumulated since the last reset, which is the question
+  // a single sample cannot answer. The raw view has one row per pid, event
+  // and queryid and grows for as long as the server runs, so it is summed
+  // here rather than returned.
+  const json wait_event_profile(const std::string& group_by, const std::string& query_id,
+                                int limit, bool include_idle) {
+    if (!group_by.empty() && group_by != "event" && group_by != "query")
+      throw std::runtime_error("group_by must be \"event\" or \"query\"");
+    const bool by_query = group_by == "query";
+    check_query_id(query_id);
+    if (limit <= 0) limit = 30;
+    if (limit > 500) limit = 500;
+
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+
+    const std::string ext = extension_schema(txn, "pg_wait_sampling");
+    if (ext.empty()) return preload_missing("pg_wait_sampling", false);
+    // 1.0's profile has no queryid column.
+    const std::string ver = extension_version(txn, "pg_wait_sampling");
+    if (!extversion_at_least(ver, 1, 1)) return too_old("pg_wait_sampling", ver, "1.1");
+    const json preloaded = preload_state(txn, "pg_wait_sampling", "pg_wait_sampling.profile_period");
+    if (preloaded.is_boolean() && !preloaded.get<bool>())
+      return not_preloaded("pg_wait_sampling", false, "");
+
+    // A queryid of 0 is no statement at all -- a background process, or
+    // profile_queries switched off -- and is reported as null rather than as
+    // an id that statementStats would never find.
+    const std::string keys = by_query ? "queryid, event_type, event" : "event_type, event";
+    const std::string qid_field = by_query ? "'query_id', g.queryid::text, " : "";
+    const std::string query = R"(
+      WITH p AS (
+        SELECT event_type, event, NULLIF(queryid, 0) AS queryid, count
+        FROM )" + ext + R"(.pg_wait_sampling_profile
+        WHERE ($1 = '' OR queryid = $1::bigint)
+      ), kept AS (
+        -- Activity is a background process idling in its main loop: the
+        -- walwriter, the checkpointer and autovacuum launcher between jobs.
+        -- Real samples, but of nothing waiting on anything, and on a quiet
+        -- server they outnumber everything else.
+        SELECT * FROM p WHERE $2 OR event_type IS DISTINCT FROM 'Activity'
+      ), g AS (
+        SELECT )" + keys + R"(, sum(count) AS samples
+        FROM kept GROUP BY )" + keys + R"(
+        ORDER BY samples DESC LIMIT $3::int
+      ), tot AS (
+        SELECT (SELECT COALESCE(sum(count), 0) FROM kept) AS kept,
+               (SELECT COALESCE(sum(count), 0) FROM p) AS all_samples,
+               -- pg_settings.setting is in the GUC's base unit, so this is
+               -- milliseconds whatever suffix postgresql.conf used.
+               (SELECT setting::bigint FROM pg_settings
+                 WHERE name = 'pg_wait_sampling.profile_period') AS period_ms
+      )
+      SELECT JSONB_BUILD_OBJECT(
+        'total_samples', tot.kept,
+        'excluded_idle_samples', tot.all_samples - tot.kept,
+        'events', COALESCE((
+          SELECT JSONB_AGG(JSONB_BUILD_OBJECT()" + qid_field + R"(
+                   'event_type', g.event_type,
+                   'event', g.event,
+                   'samples', g.samples,
+                   'percent', ROUND(100.0 * g.samples / NULLIF(tot.kept, 0), 2),
+                   'estimated_ms', g.samples * tot.period_ms)
+                 ORDER BY g.samples DESC)
+          FROM g), '[]'::jsonb),
+        'settings', JSONB_BUILD_OBJECT(
+          'profile_period_ms', tot.period_ms,
+          'profile_queries', current_setting('pg_wait_sampling.profile_queries', true),
+          'profile_pid', current_setting('pg_wait_sampling.profile_pid', true)))
+      FROM tot)";
+
+    try {
+      pqxx::result res = pqxx_exec(
+        txn, query, pqxx::params{query_id, include_idle, std::to_string(limit)});
+      json out = json::parse(res[0][0].as<std::string>());
+      out["group_by"] = by_query ? "query" : "event";
+      out["preloaded"] = preloaded;
+      out["extension_version"] = ver;
+      return out;
+    } catch (const pqxx::sql_error& e) {
+      json r = preload_ext_failure(e, "pg_wait_sampling", false);
+      if (!r.is_null()) return r;
+      throw;
+    }
+  }
+
+  // --- pg_stat_kcache: what the kernel saw each statement cost -----------
+  //
+  // pg_stat_statements counts blocks and time as PostgreSQL sees them; a
+  // shared_blks_read is a request to the kernel, which may have answered it
+  // from its page cache or from the device, and nothing inside PostgreSQL can
+  // tell which. getrusage() can: reads_bytes is what actually came off
+  // storage. Read from the pg_stat_kcache() function, which is per queryid --
+  // not from the pg_stat_kcache view, which is summed per database, nor
+  // pg_stat_kcache_detail, which joins in the statement text.
+  const json statement_kernel_stats(int limit, const std::string& query_id,
+                                    const std::string& order_by) {
+    static const std::map<std::string, std::string> ORDERINGS = {
+      {"exec_cpu_time", "(k.exec_user_time + k.exec_system_time) DESC"},
+      {"plan_cpu_time", "(k.plan_user_time + k.plan_system_time) DESC"},
+      {"exec_reads",    "k.exec_reads DESC"},
+      {"exec_writes",   "k.exec_writes DESC"},
+      {"exec_majflts",  "k.exec_majflts DESC"},
+      {"exec_nivcsws",  "k.exec_nivcsws DESC"},
+    };
+    std::string key;
+    const std::string ord = pick_ordering(ORDERINGS, order_by, "exec_cpu_time", key);
+    check_query_id(query_id);
+    if (limit <= 0) limit = 20;
+    if (limit > 500) limit = 500;
+
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+
+    const std::string ext = extension_schema(txn, "pg_stat_kcache");
+    if (ext.empty()) return preload_missing("pg_stat_kcache", true);
+    // 2.1 had one set of counters with no plan/exec split and no `top`.
+    const std::string ver = extension_version(txn, "pg_stat_kcache");
+    if (!extversion_at_least(ver, 2, 2)) return too_old("pg_stat_kcache", ver, "2.2");
+    const json preloaded = preload_state(txn, "pg_stat_kcache", "pg_stat_kcache.track");
+    if (preloaded.is_boolean() && !preloaded.get<bool>())
+      return not_preloaded("pg_stat_kcache", true, "");
+
+    // The pg_stat_statements side is what makes the kernel counters mean
+    // something -- calls to divide by, and the blocks PostgreSQL asked for
+    // beside the bytes the device delivered. Read through
+    // pg_stat_statements(false), which skips the query text file: it is not
+    // wanted here, and reading it is most of the view's cost.
+    // toplevel, the join's fourth key, is pg_stat_statements 1.9 (PostgreSQL
+    // 14). A 1.8 left behind by pg_upgrade without ALTER EXTENSION UPDATE is
+    // joined without it rather than failing on the column.
+    std::string pgss = extension_schema(txn, "pg_stat_statements");
+    const bool pgss_toplevel = !pgss.empty() &&
+      extversion_at_least(extension_version(txn, "pg_stat_statements"), 1, 9);
+    const std::string pgss_fields = pgss.empty() ? "" : R"(
+             'calls',            s.calls,
+             'total_exec_ms',    s.total_exec_time,
+             'shared_blks_read', s.shared_blks_read,)";
+    const std::string pgss_join = pgss.empty() ? "" :
+      "LEFT JOIN " + pgss + ".pg_stat_statements(false) AS s"
+      " ON s.queryid = k.queryid AND s.userid = k.userid"
+      " AND s.dbid = k.dbid" + std::string(pgss_toplevel ? " AND s.toplevel = k.top" : "");
+    const std::string since = extversion_at_least(ver, 2, 3)
+      ? ", 'stats_since', k.stats_since" : "";
+
+    // nswaps, msgsnds, msgrcvs and nsignals are left out: Linux does not
+    // maintain them in getrusage(), so they are zero on every server this
+    // runs against, and a column that is always zero invites a reading.
+    auto phase = [](const char* p) {
+      const std::string x = std::string("k.") + p + "_";
+      return "JSONB_BUILD_OBJECT("
+             "'user_time_s', " + x + "user_time, 'system_time_s', " + x + "system_time, "
+             "'reads_bytes', " + x + "reads, 'writes_bytes', " + x + "writes, "
+             "'minflts', " + x + "minflts, 'majflts', " + x + "majflts, "
+             "'nvcsws', " + x + "nvcsws, 'nivcsws', " + x + "nivcsws)";
+    };
+    const std::string query = R"(
+      SELECT JSONB_BUILD_OBJECT(
+        'statements', COALESCE((
+          SELECT JSONB_AGG(row_json ORDER BY rn)
+          FROM (
+            SELECT row_number() OVER (ORDER BY )" + ord + R"() AS rn,
+                   JSONB_BUILD_OBJECT(
+                     'query_id', k.queryid::text,
+                     'top',      k.top,
+                     'user',     r.rolname,
+                     'database', d.datname,)" + pgss_fields + R"(
+                     'exec', )" + phase("exec") + R"(,
+                     'plan', )" + phase("plan") + since + R"(
+                   ) AS row_json
+            FROM )" + ext + R"(.pg_stat_kcache() AS k
+            LEFT JOIN pg_roles AS r ON r.oid = k.userid
+            LEFT JOIN pg_database AS d ON d.oid = k.dbid
+            )" + pgss_join + R"(
+            WHERE ($2 = '' OR k.queryid = $2::bigint)
+            ORDER BY )" + ord + R"(
+            LIMIT $1::int
+          ) sub), '[]'::jsonb),
+        'block_size', current_setting('block_size')::int))";
+
+    try {
+      pqxx::result res = pqxx_exec(txn, query, pqxx::params{std::to_string(limit), query_id});
+      json out = json::parse(res[0][0].as<std::string>());
+      out["order_by"] = key;
+      out["preloaded"] = preloaded;
+      out["extension_version"] = ver;
+      if (pgss.empty())
+        out["note"] = "pg_stat_statements is not installed as an extension here, so "
+                      "calls, total_exec_ms and shared_blks_read are absent";
+      return out;
+    } catch (const pqxx::sql_error& e) {
+      json r = preload_ext_failure(e, "pg_stat_kcache", true);
+      if (!r.is_null()) return r;
+      throw;
+    }
+  }
+
+  // --- pg_qualstats: which predicates filter, and which could use an index -
+  //
+  // What this reads and what it deliberately does not. pg_qualstats records
+  // the literal constant of every predicate it samples in `constvalue`, and
+  // pg_qualstats_example_query() returns whole statements with their
+  // constants in place. Neither is read, by either tool: this server's
+  // SECURITY CONSIDERATIONS names every path by which a value from the data
+  // can reach the caller, and that list is only worth anything while it is
+  // complete. Nothing that makes predicate statistics useful needs a constant,
+  // and a predicate is rendered as `table.column op ?` -- the form the
+  // extension's own index advisor uses.
+  //
+  // Current database only. The relation and column are oids, which resolve in
+  // the database that recorded them and nowhere else.
+  const json predicate_stats(int limit, const std::string& query_id,
+                             const std::string& order_by) {
+    static const std::map<std::string, std::string> ORDERINGS = {
+      {"filtered",           "filtered"},
+      {"execution_count",    "execution_count"},
+      {"occurrences",        "occurrences"},
+      {"err_estimate_ratio", "max_err_estimate_ratio"},
+    };
+    std::string key;
+    const std::string col = pick_ordering(ORDERINGS, order_by, "filtered", key);
+    check_query_id(query_id);
+    if (limit <= 0) limit = 20;
+    if (limit > 500) limit = 500;
+
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+
+    const std::string ext = extension_schema(txn, "pg_qualstats");
+    if (ext.empty()) return preload_missing("pg_qualstats", false);
+    const std::string ver = extension_version(txn, "pg_qualstats");
+    if (!extversion_at_least(ver, 2, 0)) return too_old("pg_qualstats", ver, "2.0");
+    const json preloaded = preload_state(txn, "pg_qualstats", "pg_qualstats.max");
+    if (preloaded.is_boolean() && !preloaded.get<bool>())
+      return not_preloaded("pg_qualstats", false, "");
+
+    const std::string query = R"(
+      WITH q AS (
+        SELECT q.lrelid, q.lattnum, q.rrelid, q.rattnum, q.opno, q.eval_type,
+               q.queryid, q.occurences, q.execution_count, q.nbfiltered,
+               -- NaN and Infinity sort above every real number, so they would
+               -- lead an err_estimate_ratio ranking and then print as null.
+               NULLIF(NULLIF(NULLIF(q.mean_err_estimate_ratio, 'NaN'), 'Infinity'), '-Infinity')
+                 AS mean_err_estimate_ratio,
+               NULLIF(NULLIF(NULLIF(q.max_err_estimate_ratio, 'NaN'), 'Infinity'), '-Infinity')
+                 AS max_err_estimate_ratio,
+               NULLIF(NULLIF(NULLIF(q.mean_err_estimate_num, 'NaN'), 'Infinity'), '-Infinity')
+                 AS mean_err_estimate_num
+        FROM )" + ext + R"(.pg_qualstats() AS q
+        WHERE q.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+          AND EXISTS (SELECT 1 FROM pg_class AS c
+                      WHERE c.oid = COALESCE(q.lrelid, q.rrelid))
+          AND ($2 = '' OR q.queryid = $2::bigint)
+      ), g AS (
+        SELECT lrelid, lattnum, rrelid, rattnum, opno, eval_type,
+               sum(occurences)      AS occurrences,
+               sum(execution_count) AS execution_count,
+               sum(nbfiltered)      AS filtered,
+               -- Weighted by how often each row's predicate ran, so one
+               -- constant seen once cannot outvote one seen a million times.
+               sum(mean_err_estimate_ratio * occurences) / NULLIF(sum(occurences), 0)
+                                    AS mean_err_estimate_ratio,
+               max(max_err_estimate_ratio) AS max_err_estimate_ratio,
+               sum(mean_err_estimate_num * occurences) / NULLIF(sum(occurences), 0)
+                                    AS mean_err_estimate_num,
+               count(DISTINCT queryid) AS queries,
+               (array_agg(DISTINCT queryid::text)
+                  FILTER (WHERE queryid IS NOT NULL))[1:10] AS query_ids
+        FROM q
+        GROUP BY lrelid, lattnum, rrelid, rattnum, opno, eval_type
+        ORDER BY )" + col + R"( DESC NULLS LAST
+        LIMIT $1::int
+      )
+      SELECT JSONB_BUILD_OBJECT('predicates', COALESCE(JSONB_AGG(JSONB_BUILD_OBJECT(
+          'predicate', CASE
+             WHEN lc.oid IS NOT NULL AND rc.oid IS NOT NULL
+               THEN FORMAT('%s.%I %s %s.%I', lc.oid::regclass, la.attname,
+                           o.oprname, rc.oid::regclass, ra.attname)
+             ELSE FORMAT('%s.%I %s ?', COALESCE(lc.oid, rc.oid)::regclass,
+                         COALESCE(la.attname, ra.attname), o.oprname) END,
+          'relation',        COALESCE(lc.oid, rc.oid)::regclass::text,
+          'column',          COALESCE(la.attname, ra.attname),
+          'operator',        o.oprname,
+          'join',            lc.oid IS NOT NULL AND rc.oid IS NOT NULL,
+          'evaluated_as',    CASE g.eval_type WHEN 'i' THEN 'index'
+                                              WHEN 'f' THEN 'filter'
+                                              ELSE g.eval_type::text END,
+          'occurrences',     g.occurrences,
+          'execution_count', g.execution_count,
+          'filtered',        g.filtered,
+          'filtered_pct',    ROUND(100.0 * g.filtered / NULLIF(g.execution_count, 0), 1),
+          'filtered_per_call', ROUND(g.filtered / NULLIF(g.occurrences, 0)),
+          'mean_err_estimate_ratio', )" + finite("g.mean_err_estimate_ratio", 2) + R"(,
+          'max_err_estimate_ratio',  )" + finite("g.max_err_estimate_ratio", 2) + R"(,
+          'mean_err_estimate_num',   )" + finite("g.mean_err_estimate_num", 1) + R"(,
+          'queries',         g.queries,
+          'query_ids',       TO_JSONB(COALESCE(g.query_ids, '{}'::text[])))
+        ORDER BY g.)" + col + R"( DESC NULLS LAST), '[]'::jsonb))
+      FROM g
+      LEFT JOIN pg_class AS lc ON lc.oid = g.lrelid
+      LEFT JOIN pg_attribute AS la ON la.attrelid = g.lrelid AND la.attnum = g.lattnum
+      LEFT JOIN pg_class AS rc ON rc.oid = g.rrelid
+      LEFT JOIN pg_attribute AS ra ON ra.attrelid = g.rrelid AND ra.attnum = g.rattnum
+      LEFT JOIN pg_operator AS o ON o.oid = g.opno)";
+
+    try {
+      pqxx::result res = pqxx_exec(txn, query, pqxx::params{std::to_string(limit), query_id});
+      json out = json::parse(res[0][0].as<std::string>());
+      // Loaded in this backend now, whatever it was before, so the setting's
+      // context settles what an unprivileged role could not see up front.
+      const json after = preloaded.is_null()
+        ? preload_state(txn, "pg_qualstats", "pg_qualstats.max") : preloaded;
+      if (after.is_boolean() && !after.get<bool>())
+        return not_preloaded("pg_qualstats", false,
+                             "without the preload it reports only this session's own "
+                             "predicates, which is why this is refused rather than "
+                             "returned empty");
+      out["order_by"] = key;
+      out["preloaded"] = after;
+      out["extension_version"] = ver;
+      out["settings"] = {
+        {"sample_rate", nullptr}, {"enabled", nullptr}, {"max", nullptr}};
+      pqxx::result s = txn.exec(
+        "SELECT current_setting('pg_qualstats.sample_rate', true),"
+        "       current_setting('pg_qualstats.enabled', true),"
+        "       current_setting('pg_qualstats.max', true)");
+      if (!s[0][0].is_null()) out["settings"]["sample_rate"] = s[0][0].as<std::string>();
+      if (!s[0][1].is_null()) out["settings"]["enabled"] = s[0][1].as<std::string>();
+      if (!s[0][2].is_null()) out["settings"]["max"] = s[0][2].as<std::string>();
+      return out;
+    } catch (const pqxx::sql_error& e) {
+      json r = preload_ext_failure(e, "pg_qualstats", false);
+      if (!r.is_null()) return r;
+      throw;
+    }
+  }
+
+  // pg_qualstats_index_advisor(). Its body is PL/pgSQL that builds JSON and
+  // writes nothing, so it runs inside this server's READ ONLY transaction,
+  // and each suggestion is a whole `CREATE INDEX ON ... USING ... (...)` --
+  // exactly what evaluateIndex's `create` argument takes. The advisor
+  // suggests and evaluateIndex tests; neither builds anything.
+  const json suggest_indexes(long long min_filter, long long min_selectivity,
+                             const json& forbidden_am) {
+    if (min_filter < 0 || min_filter > std::numeric_limits<int>::max())
+      throw std::runtime_error("min_filter must be a non-negative integer");
+    if (min_selectivity < 0 || min_selectivity > 100)
+      throw std::runtime_error("min_selectivity must be between 0 and 100");
+    if (!forbidden_am.is_array())
+      throw std::runtime_error("forbidden_am must be an array of access method names");
+    for (const auto& am : forbidden_am)
+      if (!am.is_string())
+        throw std::runtime_error("forbidden_am must be an array of access method names");
+
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+
+    const std::string ext = extension_schema(txn, "pg_qualstats");
+    if (ext.empty()) return preload_missing("pg_qualstats", false);
+    const std::string ver = extension_version(txn, "pg_qualstats");
+    // Before 2.1 the advisor returned bare arrays of strings rather than
+    // {ddl, queryids} objects, and ->> on a string is NULL without an error --
+    // so every suggestion would come back as a null ddl rather than a refusal.
+    if (!extversion_at_least(ver, 2, 1)) return too_old("pg_qualstats", ver, "2.1");
+    const json preloaded = preload_state(txn, "pg_qualstats", "pg_qualstats.max");
+    if (preloaded.is_boolean() && !preloaded.get<bool>())
+      return not_preloaded("pg_qualstats", false, "");
+
+    // The advisor returns queryids as JSON numbers. Taken from the json (not
+    // jsonb) value with #>> so the digits are copied as written, then sent as
+    // strings: a 64-bit id does not survive a client that parses numbers as
+    // doubles, and every other tool here passes it as text.
+    auto ids = [](const std::string& v) {
+      return "COALESCE((SELECT JSONB_AGG(q #>> '{}') FROM JSON_ARRAY_ELEMENTS(" + v +
+             "->'queryids') AS q), '[]'::jsonb)";
+    };
+    const std::string query = R"(
+      SELECT JSONB_BUILD_OBJECT(
+        'indexes', COALESCE((
+          SELECT JSONB_AGG(JSONB_BUILD_OBJECT('ddl', i->>'ddl', 'query_ids', )" + ids("i") + R"())
+          FROM JSON_ARRAY_ELEMENTS(a.r->'indexes') AS i), '[]'::jsonb),
+        'not_indexable', COALESCE((
+          SELECT JSONB_AGG(JSONB_BUILD_OBJECT('predicate', u->>'qual', 'query_ids', )" + ids("u") + R"())
+          FROM JSON_ARRAY_ELEMENTS(a.r->'unoptimised') AS u), '[]'::jsonb))
+      FROM (SELECT )" + ext + R"(.pg_qualstats_index_advisor(
+                     $1::int, $2::int,
+                     ARRAY(SELECT JSONB_ARRAY_ELEMENTS_TEXT($3::jsonb))) AS r) AS a)";
+
+    try {
+      pqxx::result res = pqxx_exec(
+        txn, query, pqxx::params{std::to_string(min_filter), std::to_string(min_selectivity),
+                                 forbidden_am.dump()});
+      json out = json::parse(res[0][0].as<std::string>());
+      const json after = preloaded.is_null()
+        ? preload_state(txn, "pg_qualstats", "pg_qualstats.max") : preloaded;
+      if (after.is_boolean() && !after.get<bool>())
+        return not_preloaded("pg_qualstats", false,
+                             "without the preload the advisor sees only this session's "
+                             "own predicates, which is why this is refused rather than "
+                             "returned empty");
+      out["min_filter"] = min_filter;
+      out["min_selectivity"] = min_selectivity;
+      out["preloaded"] = after;
+      out["extension_version"] = ver;
+      return out;
+    } catch (const pqxx::sql_error& e) {
+      json r = preload_ext_failure(e, "pg_qualstats", false);
+      if (!r.is_null()) return r;
       throw;
     }
   }
@@ -6780,7 +7444,8 @@ private:
     }
   }
 
-  const json sequences(const std::string& schema) {
+  // `pattern` as on listTables, on the sequence name.
+  const json sequences(const std::string& schema, const std::string& pattern = "") {
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
@@ -6812,10 +7477,11 @@ private:
             AND d.deptype IN ('a', 'i')
           LIMIT 1
       ) owned ON true
-      WHERE ps.schemaname = $1;
+      WHERE ps.schemaname = $1
+        AND ($2 = '' OR ps.sequencename ILIKE '%' || $2 || '%');
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, pattern});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -7310,6 +7976,39 @@ private:
       degrade("evaluateIndex", "planning a statement needs SELECT on the tables "
                                "it references, so this fails on any statement "
                                "reaching a table this role cannot read");
+    // The three shared-memory extensions fail a second way: installed, but
+    // without the library preloaded there is no shared memory to read. That
+    // is reported only when this role can see shared_preload_libraries; when
+    // it cannot, the tool itself says so on every answer, which is the most
+    // that can honestly be said from here.
+    auto preload_deny = [&](const char* ext, const char* probe,
+                            std::initializer_list<const char*> tools) {
+      const bool installed = !extension_schema(txn, ext).empty();
+      const json loaded = installed ? preload_state(txn, ext, probe) : json(nullptr);
+      for (const char* t : tools) {
+        if (!installed)
+          deny(t, std::string("the ") + ext + " extension is not installed");
+        else if (loaded.is_boolean() && !loaded.get<bool>())
+          deny(t, std::string("the ") + ext + " extension is installed but not in "
+                  "shared_preload_libraries, so it has nothing to report");
+      }
+    };
+    preload_deny("pg_wait_sampling", "pg_wait_sampling.profile_period", {"waitEventProfile"});
+    preload_deny("pg_stat_kcache", "pg_stat_kcache.track", {"statementKernelStats"});
+    preload_deny("pg_qualstats", "pg_qualstats.max", {"predicateStats", "suggestIndexes"});
+
+    // pg_stat_kcache hides nothing, but pg_stat_statements hides the queryid
+    // of other roles' statements from a role without the stats role -- and
+    // the queryid is the join, so their calls and block counts come back null
+    // beside kernel counters that are complete.
+    const bool kcache_denied = std::any_of(denied.begin(), denied.end(), [](const json& d) {
+      return d.value("tool", "") == "statementKernelStats"; });
+    if (has_pgss && !stats && !kcache_denied && !extension_schema(txn, "pg_stat_kcache").empty())
+      degrade("statementKernelStats", "calls, total_exec_ms and shared_blks_read are "
+                                      "null for statements run by other roles, because "
+                                      "pg_stat_statements hides their queryid; the kernel "
+                                      "counters beside them are complete");
+
     if (!has_pgss)
       deny("statementStats", "the pg_stat_statements extension is not installed");
     else if (!stats)
@@ -8045,7 +8744,32 @@ private:
   // vacuum state of its own and bloat-and-vacuum-review was ranking a relation
   // whose counters are always zero while the child that is behind went
   // unlisted.
-  const json partition_details(const std::string& schema, const std::string& table) {
+  // At most `limit` partitions, 100 by default: each is about 400 bytes, so a
+  // table partitioned by day for three years was ~430 KB, and one real table
+  // answered 185 KB -- past what a client accepts, so the caller got nothing.
+  // partition_count and partitions_truncated say what was left out, and
+  // order_by decides which partitions are worth the room: autovacuum runs per
+  // partition, so the one falling behind is the answer and alphabetical order
+  // is the least likely place to find it. The DEFAULT partition is always
+  // kept -- a growing default is a missing partition that has not failed
+  // loudly yet, and by name it sorts last, exactly where a cap would cut it.
+  const json partition_details(const std::string& schema, const std::string& table,
+                               int limit = 100, const std::string& order_by = "") {
+    static const std::map<std::string, std::string> ORDERINGS = {
+      {"name",              "relname"},
+      {"dead_tuples",       "n_dead_tup DESC NULLS LAST"},
+      {"mod_since_analyze", "n_mod_since_analyze DESC NULLS LAST"},
+      {"oldest_vacuum",     "last_vac ASC NULLS FIRST"},
+      {"size",              "relpages DESC"},
+    };
+    std::string key;
+    const std::string rank = pick_ordering(ORDERINGS, order_by, "name", key);
+    if (limit <= 0) limit = 100;
+    if (limit > 10000) limit = 10000;
+    // By name the DEFAULT partition goes last, as it always has; ranked, it
+    // takes its place in the ranking.
+    const std::string display = key == "name" ? "is_def, relname" : rank + ", relname";
+
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
@@ -8064,55 +8788,60 @@ private:
              JOIN pg_namespace pn ON pn.oid = pc.relnamespace
             WHERE pi.inhrelid = c.oid),
         )") + kCountersSince + R"(,
+        'partition_count', (SELECT count(*) FROM pg_inherits WHERE inhparent = c.oid),
+        'partitions_truncated', (SELECT count(*) FROM pg_inherits WHERE inhparent = c.oid) > $3::int,
         'partitions', COALESCE((
-          SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
-                   'name',    ch.relname,
-                   'schema',  chn.nspname,
-                   -- Verbatim. Parsing a bound generically is not possible --
-                   -- it carries whatever types the key columns have -- and a
-                   -- misparsed boundary is worse than an unparsed one. For a
-                   -- RANGE parent, comparing the highest upper bound here
-                   -- against now() is how to see that next period's partition
-                   -- was never created, which is the classic overnight failure.
-                   'bound',   pg_get_expr(ch.relpartbound, ch.oid),
-                   'is_default', pg_get_expr(ch.relpartbound, ch.oid) = 'DEFAULT',
-                   'is_partitioned', ch.relkind = 'p',
-                   -- NULL rather than 0 for a partition never analyzed, for
-                   -- the reason default_rows gives in listPartitions: -1 means
-                   -- "not measured" and survives inserts, so a clamp would
-                   -- call a filling partition empty. relpages is set by the
-                   -- same VACUUM or ANALYZE, so its 0 means the same thing and
-                   -- the size estimate goes null with it.
-                   'rows', CASE WHEN ch.reltuples < 0 THEN NULL
-                                ELSE ch.reltuples::bigint END,
-                   'size_estimate',
-                     CASE WHEN ch.reltuples < 0 THEN NULL
-                          ELSE ch.relpages::bigint * current_setting('block_size')::bigint END,
-                   'n_live_tup', s.n_live_tup,
-                   'n_dead_tup', s.n_dead_tup,
-                   'n_mod_since_analyze', s.n_mod_since_analyze,
-                   'n_ins_since_vacuum',  s.n_ins_since_vacuum,
-                   'seq_scan', s.seq_scan,
-                   'idx_scan', s.idx_scan,
-                   'last_vacuum',      s.last_vacuum,
-                   'last_autovacuum',  s.last_autovacuum,
-                   'last_analyze',     s.last_analyze,
-                   'last_autoanalyze', s.last_autoanalyze)
-                 ORDER BY pg_get_expr(ch.relpartbound, ch.oid) = 'DEFAULT', ch.relname)
-            FROM pg_inherits AS i
-            JOIN pg_class AS ch ON ch.oid = i.inhrelid
-            JOIN pg_namespace AS chn ON chn.oid = ch.relnamespace
-            LEFT JOIN pg_stat_user_tables AS s ON s.relid = ch.oid
-           WHERE i.inhparent = c.oid), '[]'::jsonb))
+          SELECT JSONB_AGG(y.obj ORDER BY )" + display + R"()
+          FROM (
+            SELECT x.*, row_number() OVER (ORDER BY is_def DESC, )" + rank + R"(, relname) AS rn
+            FROM (
+              SELECT JSONB_BUILD_OBJECT(
+                       'name',    ch.relname,
+                       'schema',  chn.nspname,
+                       'bound',   pg_get_expr(ch.relpartbound, ch.oid),
+                       'is_default', pg_get_expr(ch.relpartbound, ch.oid) = 'DEFAULT',
+                       'is_partitioned', ch.relkind = 'p',
+                       'rows', CASE WHEN ch.reltuples < 0 THEN NULL
+                                    ELSE ch.reltuples::bigint END,
+                       'size_estimate',
+                         CASE WHEN ch.reltuples < 0 THEN NULL
+                              ELSE ch.relpages::bigint * current_setting('block_size')::bigint END,
+                       'n_live_tup', s.n_live_tup,
+                       'n_dead_tup', s.n_dead_tup,
+                       'n_mod_since_analyze', s.n_mod_since_analyze,
+                       'n_ins_since_vacuum',  s.n_ins_since_vacuum,
+                       'seq_scan', s.seq_scan,
+                       'idx_scan', s.idx_scan,
+                       'last_vacuum',      s.last_vacuum,
+                       'last_autovacuum',  s.last_autovacuum,
+                       'last_analyze',     s.last_analyze,
+                       'last_autoanalyze', s.last_autoanalyze) AS obj,
+                     pg_get_expr(ch.relpartbound, ch.oid) = 'DEFAULT' AS is_def,
+                     ch.relname,
+                     ch.relpages,
+                     s.n_dead_tup,
+                     s.n_mod_since_analyze,
+                     GREATEST(s.last_vacuum, s.last_autovacuum) AS last_vac
+                FROM pg_inherits AS i
+                JOIN pg_class AS ch ON ch.oid = i.inhrelid
+                JOIN pg_namespace AS chn ON chn.oid = ch.relnamespace
+                LEFT JOIN pg_stat_user_tables AS s ON s.relid = ch.oid
+               WHERE i.inhparent = c.oid
+            ) AS x
+          ) AS y
+          WHERE y.rn <= $3::int), '[]'::jsonb))
         FROM pg_class AS c
         JOIN pg_partitioned_table AS p ON p.partrelid = c.oid
        WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
          AND c.relname = $2;
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, table});
-    if (!res.empty() && !res[0][0].is_null())
-      return json::parse(res[0][0].as<std::string>());
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, table, std::to_string(limit)});
+    if (!res.empty() && !res[0][0].is_null()) {
+      json out = json::parse(res[0][0].as<std::string>());
+      out["order_by"] = key;
+      return out;
+    }
 
     // Not partitioned and does not exist are different answers, and the first
     // is the one a caller reaches by habit after listTables named the relation.
@@ -8131,7 +8860,8 @@ private:
                      "case sensitive here exactly as they are in the catalog."}};
   }
 
-  const json list_table_stats(const std::string& schema) {
+  // `pattern` as on listTables.
+  const json list_table_stats(const std::string& schema, const std::string& pattern = "") {
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
@@ -8148,10 +8878,11 @@ private:
       FROM pg_class AS c
       LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
       WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
-        AND c.relkind IN ('r', 'p', 'm', 'v');
+        AND c.relkind IN ('r', 'p', 'm', 'v')
+        AND ($2 = '' OR c.relname ILIKE '%' || $2 || '%');
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, pattern});
 
     if (!res.empty() && !res[0][0].is_null())
       return json::parse(res[0][0].as<std::string>());
@@ -8210,7 +8941,8 @@ private:
     return {};
   }
 
-  const json list_table_sizes(const std::string& schema) {
+  // `pattern` as on listTables.
+  const json list_table_sizes(const std::string& schema, const std::string& pattern = "") {
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
@@ -8227,10 +8959,11 @@ private:
                'total_size', pg_total_relation_size(c.oid)))
       FROM pg_class AS c
       WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)
-        AND c.relkind IN ('r', 'p', 'm', 'v');
+        AND c.relkind IN ('r', 'p', 'm', 'v')
+        AND ($2 = '' OR c.relname ILIKE '%' || $2 || '%');
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
+    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, pattern});
 
     if (!res.empty() && !res[0][0].is_null())
       return json::parse(res[0][0].as<std::string>());
@@ -8867,7 +9600,7 @@ private:
 				   axis == "instance" ? want_instance
 				 : axis == "replication_group" ? want_repl : want_group,
 				   want_role, tool_name, arguments);
-	  send_response(req["id"], tool_result(result_content));
+	  send_response(req["id"], tool_result(payload_guard(tool_name, result_content, true)));
 	  return;
 	}
 
@@ -8882,7 +9615,7 @@ private:
 	  return;
 	}
 
-	send_response(req["id"], tool_result(result_content));
+	send_response(req["id"], tool_result(payload_guard(tool_name, result_content, false)));
 
       } catch (const pqxx::sql_error& e) {
 	// Hitting the ceiling is reported as a result rather than an execution
@@ -9075,6 +9808,58 @@ private:
 
   bool wants_structured_content() const {
     return request_protocol_ >= kStructuredContentRevision;
+  }
+
+  // The payload guard: an answer larger than budgets.ini's [payload] max_kb
+  // is refused with a hint rather than returned.
+  //
+  // Measured, not hypothetical: listSchemas once answered 101,975 bytes on a
+  // real database and the client dropped it, so the caller saw nothing at all;
+  // searchFunctions reached 126 KB and partitionDetails 185 KB. A client that
+  // drops an oversized result gives the model no way to know that asking for
+  // less would have worked. Refusing here does: the hint names the arguments
+  // this tool declares that make its answer smaller, so the next call can
+  // succeed. The per-tool caps fix the tools known to grow; this catches the
+  // next one.
+  //
+  // Measured on the compact serialisation, which is what a client receives
+  // as text. 0 turns it off.
+  json payload_guard(const std::string& tool, json payload, bool sweep) const {
+    const long long max_kb = budgets_.payload_max_kb;
+    if (max_kb <= 0 || !payload.is_object() || payload.contains("error")) return payload;
+    const size_t bytes = payload.dump().size();
+    if (bytes <= static_cast<size_t>(max_kb) * 1024) return payload;
+
+    // Only arguments that make an answer smaller when given. include_system
+    // and group_by are not here although both change the size: each makes it
+    // larger when set, and the default is already the small one.
+    static const char* kNarrowing[] = {
+      "limit", "schema", "table", "pattern", "query_id", "pid", "state",
+      "min_calls", "min_duration_s", "relation"};
+    std::string args;
+    for (const char* k : kNarrowing)
+      if (tool_declares(tool, k) && !tool_requires(tool, k))
+        args += (args.empty() ? "" : ", ") + std::string(k);
+    // A required search term is the one required argument that does narrow:
+    // a more specific term is a smaller answer.
+    if (args.empty() && tool_requires(tool, "web_search"))
+      args = "a more specific web_search";
+
+    std::string hint;
+    if (sweep)
+      hint = "This was a sweep, and every member's answer counts toward the limit: "
+             "sweep fewer members, or name one connection. ";
+    hint += args.empty()
+      ? tool + " has no argument that narrows its answer. "
+      : "Narrow it with " + args + ". ";
+    hint += "The limit is [payload] max_kb in budgets.ini (0 turns it off); a "
+            "client that drops large tool results will drop this one whole.";
+    return {{"error", tool + "'s answer is " + std::to_string((bytes + 1023) / 1024) +
+                      " KB, over the " + std::to_string(max_kb) +
+                      " KB this server returns whole"},
+            {"hint", hint},
+            {"bytes", bytes},
+            {"max_kb", max_kb}};
   }
 
   // One success result, in whichever of the two formats the client negotiated.

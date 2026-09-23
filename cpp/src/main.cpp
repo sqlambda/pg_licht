@@ -19,6 +19,7 @@ bool file_exists(const std::string& path) {
 void usage(const char* argv0) {
   std::cerr
     << "Usage: " << argv0 << " [--config <file.ini>] [database_url]" << std::endl
+    << "       " << argv0 << " --version | --help" << std::endl
     << std::endl
     << "Resolution order:" << std::endl
     << "  1. --config <file>" << std::endl
@@ -52,6 +53,21 @@ int main(int argc, char *argv[]) {
     } else if (arg == "--help" || arg == "-h") {
       usage(argv[0]);
       return 0;
+    } else if (arg == "--version" || arg == "-V") {
+      // To stdout, since it is the answer rather than a diagnostic. A package
+      // manager knows the version; a binary installed from the Homebrew tap or
+      // built from source has nothing else to ask.
+      std::cout << "pg_licht_mcp " << PGLICHT_VERSION << std::endl;
+      return 0;
+    } else if (arg.size() > 1 && arg[0] == '-') {
+      // Through 4.3.3 any argument that was not --config or --help became the
+      // connection string, so --version started a server that read stdin and
+      // exited silently -- which looks like success. No connection string
+      // starts with '-': a URL starts with postgres:// or postgresql://, a
+      // conninfo with a keyword.
+      std::cerr << "unknown option: " << arg << std::endl << std::endl;
+      usage(argv[0]);
+      return 2;
     } else {
       db_url = arg;
     }

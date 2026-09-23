@@ -66,6 +66,11 @@ order to issue `CREATE DATABASE`. Installing the `pg_stat_statements`, `postgres
 - `*_valgrind` — registered automatically by `pglicht_add_valgrind_test()` whenever
   Valgrind is installed and no sanitizer is active.
 - `manpage_lint` — `mandoc -Tlint -Wwarning` over `cpp/man/pg_licht_mcp.1`.
+- `protocol_compat` — the response-shape contract end to end against the real binary.
+- `llms_txt` and `reference` — `llms.txt`, the HTML reference and the landing page, built
+  as the release builds them, with every mocked example checked against its tool's schema.
+- `cli_version` and `cli_unknown_option` — `--version` prints the version it was built
+  as, and an unknown option is refused rather than taken for a connection string.
 
 ### Through a connection pooler
 
@@ -76,8 +81,9 @@ and tears everything down — touching nothing else on the machine:
 
 | | why it exists |
 |---|---|
-| primary, `pg_stat_statements` preloaded, `wal_level = logical` | the suite's own database, and the publisher |
+| primary, `pg_stat_statements` preloaded (and `pg_stat_kcache`, `pg_wait_sampling`, `pg_qualstats` when installed), `wal_level = logical` | the suite's own database, and the publisher |
 | a `pg_basebackup` streaming standby | shares the primary's system identifier, which is the only way to check that the topology tools tell a replica from a second instance rather than trusting the config |
+| a cascading standby streaming from the first | `replicationStats` on a standby that is itself a sender, where the primary-only WAL functions raise |
 | a separately `initdb`-ed logical subscriber | `subscriptionStats` has nothing to report on a server that subscribes to nothing. It has to be a third cluster: logical replication between two databases of one cluster deadlocks, because `CREATE SUBSCRIPTION` waits for the slot it is creating and slot creation waits for every transaction older than itself — including that one |
 | PgBouncer, `pool_mode=transaction`, `server_reset_query=DISCARD ALL` | the deployment a session-scoped guard fails on silently |
 
@@ -93,14 +99,20 @@ cpp/test/run-pooled-tests.sh
 Requires `initdb`, `pg_ctl`, `createdb`, `pg_basebackup` and `psql` (PostgreSQL 14+) plus
 `pgbouncer`. It picks the newest installed PostgreSQL and free default ports, all
 overridable via the environment: `PG_BINDIR`, `PGBOUNCER`, `TEST_BIN`, `PG_PORT`,
-`BOUNCER_PORT`, `STANDBY_PORT`, `SUBSCRIBER_PORT`. To pin a specific major:
+`BOUNCER_PORT`, `STANDBY_PORT`, `SUBSCRIBER_PORT`, `CASCADE_PORT`. To pin a specific major:
 
 ```bash
 PG_BINDIR=/usr/lib/postgresql/16/bin cpp/test/run-pooled-tests.sh
 ```
 
-This is also the only path that covers the `pg_stat_statements` queryid tests, because the
-rig preloads the extension while a stock server usually does not.
+The rig preloads `pg_stat_statements`, which a stock server usually does not, so the
+`queryid` tests run here. It preloads `pg_stat_kcache`, `pg_wait_sampling` and
+`pg_qualstats` too when their packages are installed for that major
+(`postgresql-NN-pg-stat-kcache`, `-pg-wait-sampling`, `-pg-qualstats`, all in PGDG); a
+library that is not installed is left out, since preloading it would stop the server
+starting. The tests behind them, and behind `hypopg`, skip where the extension is
+missing. Set `PGLICHT_REQUIRE_PRELOAD_EXTENSIONS=1` and `PGLICHT_REQUIRE_HYPOPG=1` to
+make those skips failures, as CI does wherever it installs them.
 
 ### Debugging with MCP Inspector
 
