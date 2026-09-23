@@ -10,6 +10,13 @@ on:
 # A follow-up push supersedes the previous run of the same ref. Only
 # pull_request runs are cancelled: a tag run publishes the release and its
 # assets, so it must always be allowed to finish.
+# Least privilege for every job that does not say otherwise: checkout needs to
+# read the repository, and artifacts and caches use the runner's own token,
+# not GITHUB_TOKEN. A job-level block replaces this one entirely, which is how
+# the jobs that publish get more.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
