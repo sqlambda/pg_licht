@@ -417,7 +417,7 @@ memory_percent   = 10   ; worst-case plan memory, % of host_ram_mb
 vcpus_per_worker = 4    ; one parallel worker per this many host_vcpus
 
 [payload]
-max_kb = 96             ; largest answer returned whole; 0 turns it off
+max_kb = 0              ; largest answer returned whole; 0, the default, is off
 .Ed
 .Pp
 Those are the built-in values, used when no file is found.
@@ -428,14 +428,22 @@ takes 1 to 100,
 .Va max_kb
 0 to 1048576.
 .Pp
-An answer larger than
+With
 .Va max_kb
-kilobytes, as the compact JSON a client receives, is refused with an error
-whose hint names the arguments that operation declares to make its answer
-smaller, and for a sweep, that fewer members would.
-96 sits under the roughly 25,000-token limit at which a client such as Claude
-Code drops a tool result whole: past it the answer was already being lost, and
-the refusal says how to ask for less instead.
+set, an answer larger than that many kilobytes, as the compact JSON a client
+receives, is refused with an error whose hint names the arguments that
+operation declares to make its answer smaller, and for a sweep, that fewer
+members would.
+It is off by default, and it is a ceiling an operator chooses rather than a
+protection against loss: Claude Code moves a tool result over its own limit
+.Po
+.Ev MAX_MCP_OUTPUT_TOKENS ,
+25,000 tokens by default
+.Pc
+into a file the model reads back, so such an answer reaches it either way.
+The limit is in bytes, not tokens, and how many bytes of these answers make a
+token has not been measured, so set it from what a client is observed to
+accept.
 The first of these is read:
 .Ev PG_LICHT_BUDGETS ,
 which must then exist;
@@ -1005,7 +1013,7 @@ partitions are returned, 100 by default and at most 10,000, with
 and
 .Va partitions_truncated
 beside them: each costs about 400 bytes, so a table partitioned by day for three
-years outgrew what a client accepts.
+years is about 430 kB.
 .Va order_by
 decides which are kept and in what order:
 .Va name
@@ -1108,8 +1116,8 @@ are left out unless
 .Va include_system
 is true or one of those schemas is named as
 .Va schema :
-they were 97 to 99 percent of a typical answer, and enough of them pushed it past
-what a client accepts, taking the database's own functions with it.
+they were 97 to 99 percent of a typical answer, and enough of them to bury the
+database's own functions.
 A
 .Va schema
 that does not exist is an error rather than an empty answer.
@@ -3181,7 +3189,7 @@ The hint names the arguments that make this operation's answer smaller.
 Every schema-wide listing and every search has one; a single object that is
 simply large \(em a very wide table, a huge function body, a very large plan
 \(em has none, and the hint says so.
-Raise the limit, or set it to 0, only for a client known to accept more.
+Raise the limit, or set it to 0, which is the default, when a larger answer is wanted.
 .It Sy permission denied for ...
 Every
 .Li pgstattuple

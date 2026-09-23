@@ -2433,7 +2433,7 @@ private:
   // `pattern` narrows to relations whose name contains it, case-insensitively
   // -- the rule it has on listRoles and serverSettings. Measured on 18: a
   // schema of ~1,000 relations answered listTables at 194 KB and
-  // listTableStats at 294 KB, over the payload guard's 96 KB, and without an
+  // listTableStats at 294 KB, over a 96 KB cap, and without an
   // argument to narrow by, the guard's refusal would have been a dead end.
   const json tables(const std::string& schema, const std::string& pattern = "") {
     Session sess = open_session();
@@ -2657,7 +2657,7 @@ private:
   // PostgreSQL's own functions are left out unless include_system is set.
   // Measured on 18: a search for "array" returned 111 hits of which 110 were
   // in pg_catalog or information_schema, 99% of the bytes -- and on a real
-  // database the answer reached 126 KB, past what a client accepts, so the
+  // database the answer reached 126 KB, most of it PostgreSQL's, so the
   // user's own functions were lost along with the built-ins that buried them.
   // The shape is unchanged; only which functions are eligible.
   const json search_functions(const std::string& web_search, const std::string& schema = "",
@@ -8750,7 +8750,7 @@ private:
   // unlisted.
   // At most `limit` partitions, 100 by default: each is about 400 bytes, so a
   // table partitioned by day for three years was ~430 KB, and one real table
-  // answered 185 KB -- past what a client accepts, so the caller got nothing.
+  // answered 185 KB, of which the partition falling behind was one entry.
   // partition_count and partitions_truncated say what was left out, and
   // order_by decides which partitions are worth the room: autovacuum runs per
   // partition, so the one falling behind is the answer and alphabetical order
@@ -9815,16 +9815,17 @@ private:
   }
 
   // The payload guard: an answer larger than budgets.ini's [payload] max_kb
-  // is refused with a hint rather than returned.
+  // is refused with a hint rather than returned. Off by default.
   //
-  // Measured, not hypothetical: listSchemas once answered 101,975 bytes on a
-  // real database and the client dropped it, so the caller saw nothing at all;
-  // searchFunctions reached 126 KB and partitionDetails 185 KB. A client that
-  // drops an oversized result gives the model no way to know that asking for
-  // less would have worked. Refusing here does: the hint names the arguments
+  // It is a ceiling an operator chooses, not protection against loss: Claude
+  // Code moves a result over its own limit (MAX_MCP_OUTPUT_TOKENS, 25,000
+  // tokens by default) into a file the model reads back, so nothing is lost
+  // there -- verified against its documentation after an earlier version of
+  // this comment claimed the client dropped such results. What the guard
+  // adds is an answer the caller can act on: the hint names the arguments
   // this tool declares that make its answer smaller, so the next call can
-  // succeed. The per-tool caps fix the tools known to grow; this catches the
-  // next one.
+  // ask for less. The byte limit is not a token count; how many bytes of
+  // these answers make a token has not been measured.
   //
   // Measured on the compact serialisation, which is what a client receives
   // as text. 0 turns it off.
@@ -9856,8 +9857,7 @@ private:
     hint += args.empty()
       ? tool + " has no argument that narrows its answer. "
       : "Narrow it with " + args + ". ";
-    hint += "The limit is [payload] max_kb in budgets.ini (0 turns it off); a "
-            "client that drops large tool results will drop this one whole.";
+    hint += "The limit is [payload] max_kb in budgets.ini (0 turns it off).";
     return {{"error", tool + "'s answer is " + std::to_string((bytes + 1023) / 1024) +
                       " KB, over the " + std::to_string(max_kb) +
                       " KB this server returns whole"},

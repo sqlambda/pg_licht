@@ -388,23 +388,25 @@ An example is in [cpp/test/budgets.example.ini](cpp/test/budgets.example.ini). T
 out-of-memory kill restarts every connection on the instance. The per-call `ram_mb` and
 `vcpus` arguments do not count here: a caller cannot raise its own limit.
 
-The same file bounds how large one answer may be. Past `max_kb` — 96 by default, under the
-roughly 25,000-token limit at which a client such as Claude Code drops a tool result whole —
-an answer is refused with a hint naming the arguments that make that tool's answer smaller,
-instead of reaching the client and vanishing there. `0` turns it off.
+The same file can cap how large one answer may be. It is off by default. With `max_kb` set,
+an answer past it is refused with a hint naming the arguments that make that tool's answer
+smaller. It is a ceiling you choose, not protection against loss: Claude Code moves a tool
+result over its own limit (`MAX_MCP_OUTPUT_TOKENS`, 25,000 tokens by default) into a file
+the model reads back. The limit is in bytes, and how many bytes of these answers make a token
+has not been measured, so set it from what your client is observed to accept.
 
 ```ini
 [payload]
-max_kb = 96
+max_kb = 0   ; the default: off
 ```
 
-The tools known to outgrow it narrow themselves now: `searchFunctions` leaves out
+Independently of the cap, the tools known to answer at hundreds of kilobytes narrow themselves now: `searchFunctions` leaves out
 PostgreSQL's own functions unless `include_system` is set, `partitionDetails` returns at most
 100 partitions — ranked with `order_by`, and always keeping the `DEFAULT` one — with
 `partition_count` and `partitions_truncated` beside them, and `listSchemas`, `listTables`,
 `listTableStats`, `listTableSizes`, `listSequences` and `listFunctions` take a `pattern`.
 What it cannot help with is one object that is simply large — a very wide table, a huge
-function body, a very large plan: that is refused with a hint pointing at `max_kb`.
+function body, a very large plan: with a cap set, that is refused with a hint pointing at `max_kb`.
 
 ## Documentation
 

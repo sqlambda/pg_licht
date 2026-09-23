@@ -2551,7 +2551,7 @@ TEST(BudgetsTest, WithNoFileTheBuiltInRatiosApply) {
   const auto b = pglicht::Budgets::load("");
   EXPECT_EQ(b.analyze_memory_percent, 10);
   EXPECT_EQ(b.analyze_vcpus_per_worker, 4);
-  EXPECT_EQ(b.payload_max_kb, 96);
+  EXPECT_EQ(b.payload_max_kb, 0);   // off until measured against a client
   EXPECT_EQ(b.source, "built-in defaults");
 }
 
@@ -8007,6 +8007,11 @@ TEST_F(PostgresMCPServerTest, AnAnswerOverThePayloadLimitIsRefusedWithAWayToAskF
   s.set_budgets(pglicht::Budgets::load(off.path));
   json whole = rpc_payload(rpc_call(s, "serverSettings", {{"all", true}}));
   EXPECT_FALSE(whole.contains("error")) << "max_kb = 0 must turn the guard off";
+
+  // And off is the default: a server given no budgets.ini refuses nothing.
+  PostgresMCPServer fresh(test_url);
+  json dflt = rpc_payload(rpc_call(fresh, "serverSettings", {{"all", true}}));
+  EXPECT_FALSE(dflt.contains("error")) << "the guard must be off unless configured";
 }
 
 TEST_F(PostgresMCPServerTest, SchemaWideListingsNarrowByPattern) {
@@ -8091,7 +8096,11 @@ TEST_F(PostgresMCPServerTest, NoSchemaWideAnswerIsRefusedWithoutAWayToNarrowIt) 
            "END LOOP; END $$");
     w.commit();
   }
-  PostgresMCPServer s(test_url);   // built-in budgets: the 96 KB default
+  // The guard is off by default, so this sets the value it was designed
+  // around; the invariant is about what happens when an operator turns it on.
+  PostgresMCPServer s(test_url);
+  BudgetsFile limit("[payload]\nmax_kb = 96\n");
+  s.set_budgets(pglicht::Budgets::load(limit.path));
 
   size_t called = 0, refused = 0;
   for (const auto& t : s.call_tools_list()) {

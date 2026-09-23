@@ -58,16 +58,19 @@
   `pg_read_all_stats`: `pg_stat_statements` hides the queryid of other roles'
   statements, so the join to their call counts comes back null.
 
-- **A payload guard.** An answer larger than `max_kb` in a new `[payload]`
-  section of `budgets.ini` — 96 KB by default — is refused with `{error,
+- **A payload cap, off by default.** With `max_kb` set in a new `[payload]`
+  section of `budgets.ini`, an answer larger than it is refused with `{error,
   hint}`, the hint naming the arguments that make that tool's answer smaller
   (never its required ones, which name the object rather than shrink it), and
-  for a sweep that fewer members would. 96 KB sits under the ~25k-token limit
-  at which a client such as Claude Code drops a tool result whole: past it the
-  answer was already lost, with nothing to say that asking for less would have
-  worked. `0` turns it off.
+  for a sweep that fewer members would. It is a ceiling an operator chooses,
+  not protection against loss: Claude Code moves a tool result over its own
+  limit (`MAX_MCP_OUTPUT_TOKENS`, 25,000 tokens by default) into a file the
+  model reads back. It shipped off because the limit is in bytes and how many
+  bytes of these answers make a token has not been measured, and because at
+  the 96 KB first proposed it refused fleet sweeps: `statementStats` answers
+  ~19 KB a server, so a sweep of six was refused whole.
 
-  **What it cannot help with.** One object that is simply large — a very wide
+  **What it cannot help with.** With a cap set, one object that is simply large — a very wide
   table in `tableDetails`, a huge function body in `functionDetails`, a very
   large plan — has nothing to narrow, and is refused with a hint that says so
   and points at `max_kb`. Before 4.4 such an answer reached a client whose own
@@ -89,7 +92,7 @@
   object's name, as on `listRoles`. Found by measuring every tool against the
   new guard before release: on a schema of 1,000 relations `listTables`
   answered 194 KB and `listTableStats` 294 KB, and with nothing to narrow by,
-  the guard's refusal would have been a dead end. `listSchemas` is up to
+  a capped server's refusal would have been a dead end. `listSchemas` is up to
   0.7 KB a schema, which a schema-per-tenant database crosses at around 140. A test now builds such a
   schema and fails if any schema-wide tool is refused without a way to ask for
   less.
@@ -99,8 +102,8 @@
 - **`searchFunctions` leaves out PostgreSQL's own functions** in
   `pg_catalog` and `information_schema` unless `include_system` is true or
   one of those schemas is named. Measured on 18, they were 97–99% of a
-  typical answer; on a real database the answer reached 126 KB and was
-  dropped, taking the database's own functions with it. A new `schema`
+  typical answer; on a real database the answer reached 126 KB, most of it
+  PostgreSQL's own. A new `schema`
   argument narrows further, and a schema that does not exist is an error. The
   shape is unchanged; a search for a built-in needs the flag.
 

@@ -706,7 +706,7 @@ private:
 //   vcpus_per_worker = 4    ; one parallel worker per this many host_vcpus
 //
 //   [payload]
-//   max_kb = 96             ; largest answer returned whole; 0 turns it off
+//   max_kb = 0              ; largest answer returned whole; 0, the default, is off
 //
 // Strict, like the connections file: an unknown section or key, or a value out
 // of range, fails at startup. A typo that silently kept the default would leave
@@ -714,10 +714,12 @@ private:
 struct Budgets {
   int analyze_memory_percent = 10;
   int analyze_vcpus_per_worker = 4;
-  // 96 KB sits under the ~25k-token limit at which a client such as Claude
-  // Code drops a tool result. An answer past it was already being lost; the
-  // guard turns the loss into an error that says how to ask for less.
-  long long payload_max_kb = 96;
+  // Off by default. The limit that matters is the client's, counted in
+  // tokens, and how many bytes of these answers make a token has not been
+  // measured against a real client -- so a byte default would be a guess,
+  // and a guess set too low refuses answers a client would have taken. An
+  // operator who knows their client's limit sets it.
+  long long payload_max_kb = 0;
   std::string source = "built-in defaults";
 
   // Which file to read, or "" for the built-in defaults. Pure, so the order is

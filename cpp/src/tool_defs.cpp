@@ -6,7 +6,7 @@
 auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
     static const std::vector<ToolDef> defs = {
       {"listSchemas",
-       "return schema list with basic summaries: table_count, up to 25 table names, and role grants per schema. tables_truncated says when a schema holds more than the names shown -- listTables is the tool that names every relation in one schema. pattern narrows to schemas whose name contains it: a schema-per-tenant database outgrows what a client accepts at around 140 schemas",
+       "return schema list with basic summaries: table_count, up to 25 table names, and role grants per schema. tables_truncated says when a schema holds more than the names shown -- listTables is the tool that names every relation in one schema. pattern narrows to schemas whose name contains it: a schema-per-tenant database passes 100 KB of answer at around 140 schemas",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
@@ -21,7 +21,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		{"type", "object"},
    		{"properties", {
    		    {"schema", {{"type", "string"}}},
-   		    {"pattern", {{"type", "string"}, {"description", "only relations whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed. On a large schema the whole list can outgrow what a client accepts"}}}
+   		    {"pattern", {{"type", "string"}, {"description", "only relations whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed. On a large schema the whole list is more than a model should read at once"}}}
    		  }},
    		{"required", {"schema"}}
    	      }; },
@@ -167,7 +167,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args& a) -> json {
          return s.list_partitions(a.str("schema", "public")); }},
       {"partitionDetails",
-       "return one partitioned table with every partition: its bound expression verbatim, whether it is the DEFAULT, whether it is itself partitioned, estimated rows and size (both null, not 0, for a partition never analyzed), and the per-partition live/dead tuples, scan counters and vacuum and analyze timestamps. Those statistics are the reason this exists: autovacuum runs per PARTITION, so a parent has no vacuum state of its own and ranking parents finds nothing while one child falls behind. Bounds are returned verbatim rather than parsed -- a bound carries whatever types the key columns have, and a misparsed boundary is worse than an unparsed one; for a RANGE parent, comparing the highest upper bound against now() is how to see that next period's partition was never created. counters_since says when the scan counters were last reset. Returns a clear error naming the relkind if the table exists but is not partitioned. At most limit partitions are returned, 100 by default, with partition_count and partitions_truncated beside them: on a table partitioned by day each partition costs about 400 bytes, so the whole list outgrew what a client accepts. To find the partition falling behind, rank with order_by=dead_tuples or oldest_vacuum rather than reading them by name",
+       "return one partitioned table with every partition: its bound expression verbatim, whether it is the DEFAULT, whether it is itself partitioned, estimated rows and size (both null, not 0, for a partition never analyzed), and the per-partition live/dead tuples, scan counters and vacuum and analyze timestamps. Those statistics are the reason this exists: autovacuum runs per PARTITION, so a parent has no vacuum state of its own and ranking parents finds nothing while one child falls behind. Bounds are returned verbatim rather than parsed -- a bound carries whatever types the key columns have, and a misparsed boundary is worse than an unparsed one; for a RANGE parent, comparing the highest upper bound against now() is how to see that next period's partition was never created. counters_since says when the scan counters were last reset. Returns a clear error naming the relkind if the table exists but is not partitioned. At most limit partitions are returned, 100 by default, with partition_count and partitions_truncated beside them: on a table partitioned by day each partition costs about 400 bytes, so three years of them is ~430 KB. To find the partition falling behind, rank with order_by=dead_tuples or oldest_vacuum rather than reading them by name",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
@@ -188,7 +188,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		{"type", "object"},
    		{"properties", {
    		    {"schema", {{"type", "string"}}},
-   		    {"pattern", {{"type", "string"}, {"description", "only relations whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed. On a large schema the whole list can outgrow what a client accepts"}}}
+   		    {"pattern", {{"type", "string"}, {"description", "only relations whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed. On a large schema the whole list is more than a model should read at once"}}}
    		  }},
    		{"required", {"schema"}}
    	      }; },
@@ -212,7 +212,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		{"type", "object"},
    		{"properties", {
    		    {"schema", {{"type", "string"}}},
-   		    {"pattern", {{"type", "string"}, {"description", "only relations whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed. On a large schema the whole list can outgrow what a client accepts"}}}
+   		    {"pattern", {{"type", "string"}, {"description", "only relations whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed. On a large schema the whole list is more than a model should read at once"}}}
    		  }},
    		{"required", {"schema"}}
    	      }; },
@@ -224,7 +224,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		{"type", "object"},
    		{"properties", {
    		    {"schema", {{"type", "string"}}},
-   		    {"pattern", {{"type", "string"}, {"description", "only functions whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed. On a large schema the whole list can outgrow what a client accepts"}}}
+   		    {"pattern", {{"type", "string"}, {"description", "only functions whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed. On a large schema the whole list is more than a model should read at once"}}}
    		  }},
    		{"required", {"schema"}}
    	      }; },
@@ -243,7 +243,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args& a) -> json {
          return s.function_detail(a.str("schema", "public"), a.str("function", "")); }},
       {"searchFunctions",
-       "search functions and procedures by name, source, language, trigger name, or description. PostgreSQL's own functions in pg_catalog and information_schema are left out unless include_system is true or one of those schemas is named: they were 97-99% of a typical answer, and enough of them pushed a search past what a client accepts, losing the database's own functions with them",
+       "search functions and procedures by name, source, language, trigger name, or description. PostgreSQL's own functions in pg_catalog and information_schema are left out unless include_system is true or one of those schemas is named: they were 97-99% of a typical answer, and enough of them to bury the database's own functions",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
@@ -507,7 +507,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		{"type", "object"},
    		{"properties", {
    		    {"schema", {{"type", "string"}}},
-   		    {"pattern", {{"type", "string"}, {"description", "only sequences whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed. On a large schema the whole list can outgrow what a client accepts"}}}
+   		    {"pattern", {{"type", "string"}, {"description", "only sequences whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed. On a large schema the whole list is more than a model should read at once"}}}
    		  }},
    		{"required", {"schema"}}
    	      }; },
