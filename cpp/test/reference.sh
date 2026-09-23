@@ -190,6 +190,24 @@ for arg, tools in by_arg.items():
             unlisted.append(f"{name} ({arg}) is not in the README's {arg} row")
 assert not unlisted, "\n  ".join(["matching is undocumented for:"] + unlisted)
 
+# The release's dates and version, which drifted apart in 4.3.2 and 4.3.3:
+# CHANGES carried the UTC day and the manual the local one. The top CHANGES
+# entry must be this binary's version, and once it has a date instead of
+# "unreleased", the manual's .Dd must be that same day.
+import datetime
+top = next(l for l in open(os.path.join(repo, "CHANGES.md"), encoding="utf-8")
+           if l.startswith("## "))
+m = re.match(r"## (\d+\.\d+\.\d+) \((unreleased|\d{4}-\d{2}-\d{2})\)", top)
+assert m, f"CHANGES.md's first entry is not '## X.Y.Z (date|unreleased)': {top.strip()}"
+built = subprocess.run([binary, "--version"], capture_output=True, text=True).stdout.split()[-1]
+assert m.group(1) == built, f"CHANGES.md's first entry is {m.group(1)}, the binary is {built}"
+if m.group(2) != "unreleased":
+    dd = next(l for l in open(os.path.join(repo, "cpp", "man", "pg_licht_mcp.1"), encoding="utf-8")
+              if l.startswith(".Dd "))[4:].strip()
+    man_day = datetime.datetime.strptime(dd, "%B %d, %Y").date().isoformat()
+    assert man_day == m.group(2), (f"CHANGES.md dates {m.group(1)} {m.group(2)}, "
+                                    f"the manual's .Dd says {dd}")
+
 print(f"site: {len(names)} reference pages, {len([f for f in files if f.endswith('.html')])} "
       f"html files, every internal link resolves")
 PY
