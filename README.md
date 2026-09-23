@@ -182,6 +182,16 @@ policies), `searchTables` (full-text search across names, descriptions, and enum
 and `explainQuery` (recover a slow statement from `pg_stat_statements` by `queryid` and get
 its `EXPLAIN` plan).
 
+Two arguments narrow an answer by a string, and they match differently:
+
+| argument | how it matches | taken by |
+|---|---|---|
+| `pattern` | a literal, case-insensitive substring of a name — `_` and `%` match themselves, nothing is stemmed, so `user_` finds `user_x` and not `users` | `listSchemas`, `listTables`, `listTableStats`, `listTableSizes`, `listFunctions`, `listSequences`, `listRoles`, `serverSettings`, `listConnections`, `listTopology` |
+| `web_search` | full-text search (`websearch_to_tsquery`, English) — words are stemmed, names are split into words at `_` and capitals, `"a phrase"`, `or` and `-word` work, and a fragment of a word matches nothing | `searchTables`, `searchFunctions`, `searchEnums` |
+
+To find part of a name, use a listing's `pattern`; to find a word anywhere in names, comments
+or source, use a search.
+
 `checkPrivileges` reports which of them the current role can actually use on a given
 connection. Most work for any role that can connect, since the catalog is world-readable:
 measured on PostgreSQL 18 with every extension present, a bare login role runs 59 of 72 at

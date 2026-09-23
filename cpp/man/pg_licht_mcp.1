@@ -531,6 +531,74 @@ is running is picked up on the next call.
 An extension that is absent is reported as not installed, with the hint naming
 the setup steps; see
 .Sx DIAGNOSTICS .
+.Ss Matching: pattern and web_search
+Two arguments narrow an answer by a string, and they match differently.
+.Bl -tag -width "web_search"
+.It Va pattern
+A literal, case-insensitive substring of a name.
+There are no wildcards:
+.Ql _
+and
+.Ql %
+match themselves, so
+.Ql user_
+finds
+.Li user_x
+and not
+.Li users .
+Nothing is stemmed or split into words.
+Taken by
+.Ic listSchemas , listTables , listTableStats , listTableSizes ,
+.Ic listFunctions , listSequences , listRoles , serverSettings ,
+.Ic listConnections
+and
+.Ic listTopology .
+.It Va web_search
+Full-text search, not a substring: PostgreSQL's
+.Fn websearch_to_tsquery
+with the English configuration.
+Words are stemmed, so
+.Ql order
+finds
+.Li orders ;
+names are split into words at underscores and capitals before they are
+indexed, so
+.Li customer_id
+contributes
+.Ql customer ;
+a phrase in double quotes must match in order,
+.Ql or
+between words means either, and
+.Ql -word
+excludes.
+A fragment of a word matches nothing: to find part of a name, use a listing's
+.Va pattern
+instead.
+Taken by
+.Ic searchTables , searchFunctions
+and
+.Ic searchEnums ,
+which each say what they search.
+.Ic searchFunctions
+also matches the language name as a literal substring, so
+.Ql sql
+finds
+.Li plpgsql
+functions.
+.El
+.Pp
+Through 4.3.3,
+.Va pattern
+on
+.Ic listRoles
+and
+.Ic serverSettings
+was an
+.Li ILIKE ,
+where
+.Ql _
+matches any character; it is now the literal substring its description always
+said it was.
 .Ss Privileges
 .Bl -tag -width Ds
 .It Ic checkPrivileges
@@ -1011,8 +1079,11 @@ description.
 .Ss Catalog search
 .Bl -tag -width Ds
 .It Ic searchTables Ar web_search
-Full-text search across table and schema names, descriptions, column names and
-descriptions, enum values used by columns, and role names.
+Full-text search, as described in
+.Sx Matching: pattern and web_search ,
+across table and schema names, the table's comment, column names and comments,
+the names, comments and values of enum types its columns use, and the roles
+granted on it.
 Returns the same fields as
 .Ic listTables
 plus
@@ -1025,8 +1096,10 @@ or
 .Ic tableSize
 for those.
 .It Ic searchFunctions Ar web_search Op Va schema , Va include_system
-Full-text search across function names, source code, language, trigger names,
-and descriptions.
+Full-text search, as described in
+.Sx Matching: pattern and web_search ,
+across function names, source code, trigger names and descriptions, and the
+language name as a literal substring.
 PostgreSQL's own functions, in
 .Li pg_catalog
 and
@@ -1041,7 +1114,9 @@ A
 .Va schema
 that does not exist is an error rather than an empty answer.
 .It Ic searchEnums Ar web_search
-Full-text search across enum names, values, and descriptions.
+Full-text search, as described in
+.Sx Matching: pattern and web_search ,
+across enum names, values, and descriptions.
 .El
 .Ss Cluster-wide objects
 .Bl -tag -width Ds

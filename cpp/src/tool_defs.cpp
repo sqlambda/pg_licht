@@ -10,7 +10,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
-   		    {"pattern", {{"type", "string"}, {"description", "only schemas whose name contains this, case-insensitively"}}}
+   		    {"pattern", {{"type", "string"}, {"description", "only schemas whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed"}}}
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
@@ -21,7 +21,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		{"type", "object"},
    		{"properties", {
    		    {"schema", {{"type", "string"}}},
-   		    {"pattern", {{"type", "string"}, {"description", "only relations whose name contains this, case-insensitively. On a large schema the whole list can outgrow what a client accepts"}}}
+   		    {"pattern", {{"type", "string"}, {"description", "only relations whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed. On a large schema the whole list can outgrow what a client accepts"}}}
    		  }},
    		{"required", {"schema"}}
    	      }; },
@@ -44,7 +44,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
-   		    {"web_search", {{"type", "string"}}}
+   		    {"web_search", {{"type", "string"}, {"description", "full-text search, not a substring: websearch_to_tsquery syntax in English, so words are stemmed (users finds user), \"a phrase\" in double quotes must match in order, or between words means either, and -word excludes. A fragment of a word does not match. Matched against table and schema names split into words at underscores and capitals, the table's comment, its columns' names and comments, the grantee roles, and the names, comments and values of enum types its columns use. To match part of a table name, use listTables with pattern"}}}
    		  }},
    		{"required", {"web_search"}}
    	      }; },
@@ -188,7 +188,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		{"type", "object"},
    		{"properties", {
    		    {"schema", {{"type", "string"}}},
-   		    {"pattern", {{"type", "string"}, {"description", "only relations whose name contains this, case-insensitively. On a large schema the whole list can outgrow what a client accepts"}}}
+   		    {"pattern", {{"type", "string"}, {"description", "only relations whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed. On a large schema the whole list can outgrow what a client accepts"}}}
    		  }},
    		{"required", {"schema"}}
    	      }; },
@@ -212,7 +212,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		{"type", "object"},
    		{"properties", {
    		    {"schema", {{"type", "string"}}},
-   		    {"pattern", {{"type", "string"}, {"description", "only relations whose name contains this, case-insensitively. On a large schema the whole list can outgrow what a client accepts"}}}
+   		    {"pattern", {{"type", "string"}, {"description", "only relations whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed. On a large schema the whole list can outgrow what a client accepts"}}}
    		  }},
    		{"required", {"schema"}}
    	      }; },
@@ -224,7 +224,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		{"type", "object"},
    		{"properties", {
    		    {"schema", {{"type", "string"}}},
-   		    {"pattern", {{"type", "string"}, {"description", "only functions whose name contains this, case-insensitively. On a large schema the whole list can outgrow what a client accepts"}}}
+   		    {"pattern", {{"type", "string"}, {"description", "only functions whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed. On a large schema the whole list can outgrow what a client accepts"}}}
    		  }},
    		{"required", {"schema"}}
    	      }; },
@@ -247,7 +247,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
-   		    {"web_search", {{"type", "string"}}},
+   		    {"web_search", {{"type", "string"}, {"description", "full-text search, not a substring: websearch_to_tsquery syntax in English, so words are stemmed (users finds user), \"a phrase\" in double quotes must match in order, or between words means either, and -word excludes. A fragment of a word does not match. Matched against function names split into words at underscores and capitals, their source code and descriptions, and the names of triggers that call them -- plus the language name as a literal substring, so plpgsql is found by sql. To match part of a function name, use listFunctions with pattern"}}},
    		    {"schema", {{"type", "string"}, {"description", "only functions in this schema"}}},
    		    {"include_system", {{"type", "boolean"}, {"description", "also search pg_catalog and information_schema. Defaults to false"}}}
    		  }},
@@ -284,7 +284,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
-   		    {"web_search", {{"type", "string"}}}
+   		    {"web_search", {{"type", "string"}, {"description", "full-text search, not a substring: websearch_to_tsquery syntax in English, so words are stemmed (users finds user), \"a phrase\" in double quotes must match in order, or between words means either, and -word excludes. A fragment of a word does not match. Matched against enum type names split into words at underscores and capitals, their comments and their values"}}}
    		  }},
    		{"required", {"web_search"}}
    	      }; },
@@ -318,7 +318,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
-   		    {"pattern", {{"type", "string"}, {"description", "case-insensitive substring of the role name"}}}
+   		    {"pattern", {{"type", "string"}, {"description", "only roles whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed"}}}
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
@@ -507,7 +507,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		{"type", "object"},
    		{"properties", {
    		    {"schema", {{"type", "string"}}},
-   		    {"pattern", {{"type", "string"}, {"description", "only sequences whose name contains this, case-insensitively. On a large schema the whole list can outgrow what a client accepts"}}}
+   		    {"pattern", {{"type", "string"}, {"description", "only sequences whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed. On a large schema the whole list can outgrow what a client accepts"}}}
    		  }},
    		{"required", {"schema"}}
    	      }; },
@@ -534,7 +534,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
-   		    {"pattern", {{"type", "string"}, {"description", "case-insensitive substring of the setting name or category"}}},
+   		    {"pattern", {{"type", "string"}, {"description", "only settings whose name or category contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed"}}},
    		    {"all", {{"type", "boolean"}, {"description", "include settings still at their built-in default; defaults to false"}}}
    		  }}
    	      }; },
@@ -929,7 +929,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
-   		    {"pattern", {{"type", "string"}, {"description", "case-insensitive substring of an instance, replication_group or group name, or of a connection name belonging to one"}}}
+   		    {"pattern", {{"type", "string"}, {"description", "a literal, case-insensitive substring of an instance, replication_group or group name, or of a connection name belonging to one; _ and % match themselves and nothing is stemmed"}}}
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
@@ -939,7 +939,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
-   		    {"pattern", {{"type", "string"}, {"description", "case-insensitive substring of the connection name or of its instance, replication_group or group label"}}}
+   		    {"pattern", {{"type", "string"}, {"description", "a literal, case-insensitive substring of the connection name or of its instance, replication_group or group label; _ and % match themselves and nothing is stemmed"}}}
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {

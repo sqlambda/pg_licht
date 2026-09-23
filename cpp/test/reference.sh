@@ -152,6 +152,44 @@ assert abs(stated - listing_bytes) <= listing_bytes / 10, (
     f"the manual says tools/list is roughly {m.group(1)} kB; it is "
     f"{listing_bytes} bytes (about {round(listing_bytes / 1000)} kB)")
 
+# `pattern` and `web_search` both narrow by a string and match differently --
+# one a literal substring, one full-text -- and the difference is invisible
+# from the name. Every tool that takes either must say which in its own
+# description, and be listed under that argument in the manual's Matching
+# section and in the README's table. `pattern` was an ILIKE on two tools
+# through 4.3.3 while documented as a substring, and the three web_search
+# arguments had no description at all.
+by_arg = {"pattern": [], "web_search": []}
+says = {"pattern": "literal, case-insensitive substring",
+        "web_search": "full-text search, not a substring"}
+silent = []
+for t in res[2]["tools"]:
+    for arg, phrase in says.items():
+        p = t["inputSchema"].get("properties", {}).get(arg)
+        if p is None:
+            continue
+        by_arg[arg].append(t["name"])
+        if phrase not in p.get("description", ""):
+            silent.append(f"{t['name']}.{arg} does not say \"{phrase}\"")
+assert not silent, "arguments that do not say how they match:\n  " + "\n  ".join(silent)
+
+man_text = text_of(os.path.join(site, "pg_licht_mcp.1.html"), True)
+start = man_text.find("Matching: pattern and web_search")
+end = man_text.find("Privileges", start)
+assert start >= 0, "the manual has no Matching: pattern and web_search section"
+section = man_text[start:end]
+readme = open(os.path.join(repo, "README.md"), encoding="utf-8").read()
+rows = {arg: next((l for l in readme.splitlines() if l.startswith(f"| `{arg}` |")), "")
+        for arg in by_arg}
+unlisted = []
+for arg, tools in by_arg.items():
+    for name in tools:
+        if name not in section:
+            unlisted.append(f"{name} ({arg}) is not in the manual's Matching section")
+        if f"`{name}`" not in rows[arg]:
+            unlisted.append(f"{name} ({arg}) is not in the README's {arg} row")
+assert not unlisted, "\n  ".join(["matching is undocumented for:"] + unlisted)
+
 print(f"site: {len(names)} reference pages, {len([f for f in files if f.endswith('.html')])} "
       f"html files, every internal link resolves")
 PY

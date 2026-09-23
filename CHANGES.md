@@ -135,6 +135,15 @@
   process id contained 42; an independent review had flagged it and it was
   wrongly waved through as consistent with the existing tools.
 
+- **Which argument is a substring and which is full-text is now written
+  down everywhere.** `pattern` (ten tools) is a literal substring;
+  `web_search` (`searchTables`, `searchFunctions`, `searchEnums`) is
+  full-text search, stemmed, with names split into words -- so a fragment of
+  a word matches nothing there. The three `web_search` arguments had no
+  description at all. Each argument now says which it is, the manual has a
+  Matching section and the README a table, and the reference test fails if a
+  tool taking either is missing from any of them.
+
 - **The sanitizer and valgrind jobs skipped every extension-backed test.**
   They ran against stock `postgres:NN` service containers, which have no
   hypopg and preload nothing, so `evaluateIndex`, the `queryid` path and all
