@@ -6838,6 +6838,277 @@ TEST_F(PreloadExtTest, CheckPrivilegesDoesNotDenyAUsableExtension) {
   }
 }
 
+// --- The failure paths of the extension-backed tools ---
+//
+// Coverage showed every one of these unexecuted: the suites above run where
+// each extension is installed, current and preloaded, so "too old", "not
+// installed", "not permitted", "moved while running" and "installed but not
+// preloaded" -- the answers a real deployment gets first -- were checked by
+// hand once and never again. Each is set up here for real rather than mocked.
+namespace {
+
+// A connection string for `db` on the server `base` points at.
+std::string with_dbname(const std::string& base, const std::string& db) {
+  static const std::regex dbname_re(R"(\bdbname\s*=\s*\S+)");
+  return std::regex_search(base, dbname_re)
+    ? std::regex_replace(base, dbname_re, "dbname=" + db)
+    : base + " dbname=" + db;
+}
+
+// The same, logged in as `role` -- or "" when this environment cannot: peer
+// authentication refuses the login, or a forced-user pooler hands back the
+// superuser's session whichever role was asked for.
+std::string as_role(const std::string& url, const std::string& role) {
+  const std::string u = std::regex_replace(url, std::regex(R"(\buser\s*=\s*\S+)"), "") +
+                        " user=" + role;
+  try {
+    pqxx::connection probe(u);
+    pqxx::work t(probe);
+    if (t.exec("SELECT current_user")[0][0].as<std::string>() == role) return u;
+  } catch (const std::exception&) {}
+  return "";
+}
+
+// Runs `sql` in its own transaction, true if it worked: a package absent from
+// this machine fails CREATE EXTENSION, and that is a reason to skip one case,
+// not to fail the rest.
+bool try_exec(const std::string& url, const std::string& sql) {
+  try {
+    pqxx::connection c(url);
+    pqxx::work t(c);
+    t.exec(sql);
+    t.commit();
+    return true;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
+}  // namespace
+
+// Old versions, missing, not permitted, and moved -- on the primary, where the
+// libraries are preloaded, so each gate is reached for its own reason.
+class ExtensionEdgeTest : public ::testing::Test {
+protected:
+  static std::string base, db, url, role;
+  static bool created;
+
+  static void SetUpTestSuite() {
+    const char* env = std::getenv("DATABASE_URL");
+    if (!env) return;
+    base = env;
+    db = "pg_licht_extedge_" + std::to_string(getpid());
+    role = "licht_extedge_" + std::to_string(getpid());
+    try {
+      pqxx::connection admin(base);
+      pqxx::nontransaction n(admin);
+      n.exec("CREATE DATABASE \"" + db + "\"");
+      n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+      n.exec("CREATE ROLE \"" + role + "\" LOGIN");
+      url = with_dbname(base, db);
+      pqxx::connection c(url);
+      pqxx::work t(c);
+      t.exec("CREATE TABLE public.t (id int)");
+      t.exec("INSERT INTO public.t SELECT generate_series(1, 100)");
+      t.exec("GRANT CONNECT ON DATABASE \"" + db + "\" TO \"" + role + "\"");
+      t.exec("GRANT SELECT ON public.t TO \"" + role + "\"");
+      t.commit();
+      created = true;
+    } catch (const std::exception&) {}
+  }
+
+  static void TearDownTestSuite() {
+    if (!created) return;
+    try {
+      pqxx::connection admin(base);
+      pqxx::nontransaction n(admin);
+      n.exec("DROP DATABASE IF EXISTS \"" + db + "\" WITH (FORCE)");
+      n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+    } catch (const std::exception&) {}
+  }
+
+  void SetUp() override {
+    if (!created) GTEST_SKIP() << "no DATABASE_URL, or CREATE DATABASE refused";
+  }
+};
+std::string ExtensionEdgeTest::base, ExtensionEdgeTest::db, ExtensionEdgeTest::url,
+            ExtensionEdgeTest::role;
+bool ExtensionEdgeTest::created = false;
+
+// An installation older than a tool needs is refused with the update that
+// fixes it -- not attempted, which on pg_stat_kcache 2.1 would fail on columns
+// that do not exist, and on pg_qualstats 2.0 would return advice whose every
+// field is null. predicateStats reads columns 2.0 already has, and must not be
+// refused for the advisor's reason.
+TEST_F(ExtensionEdgeTest, AnExtensionTooOldForATool) {
+  const bool kcache = try_exec(url, "CREATE EXTENSION pg_stat_statements") &&
+                      try_exec(url, "CREATE EXTENSION pg_stat_kcache VERSION '2.1.0'");
+  const bool qualstats = try_exec(url, "CREATE EXTENSION pg_qualstats VERSION '2.0.4'");
+  const bool buffercache = try_exec(url, "CREATE EXTENSION pg_buffercache VERSION '1.2'");
+  if (!kcache && !qualstats && !buffercache)
+    GTEST_SKIP() << "no old extension version is installable here";
+  PostgresMCPServer srv(url);
+
+  if (kcache) {
+    json r = srv.call_statement_kernel_stats();
+    ASSERT_TRUE(r.contains("error")) << r.dump(2);
+    EXPECT_NE(r["error"].get<std::string>().find("2.1.0 is too old"), std::string::npos) << r;
+    EXPECT_NE(r["hint"].get<std::string>().find("ALTER EXTENSION pg_stat_kcache UPDATE"),
+              std::string::npos) << r;
+  }
+  if (qualstats) {
+    json advice = srv.call_suggest_indexes(1, 1);
+    ASSERT_TRUE(advice.contains("error")) << advice.dump(2);
+    EXPECT_NE(advice["error"].get<std::string>().find("2.1 or later"), std::string::npos) << advice;
+    json preds = srv.call_predicate_stats();
+    const std::string e = preds.value("error", "");
+    EXPECT_EQ(e.find("too old"), std::string::npos) << "predicateStats needs only 2.0: " << preds;
+  }
+  if (buffercache) {
+    json r = srv.call_buffer_cache_summary();
+    ASSERT_TRUE(r.contains("error")) << r.dump(2);
+    EXPECT_NE(r["error"].get<std::string>().find("1.4"), std::string::npos) << r;
+  }
+}
+
+// pgstattuple through its whole life on one server: absent, then denied to a
+// role without the grant, then installed, then moved to another schema while
+// the location is cached -- the one call that fails on the stale schema must
+// say "not installed" and forget it, and the next must find it again.
+TEST_F(ExtensionEdgeTest, PgstattupleMissingDeniedAndMovedWhileRunning) {
+  PostgresMCPServer srv(url);
+  json absent = srv.call_table_bloat("public", "t", false);
+  ASSERT_TRUE(absent.contains("error")) << absent.dump(2);
+  EXPECT_NE(absent["error"].get<std::string>().find("pgstattuple is not installed"),
+            std::string::npos) << absent;
+
+  if (!try_exec(url, "CREATE SCHEMA a") || !try_exec(url, "CREATE SCHEMA b") ||
+      !try_exec(url, "CREATE EXTENSION pgstattuple SCHEMA a"))
+    GTEST_SKIP() << "pgstattuple is not installable here";
+
+  const std::string bare = as_role(url, role);
+  if (!bare.empty()) {
+    try_exec(url, "GRANT USAGE ON SCHEMA a TO \"" + role + "\"");
+    PostgresMCPServer unpriv(bare);
+    json denied = unpriv.call_table_bloat("public", "t", false);
+    ASSERT_TRUE(denied.contains("error")) << denied.dump(2);
+    EXPECT_NE(denied["hint"].get<std::string>().find("pg_stat_scan_tables"),
+              std::string::npos) << denied;
+  }
+
+  json first = srv.call_table_bloat("public", "t", false);
+  ASSERT_FALSE(first.contains("error")) << first.dump(2);   // location now cached: a
+
+  ASSERT_TRUE(try_exec(url, "ALTER EXTENSION pgstattuple SET SCHEMA b"));
+  json stale = srv.call_table_bloat("public", "t", false);
+  ASSERT_TRUE(stale.contains("error")) << stale.dump(2);
+  EXPECT_NE(stale["error"].get<std::string>().find("not installed"), std::string::npos) << stale;
+  json found = srv.call_table_bloat("public", "t", false);
+  EXPECT_FALSE(found.contains("error")) << "the moved extension was not found again: "
+                                        << found.dump(2);
+}
+
+// Installed but not preloaded, on the rig's logical subscriber: the same
+// binaries and packages as the primary, and nothing preloaded. pg_stat_kcache
+// refuses CREATE EXTENSION outright there ("can only be loaded via
+// shared_preload_libraries"), so it cannot be put in this state on a live
+// server and is not tested here; the other three go through the same refusal.
+class NotPreloadedTest : public ::testing::Test {
+protected:
+  static std::string sub, db, url, role;
+  static std::set<std::string> installed;
+
+  static void SetUpTestSuite() {
+    const char* env = std::getenv("SUBSCRIBER_URL");
+    if (!env) return;
+    sub = env;
+    db = "pg_licht_nopreload_" + std::to_string(getpid());
+    role = "licht_nopreload_" + std::to_string(getpid());
+    try {
+      pqxx::connection admin(sub);
+      pqxx::nontransaction n(admin);
+      n.exec("CREATE DATABASE \"" + db + "\"");
+      n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+      n.exec("CREATE ROLE \"" + role + "\" LOGIN");
+      url = with_dbname(sub, db);
+      for (const char* ext : {"pg_wait_sampling", "pg_qualstats"})
+        if (try_exec(url, std::string("CREATE EXTENSION ") + ext)) installed.insert(ext);
+      try_exec(url, "GRANT CONNECT ON DATABASE \"" + db + "\" TO \"" + role + "\"");
+    } catch (const std::exception&) {}
+  }
+
+  static void TearDownTestSuite() {
+    if (db.empty() || sub.empty()) return;
+    try {
+      pqxx::connection admin(sub);
+      pqxx::nontransaction n(admin);
+      n.exec("DROP DATABASE IF EXISTS \"" + db + "\" WITH (FORCE)");
+      n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+    } catch (const std::exception&) {}
+  }
+
+  void SetUp() override {
+    if (sub.empty()) GTEST_SKIP() << "no SUBSCRIBER_URL; run cpp/test/run-pooled-tests.sh";
+    if (installed.empty()) GTEST_SKIP() << "no preload extension is installable here";
+  }
+
+  static void expect_not_preloaded(const json& r, const std::string& lib) {
+    ASSERT_TRUE(r.contains("error")) << r.dump(2);
+    EXPECT_NE(r["error"].get<std::string>().find("not in shared_preload_libraries"),
+              std::string::npos) << r;
+    EXPECT_NE(r["hint"].get<std::string>().find("shared_preload_libraries"),
+              std::string::npos) << r;
+    EXPECT_NE(r["error"].get<std::string>().find(lib), std::string::npos) << r;
+  }
+};
+std::string NotPreloadedTest::sub, NotPreloadedTest::db, NotPreloadedTest::url,
+            NotPreloadedTest::role;
+std::set<std::string> NotPreloadedTest::installed;
+
+// A superuser can read shared_preload_libraries, so each tool refuses before
+// running anything -- and checkPrivileges says the same.
+TEST_F(NotPreloadedTest, ASuperuserIsToldBeforeAnythingRuns) {
+  PostgresMCPServer srv(url);
+  if (installed.count("pg_wait_sampling"))
+    expect_not_preloaded(srv.call_wait_event_profile(), "pg_wait_sampling");
+  if (installed.count("pg_qualstats")) {
+    expect_not_preloaded(srv.call_predicate_stats(), "pg_qualstats");
+    expect_not_preloaded(srv.call_suggest_indexes(1, 1), "pg_qualstats");
+  }
+  json p = srv.call_check_privileges();
+  std::set<std::string> denied;
+  for (const auto& d : p.value("denied", json::array()))
+    if (d["reason"].get<std::string>().find("shared_preload_libraries") != std::string::npos)
+      denied.insert(d["tool"].get<std::string>());
+  if (installed.count("pg_wait_sampling")) {
+    EXPECT_TRUE(denied.count("waitEventProfile")) << p;
+  }
+  if (installed.count("pg_qualstats")) {
+    EXPECT_TRUE(denied.count("predicateStats")) << p;
+    EXPECT_TRUE(denied.count("suggestIndexes")) << p;
+  }
+}
+
+// A bare role cannot read shared_preload_libraries, so the refusal has to come
+// from somewhere else. pg_wait_sampling raises when it has no shared memory,
+// and that error is recognised. pg_qualstats raises nothing at all -- it
+// quietly answers from the calling session alone -- and is caught by its own
+// setting's context once it has loaded: the case that would otherwise be an
+// empty answer indistinguishable from a real one.
+TEST_F(NotPreloadedTest, ABareRoleIsToldTooEvenWhenNothingRaises) {
+  const std::string bare = as_role(url, role);
+  if (bare.empty()) GTEST_SKIP() << "cannot log in as an unprivileged role here";
+  PostgresMCPServer srv(bare);
+  if (installed.count("pg_wait_sampling"))
+    expect_not_preloaded(srv.call_wait_event_profile(), "pg_wait_sampling");
+  if (installed.count("pg_qualstats")) {
+    json preds = srv.call_predicate_stats();
+    expect_not_preloaded(preds, "pg_qualstats");
+    EXPECT_NE(preds.value("detail", "").find("this session's own"), std::string::npos) << preds;
+    expect_not_preloaded(srv.call_suggest_indexes(1, 1), "pg_qualstats");
+  }
+}
+
 // --- evaluateIndex (hypopg) ---
 
 namespace {
@@ -7563,6 +7834,10 @@ TEST_F(TopologyFixture, ListConnectionsNarrowsByPattern) {
   EXPECT_EQ(connection_names(s->call_connections("shop-ha")),
             (std::vector<std::string>{"default", "shop_replica"}));
   EXPECT_EQ(connection_names(s->call_connections("fleet")),
+            (std::vector<std::string>{"default", "billing"}));
+  // And by instance, the third label: "pg-" is in both instance names and in
+  // no connection name, so only a match on the instance label finds them.
+  EXPECT_EQ(connection_names(s->call_connections("pg-")),
             (std::vector<std::string>{"default", "billing"}));
 
   // Configuration, not a lookup that can fail: no match is an empty list.
