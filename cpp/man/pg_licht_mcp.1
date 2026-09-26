@@ -25,9 +25,11 @@ the statistics views.
 It does not read user table data, with the single narrow exception of
 .Ic checkKey ,
 which tests a primary key for existence.
-Every tool call runs inside its own
+Every call to a database runs inside its own
 .Ql READ ONLY
-transaction; see
+transaction, and the pooler tools send PgBouncer's admin console nothing but
+.Ql SHOW
+commands; see
 .Sx SECURITY CONSIDERATIONS .
 .Pp
 The options are as follows:
@@ -106,7 +108,94 @@ argument of any operation to run it against that database; omit it to use
 .Sy [default] ,
 or, if there is no
 .Sy [default] ,
-the first section in the file.
+the first section in the file that is not a PgBouncer console, since a call
+naming no connection is a database question.
+.Pp
+A section with
+.Ql kind = pgbouncer
+is a PgBouncer admin console rather than a database, and only the operations in
+.Sx Connection poolers
+run against it; every other operation refuses it, as those refuse a database.
+Its
+.Va dbname
+is always
+.Li pgbouncer
+and may be left out, and its
+.Va user
+should be one listed in PgBouncer's
+.Va stats_users ,
+which may run
+.Ql SHOW
+and nothing else.
+.Nm
+cannot tell which list a user is in without trying a command only an admin may
+run, so that choice is the operator's.
+Its
+.Va statement_timeout_ms
+bounds each
+.Ql SHOW
+from this side, since the console has no
+.Va statement_timeout
+to set.
+It may carry
+.Va group
+labels, so a group sweep can ask every pooler at once, but not
+.Va instance
+or
+.Va replication_group ,
+which describe PostgreSQL servers; and it is never inferred into an instance,
+though a database reached through the same pooler shares its host and port.
+.Bd -literal -offset indent
+[pooler_prod]
+kind  = pgbouncer
+host  = pooler01
+port  = 6432
+user  = pglicht_stats
+group = poolers
+.Ed
+.Pp
+A database section reached through such a console says so with
+.Ql pooler = Ar section .
+Nothing else in the file can: through PgBouncer,
+.Fn inet_server_addr
+is the pooler's own connection to PostgreSQL, so the pooled database cannot be
+told from its address.
+The key is declared, never inferred, and checked:
+.Ic verifyTopology
+reads the console's
+.Ql SHOW DATABASES
+and reports the route beside the connection.
+It must name a section with
+.Ql kind = pgbouncer
+that loaded, or the section declaring it is skipped.
+.Bd -literal -offset indent
+[orders_pooled]
+host   = pooler01
+port   = 6432
+dbname = orders
+user   = pglicht_ro
+instance = pg-orders-01
+pooler = pooler_prod
+.Ed
+.Pp
+It buys three things.
+.Ic verifyTopology
+checks the route: a name the pooler cannot route, or routes to another database
+or port, is an error, an alias is noted, and the direct connection that is the
+same database \(em one postmaster, one database, one user \(em is named.
+The pooler operations accept the database's own name as
+.Va connection
+and answer from its console, about its pool, with
+.Va pooler
+naming the console in the answer.
+And a sweep of a per-database operation answers that database once: the pooled
+member is skipped when a direct member is declared the same
+.Va instance ,
+connects as the same user, and the console routes the pooled name to the direct
+member's database without forcing another user.
+The skip names the twin.
+Anything less \(em an alias to another database, another user, a console that
+cannot be read \(em keeps both, since their answers may differ.
 .Ss Topology: instances, replication groups, and groups
 Three optional keys per section say how the configured databases relate.
 They are deliberately separate, because only the first two license a
@@ -558,7 +647,7 @@ Nothing is stemmed or split into words.
 Taken by
 .Ic listSchemas , listTables , listTableStats , listTableSizes ,
 .Ic listFunctions , listSequences , listRoles , serverSettings ,
-.Ic listConnections
+.Ic poolerConfig , listConnections
 and
 .Ic listTopology .
 .It Va web_search
@@ -617,7 +706,7 @@ Most of this server works for any role that can connect, because the catalog is
 world-readable.
 Measured on PostgreSQL 18: a bare
 .Ic LOGIN
-role with no grants runs 59 of the 72 operations at full fidelity when every
+role with no grants runs 59 of the 72 database operations at full fidelity when every
 extension is present, and the monitoring role takes that to 67.
 What remains for the monitoring role is the three that read row data \(em the
 .Ic tableStats
@@ -2389,17 +2478,29 @@ A pattern matching nothing returns empty lists rather than an error.
 .El
 .It Ic verifyTopology
 Connects to every configured connection and reports what each server actually
-is: its role, system identifier, database, address, port and version.
+is: its role, system identifier, postmaster start time, database, address, port
+and version.
 Then checks the declared topology against them.
 .Pp
 The whole operation turns on one fact: a system identifier names a replication
 .Em lineage ,
 not a postmaster.
 A physical replica began as a copy of its primary and carries the same value
-forever, so the identifier alone cannot separate the two axes and the endpoint
-has to be read alongside it.
-The same identifier on the same host and port is one instance; the same
-identifier on different hosts is a replication group.
+forever, so the identifier alone cannot separate the two axes and the
+postmaster's start time is read alongside it.
+The same identifier and the same start time is one instance, however it was
+reached; the same identifier with a different start time is another server of
+the same lineage, which is a replication group.
+.Pp
+The address a connection reports cannot decide this, and through a pooler it is
+wrong: behind PgBouncer,
+.Fn inet_server_addr
+is the pooler's own connection to PostgreSQL \(em
+.Li 127.0.0.1
+for a pooler on the database's machine \(em so one server reached directly and
+through its pooler reports two addresses.
+Through 4.4 that was read as two servers, and a correct instance declaration
+was reported as an error.
 .Pp
 Reports declarations the servers contradict, connections that share an
 identifier without being declared together, a replication group with no
@@ -2409,6 +2510,22 @@ Logical replication cannot be verified this way, because a logical replica has
 its own identifier, and is reported as
 .Ql cannot verify
 rather than as a mismatch.
+.Pp
+A connection declaring
+.Va pooler
+is also checked against that console's routing, and its
+.Va route
+is reported: the pooler database name, the backend host, port and database, any
+.Va force_user ,
+the pool mode and size, and
+.Va via_fallback
+when PgBouncer's
+.Ql *
+entry routed it.
+PgBouncer registers a name routed by the fallback as an entry of its own once a
+client has asked for it, so
+.Va via_fallback
+is seen only before that.
 Takes no
 .Va connection
 argument.
@@ -2446,6 +2563,118 @@ This answer carries every configured connection otherwise and has no cursor,
 so on a registry holding hundreds this is how to ask for one.
 A pattern matching nothing returns an empty list rather than an error.
 .El
+.El
+.Ss Connection poolers
+These read a PgBouncer admin console, named by a
+.Ql kind = pgbouncer
+section of the connections file \(em or by a database section that declares
+.Ql pooler = Ar console ,
+answered by that console about the database's own pool.
+With no
+.Va connection
+named they read the only console configured, never the default connection,
+which is a database; with several configured, one must be named or swept by
+.Va group .
+The console is not PostgreSQL: it refuses
+.Ql BEGIN
+and
+.Ql SET ,
+so these run in no transaction and send only
+.Ql SHOW
+commands fixed in the server, as the user the section names.
+Swept by
+.Va group
+only, and without
+.Va role ,
+since a pooler is neither primary nor replica.
+No resources are offered for a console.
+.Pp
+Each
+.Ql SHOW
+is bounded by the section's
+.Va statement_timeout_ms ,
+cancelled on the client side when it expires.
+A command this PgBouncer refuses \(em an older version that does not know it \(em
+leaves its part of the answer empty and names it under
+.Va unavailable ,
+and the rest is answered; only a console that answers none of them is an error.
+Like an absent extension on a database, an unreachable console or a refused
+login is an answer carrying
+.Va error
+and
+.Va hint ,
+not a failed call.
+.Bl -tag -width Ds
+.It Ic poolerStatus Op Va database
+Whether the pools can take what is asked of them, per database: clients active
+and waiting, the longest current wait, servers active, idle, used and logging
+in, against the
+.Va pool_size ,
+reserve and
+.Va max_connections
+each database is allowed, with PgBouncer's own averages per transaction, per
+query and per wait.
+.Va saturated
+is true when a client is waiting: it is queued for a server connection, and
+.Va longest_wait_s
+says for how long.
+The raw
+.Ql SHOW POOLS ,
+.Ql SHOW STATS
+and
+.Ql SHOW DATABASES
+rows are returned beside the summary, keyed by the columns this PgBouncer
+version reports, and
+.Ql SHOW LISTS
+as totals.
+The admin database
+.Li pgbouncer
+is left out unless
+.Va database
+names it.
+.It Ic poolerConnections Op Va database , Va state , Va limit
+Every client connected to the pooler and every server connection it holds open,
+each with its state, database, user,
+.Va application_name ,
+address and wait.
+The counts by state are taken after
+.Va database
+narrows the rows and before
+.Va state
+and
+.Va limit
+do.
+A client in state
+.Li waiting
+has no server yet.
+No statement text is here \(em PgBouncer does not keep it \(em but client
+addresses and ports, user and database names and
+.Va application_name
+are; see
+.Sx What reaches the caller .
+.Va limit
+defaults to 100, at most 1000, for clients and servers each.
+.It Ic poolerConfig Op Va pattern , Va all
+PgBouncer's settings and version.
+By default only those that differ from PgBouncer's built-in default, which is
+the set describing this pooler;
+.Va all
+returns every one, and
+.Va pattern
+is a literal, case-insensitive substring of the setting name.
+Values that read as numbers are compared as numbers, a leading 0 meaning octal,
+since PgBouncer prints
+.Va unix_socket_mode
+in decimal and its default in octal.
+A setting with no default, such as
+.Va conffile
+or
+.Va auth_file ,
+has nothing to differ from and is returned under
+.Va without_default
+with its value rather than as a change.
+File paths and user names appear as configured; a password never does, since it
+lives in the auth file rather than the configuration.
 .El
 .Sh OUTPUT FORMAT
 A client that negotiated MCP revision
@@ -2534,7 +2763,7 @@ capability is declared, so there is no mechanism by which it could.
 Anything read from a live catalog is hinted at one minute.
 This matters most for
 .Ic tools/list ,
-which is roughly 150 kB once 72 operations carry descriptions, annotations,
+which is roughly 160 kB once 75 operations carry descriptions, annotations,
 titles and output schemas, and which a client would otherwise re-fetch whenever
 it needed the list.
 .Pp
@@ -2611,7 +2840,7 @@ at all unless
 .Va server_reset_query_always
 is set.
 .Ss Transactions
-Every session runs inside a transaction opened with
+Every session on a database runs inside a transaction opened with
 .Ic SET TRANSACTION READ ONLY
 and ends in
 .Ic ROLLBACK .
@@ -3122,16 +3351,31 @@ or
 .Ic grok mcp doctor pg-licht .
 .Sh DIAGNOSTICS
 .Bl -tag -width Ds
-.It Sy Fatal DB Error No at startup
-The default connection could not be reached, or the configuration file could not
-be parsed.
-The libpq or parser message follows.
+.It Sy Configuration error: No at startup
+The budgets file, the connections file or the connection string could not be
+read, and the server did not start.
+No database has been contacted at this point: connections open on the first call
+that needs one.
+Through 4.4 this was reported as
+.Sy Fatal DB Error .
 .It Sy config file ... is group/world accessible
 The connections file has unsafe permissions; see
 .Sx File permissions .
-.It Sy [section] must set either 'service' or at least 'dbname'
-A configuration section is incomplete.
-The offending section is named.
+.It Sy pg_licht_mcp: skipped [section]: ... No at startup
+A section of the connections file did not validate \(em it is incomplete, sets
+an unknown
+.Va kind ,
+or gives a PgBouncer console an
+.Va instance
+\(em and was left out, and the server started with the others.
+Through 4.4 one such section stopped the server.
+.Ic listConnections
+and
+.Ic verifyTopology
+list it under
+.Va invalid
+with the reason, and a call naming it returns the reason.
+Only a file in which no section validates stops the server.
 .It Sy unknown connection ...
 The
 .Va connection
@@ -3354,6 +3598,21 @@ timing columns that PostgreSQL 18 removed.
 .Ic progressStats
 reports the PostgreSQL 17 vacuum dead-tuple columns under their own names and
 labels the unit, since the old and new columns count different things.
+.Pp
+On a Citus worker the shards are ordinary tables that Citus hides from any
+client whose
+.Va application_name
+does not match
+.Va citus.show_shards_for_app_name_prefixes .
+.Nm
+therefore sees only the empty distributed shells there, and the size and
+statistics operations report a worker holding gigabytes as holding nothing.
+It cannot change this itself, since the setting needs a superuser; on each
+worker, for the role it connects as:
+.Bd -literal -offset indent
+ALTER ROLE pglicht_ro
+  SET citus.show_shards_for_app_name_prefixes = 'pg-licht';
+.Ed
 .Sh SEE ALSO
 .Xr pgbouncer 1 ,
 .Xr psql 1 ,
@@ -3398,7 +3657,7 @@ parameter binding with every value escaped through libpq, a
 gate that refuses to execute anything that writes, and a bounded
 .Va statement_timeout .
 .Pp
-Every tool call runs inside its own
+Every tool call to a database runs inside its own
 .Ql READ ONLY
 transaction, so even a bug that let a query attempt a write would fail with
 SQLSTATE
@@ -3430,8 +3689,27 @@ for the value and how to change it.
 .Ss What reaches the caller
 .Nm
 never writes, and it never returns rows from your tables.
-Every call is a read-only transaction, so nothing it runs can change data or
-schema.
+Every call to a database is a read-only transaction, so nothing it runs can
+change data or schema.
+A PgBouncer console refuses transactions, so the pooler tools rest on two other
+guards: they send only
+.Ql SHOW
+commands, which are constants in the server with nothing from the caller in
+them; and the connection's user should be one of PgBouncer's
+.Va stats_users ,
+which may run
+.Ql SHOW
+and is refused
+.Ql PAUSE ,
+.Ql RELOAD ,
+.Ql SET
+and every other command \(em so the pooler would refuse a write even if one
+were sent.
+The second guard is the operator's to set up:
+.Nm
+does not verify it, and a user from
+.Va admin_users
+would work and would not be refused.
 Two operations read a user table, and neither returns its rows:
 .Ic checkKey
 answers only whether a row with the given primary key exists, though that answer
@@ -3476,6 +3754,15 @@ Plans, which repeat the literals of the statement the caller wrote.
 Definitions as written: function source, view definitions, column defaults,
 check constraints and policy expressions, carrying whatever literals were
 written into them.
+.It Ic poolerStatus , poolerConnections , poolerConfig
+From a PgBouncer console: the address, port, user, database and
+.Va application_name
+of every client connected to the pooler; each pooled database's backend host,
+port, database name and any
+.Va force_user ,
+and the users each pool serves; and the pooler's settings with their file paths
+and user names.
+No statement text and no password.
 .It Ic serverSettings
 Setting values.
 For a role allowed to read superuser-only settings that includes a standby's

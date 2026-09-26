@@ -90,6 +90,11 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  // Everything before run() is reading configuration: the budgets file, the
+  // connections file, a connection string. Nothing has connected yet --
+  // connections open on the first call that needs one -- so a failure here was
+  // reported as "Fatal DB Error" about a database nobody had reached.
+  bool configured = false;
   try {
     // Loaded here and only here, so a server built any other way -- the test
     // fixture above all -- keeps the built-in limits and never reads a
@@ -104,16 +109,23 @@ int main(int argc, char *argv[]) {
     if (!config_path.empty()) {
       auto registry = pglicht::ConnectionRegistry::from_ini(
         config_path, std::string("pg-licht-cpp/") + PGLICHT_VERSION);
+      // A skipped section is reported where the operator looks first: the
+      // client's MCP server log, which is where stderr goes.
+      for (const auto& [name, why] : registry.invalid())
+        std::cerr << "pg_licht_mcp: skipped [" << name << "]: " << why << std::endl;
       PostgresMCPServer server(std::move(registry));
       server.set_budgets(budgets);
+      configured = true;
       server.run();
     } else {
       PostgresMCPServer server(db_url);
       server.set_budgets(budgets);
+      configured = true;
       server.run();
     }
   } catch (const std::exception& e) {
-    std::cerr << "Fatal DB Error: " << e.what() << std::endl;
+    std::cerr << (configured ? "Fatal error: " : "Configuration error: ") << e.what()
+              << std::endl;
     return 1;
   }
 

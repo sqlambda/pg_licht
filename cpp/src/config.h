@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -95,6 +96,22 @@ struct HostCapacity {
 struct ConnConfig {
   std::string name;
   std::string conninfo;   // assembled libpq conninfo string
+
+  // What answers at the other end. "postgres" is a database, reached through
+  // a READ ONLY transaction per call. "pgbouncer" is a PgBouncer admin
+  // console, which is not PostgreSQL: it refuses BEGIN and SET outright, so
+  // the pooler tools reach it on a path of their own, and every other tool
+  // refuses such a connection rather than fail on its first statement.
+  std::string kind = "postgres";
+  bool is_pooler() const { return kind == "pgbouncer"; }
+
+  // The PgBouncer console this database connection goes through, when the
+  // section declares one (pooler = <section>). Nothing else in the file can say
+  // that two sections are one database reached directly and through a pooler:
+  // the pooled connection reports the pooler's own hop to PostgreSQL as its
+  // server address. Declared, then checked by verifyTopology against the
+  // console's [databases] routing -- never inferred.
+  std::string pooler;
 
   // Non-secret fields echoed by listConnections. A password, if any, is parsed
   // into the conninfo but deliberately never retained here.
@@ -354,13 +371,69 @@ public:
     if (reg.order_.empty())
       throw std::runtime_error(path + ": no connection sections defined");
 
+    // A section that does not validate is skipped, not fatal. It used to stop
+    // the whole server, so one mistyped section -- a PgBouncer console left
+    // with an instance key -- took every other connection down with it, and a
+    // server that never starts is harder to notice than one flagged section.
+    // The skipped section and its reason stay visible: listConnections and
+    // verifyTopology report it, and a call naming it gets the reason instead of
+    // "unknown connection". What still stops startup is what is not one
+    // section's: an unreadable file, a malformed line, a duplicate header, a
+    // name reused across two axes -- and a file in which no section survives.
+    std::vector<std::string> usable;
     for (const auto& name : reg.order_) {
-      reg.conns_[name] = build(name, raw[name], app_name, path);
+      try {
+        reg.conns_[name] = build(name, raw[name], app_name, path);
+        usable.push_back(name);
+      } catch (const std::exception& e) {
+        reg.invalid_.push_back({name, e.what()});
+        // An [instance:<name>] section claimed only by a skipped section is
+        // not a typo, and must not turn a skipped section into a fatal one.
+        for (const auto& [k, v] : raw[name])
+          if (k == "instance") reg.claimed_by_invalid_.insert(v);
+      }
+    }
+    // `pooler` names another section, so it is checked once every section is
+    // built: it must be a console that survived validation. A route to nothing
+    // is skipped like any other invalid section, with the reason.
+    {
+      std::vector<std::string> kept;
+      for (const auto& name : usable) {
+        const ConnConfig& c = reg.conns_.at(name);
+        if (!c.pooler.empty()) {
+          auto it = reg.conns_.find(c.pooler);
+          std::string why;
+          if (it == reg.conns_.end())
+            why = "names no section, or one that was itself skipped";
+          else if (!it->second.is_pooler())
+            why = "names a database section, not one with kind = pgbouncer";
+          if (!why.empty()) {
+            reg.invalid_.push_back({name, path + ": [" + name + "] pooler = " +
+                                          c.pooler + " " + why});
+            if (!c.instance.empty()) reg.claimed_by_invalid_.insert(c.instance);
+            reg.conns_.erase(name);
+            continue;
+          }
+        }
+        kept.push_back(name);
+      }
+      usable = kept;
+    }
+    reg.order_ = usable;
+    if (reg.order_.empty()) {
+      std::string why;
+      for (const auto& [n, e] : reg.invalid_) why += "\n  " + e;
+      throw std::runtime_error(path + ": no usable connection section" + why);
     }
 
-    // "default" if present, else the first connection section in file order.
-    reg.default_name_ =
-      (reg.conns_.count("default") ? std::string("default") : reg.order_.front());
+    // "default" if present, else the first database section in file order: a
+    // call that names no connection is a database question, and a PgBouncer
+    // console listed first would refuse every one of them. Only a file with
+    // nothing but poolers defaults to one.
+    reg.default_name_ = reg.conns_.count("default") ? std::string("default") : reg.order_.front();
+    if (!reg.conns_.count("default"))
+      for (const auto& n : reg.order_)
+        if (!reg.conns_.at(n).is_pooler()) { reg.default_name_ = n; break; }
 
     reg.resolve_topology(path);
     return reg;
@@ -369,6 +442,10 @@ public:
   const ConnConfig& get(const std::string& name) const {
     auto it = conns_.find(name.empty() ? default_name_ : name);
     if (it == conns_.end()) {
+      for (const auto& [n, e] : invalid_)
+        if (n == name)
+          throw std::runtime_error("connection \"" + name + "\" was skipped at "
+                                   "startup because its section is invalid: " + e);
       std::string known;
       for (const auto& n : order_) known += (known.empty() ? "" : ", ") + n;
       throw std::runtime_error("unknown connection \"" + name +
@@ -378,6 +455,8 @@ public:
   }
 
   const std::vector<std::string>& names() const { return order_; }
+  // Sections skipped at startup, each with the reason, in file order.
+  const std::vector<std::pair<std::string, std::string>>& invalid() const { return invalid_; }
   const std::string& default_name() const { return default_name_; }
 
   // Topology indexes. Each maps a name to its members in config file order,
@@ -449,6 +528,8 @@ private:
   std::string default_name_;
   Members instances_, replication_groups_, groups_;
   std::map<std::string, HostCapacity> instance_caps_;
+  std::vector<std::pair<std::string, std::string>> invalid_;
+  std::set<std::string> claimed_by_invalid_;
 
   // A reserved [instance:<name>] section carries capacity keys and nothing
   // else. Rejecting anything else here catches a connection section that was
@@ -513,7 +594,7 @@ private:
       bool claimed = false;
       for (const auto& name : order_)
         if (conns_.at(name).instance == iname) { claimed = true; break; }
-      if (!claimed)
+      if (!claimed && !claimed_by_invalid_.count(iname))
         throw std::runtime_error(
           path + ": [instance:" + iname + "] is declared but no connection sets "
           "instance = " + iname);
@@ -538,6 +619,9 @@ private:
     for (const auto& name : order_) {
       const ConnConfig& c = conns_.at(name);
       if (!c.instance.empty() || !c.service.empty()) continue;
+      // A pooler console on :6432 and a database reached *through* :6432
+      // share host and port, and would otherwise be read as one server.
+      if (c.is_pooler()) continue;
       if (c.host.empty() || c.port.empty()) continue;
       by_endpoint[c.host + ":" + c.port].push_back(name);
     }
@@ -594,9 +678,32 @@ private:
     ConnConfig cfg;
     cfg.name = name;
     std::string conninfo;
-    bool has_app_name = false;
+    bool has_app_name = false, has_kind = false;
 
     for (const auto& [key, val] : kvs) {
+      // `kind` says what answers at the other end, and so which tools apply.
+      // Consumed here: libpq has no such keyword and would reject the conninfo.
+      if (key == "pooler") {
+        if (!cfg.pooler.empty())
+          throw std::runtime_error(path + ": [" + name + "] declares 'pooler' more than once");
+        if (val.empty())
+          throw std::runtime_error(path + ": [" + name + "] has an empty 'pooler'");
+        cfg.pooler = val;
+        continue;
+      }
+      if (key == "kind") {
+        if (val != "postgres" && val != "pgbouncer")
+          throw std::runtime_error(path + ": [" + name + "] kind = " + val +
+                                   " is not known; use postgres (the default) or pgbouncer");
+        // Two kinds would be decided by whichever line came last -- and the
+        // kind decides which tools may reach the connection.
+        if (has_kind)
+          throw std::runtime_error(path + ": [" + name + "] declares 'kind' more than once");
+        has_kind = true;
+        cfg.kind = val;
+        continue;
+      }
+
       // GUCs in `options` are rejected by PgBouncer at startup
       // ("unsupported startup parameter in options: ..."), so a config that
       // relied on them would fail only at connect time, against the pooler
@@ -669,6 +776,35 @@ private:
 
       if (!conninfo.empty()) conninfo += " ";
       conninfo += key + "=" + detail::quote_conninfo(val);
+    }
+
+    // A PgBouncer console is always the database named pgbouncer, so it is
+    // supplied rather than required -- and a different dbname is refused, since
+    // it would be a database reached through the pooler, not the pooler.
+    // instance and replication_group describe PostgreSQL servers: on a pooler
+    // they would put it into database sweeps it can never answer, so only
+    // `group` is allowed, and "all my poolers" is a group sweep.
+    if (cfg.is_pooler()) {
+      if (!cfg.pooler.empty())
+        throw std::runtime_error(
+          path + ": [" + name + "] is kind = pgbouncer and declares pooler = " +
+          cfg.pooler + "; 'pooler' belongs on a database section, naming the "
+          "console that database is reached through");
+      if (!cfg.instance.empty() || !cfg.replication_group.empty())
+        throw std::runtime_error(
+          path + ": [" + name + "] is kind = pgbouncer, and instance and "
+          "replication_group describe PostgreSQL servers; label a pooler with "
+          "'group' instead");
+      if (!cfg.dbname.empty() && cfg.dbname != "pgbouncer")
+        throw std::runtime_error(
+          path + ": [" + name + "] is kind = pgbouncer but sets dbname = " +
+          cfg.dbname + "; the console is always dbname pgbouncer -- a database "
+          "reached through the pooler is an ordinary section without 'kind'");
+      if (cfg.dbname.empty()) {
+        cfg.dbname = "pgbouncer";
+        if (!conninfo.empty()) conninfo += " ";
+        conninfo += "dbname=pgbouncer";
+      }
     }
 
     // Either a service (which supplies the rest from the service file) or at

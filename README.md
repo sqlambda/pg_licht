@@ -11,8 +11,11 @@ Motivation to create another PostgreSQL MCP:
 ## Safety
 
 Every catalog query is parameterized — no schema, table, or search-term argument is ever
-concatenated into SQL text. Every tool call runs inside its own `READ ONLY` transaction,
-so even a bug that let a query attempt a write would fail rather than succeed silently.
+concatenated into SQL text. Every call to a database runs inside its own `READ ONLY`
+transaction, so even a bug that let a query attempt a write would fail rather than succeed
+silently. The pooler tools send a PgBouncer console only fixed `SHOW` commands, as the user
+you configure — one from its `stats_users`, which PgBouncer allows to run `SHOW` and nothing
+else.
 That guard is transaction-scoped rather than session-scoped, which is what makes it hold
 behind a connection pooler in transaction mode.
 
@@ -145,7 +148,7 @@ for free space. The prompt leads with what makes the obvious response wrong:
 `VACUUM FULL` needs free space equal to the table and its indexes *before* it
 releases any, so it is not a disk-full action.
 
-Counts: 59 of 72 operations for a bare login role, 67 with `pg_monitor` — the
+Counts: 59 of 72 database operations for a bare login role, 67 with `pg_monitor` — the
 `pg_ls_*` directory reads `diskUsage` uses are part of what that role grants.
 
 `triage-active-sessions` is for a server running more sessions at once than it
@@ -174,9 +177,9 @@ indexes and current lock waits can tell the two apart. **Completions** are offer
 
 ## Tools
 
-72 read-only operations, grouped as schema exploration, catalog search, cluster-wide
+75 read-only operations, grouped as schema exploration, catalog search, cluster-wide
 objects, extensibility and text search, foreign data and replication, monitoring and
-statistics, diagnostics and query planning, topology, and connections. Highlights include
+statistics, diagnostics and query planning, topology, connections, and connection poolers. Highlights include
 `tableDetails` (columns, indexes, constraints, foreign keys in both directions, triggers,
 policies), `searchTables` (full-text search across names, descriptions, and enum values),
 and `explainQuery` (recover a slow statement from `pg_stat_statements` by `queryid` and get
@@ -186,7 +189,7 @@ Two arguments narrow an answer by a string, and they match differently:
 
 | argument | how it matches | taken by |
 |---|---|---|
-| `pattern` | a literal, case-insensitive substring of a name — `_` and `%` match themselves, nothing is stemmed, so `user_` finds `user_x` and not `users` | `listSchemas`, `listTables`, `listTableStats`, `listTableSizes`, `listFunctions`, `listSequences`, `listRoles`, `serverSettings`, `listConnections`, `listTopology` |
+| `pattern` | a literal, case-insensitive substring of a name — `_` and `%` match themselves, nothing is stemmed, so `user_` finds `user_x` and not `users` | `listSchemas`, `listTables`, `listTableStats`, `listTableSizes`, `listFunctions`, `listSequences`, `listRoles`, `serverSettings`, `poolerConfig`, `listConnections`, `listTopology` |
 | `web_search` | full-text search (`websearch_to_tsquery`, English) — words are stemmed, names are split into words at `_` and capitals, `"a phrase"`, `or` and `-word` work, and a fragment of a word matches nothing | `searchTables`, `searchFunctions`, `searchEnums` |
 
 To find part of a name, use a listing's `pattern`; to find a word anywhere in names, comments
@@ -194,8 +197,8 @@ or source, use a search.
 
 `checkPrivileges` reports which of them the current role can actually use on a given
 connection. Most work for any role that can connect, since the catalog is world-readable:
-measured on PostgreSQL 18 with every extension present, a bare login role runs 59 of 72 at
-full fidelity, the monitoring role 67. What remains for the monitoring role reads row data or
+measured on PostgreSQL 18 with every extension present, a bare login role runs 59 of the 72
+database operations at full fidelity, the monitoring role 67. What remains for the monitoring role reads row data or
 plans against it, apart from replication origin progress, which only the superuser can read. Worth calling first
 against an unfamiliar connection — a privilege-filtered answer is easy to mistake for an
 empty one, since `tableStats` on a role without `SELECT` returns columns with null
@@ -207,6 +210,62 @@ building it, `hide` plans without an existing one — which is how to ask whethe
 safe to drop. Nothing is built, nothing is locked, and the statement is never executed. It
 reports whether the planner actually *used* each index, which is the answer a cost figure
 hides.
+
+Three tools read PgBouncer, the pooler in front of the database, rather than the database
+behind it. `poolerStatus` answers whether the pools can keep up — clients waiting for a
+server, the longest wait, servers in use against each database's `pool_size` —
+`poolerConnections` lists the clients and server connections, and `poolerConfig` the
+settings that differ from PgBouncer's defaults. They connect to PgBouncer's admin console,
+declared as its own section:
+
+```ini
+[pooler_prod]
+kind  = pgbouncer
+host  = pooler01
+port  = 6432
+user  = pglicht_stats   ; in PgBouncer's stats_users
+group = poolers
+```
+
+The console refuses transactions, so these send only fixed `SHOW` commands, and the user
+should be one from `stats_users`, which PgBouncer allows to run `SHOW` and nothing else —
+pg_licht cannot check which list a user is in, so that second guard is yours to set up.
+`statement_timeout_ms` in the section bounds each `SHOW`, cancelled from this side, and a
+command an older PgBouncer does not know is named under `unavailable` while the rest is
+answered. Database tools refuse a pooler section and pooler tools refuse a database; a group
+holding both is swept by each kind of tool over its own members. A database tool called
+with no connection goes to the first section that is not a pooler; a pooler tool, to the
+only console configured, and with several it must be told which.
+
+A database reached through a console says so with `pooler = <section>`, since nothing else
+can: through PgBouncer the server's address is the pooler's own hop. `verifyTopology` then
+checks it against the console's routing and names the direct connection that is the same
+database; the pooler tools accept the database's name and answer about its pool; and a
+per-database sweep answers that database once, skipping the pooled twin only when the
+console confirms it is the same database, reached as the same user.
+
+```ini
+[orders_pooled]
+host   = pooler01
+port   = 6432
+dbname = orders
+pooler = pooler_prod
+```
+
+A section that does not validate — an unknown `kind`, a console given an `instance` — is
+skipped with a warning instead of stopping the server: the other connections keep working,
+`listConnections` and `verifyTopology` list it under `invalid` with the reason, and a call
+naming it gets the reason back. Only a file with no usable section stops startup.
+
+**Citus.** On a Citus worker the shards are ordinary tables that Citus hides from any client
+whose `application_name` does not match `citus.show_shards_for_app_name_prefixes`, so
+pg_licht sees only the empty distributed shells there, and the size and statistics tools
+report a worker holding gigabytes as holding nothing. pg_licht cannot set this for itself: it
+is a superuser setting. On the workers, for the role pg_licht connects as:
+
+```sql
+ALTER ROLE pglicht_ro SET citus.show_shards_for_app_name_prefixes = 'pg-licht';
+```
 
 Three optional extensions that keep their counters in shared memory, all keyed by the same
 `query_id` as `statementStats`, each get a tool. `waitEventProfile` reads
@@ -412,7 +471,7 @@ function body, a very large plan: with a cap set, that is refused with a hint po
 
 | | |
 |---|---|
-| `man pg_licht_mcp` | configuration, connection strings, all 72 operations, MCP client setup |
+| `man pg_licht_mcp` | configuration, connection strings, all 75 operations, MCP client setup |
 | [INSTALL.md](INSTALL.md) | Homebrew, deb, rpm, tarball, verifying, uninstalling |
 | [BUILD.md](BUILD.md) | building from source, tests, sanitizers, CI, release process |
 | [CHANGES.md](CHANGES.md) | changelog |

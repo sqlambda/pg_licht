@@ -897,7 +897,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
          std::string as_role = a.str("plan_as_role");
          return s.explain_query(qid, sql, prms, do_analyze, tmo, settings, as_role); }},
       {"verifyTopology",
-       "connect to every configured connection and report what each server actually is: its role (primary or replica, from pg_is_in_recovery(), observed now rather than configured), its system identifier, database, address, port and version -- then check the declared topology against them. A physical replica carries the same system identifier as its primary forever, so the identifier alone cannot separate the two axes: same identifier with the same host and port is one instance, same identifier on different hosts is a replication group. Reports declarations the servers contradict, connections that share an identifier but are not declared together (an undeclared replica is where 'is this index used?' quietly gets the wrong answer), a replication group with no primary, and split brain. Logical replication cannot be verified this way and is reported as such rather than as a mismatch. Connects once per configured connection, sequentially, with a short connect timeout; a connection that fails is reported and does not abort the rest",
+       "connect to every configured connection and report what each server actually is: its role (primary or replica, from pg_is_in_recovery(), observed now rather than configured), its system identifier, postmaster start time, database, address, port and version -- then check the declared topology against them. A physical replica carries the same system identifier as its primary forever, so the identifier alone cannot separate the two axes: the same identifier and the same postmaster start time is one instance however it was reached -- directly or through a pooler, whose reported address is its own hop to the server -- and the same identifier with a different start time is another server of the lineage, a replication group. Reports declarations the servers contradict, connections that share an identifier but are not declared together (an undeclared replica is where 'is this index used?' quietly gets the wrong answer), a replication group with no primary, and split brain. Logical replication cannot be verified this way and is reported as such rather than as a mismatch. A connection declaring pooler = <console> is checked against that console's own routing (SHOW DATABASES): the route is reported beside it, a name the pooler cannot route or routes to another database or port is an error, an alias is noted, and the direct connection that is the same database -- one postmaster, one database, one user -- is named. Connects once per configured connection, several at a time, with a short connect timeout; a connection that fails is reported and does not abort the rest",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", json::object()}
@@ -934,6 +934,39 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
          return s.topology(a.str("pattern")); }},
+      {"poolerStatus",
+       "return how a PgBouncer pooler's pools are coping, per database: clients active and waiting, the longest current wait, servers active, idle, used and logging in, against the pool_size, reserve and max_connections each database is allowed, with PgBouncer's own averages per transaction, per query and per wait. clients_waiting above zero is the pooler being the bottleneck: a client is queued for a server connection, and longest_wait_s says for how long. The raw SHOW POOLS, SHOW STATS and SHOW DATABASES rows are returned beside the summary, keyed by the columns this PgBouncer version reports, and SHOW LISTS as totals. The admin database 'pgbouncer' is left out unless named. A SHOW this PgBouncer does not know is named under 'unavailable' and the rest still answered. Reads the admin console with SHOW commands only, no transaction, each bounded by the section's statement_timeout_ms: configure the section with kind = pgbouncer and a user from stats_users, which PgBouncer allows to run SHOW and nothing else -- this server cannot verify which list the user is in",
+       []() -> json { return {
+   		{"type", "object"},
+   		{"properties", {
+   		    {"database", {{"type", "string"}, {"description", "only this pooler database, as named in its [databases] section"}}}
+   		  }}
+   	      }; },
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.pooler_status(a.str("database")); }},
+      {"poolerConnections",
+       "return the connections a PgBouncer pooler holds: every client connected to it (SHOW CLIENTS) and every server connection it has open to PostgreSQL (SHOW SERVERS), each with its state, database, user, application_name, address and how long it has waited, plus counts by state, taken after 'database' narrows the rows and before 'state' and 'limit' do. A client in state 'waiting' has no server yet -- the queue behind a saturated pool. No statement text is here, since PgBouncer does not keep it, but client IP addresses and ports, user and database names and application_name are. Reads the admin console with SHOW commands only; see poolerStatus",
+       []() -> json { return {
+   		{"type", "object"},
+   		{"properties", {
+   		    {"database", {{"type", "string"}, {"description", "only connections to this pooler database"}}},
+   		    {"state", {{"type", "string"}, {"description", "only this state, e.g. \"active\", \"waiting\" or \"idle\"; the counts by state still cover all of them"}}},
+   		    {"limit", {{"type", "integer"}, {"description", "at most this many clients and this many servers, 100 by default and at most 1000; *_truncated says when more matched"}}}
+   		  }}
+   	      }; },
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.pooler_connections(a.str("database"), a.str("state"), a.num("limit", 100)); }},
+      {"poolerConfig",
+       "return a PgBouncer pooler's settings (SHOW CONFIG) and its version. By default only the settings that differ from PgBouncer's built-in default, which is the set describing this pooler: pool_mode, the pool sizes, the timeouts, max_client_conn. A number is compared as a number, so unix_socket_mode 511 is its default 0777. A setting PgBouncer gives no default -- conffile, auth_file -- has nothing to differ from and is returned under without_default with its value, not as a change. File paths and user names appear as configured -- auth_file, admin_users, stats_users -- and never a password, which lives in the auth file rather than the configuration. Reads the admin console with SHOW commands only; see poolerStatus",
+       []() -> json { return {
+   		{"type", "object"},
+   		{"properties", {
+   		    {"pattern", {{"type", "string"}, {"description", "only settings whose name contains this: a literal, case-insensitive substring, so _ and % match themselves and nothing is stemmed"}}},
+   		    {"all", {{"type", "boolean"}, {"description", "include settings still at their default; defaults to false"}}}
+   		  }}
+   	      }; },
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.pooler_config(a.str("pattern"), a.flag("all", false)); }},
       {"listConnections",
        "return the configured database connections by name, with the libpq service name or host/port/dbname/user for each, its instance, replication_group and group labels where configured, and which is the default; passwords are never returned and a service file is never expanded. Pass a name as the 'connection' argument of any other tool to run that tool against that database. See listTopology for the same labels indexed the other way round, by topology name rather than by connection. Pass 'pattern' to narrow the list: a case-insensitive substring matched against the connection name AND its instance, replication_group and group labels. That is how to find one connection on a registry holding hundreds -- this answer carries every configured connection otherwise, and it has no cursor. A pattern that matches nothing returns an empty list rather than an error",
        []() -> json { return {

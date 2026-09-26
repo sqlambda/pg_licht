@@ -479,8 +479,8 @@
       "arguments": {},
       "result": {
         "connections": [
-          {"connection": "shop_prod", "role": "primary", "system_identifier": "7412203311020332211", "database": "shop", "server_addr": "10.0.2.10", "server_port": 5432, "server_version": "18.6"},
-          {"connection": "shop_replica_1", "role": "replica", "system_identifier": "7412203311020332211", "database": "shop", "server_addr": "10.0.2.21", "server_port": 5432, "server_version": "18.6"}
+          {"connection": "shop_prod", "role": "primary", "system_identifier": "7412203311020332211", "postmaster_start_time": "2026-09-14 03:12:40.118204+00", "database": "shop", "server_addr": "10.0.2.10", "server_port": 5432, "server_version": "18.6"},
+          {"connection": "shop_replica_1", "role": "replica", "system_identifier": "7412203311020332211", "postmaster_start_time": "2026-09-14 03:15:02.540911+00", "database": "shop", "server_addr": "10.0.2.21", "server_port": 5432, "server_version": "18.6"}
         ],
         "findings": []
       }
@@ -503,6 +503,47 @@
         "replication_groups": [{"name": "shop-ha", "connections": ["shop_prod", "shop_replica_1"]}],
         "groups": [{"name": "fleet", "connections": ["shop_prod", "shop_replica_1", "reports_prod"]}],
         "unlabelled": []
+      }
+    },
+    "poolerStatus": {
+      "arguments": {"connection": "pooler_prod", "database": "shop"},
+      "result": {
+        "version": "PgBouncer 1.25.2",
+        "summary": [
+          {"database": "shop", "clients_active": 20, "clients_waiting": 7, "longest_wait_s": 1.84, "servers_active": 20, "servers_idle": 0, "servers_used": 0, "servers_login": 0, "saturated": true, "pool_mode": "transaction", "pool_size": 20, "reserve_pool_size": 0, "max_connections": 0, "current_connections": 20, "paused": 0, "disabled": 0, "avg_xact_time": 41250, "avg_query_time": 39870, "avg_wait_time": 612000, "total_xact_count": 18244102, "total_query_count": 20118933}
+        ],
+        "lists": {"databases": 2, "users": 2, "pools": 2, "free_clients": 173, "used_clients": 27, "login_clients": 0, "free_servers": 30, "used_servers": 20},
+        "databases": [
+          {"name": "shop", "host": "db01", "port": 5432, "database": "shop", "pool_size": 20, "reserve_pool_size": 0, "max_connections": 0, "current_connections": 20, "paused": 0, "disabled": 0}
+        ],
+        "pools": [
+          {"database": "shop", "user": "app_rw", "cl_active": 20, "cl_waiting": 7, "sv_active": 20, "sv_idle": 0, "sv_used": 0, "sv_login": 0, "maxwait": 1, "maxwait_us": 840000, "pool_mode": "transaction"}
+        ],
+        "stats": [
+          {"database": "shop", "total_xact_count": 18244102, "total_query_count": 20118933, "avg_xact_time": 41250, "avg_query_time": 39870, "avg_wait_time": 612000}
+        ]
+      }
+    },
+    "poolerConnections": {
+      "arguments": {"connection": "pooler_prod", "database": "shop", "state": "waiting", "limit": 2},
+      "result": {
+        "clients": [
+          {"type": "C", "user": "app_rw", "database": "shop", "state": "waiting", "addr": "10.0.4.17", "port": 51526, "application_name": "checkout-api", "connect_time": "2026-09-25 14:02:11 +00", "request_time": "2026-09-25 14:07:43 +00", "wait": 1, "wait_us": 840000},
+          {"type": "C", "user": "app_rw", "database": "shop", "state": "waiting", "addr": "10.0.4.18", "port": 49870, "application_name": "checkout-api", "connect_time": "2026-09-25 14:02:12 +00", "request_time": "2026-09-25 14:07:43 +00", "wait": 0, "wait_us": 910000}
+        ],
+        "clients_by_state": {"active": 20, "waiting": 7, "idle": 3},
+        "clients_truncated": true,
+        "servers": [],
+        "servers_by_state": {"active": 20},
+        "servers_truncated": false
+      }
+    },
+    "poolerConfig": {
+      "arguments": {"connection": "pooler_prod", "pattern": "pool"},
+      "result": {
+        "version": "PgBouncer 1.25.2",
+        "settings": {"default_pool_size": {"value": "40", "default": "20", "changeable": "yes"}, "pool_mode": {"value": "transaction", "default": "session", "changeable": "yes"}},
+        "all": false
       }
     },
     "listConnections": {
