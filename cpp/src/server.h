@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -28,6 +29,9 @@
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #endif
 #include <pqxx/pqxx>
+#include <libpq-fe.h>
+#include <poll.h>
+#include <cerrno>
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
@@ -315,7 +319,7 @@ public:
     for (int attempt = 0; attempt < 2; attempt++) {
       const bool reused = (attempt == 0 && cache_ != nullptr);
       conn_ = reused ? cache_->take(name_) : nullptr;
-      if (!conn_) conn_ = std::make_unique<pqxx::connection>(cfg.conninfo);
+      if (!conn_) conn_ = connect(cfg);
       try {
         txn_.emplace(*conn_);
         break;
@@ -452,6 +456,33 @@ public:
     if (cache_ && conn_) cache_->release(name_, std::move(conn_));
   }
 
+  // A PgBouncer admin console configured as a database -- the section says
+  // dbname = pgbouncer but not kind = pgbouncer -- gets as far as libpqxx,
+  // which reads the console's server_version (PgBouncer's own, 1.x) and
+  // refuses: "Unsupported server version; 9.0 is the minimum." True, and no
+  // help: it names neither the console nor the one line that fixes it. Found
+  // on a lab config written exactly so. Not refused at startup, because a real
+  // database may be named pgbouncer -- auth_query functions often live in one --
+  // and only connecting tells the two apart.
+  static std::unique_ptr<pqxx::connection> connect(const pglicht::ConnConfig& cfg) {
+    try {
+      return std::make_unique<pqxx::connection>(cfg.conninfo);
+    } catch (const std::exception& e) {
+      const std::string w = e.what();
+      if (w.find("Unsupported server version") == std::string::npos) throw;
+      throw std::runtime_error(
+        "connection " + cfg.name + " did not answer as PostgreSQL 9.0 or later (" + w +
+        "). " + (cfg.dbname == "pgbouncer"
+                   ? "Its dbname is pgbouncer, so this is almost certainly a "
+                     "PgBouncer admin console: add kind = pgbouncer to its section "
+                     "and use poolerStatus, poolerConnections and poolerConfig "
+                     "there. Database tools cannot run against a console"
+                   : "If this is a PgBouncer admin console, add kind = pgbouncer to "
+                     "its section; the pooler tools read it and database tools "
+                     "cannot"));
+    }
+  }
+
   Session(const Session&) = delete;
   Session& operator=(const Session&) = delete;
 
@@ -508,6 +539,124 @@ public:
 private:
   const json& a_;
 };
+
+// --- PgBouncer's admin console, through libpq ---------------------------------
+//
+// Outside the server class so the tests can reach them directly: the deadline
+// and the UTF-8 repair are the parts no well-behaved rig pooler exercises.
+namespace pgbouncer {
+
+// The console passes on what clients sent, application_name included, with
+// no encoding check of its own, and json::dump() throws on invalid UTF-8 --
+// one misbehaving client would fail the whole call. Each invalid byte becomes
+// U+FFFD, so the rest of the value still reads.
+inline std::string valid_utf8(const std::string& in) {
+  std::string out;
+  out.reserve(in.size());
+  const auto* b = reinterpret_cast<const unsigned char*>(in.data());
+  const size_t n = in.size();
+  for (size_t i = 0; i < n;) {
+    const unsigned char c = b[i];
+    size_t len = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 0;
+    bool ok = len > 0 && i + len <= n;
+    for (size_t k = 1; ok && k < len; k++) ok = (b[i + k] & 0xC0) == 0x80;
+    if (ok && len > 1) {
+      // Overlong forms, surrogates and code points past U+10FFFF are
+      // well-formed byte patterns that are still not UTF-8.
+      unsigned cp = c & (0x7F >> len);
+      for (size_t k = 1; k < len; k++) cp = (cp << 6) | (b[i + k] & 0x3F);
+      ok = !(len == 2 && cp < 0x80) && !(len == 3 && cp < 0x800) &&
+           !(len == 4 && cp < 0x10000) && !(cp >= 0xD800 && cp <= 0xDFFF) && cp <= 0x10FFFF;
+    }
+    if (ok) { out.append(in, i, len); i += len; }
+    else    { out += "\xEF\xBF\xBD"; i++; }
+  }
+  return out;
+}
+
+// Rows keyed by the column names the pooler sent. They differ between
+// PgBouncer versions, so nothing here assumes one: counters come back as
+// numbers where the console types them as numbers, everything else as text.
+inline json rows(const PGresult* r) {
+  json out = json::array();
+  const int n = PQntuples(r), f = PQnfields(r);
+  for (int i = 0; i < n; i++) {
+    json o = json::object();
+    for (int j = 0; j < f; j++) {
+      const std::string col = valid_utf8(PQfname(r, j));
+      if (PQgetisnull(r, i, j)) { o[col] = nullptr; continue; }
+      const std::string v = valid_utf8(PQgetvalue(r, i, j));
+      const Oid t = PQftype(r, j);
+      try {
+        if (t == 20 || t == 21 || t == 23) { o[col] = std::stoll(v); continue; }
+        // SHOW STATS types its counters as numeric, so a whole number stays
+        // an integer rather than arriving as 12.0.
+        if (t == 1700 && v.find_first_of(".eE") == std::string::npos) {
+          o[col] = std::stoll(v); continue;
+        }
+        if (t == 700 || t == 701 || t == 1700) { o[col] = std::stod(v); continue; }
+      } catch (const std::exception&) {}
+      o[col] = v;
+    }
+    out.push_back(o);
+  }
+  return out;
+}
+
+// One SHOW, bounded by the section's statement_timeout_ms. The console has no
+// statement_timeout of its own to set -- it refuses SET -- so the deadline is
+// kept here: PQexec would wait as long as a wedged pooler took to answer, and
+// this server answers one call at a time. On expiry the command is cancelled
+// and `dead` set, so the caller sends nothing more on it. 0 turns the bound
+// off, as it does for statement_timeout.
+inline json exec(PGconn* conn, const std::string& cmd, int timeout_ms,
+                 std::string& why, bool& dead) {
+  if (!PQsendQuery(conn, cmd.c_str())) { why = PQerrorMessage(conn); dead = true; return json(); }
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(timeout_ms);
+  while (PQisBusy(conn)) {
+    int wait = -1;
+    if (timeout_ms > 0) {
+      const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now()).count();
+      if (left <= 0) {
+        if (PGcancel* cn = PQgetCancel(conn)) {
+          char buf[256];
+          PQcancel(cn, buf, sizeof buf);
+          PQfreeCancel(cn);
+        }
+        why = cmd + " did not answer within statement_timeout_ms (" +
+              std::to_string(timeout_ms) + "ms)";
+        dead = true;
+        return json();
+      }
+      wait = static_cast<int>(left);
+    }
+    pollfd pfd{PQsocket(conn), POLLIN, 0};
+    if (pfd.fd < 0 || (::poll(&pfd, 1, wait) < 0 && errno != EINTR) ||
+        !PQconsumeInput(conn)) {
+      why = PQerrorMessage(conn);
+      dead = true;
+      return json();
+    }
+  }
+  json result;
+  bool first = true;
+  while (PGresult* raw = PQgetResult(conn)) {
+    std::unique_ptr<PGresult, decltype(&PQclear)> r(raw, &PQclear);
+    if (!first) continue;   // drain: the next command needs an idle connection
+    first = false;
+    if (PQresultStatus(r.get()) != PGRES_TUPLES_OK) why = PQresultErrorMessage(r.get());
+    else result = rows(r.get());
+  }
+  if (first && why.empty()) why = PQerrorMessage(conn);
+  // An empty message must still read as a failure to the caller, which tells
+  // an answer from a refusal by whether `why` is set.
+  if ((first || result.is_null()) && why.empty()) why = cmd + " returned no rows";
+  return result;
+}
+
+}  // namespace pgbouncer
 
 class PostgresMCPServer {
 public:
@@ -668,6 +817,14 @@ public:
   const json call_predicate_stats(int limit = 20, const std::string& query_id = "",
                                   const std::string& order_by = "") {
     return predicate_stats(limit, query_id, order_by);
+  }
+  const json call_pooler_status(const std::string& database = "") { return pooler_status(database); }
+  const json call_pooler_connections(const std::string& database = "", const std::string& state = "",
+                                     int limit = 100) {
+    return pooler_connections(database, state, limit);
+  }
+  const json call_pooler_config(const std::string& pattern = "", bool all = false) {
+    return pooler_config(pattern, all);
   }
   const json call_suggest_indexes(long long min_filter = 1000, long long min_selectivity = 30,
                                   const json& forbidden_am = json::array()) {
@@ -1165,6 +1322,48 @@ private:
     return false;
   }
 
+  // The PgBouncer consoles configured, in file order.
+  std::vector<std::string> pooler_names() const {
+    std::vector<std::string> out;
+    for (const auto& n : registry_.names())
+      if (registry_.get(n).is_pooler()) out.push_back(n);
+    return out;
+  }
+
+  // What a pooler tool does with no connection named. The default connection
+  // is a database -- a call naming none is a database question -- so for a
+  // pooler tool it was always refused, while the schema said it "defaults to"
+  // that database. With exactly one console configured there is no question
+  // which is meant; with several, the caller must say.
+  std::string pooler_default() const {
+    const auto p = pooler_names();
+    return p.size() == 1 ? p.front() : std::string{};
+  }
+
+  json pooler_conn_prop() const {
+    const auto p = pooler_names();
+    std::string d = "name of a configured connection with kind = pgbouncer (see "
+                    "listConnections); ";
+    if (p.size() == 1)
+      d += "defaults to \"" + p.front() + "\", the only one configured";
+    else if (p.empty())
+      d += "none is configured, so every call is refused until one is";
+    else {
+      std::string names;
+      for (const auto& n : p) names += (names.empty() ? "" : ", ") + n;
+      d += "required, since several are configured: " + names;
+    }
+    return {{"type", "string"}, {"description", d}};
+  }
+
+  json invalid_sections(const std::string& pattern) const {
+    json out = json::array();
+    for (const auto& [name, why] : registry_.invalid())
+      if (pattern.empty() || pattern_matches(name, pattern))
+        out.push_back({{"name", name}, {"error", why}});
+    return out;
+  }
+
   const json connections(const std::string& pattern) {
     json out = json::array();
     for (const auto& name : registry_.names()) {
@@ -1179,6 +1378,10 @@ private:
       if (!c.port.empty())    entry["port"]    = c.port;
       if (!c.dbname.empty())  entry["dbname"]  = c.dbname;
       if (!c.user.empty())    entry["user"]    = c.user;
+      // Only when it is not the default, so a registry of databases answers
+      // exactly as it always has.
+      if (c.is_pooler())      entry["kind"]    = c.kind;
+      if (!c.pooler.empty())  entry["pooler"]  = c.pooler;
       // Topology, so a caller can see which connections share a postmaster and
       // which hold the same data, without a second call. Role is deliberately
       // absent: it is observed, not configured (see verifyTopology).
@@ -1198,7 +1401,12 @@ private:
     }
     // Wrapped for the same reason as currentLocks: a top-level array cannot be
     // a `structuredContent` payload.
-    return json{{"connections", out}};
+    json result = {{"connections", out}};
+    // Sections skipped at startup, so a connection the operator configured is
+    // never simply missing from the answer. Only when there are any, so a
+    // valid file answers exactly as it always has.
+    if (!registry_.invalid().empty()) result["invalid"] = invalid_sections(pattern);
+    return result;
   }
 
   // The configured topology, as three indexes plus whatever belongs to none of
@@ -1289,7 +1497,7 @@ private:
   // that is correct.
   const json verify_topology() {
     struct Observed {
-      std::string name, role, sysid, database, addr, version, error;
+      std::string name, role, sysid, started, database, addr, version, error;
       long long port = 0;
       bool ok = false, endpoint_known = false;
     };
@@ -1303,13 +1511,20 @@ private:
     // Only the observing is parallel. Results land in fixed slots, so the
     // comparison passes read the registry in configuration order exactly as
     // before and the payload is byte-identical.
-    const std::vector<std::string> names = registry_.names();
+    // PgBouncer consoles are not PostgreSQL servers: no system identifier, no
+    // role, nothing to check a topology against. They are listed under
+    // 'poolers' rather than dropped, since a configured connection missing from
+    // the answer would read as one that was never configured.
+    std::vector<std::string> names, poolers;
+    for (const auto& n : registry_.names())
+      (registry_.get(n).is_pooler() ? poolers : names).push_back(n);
     std::vector<Observed> seen(names.size());
 
     const std::string q = R"(
       SELECT JSONB_BUILD_OBJECT(
                'system_identifier', (SELECT c.system_identifier::text
                                      FROM pg_control_system() AS c),
+               'postmaster_start_time', pg_postmaster_start_time()::text,
                'database',          current_database(),
                'server_addr',       HOST(inet_server_addr()),
                'server_port',       inet_server_port(),
@@ -1330,6 +1545,8 @@ private:
         // JSON number precision, the same reason query_id is a string.
         if (!row["system_identifier"].is_null())
           o.sysid = row["system_identifier"].get<std::string>();
+        if (!row["postmaster_start_time"].is_null())
+          o.started = row["postmaster_start_time"].get<std::string>();
         o.database = row.value("database", "");
         o.version  = row.value("server_version", "");
         if (!row["server_addr"].is_null() && !row["server_port"].is_null()) {
@@ -1366,33 +1583,36 @@ private:
     // --- declared instances ---
     for (const auto& [iname, members] : registry_.instances()) {
       if (registry_.get(members.front()).instance_source != "declared") continue;
+      // One postmaster is told by the system identifier AND the postmaster's
+      // start time, both read from the server itself. The address it was
+      // reached at cannot say it: through PgBouncer, inet_server_addr() is the
+      // pooler's own hop to PostgreSQL -- 127.0.0.1 for a pooler on the same
+      // machine -- so a database reached directly and through its pooler read
+      // as two servers, and a correct declaration was reported as an error.
+      // Found on a lab where both were declared one instance, as they are. A
+      // replica has its own postmaster and so its own start time, whatever
+      // address it is reached by; and unlike the address, the start time is
+      // known over a Unix socket too.
       std::vector<std::string> reachable;
-      std::set<std::string> ids, endpoints;
-      bool endpoints_known = true;
+      std::set<std::string> ids, starts;
       for (const auto& m : members) {
         const Observed* o = by_name(m);
         if (!o || !o->ok) continue;
         reachable.push_back(m);
         if (!o->sysid.empty()) ids.insert(o->sysid);
-        if (o->endpoint_known) endpoints.insert(o->addr + ":" + std::to_string(o->port));
-        else endpoints_known = false;
+        if (!o->started.empty()) starts.insert(o->started);
       }
       if (reachable.size() < 2) continue;
       if (ids.size() > 1) {
         finding("instance", iname, "error",
                 "members report different system identifiers, so they are not one "
                 "postmaster and share no buffers: " + join(reachable));
-      } else if (!endpoints_known) {
-        finding("instance", iname, "info",
-                "members agree on the system identifier, but at least one is "
-                "connected over a Unix socket, where inet_server_addr() is null "
-                "-- an instance and a replication group cannot be told apart "
-                "without an endpoint");
-      } else if (endpoints.size() > 1) {
+      } else if (starts.size() > 1) {
         finding("instance", iname, "error",
-                "members share a system identifier but sit on different servers. "
-                "That is a replication lineage, not one postmaster: declare them "
-                "as a replication_group instead");
+                "members share a system identifier but report different postmaster "
+                "start times, so they are separate servers. That is a replication "
+                "lineage, not one postmaster: declare them as a replication_group "
+                "instead");
       }
     }
 
@@ -1400,12 +1620,23 @@ private:
     for (const auto& [rname, members] : registry_.replication_groups()) {
       std::vector<std::string> reachable, primaries;
       std::set<std::string> ids;
+      // Primaries keyed by postmaster: system identifier and start time. Two
+      // connections to one server are one primary listed twice, not split
+      // brain -- the same mistake the instance check made by address, found
+      // for it on a lab reaching one server directly and through its pooler.
+      std::map<std::string, std::vector<std::string>> primary_postmasters;
       for (const auto& m : members) {
         const Observed* o = by_name(m);
         if (!o || !o->ok) continue;
         reachable.push_back(m);
         if (!o->sysid.empty()) ids.insert(o->sysid);
-        if (o->role == std::string("primary")) primaries.push_back(m);
+        if (o->role == std::string("primary")) {
+          primaries.push_back(m);
+          // Without a start time a member counts as its own postmaster, which
+          // errs toward reporting split brain rather than hiding it.
+          primary_postmasters[o->started.empty() ? "?" + m : o->sysid + "@" + o->started]
+            .push_back(m);
+        }
       }
       if (reachable.empty()) {
         finding("replication_group", rname, "error",
@@ -1425,12 +1656,19 @@ private:
         finding("replication_group", rname, "error",
                 "every reachable member is in recovery: there is no primary. "
                 "During a failover this is the finding, not an empty result");
-      } else if (primaries.size() > 1) {
+      } else if (primary_postmasters.size() > 1) {
         finding("replication_group", rname, "error",
                 "more than one member reports itself a primary, which is split "
                 "brain: " + join(primaries) + ". Both are reported; neither is "
                 "chosen");
       }
+      for (const auto& [pm, same] : primary_postmasters)
+        if (same.size() > 1)
+          finding("replication_group", rname, "warning",
+                  "these connections reach one primary -- the same system "
+                  "identifier and postmaster start time -- so it is listed more "
+                  "than once, not split brain: " + join(same) + ". Declare them "
+                  "one instance");
     }
 
     // --- lineages the config never mentions ---
@@ -1458,13 +1696,104 @@ private:
               "server's own, so a sweep that misses one misses that workload");
     }
 
+    // --- routes through a pooler ---
+    // Declared with pooler = <console>, and checked here against the console's
+    // own routing, read once per connection. The pooled connection's server
+    // address is the pooler's hop and says nothing; the route says where the
+    // pooler sends it, and the observation says what answered.
+    std::map<std::string, json> routes;
+    for (const auto& o : seen) {
+      const auto& cfg = registry_.get(o.name);
+      if (cfg.pooler.empty()) continue;
+      const auto& console = registry_.get(cfg.pooler);
+      json route = pooler_route(cfg);
+      routes[o.name] = route;
+      // The connection must reach the console's own listener: PgBouncer serves
+      // clients and its admin console on one port. A section pointing
+      // elsewhere declares a route it does not take.
+      if (!cfg.host.empty() && !console.host.empty() &&
+          (cfg.host != console.host || cfg.port != console.port))
+        finding("pooler", o.name, "warning",
+                "declares pooler = " + cfg.pooler + " but connects to " + cfg.host +
+                ":" + cfg.port + ", while that console listens on " + console.host +
+                ":" + console.port + "; the route below is the console's, which "
+                "may not be the one this connection takes");
+      if (route.contains("error")) {
+        finding("pooler", o.name, "warning",
+                "the route through " + cfg.pooler + " could not be read, so it is "
+                "not verified: " + route.value("error", ""));
+        continue;
+      }
+      if (!route.value("found", false)) {
+        finding("pooler", o.name, "error",
+                cfg.pooler + " has no [databases] entry for " + cfg.dbname +
+                " and no '*' fallback, so a connection to it through the pooler "
+                "cannot be routed");
+        continue;
+      }
+      if (!o.ok) continue;
+      const std::string backend_db = route.value("backend_database", "");
+      if (!backend_db.empty() && backend_db != o.database)
+        finding("pooler", o.name, "error",
+                cfg.pooler + " routes " + cfg.dbname + " to database " + backend_db +
+                ", but the connection reached " + o.database);
+      else if (backend_db != cfg.dbname)
+        finding("pooler", o.name, "info",
+                cfg.pooler + " maps the name " + cfg.dbname + " to database " +
+                backend_db + " -- an alias, so this connection is " + backend_db +
+                " under another name");
+      if (o.endpoint_known && route.contains("backend_port") &&
+          route["backend_port"].is_number() &&
+          route["backend_port"].get<long long>() != o.port)
+        finding("pooler", o.name, "error",
+                cfg.pooler + " routes to port " +
+                std::to_string(route["backend_port"].get<long long>()) +
+                ", but the server that answered listens on " + std::to_string(o.port));
+      // What the declaration buys: which configured connection is the same
+      // database reached directly -- one postmaster, one database, one user, so
+      // one answer. Stated here, where it is checked, for the caller to use.
+      for (const auto& d : seen) {
+        if (d.name == o.name || !d.ok) continue;
+        const auto& dc = registry_.get(d.name);
+        if (!dc.pooler.empty()) continue;
+        if (!d.sysid.empty() && d.sysid == o.sysid && !d.started.empty() &&
+            d.started == o.started && d.database == o.database &&
+            !cfg.user.empty() && dc.user == cfg.user)
+          finding("pooler", o.name, "info",
+                  "reaches the same database as " + d.name + " -- one postmaster, "
+                  "database " + o.database + ", user " + cfg.user + " -- through " +
+                  cfg.pooler);
+      }
+    }
+
+    // --- sections skipped at startup ---
+    // Nothing about them could be checked, and the operator may not know they
+    // were skipped: the server started, which it used not to.
+    for (const auto& [name, why] : registry_.invalid())
+      finding("configuration", name, "error",
+              "this section was skipped at startup and is not a connection: " + why);
+
     // --- what could not be answered ---
     std::vector<std::string> failed;
     for (const auto& o : seen) if (!o.ok) failed.push_back(o.name);
-    if (!failed.empty())
-      finding("reachability", "", "warning",
-              "not reached, so every finding above covers only what answered: " +
-              join(failed));
+    // Named for what it is about -- how many of the configured connections
+    // were checked -- with the unreached ones listed as such. It read "covers
+    // only what answered: <list>" with the list being the ones that did NOT
+    // answer, and an empty name.
+    if (!failed.empty()) {
+      const size_t answered = seen.size() - failed.size();
+      finding("reachability",
+              std::to_string(failed.size()) + " of " + std::to_string(seen.size()) +
+                " connections unreached",
+              "warning",
+              "could not connect to " + join(failed) + ". " +
+              (answered == 0
+                 ? std::string("No connection answered, so nothing about the "
+                               "topology could be checked")
+                 : "The other findings were checked only against the " +
+                   std::to_string(answered) + " that answered, so a mismatch "
+                   "involving an unreached connection cannot show up in them"));
+    }
 
     json conns = json::array();
     for (const auto& o : seen) {
@@ -1475,11 +1804,16 @@ private:
         e["instance_source"] = cfg.instance_source;
       }
       if (!cfg.replication_group.empty()) e["replication_group"] = cfg.replication_group;
+      // The route is reported even when the connection failed: a pooler with
+      // no entry for the name is often why it failed.
+      if (!cfg.pooler.empty()) e["pooler"] = cfg.pooler;
+      if (routes.count(o.name)) e["route"] = routes[o.name];
       if (!o.ok) { e["error"] = o.error; conns.push_back(e); continue; }
       e["role"] = o.role;
       e["database"] = o.database;
       e["server_version"] = o.version;
       if (!o.sysid.empty()) e["system_identifier"] = o.sysid;
+      if (!o.started.empty()) e["postmaster_start_time"] = o.started;
       if (o.endpoint_known) {
         e["server_addr"] = o.addr;
         e["server_port"] = o.port;
@@ -1487,7 +1821,10 @@ private:
       conns.push_back(e);
     }
 
-    return {{"connections", conns}, {"findings", findings}};
+    json out = {{"connections", conns}, {"findings", findings}};
+    if (!poolers.empty()) out["poolers"] = poolers;
+    if (!registry_.invalid().empty()) out["invalid"] = invalid_sections("");
+    return out;
   }
 
   // Where a tool's answer actually varies.
@@ -1522,6 +1859,9 @@ private:
     bool per_server = false;
     bool primary_authoritative = false;
     bool registry = false;
+    // Reads a PgBouncer admin console rather than a database: it runs only on
+    // a kind = pgbouncer connection, and every other tool refuses one.
+    bool pooler = false;
   };
 
   static const std::map<std::string, ToolScope>& tool_scopes() {
@@ -1531,6 +1871,10 @@ private:
       {"listConnections",       {false, false, false, true}},
       {"listTopology",          {false, false, false, true}},
       {"verifyTopology",        {false, false, false, true}},
+      // A PgBouncer console, not a database: swept only by group.
+      {"poolerStatus",          {false, false, false, false, true}},
+      {"poolerConnections",     {false, false, false, false, true}},
+      {"poolerConfig",          {false, false, false, false, true}},
 
       // Instance-wide readings: one answer per postmaster.
       {"bufferCacheContents",   {false, true,  false, false}},
@@ -1673,6 +2017,12 @@ private:
   // silently repeated one answer would read as agreement between databases.
   static std::string scope_note(const std::string& name, const ToolScope& sc) {
     if (sc.registry) return "";
+    if (sc.pooler)
+      return " Reads a PgBouncer admin console, not a database: 'connection' names"
+             " a section with kind = pgbouncer, or a database section declaring"
+             " pooler = <that section>, which is answered by its console about its"
+             " own pool; 'group' asks every pooler carrying that label, one result"
+             " each.";
     if (name == "explainQuery")
       return " Never runs across more than one connection: the same statement is"
              " rarely valid in another database, and with analyze it would"
@@ -1768,6 +2118,9 @@ private:
   json get_resources_list() {
     json out = json::array();
     for (const auto& conn : registry_.names()) {
+      // A PgBouncer console has no schemas, roles or settings of PostgreSQL's
+      // to read, and refuses the transaction every resource opens.
+      if (registry_.get(conn).is_pooler()) continue;
       const std::string c = uri_encode(conn);
       const std::string base = "pglicht://" + c;
       out.push_back(resource_entry(base + "/schemas", conn + " schemas",
@@ -1825,7 +2178,10 @@ private:
     const std::string conn = seg[0];
     // Fails here, naming the configured connections, rather than as a
     // confusing connect error later.
-    (void)registry_.get(conn);
+    if (registry_.get(conn).is_pooler())
+      throw std::invalid_argument("connection " + conn + " is a PgBouncer console "
+                                  "(kind = pgbouncer), which has no resources; "
+                                  "use poolerStatus, poolerConnections or poolerConfig");
 
     struct Restore {
       std::string& slot; std::string prev;
@@ -2125,12 +2481,13 @@ private:
       {"currentLocks",           schema_fixed("Lock rows, newest blocking chain first.",
                                    {{"locks", "array"}})},
       {"listConnections",        schema_fixed("The configured connection registry.",
-                                   {{"connections", "array"}})},
+                                   {{"connections", "array"}, {"invalid", "array"}})},
       {"listTopology",           schema_fixed("The three configured topology axes.",
                                    {{"instances", "array"}, {"replication_groups", "array"},
                                     {"groups", "array"}, {"unlabelled", "array"}})},
       {"verifyTopology",         schema_fixed("Declared topology checked against each server.",
-                                   {{"connections", "array"}, {"findings", "array"}})},
+                                   {{"connections", "array"}, {"findings", "array"},
+                                    {"poolers", "array"}, {"invalid", "array"}})},
       {"ioStats",                schema_fixed("pg_stat_io rows per backend type and context.",
                                    {{"io", "array"}})},
       {"duplicateIndexes",       schema_fixed("Indexes that duplicate or cover another.",
@@ -2164,6 +2521,19 @@ private:
       {"predicateStats",         schema_fixed("Per-predicate statistics from pg_qualstats, without constants.",
                                    {{"predicates", "array"}, {"order_by", "string"},
                                     {"settings", "object"}})},
+      {"poolerStatus",           schema_fixed("PgBouncer's pools per database: waiting clients, servers in use, averages.",
+                                   {{"version", "string"}, {"summary", "array"}, {"lists", "object"},
+                                    {"databases", "array"}, {"pools", "array"}, {"stats", "array"},
+                                    {"unavailable", "object"}, {"pooler", "string"}})},
+      {"poolerConnections",      schema_fixed("PgBouncer's client and server connections.",
+                                   {{"clients", "array"}, {"servers", "array"},
+                                    {"clients_by_state", "object"}, {"servers_by_state", "object"},
+                                    {"clients_truncated", "boolean"}, {"servers_truncated", "boolean"},
+                                    {"unavailable", "object"}, {"pooler", "string"}})},
+      {"poolerConfig",           schema_fixed("PgBouncer's settings, non-default unless all is set.",
+                                   {{"version", "string"}, {"settings", "object"}, {"all", "boolean"},
+                                    {"without_default", "object"}, {"note", "string"},
+                                    {"unavailable", "object"}, {"pooler", "string"}})},
       {"suggestIndexes",         schema_fixed("Index suggestions from pg_qualstats' index advisor.",
                                    {{"indexes", "array"}, {"not_indexable", "array"}})},
     };
@@ -2253,7 +2623,7 @@ private:
       };
 
       if (!sc.registry) {
-        add_selector("connection", conn_prop);
+        add_selector("connection", sc.pooler ? pooler_conn_prop() : conn_prop);
 
         // The sweep arguments are advertised only where they are eligible, so
         // the schema itself teaches the rule and the -32602 is only a backstop.
@@ -2302,8 +2672,10 @@ private:
       }
 
       if (wants_annotations) {
-        // Every tool runs inside SET TRANSACTION READ ONLY, which is what makes
-        // the claim honest rather than aspirational.
+        // Every database tool runs inside SET TRANSACTION READ ONLY, and the
+        // pooler tools send only SHOW, which a stats_users login can run and
+        // nothing else -- which is what makes the claim honest rather than
+        // aspirational.
         json ann = {
           {"readOnlyHint", true},
           {"destructiveHint", false},
@@ -3684,6 +4056,325 @@ private:
       if (!r.is_null()) return r;
       throw;
     }
+  }
+
+  // --- PgBouncer: the admin console -----------------------------------------
+  //
+  // The console is not PostgreSQL. It refuses BEGIN ("invalid command") and
+  // SET, so the per-call READ ONLY transaction that guards every other tool
+  // cannot be opened here -- verified against PgBouncer 1.25.2. The guarantee
+  // is two layers instead. This server sends nothing but the SHOW commands in
+  // pooler_commands(), which are constants in this file, with no parameters
+  // and nothing from the caller in the text. And the operator is asked to
+  // configure a user from PgBouncer's stats_users, which may run SHOW and
+  // nothing else: PAUSE, RELOAD and SET answer "admin access needed", so the
+  // pooler refuses a write even if this server ever sent one. That second layer
+  // is the operator's to set up -- this server cannot tell a stats_users login
+  // from an admin_users one without trying something only an admin may do.
+  //
+  // One connection per call, closed after it, like a database call: the console
+  // answers from memory, and a cached connection would need a pool of its own.
+  static const std::set<std::string>& pooler_commands() {
+    static const std::set<std::string> s = {
+      "SHOW VERSION", "SHOW POOLS", "SHOW STATS", "SHOW DATABASES",
+      "SHOW LISTS", "SHOW CLIENTS", "SHOW SERVERS", "SHOW CONFIG"};
+    return s;
+  }
+
+  // Runs `commands` on this connection's console and returns each one's rows,
+  // or {error, hint} when the console cannot be reached or refuses the login.
+  //
+  // Through libpq itself, not libpqxx: libpqxx checks server_version on
+  // connect and refuses anything below 9.0, and the console reports
+  // PgBouncer's own version -- "Unsupported server version; 9.0 is the
+  // minimum", found against PgBouncer 1.25.2. libpq makes no such check, and
+  // PQexec with no parameters is the simple protocol the console speaks.
+  json pooler_show(const std::vector<std::string>& commands) {
+    for (const auto& c : commands)
+      if (!pooler_commands().count(c))
+        throw std::logic_error("not an allowed pooler command: " + c);
+    // Dispatch already refuses a pooler tool on a database; this holds the line
+    // for any path that reaches here without it -- a SHOW sent to PostgreSQL is
+    // a different command, not a harmless one.
+    if (!active_cfg().is_pooler())
+      return {{"error", "connection " + active_cfg().name + " is not a PgBouncer console"},
+              {"hint", "the pooler tools need a connections-file section with "
+                       "kind = pgbouncer"}};
+    const std::string conninfo =
+      with_connect_timeout(active_cfg(), kSweepConnectTimeoutSeconds).conninfo;
+    std::unique_ptr<PGconn, decltype(&PQfinish)> conn(PQconnectdb(conninfo.c_str()), &PQfinish);
+    if (!conn || PQstatus(conn.get()) != CONNECTION_OK) {
+      const std::string w = conn ? PQerrorMessage(conn.get()) : "out of memory";
+      const bool refused = w.find("not allowed") != std::string::npos ||
+                           w.find("no such user") != std::string::npos ||
+                           w.find("password authentication") != std::string::npos;
+      return {{"error", refused
+                 ? "the PgBouncer console refused this login"
+                 : "could not reach the PgBouncer console"},
+              {"hint", refused
+                 ? "Add the user to stats_users in pgbouncer.ini, which may run "
+                   "SHOW and nothing else, and to the auth_file; then RELOAD the "
+                   "pooler"
+                 : "Check host and port: the console listens on PgBouncer's own "
+                   "listen_port, the one clients connect to, as the database "
+                   "named pgbouncer"},
+              {"detail", w}};
+    }
+    // One command the console refuses -- an older PgBouncer that does not know
+    // it -- costs that command's part of the answer, not the rest: its rows
+    // come back empty and the refusal is named under "unavailable". Only a
+    // console that refuses everything is an error.
+    json out = json::object(), unavailable = json::object();
+    const int timeout_ms = active_cfg().statement_timeout_ms;
+    for (const auto& c : commands) {
+      std::string why;
+      bool dead = false;
+      json rows = pgbouncer::exec(conn.get(), c, timeout_ms, why, dead);
+      if (!why.empty()) {
+        unavailable[c] = why;
+        out[c] = json::array();
+        // A timed-out or broken connection answers nothing after this.
+        if (dead || PQstatus(conn.get()) != CONNECTION_OK) {
+          for (const auto& rest : commands)
+            if (!out.contains(rest)) { out[rest] = json::array(); unavailable[rest] = why; }
+          break;
+        }
+        continue;
+      }
+      out[c] = std::move(rows);
+    }
+    if (unavailable.size() == commands.size())
+      return {{"error", "the PgBouncer console answered none of " +
+                        std::to_string(commands.size()) + " SHOW commands"},
+              {"hint", "A user in stats_users may run every SHOW this server sends. "
+                       "A timeout is statement_timeout_ms in this section, which "
+                       "bounds each SHOW here as it bounds a statement elsewhere"},
+              {"detail", unavailable}};
+    if (!unavailable.empty()) out["unavailable"] = unavailable;
+    return out;
+  }
+
+
+  // A console column can be NULL -- a client still logging in has no
+  // database yet -- and json::value() throws on a null read as a string.
+  static std::string text_of(const json& o, const char* k) {
+    return o.contains(k) && o[k].is_string() ? o[k].get<std::string>() : std::string{};
+  }
+
+  static long long num_or(const json& o, const char* k, long long d = 0) {
+    return o.contains(k) && o[k].is_number() ? o[k].get<long long>() : d;
+  }
+
+  // Whether the pools can take what is asked of them. SHOW POOLS says who is
+  // waiting and for how long, SHOW DATABASES how many servers each pool may
+  // open, SHOW STATS what a transaction and a wait cost on average, SHOW LISTS
+  // the totals. The summary joins them per database -- the answer to "is the
+  // pooler the bottleneck" -- and the raw rows are kept beside it, since their
+  // columns vary by version and a summary can only use what every version has.
+  // Where a database connection that declares `pooler` is routed: the entry
+  // for its dbname in that console's SHOW DATABASES -- or PgBouncer's "*"
+  // fallback, which routes any name to the same-named database. A name routed
+  // by the fallback is listed as an entry of its own once any client has asked
+  // for it, so via_fallback is seen only before the first connection. One console
+  // read. Returns {error, hint, detail} when the console cannot be read, and
+  // found:false when it has no route for the name, which is a connection that
+  // cannot work.
+  json pooler_route(const pglicht::ConnConfig& db) {
+    struct Restore {
+      std::string& slot; std::string prev;
+      ~Restore() { slot = prev; }
+    } restore{active_, active_};
+    active_ = db.pooler;
+    json r = pooler_show({"SHOW DATABASES"});
+    if (r.contains("error")) return r;
+    json route = {{"pooler", db.pooler}, {"pooler_database", db.dbname}, {"found", false}};
+    const json* hit = nullptr;
+    const json* wildcard = nullptr;
+    for (const auto& row : r["SHOW DATABASES"]) {
+      const std::string n = text_of(row, "name");
+      if (n == db.dbname) { hit = &row; break; }
+      if (n == "*") wildcard = &row;
+    }
+    if (!hit) hit = wildcard;
+    if (!hit) return route;
+    route["found"] = true;
+    if (hit == wildcard) route["via_fallback"] = true;
+    // The backend database: the entry's own dbname, or -- when it sets none,
+    // and always for the fallback -- the name the client asked for.
+    const std::string backend_db = text_of(*hit, "database");
+    route["backend_database"] = backend_db.empty() || hit == wildcard ? db.dbname : backend_db;
+    for (const auto& [from, to] : {std::pair<const char*, const char*>{"host", "backend_host"},
+                                   {"port", "backend_port"}, {"force_user", "force_user"},
+                                   {"pool_mode", "pool_mode"}, {"pool_size", "pool_size"}})
+      if (hit->contains(from)) route[to] = (*hit)[from];
+    return route;
+  }
+
+  const json pooler_status(const std::string& database) {
+    json r = pooler_show({"SHOW VERSION", "SHOW LISTS", "SHOW DATABASES",
+                          "SHOW POOLS", "SHOW STATS"});
+    if (r.contains("error")) return r;
+    auto keep = [&](const json& rows, const char* key) {
+      json out = json::array();
+      for (const auto& row : rows) {
+        const std::string db = text_of(row, key);
+        if (database.empty() ? db != "pgbouncer" : db == database) out.push_back(row);
+      }
+      return out;
+    };
+    const json dbs = keep(r["SHOW DATABASES"], "name");
+    const json pools = keep(r["SHOW POOLS"], "database");
+    const json stats = keep(r["SHOW STATS"], "database");
+
+    json summary = json::array();
+    for (const auto& d : dbs) {
+      const std::string name = text_of(d, "name");
+      long long cl_active = 0, cl_waiting = 0, sv_active = 0, sv_idle = 0,
+                sv_used = 0, sv_login = 0;
+      double longest_wait_s = 0;
+      for (const auto& p : pools) {
+        if (text_of(p, "database") != name) continue;
+        cl_active += num_or(p, "cl_active");
+        cl_waiting += num_or(p, "cl_waiting");
+        sv_active += num_or(p, "sv_active");
+        sv_idle += num_or(p, "sv_idle");
+        sv_used += num_or(p, "sv_used");
+        sv_login += num_or(p, "sv_login");
+        const double w = static_cast<double>(num_or(p, "maxwait")) +
+                         static_cast<double>(num_or(p, "maxwait_us")) / 1e6;
+        if (w > longest_wait_s) longest_wait_s = w;
+      }
+      json e = {{"database", name},
+                {"clients_active", cl_active}, {"clients_waiting", cl_waiting},
+                {"longest_wait_s", longest_wait_s},
+                {"servers_active", sv_active}, {"servers_idle", sv_idle},
+                {"servers_used", sv_used}, {"servers_login", sv_login},
+                {"saturated", cl_waiting > 0}};
+      for (const char* k : {"pool_mode", "pool_size", "min_pool_size",
+                            "reserve_pool", "reserve_pool_size", "max_connections",
+                            "current_connections", "paused", "disabled"})
+        if (d.contains(k)) e[k] = d[k];
+      // SHOW DATABASES has pool_mode NULL for a database that inherits the
+      // global one -- the usual case -- while SHOW POOLS carries the mode in
+      // effect. The summary says which mode the pool runs in, not where it
+      // was set.
+      if (!e.contains("pool_mode") || e["pool_mode"].is_null())
+        for (const auto& p : pools)
+          if (text_of(p, "database") == name && p.contains("pool_mode") &&
+              p["pool_mode"].is_string()) { e["pool_mode"] = p["pool_mode"]; break; }
+      for (const auto& st : stats) {
+        if (text_of(st, "database") != name) continue;
+        for (const char* k : {"avg_xact_time", "avg_query_time", "avg_wait_time",
+                              "total_xact_count", "total_query_count"})
+          if (st.contains(k)) e[k] = st[k];
+      }
+      summary.push_back(e);
+    }
+    json lists = json::object();
+    for (const auto& l : r["SHOW LISTS"])
+      if (l.contains("list")) lists[l["list"].get<std::string>()] = l.value("items", json());
+    const json& v = r["SHOW VERSION"];
+    json out = {{"version", v.empty() ? json() : v[0].begin().value()},
+                {"summary", summary}, {"lists", lists},
+                {"databases", dbs}, {"pools", pools}, {"stats", stats}};
+    if (r.contains("unavailable")) out["unavailable"] = r["unavailable"];
+    return out;
+  }
+
+  // Who is connected to the pooler and which servers it holds open. No
+  // statement text is in either -- PgBouncer does not keep it -- but client
+  // addresses, user and database names and application_name are.
+  const json pooler_connections(const std::string& database, const std::string& state,
+                                int limit) {
+    if (limit <= 0) limit = 100;
+    if (limit > 1000) limit = 1000;
+    json r = pooler_show({"SHOW CLIENTS", "SHOW SERVERS"});
+    if (r.contains("error")) return r;
+    json out = json::object();
+    for (const auto& [cmd, key] : {std::pair<const char*, const char*>{"SHOW CLIENTS", "clients"},
+                                   {"SHOW SERVERS", "servers"}}) {
+      json rows = json::array(), by_state = json::object();
+      size_t matched = 0;
+      for (const auto& row : r[cmd]) {
+        if (!database.empty() && text_of(row, "database") != database) continue;
+        const std::string st = text_of(row, "state");
+        by_state[st] = by_state.value(st, 0) + 1;
+        if (!state.empty() && st != state) continue;
+        if (matched++ < static_cast<size_t>(limit)) rows.push_back(row);
+      }
+      out[key] = rows;
+      out[std::string(key) + "_by_state"] = by_state;
+      out[std::string(key) + "_truncated"] = matched > static_cast<size_t>(limit);
+    }
+    if (r.contains("unavailable")) out["unavailable"] = r["unavailable"];
+    return out;
+  }
+
+  // PgBouncer's settings. Like serverSettings, only those that differ from the
+  // built-in default unless all is set: that is the set describing THIS pooler.
+  // Whether a SHOW CONFIG value equals its default. Mostly a string compare,
+  // but PgBouncer prints a mode in decimal and its default in octal --
+  // unix_socket_mode is 511 against 0777, the same number -- so two values
+  // that both read as whole numbers are compared as numbers, a leading 0
+  // meaning octal as it does in pgbouncer.ini.
+  static bool pooler_setting_is_default(const std::string& value, const std::string& dflt) {
+    if (value == dflt) return true;
+    auto number = [](const std::string& t, long long& out) {
+      if (t.empty() || t.find_first_not_of("0123456789") != std::string::npos) return false;
+      const int base = t.size() > 1 && t[0] == '0' ? 8 : 10;
+      if (base == 8 && t.find_first_of("89") != std::string::npos) return false;
+      try { out = std::stoll(t, nullptr, base); } catch (const std::exception&) { return false; }
+      return true;
+    };
+    long long a = 0, b = 0;
+    return number(value, a) && number(dflt, b) && a == b;
+  }
+
+  // PgBouncer's settings. Like serverSettings, only those that differ from the
+  // built-in default unless all is set: that is the set describing THIS pooler.
+  //
+  // A setting whose default is NULL -- conffile, auth_file, verbose on 1.25 --
+  // has nothing to differ from, and was listed as changed on every pooler. It
+  // goes under without_default instead, where its value is still readable
+  // (auth_file's path is worth knowing) without claiming anyone set it.
+  const json pooler_config(const std::string& pattern, bool all) {
+    json r = pooler_show({"SHOW VERSION", "SHOW CONFIG"});
+    if (r.contains("error")) return r;
+    // A setting with no value -- an unset file path -- arrives as SQL NULL,
+    // and json::value() throws on a null it was asked to read as a string.
+    auto text = [](const json& row, const char* k) {
+      return row.contains(k) && row[k].is_string() ? row[k].get<std::string>() : std::string{};
+    };
+    json settings = json::object(), without_default = json::object();
+    bool has_default = false;
+    for (const auto& row : r["SHOW CONFIG"]) {
+      // Whether this PgBouncer reports defaults at all is a property of the
+      // version, so it is read before the pattern narrows the rows: a pattern
+      // matching nothing is not "no defaults".
+      has_default = has_default || row.contains("default");
+      const std::string key = text(row, "key");
+      if (!pattern_matches(key, pattern)) continue;
+      const bool null_default = row.contains("default") && row["default"].is_null();
+      if (!all && null_default) {
+        without_default[key] = row.contains("value") ? row["value"] : json();
+        continue;
+      }
+      if (!all && row.contains("default") &&
+          pooler_setting_is_default(text(row, "value"), text(row, "default")))
+        continue;
+      json e = {{"value", row.contains("value") ? row["value"] : json()}};
+      if (row.contains("default")) e["default"] = row["default"];
+      if (row.contains("changeable")) e["changeable"] = row["changeable"];
+      settings[key] = e;
+    }
+    const json& v = r["SHOW VERSION"];
+    json out = {{"version", v.empty() ? json() : v[0].begin().value()},
+                {"settings", settings}, {"all", all}};
+    if (!without_default.empty()) out["without_default"] = without_default;
+    if (!all && !has_default)
+      out["note"] = "this PgBouncer reports no defaults, so every setting is shown";
+    if (r.contains("unavailable")) out["unavailable"] = r["unavailable"];
+    return out;
   }
 
   const json progress_stats(int pid, const std::string& relation) {
@@ -8072,7 +8763,12 @@ private:
     // Everything not named is fully available. Counting rather than listing:
     // the exceptions are the answer, and enumerating 53 working tool names
     // would be most of the payload.
-    const size_t total = tool_scopes().size();
+    //
+    // Only the tools that can run on this connection at all: the pooler tools
+    // need a kind = pgbouncer connection, so counting them here would report
+    // three tools this database could never offer as if they were missing.
+    size_t total = 0;
+    for (const auto& [name, sc] : tool_scopes()) { (void)name; if (!sc.pooler) total++; }
     json out = {
       {"connection", active_cfg().name},
       {"role", p.value("role", "")},
@@ -9035,10 +9731,14 @@ private:
   // never sees it.
   static std::string instructions() {
     return
-      "Every statement runs inside a transaction opened with SET TRANSACTION "
-      "READ ONLY. Nothing here writes: the one tool that executes anything is "
-      "explainQuery with analyze:true, and it does so only after the plan is "
-      "proven free of any ModifyTable node.\n\n"
+      "Every statement sent to a database runs inside a transaction opened with "
+      "SET TRANSACTION READ ONLY. Nothing here writes: the one tool that executes "
+      "anything is explainQuery with analyze:true, and it does so only after the "
+      "plan is proven free of any ModifyTable node. The three pooler tools read a "
+      "PgBouncer admin console instead, which refuses transactions: they send "
+      "only fixed SHOW commands, to a connection declared kind = pgbouncer whose "
+      "user should be one of PgBouncer's stats_users, which may run SHOW and "
+      "nothing else.\n\n"
       "explainQuery returns the plan verbatim. There are no heuristics and no "
       "generated DDL -- reading the plan is yours to do.\n\n"
       "Every tool that reads a database takes an optional 'connection' naming "
@@ -9153,6 +9853,9 @@ private:
 
     if (sc.registry)
       return tool_name + " reads no database, so it has no target to sweep";
+    if (sc.pooler && axis != "group")
+      return tool_name + " reads a PgBouncer console, and " + axis + " describes "
+             "PostgreSQL servers; sweep poolers by their group label instead";
     if (tool_name == "explainQuery")
       return "explainQuery never sweeps: the same statement is rarely valid in "
              "another database, and with analyze:true it would execute once per "
@@ -9185,6 +9888,20 @@ private:
       skipped.push_back({{"connection", conn}, {"reason", why}});
     };
 
+    // A group can hold databases and poolers alike, and a question for one
+    // cannot be put to the other: skip the member and say which it is, rather
+    // than fail the sweep or answer with a connect error.
+    {
+      std::vector<std::string> kept;
+      for (const auto& m : members) {
+        const bool pooler = registry_.get(m).is_pooler();
+        if (pooler && !sc.pooler) { skip(m, "a PgBouncer console, not a database"); continue; }
+        if (!pooler && sc.pooler) { skip(m, "a database, not a PgBouncer console"); continue; }
+        kept.push_back(m);
+      }
+      members = kept;
+    }
+
     // A group may span instances and replication groups, so it cannot be
     // refused the way the two topology axes are -- sweeping listTables across
     // two databases on different hosts is exactly what a group is for. Instead
@@ -9203,6 +9920,48 @@ private:
             !seen_group.insert(c.replication_group).second) {
           skip(m, "another member of replication_group " + c.replication_group +
                   " already answered, and this reading is byte-identical across it");
+          continue;
+        }
+        kept.push_back(m);
+      }
+      members = kept;
+    }
+
+    // One database reached directly and through its declared pooler answers a
+    // per-database question twice, identically. Collapsed only when nothing is
+    // guessed: the pooled member declares pooler = <console>, the direct one is
+    // declared the same instance (a claim verifyTopology checks by postmaster),
+    // both connect as the same user, and the console itself says it routes the
+    // pooled name to the direct member's database without forcing another
+    // user. A pooler alias, a different user or an unreadable console keeps
+    // both. The route costs one console read per pooled member, and only
+    // where a direct twin is in the sweep at all.
+    if (sc.per_database) {
+      std::vector<std::string> kept;
+      for (const auto& m : members) {
+        const auto& c = registry_.get(m);
+        std::string twin;
+        auto candidate = [&](const std::string& d) {
+          const auto& dc = registry_.get(d);
+          return d != m && dc.pooler.empty() && dc.instance == c.instance && dc.user == c.user;
+        };
+        if (!c.pooler.empty() && !c.instance.empty() && !c.user.empty() &&
+            std::any_of(members.begin(), members.end(), candidate)) {
+          const json route = pooler_route(c);
+          const bool forced = route.contains("force_user") && route["force_user"].is_string() &&
+                              route["force_user"].get<std::string>() != c.user;
+          if (!route.contains("error") && route.value("found", false) && !forced)
+            for (const auto& d : members)
+              if (candidate(d) && registry_.get(d).dbname == route.value("backend_database", "")) {
+                twin = d;
+                break;
+              }
+        }
+        if (!twin.empty()) {
+          skip(m, "the same database as " + twin + ", reached through " + c.pooler +
+                  " -- declared instance " + c.instance + ", same user, and " +
+                  c.pooler + " routes " + c.dbname + " to " + registry_.get(twin).dbname +
+                  " -- so this answer would repeat it; name the connection to compare");
           continue;
         }
         kept.push_back(m);
@@ -9329,7 +10088,9 @@ private:
             // during an incident beats an exception.
             entry["error"] = e.what();
           }
-          entry["role"] = Session::last_observed_role();
+          // A pooler is neither primary nor replica; "unknown" would read as a
+          // probe that failed rather than a question that does not apply.
+          if (!sc.pooler) entry["role"] = Session::last_observed_role();
           slots[i] = std::move(entry);
         }
       };
@@ -9589,6 +10350,14 @@ private:
 		       "every database of one instance has the same role");
 	    return;
 	  }
+	  // A pooler has no role to observe: filtering on one would skip every
+	  // member as "unknown" and return an empty sweep that looks like an answer.
+	  if (tool_scopes().count(tool_name) && tool_scopes().at(tool_name).pooler) {
+	    send_error(req["id"], -32602,
+		       tool_name + " reads PgBouncer consoles, which are neither "
+		       "primary nor replica; drop role");
+	    return;
+	  }
 	}
 
 	if (!axis.empty()) {
@@ -9612,12 +10381,64 @@ private:
 	// message listing the configured names if this one is unknown, so a
 	// typo fails here rather than as a confusing connect error later.
 	active_ = want_conn;
-	(void)registry_.get(active_);
+	// Set when a pooler tool named a database and its declared console
+	// answered, so the answer says whose it is.
+	std::string answered_by;
+	// A pooler tool with no connection named goes to the only console, not to
+	// the default connection, which is a database; see pooler_default().
+	if (active_.empty() && tool_scopes().count(tool_name) &&
+	    tool_scopes().at(tool_name).pooler) {
+	  active_ = pooler_default();
+	  if (active_.empty()) {
+	    const auto p = pooler_names();
+	    std::string names;
+	    for (const auto& n : p) names += (names.empty() ? "" : ", ") + n;
+	    send_error(req["id"], -32602, p.empty()
+	      ? tool_name + " reads a PgBouncer admin console, and no connection "
+	        "has kind = pgbouncer"
+	      : tool_name + " needs 'connection' naming one PgBouncer console, or "
+	        "'group': several are configured: " + names);
+	    return;
+	  }
+	}
+	const bool target_is_pooler = registry_.get(active_).is_pooler();
+
+	// The console and a database cannot answer each other's questions: the
+	// console refuses BEGIN, which every database tool opens with, and a
+	// database has no SHOW POOLS. Refused by name, before anything connects.
+	if (tool_scopes().count(tool_name) && !tool_scopes().at(tool_name).registry) {
+	  const bool pooler_tool = tool_scopes().at(tool_name).pooler;
+	  if (target_is_pooler && !pooler_tool) {
+	    send_error(req["id"], -32602, "connection " + active_ + " is a PgBouncer "
+	               "console (kind = pgbouncer), which answers only the pooler "
+	               "tools: poolerStatus, poolerConnections and poolerConfig");
+	    return;
+	  }
+	  if (!target_is_pooler && pooler_tool) {
+	    // A database that declares the console it goes through is answered by
+	    // that console, about its own pool: the question "how is the pool in
+	    // front of this database doing" asked by the name the caller knows.
+	    const auto& db = registry_.get(active_);
+	    if (db.pooler.empty()) {
+	      send_error(req["id"], -32602, tool_name + " reads a PgBouncer admin "
+	                 "console, and connection " + active_ + " is a database; name "
+	                 "a connections-file section with kind = pgbouncer, or declare "
+	                 "pooler = <that section> on this one");
+	      return;
+	    }
+	    if (tool_declares(tool_name, "database") && str_arg("database").empty())
+	      arguments["database"] = db.dbname;
+	    answered_by = db.pooler;
+	    active_ = db.pooler;
+	  }
+	}
 
 	if (!dispatch_tool(tool_name, arguments, result_content)) {
 	  send_error(req["id"], -32601, "Tool not found: " + tool_name);
 	  return;
 	}
+	if (!answered_by.empty() && result_content.is_object())
+	  result_content["pooler"] = answered_by;
 
 	send_response(req["id"], tool_result(payload_guard(tool_name, result_content, false)));
 
@@ -9840,7 +10661,7 @@ private:
     // larger when set, and the default is already the small one.
     static const char* kNarrowing[] = {
       "limit", "schema", "table", "pattern", "query_id", "pid", "state",
-      "min_calls", "min_duration_s", "relation"};
+      "min_calls", "min_duration_s", "relation", "database"};
     std::string args;
     for (const char* k : kNarrowing)
       if (tool_declares(tool, k) && !tool_requires(tool, k))

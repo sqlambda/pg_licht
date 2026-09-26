@@ -1,5 +1,170 @@
 # Changelog
 
+## 4.5.0 (unreleased)
+
+### Added
+
+- **Three tools for PgBouncer, the pooler in front of the database.**
+  pg_licht has always run *through* PgBouncer; now it reads the pooler
+  itself.
+  - `poolerStatus`: per database, clients active and waiting, the longest
+    current wait, and servers active, idle and logging in against the
+    `pool_size` each database is allowed, with PgBouncer's averages per
+    transaction, query and wait. `saturated` is true when a client is queued
+    for a server, which is the pooler being the bottleneck, and `pool_mode`
+    is the one in effect. The raw `SHOW POOLS`, `STATS` and `DATABASES` rows
+    come beside the summary, keyed by whatever columns this PgBouncer version
+    reports, and `SHOW LISTS` as totals.
+  - `poolerConnections`: every client and server connection with its state,
+    and counts by state (after the `database` filter, before `state` and
+    `limit`).
+  - `poolerConfig`: the settings that differ from PgBouncer's defaults (or
+    all of them), with a literal `pattern`.
+
+- **`kind = pgbouncer` in the connections file** names a PgBouncer admin
+  console. Only the pooler tools run against it, and they run against
+  nothing else, each refusal naming the reason before anything connects. A
+  pooler takes `group` labels, so a group sweep can ask every pooler at once
+  and skips the databases in the group (and the reverse); `instance` and
+  `replication_group` describe PostgreSQL servers and are refused on it. It
+  is never inferred into an instance, though a database reached through the
+  same pooler shares its host and port. `listConnections` shows the kind,
+  `verifyTopology` lists poolers apart from the servers it checks, and
+  `checkPrivileges` counts only the tools a database can run. A call naming
+  no connection goes to the first section that is not a pooler, no resources
+  are listed for one, and `kind` given twice is refused.
+
+- **Each `SHOW` is bounded by the section's `statement_timeout_ms`**, kept on
+  the client side and cancelled on expiry, since the console has no
+  `statement_timeout` to set. A command an older PgBouncer does not know is
+  named under `unavailable` and the rest of the answer still comes back; only
+  a console that answers nothing is an error, which like an absent extension
+  is an answer carrying `error` and `hint`. Invalid UTF-8 a client sent as its
+  `application_name` becomes U+FFFD rather than failing the call.
+
+- **The guarantee is different for a pooler, and the documentation says
+  so.** The console refuses `BEGIN` and `SET`, so no `READ ONLY` transaction
+  can be opened there. The pooler tools send only `SHOW` commands fixed in
+  the server, with nothing from the caller in them, and the section's user
+  should be one of PgBouncer's `stats_users`, which may run `SHOW` and is
+  refused `PAUSE`, `RELOAD`, `SET` and everything else. That second guard is
+  the operator's: pg_licht cannot tell a stats user from an admin one without
+  trying something only an admin may do. The MCP instructions, the
+  manual, the README, the landing page and `llms.txt` all said every call ran
+  in a read-only transaction; each now says which calls do and what guards
+  the rest. The pooler tools return client addresses and application names,
+  backend hosts and pool users, a new entry under "What reaches the caller";
+  no statement text and no password reach the caller from the pooler.
+
+  Found on the way, against a real PgBouncer 1.25.2: libpqxx refuses to
+  connect to the console at all ("Unsupported server version; 9.0 is the
+  minimum", since the console reports PgBouncer's own version), so the
+  pooler tools speak to it through libpq directly.
+
+### Fixed
+
+- **`verifyTopology`'s reachability warning said the opposite of what it
+  meant.** It read "every finding above covers only what answered:" followed
+  by the connections that had *not* answered, and it was the one finding with
+  an empty `name`. It is now named for its count ("3 of 9 connections
+  unreached"), says "could not connect to" before the list, and says how many
+  connections the other findings were checked against -- or that nothing
+  could be checked, when none answered. Found on a lab registry of eight
+  unreachable servers.
+
+- **`verifyTopology` called one server reached through its own pooler two
+  servers**, and reported a correct `instance` declaration as an error
+  ("declare them as a replication_group instead"). It told a postmaster by
+  the address it reported, and behind PgBouncer `inet_server_addr()` is the
+  pooler's own hop to PostgreSQL -- `127.0.0.1` for a pooler on the
+  database's machine -- so a database reached directly and through the pooler
+  on the same host reported two addresses. A postmaster is now told by its
+  system identifier and `pg_postmaster_start_time()`, both read from the
+  server, and each connection reports its `postmaster_start_time`. A replica
+  has its own postmaster and start time, so it is still caught; and a member
+  on a Unix socket, which has no address, no longer leaves the question
+  open. Found on a lab where the direct and pooled connections to one
+  server were declared one instance, as they are. The test rig's primary
+  now also listens on `127.0.0.2` to reproduce it.
+
+- **A PgBouncer console configured as a database now says so.** A section
+  with `dbname = pgbouncer` but no `kind = pgbouncer` reached libpqxx, which
+  refused it with "Unsupported server version; 9.0 is the minimum" -- true,
+  since the console reports PgBouncer's own version, but it named neither
+  the console nor the fix. That error now carries the connection's name and
+  "add kind = pgbouncer to its section", on every path that connects:
+  tools, sweeps, `verifyTopology` and resources. It is not refused at
+  startup, because a real database may be named `pgbouncer` -- `auth_query`
+  functions often live in one -- and only connecting tells the two apart.
+
+- **One invalid section no longer stops the server.** A section that did not
+  validate -- a PgBouncer console left with an `instance` key, an unknown
+  `kind` -- was fatal, so one mistake took every other connection down with
+  it. It is now skipped: a line on stderr names it, `listConnections` and
+  `verifyTopology` list it under `invalid` with the reason (and
+  `verifyTopology` raises it as a `configuration` finding), and a call naming
+  it gets the reason instead of "unknown connection". What is not one
+  section's still stops startup: an unreadable or malformed file, a duplicate
+  header, a name reused across two axes, and a file with no usable section.
+
+- **A startup failure reads "Configuration error:"**, not "Fatal DB Error:".
+  Nothing has connected at that point -- connections open on the first call
+  that needs one -- so the old label named a database no one had reached.
+
+- **`verifyTopology` called one primary listed twice in a
+  `replication_group` split brain.** The same mistake as the `instance` one
+  above: two connections to one server counted as two primaries. Primaries
+  are now counted by postmaster, so one server listed twice is a warning
+  saying so, and split brain -- two postmasters of one lineage both taking
+  writes -- is still an error. The rig now builds real split brain, a copy of
+  the primary started as a primary, since the only fixture for it until now
+  was the case that turned out not to be it.
+
+- **`poolerConfig` reported defaults as changes.** PgBouncer prints
+  `unix_socket_mode` in decimal and its default in octal, 511 against 0777,
+  and a string compare called that a change; numbers are now compared as
+  numbers. A setting with no default at all -- `conffile`, `auth_file` --
+  was listed as changed on every pooler; it is returned under
+  `without_default` with its value instead.
+
+- **A pooler tool with no `connection` went to the default connection**,
+  which is a database, so it was always refused while its schema said it
+  "defaults to" that database. It now reads the only PgBouncer console
+  configured, and with several it asks which, naming them; the schema says
+  which applies.
+
+- **`pooler = <section>` declares that a database connection goes through a
+  PgBouncer console.** Nothing else in the file could say so: through the
+  pooler, the server's address is the pooler's own hop. Declared, never
+  inferred, and checked:
+  - `verifyTopology` reads the console's `SHOW DATABASES` and reports the
+    `route` beside the connection -- backend host, port and database,
+    `force_user`, pool mode and size, and whether PgBouncer's `*` fallback
+    routed it. A name the pooler cannot route, or routes to another database
+    or port, is an error; an alias is noted; and the direct connection that
+    is the same database -- one postmaster, one database, one user -- is
+    named.
+  - The pooler tools accept the database's name as `connection` and answer
+    from its console, about its own pool, with `pooler` naming the console.
+  - A per-database sweep answers that database once. The pooled member is
+    skipped only when a direct member is declared the same instance,
+    connects as the same user, and the console routes the pooled name to
+    the direct member's database without forcing another user; the skip
+    names the twin. Anything less keeps both. Guessing this from the
+    configuration alone was considered and rejected, since a pooler alias or
+    another user can make the two answers differ.
+  - It must name a console that loaded, only a database section may carry
+    it, and it may be given once; otherwise the section is skipped.
+
+### Documented
+
+- **Citus hides its shards from pg_licht.** On a worker, the shards are
+  visible only to clients whose `application_name` matches
+  `citus.show_shards_for_app_name_prefixes`, so every size and statistics
+  tool reported a worker holding gigabytes as holding nothing. The manual
+  (COMPATIBILITY) and the README give the one `ALTER ROLE` that shows them;
+  pg_licht cannot set it itself, since it needs a superuser.
+
 ## 4.4.0 (2026-09-22)
 
 ### Added

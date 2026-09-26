@@ -4821,6 +4821,15 @@ TEST(ConnectionConfigTest, UnknownConnectionNameListsConfiguredOnes) {
   }
 }
 
+// A call naming no connection is a database question, and a console listed
+// first would refuse every one of them.
+TEST(ConnectionConfigTest, APoolerListedFirstIsNotTheDefault) {
+  auto reg = load("[pool]\nkind = pgbouncer\nport = 6432\n\n[app]\ndbname = one\n");
+  EXPECT_EQ(reg.default_name(), "app");
+  // Only a file of nothing but poolers defaults to one.
+  EXPECT_EQ(load("[pool]\nkind = pgbouncer\nport = 6432\n").default_name(), "pool");
+}
+
 TEST(ConnectionConfigTest, EmptyNameResolvesToDefault) {
   auto reg = load("[first]\ndbname = one\n\n[second]\ndbname = two\n");
   // No [default] section, so the first in file order becomes the default.
@@ -5259,13 +5268,15 @@ TEST_F(PostgresMCPServerTest, EveryToolIsClassified) {
           d.find("instance-wide") != std::string::npos ||
           d.find("byte-identical here") != std::string::npos ||
           d.find("each server's own") != std::string::npos ||
-          d.find("Never runs across more than one connection") != std::string::npos;
+          d.find("Never runs across more than one connection") != std::string::npos ||
+          d.find("Reads a PgBouncer admin console") != std::string::npos;
       EXPECT_TRUE(classified) << name << " carries no scope note: " << d;
       // And the note is a sentence of its own, not run into the one before.
       for (const char* opener : {" This reading is instance-wide",
                                  " A physical replica is byte-identical",
                                  " The counters here are each server's own",
-                                 " Never runs across more than one connection"}) {
+                                 " Never runs across more than one connection",
+                                 " Reads a PgBouncer admin console"}) {
         const auto at = d.find(opener);
         if (at != std::string::npos && at > 0) {
           EXPECT_TRUE(d[at - 1] == '.' || d[at - 1] == '!' || d[at - 1] == '?')
@@ -7003,7 +7014,13 @@ TEST_F(PostgresMCPServerTest, CheckPrivilegesCountsEveryToolExactlyOnce) {
   // Tools absent from both lists are fully available, so the arithmetic has to
   // close or the count is telling the caller something untrue.
   EXPECT_EQ(avail + degraded + denied, total);
-  EXPECT_EQ(total, srv->call_tools_list().size());
+  // Every tool a database can run: the pooler tools need a kind = pgbouncer
+  // connection, and counting them here would report them as missing.
+  size_t database_tools = 0;
+  for (const auto& t : srv->call_tools_list())
+    if (t.value("description", "").find("Reads a PgBouncer admin console") == std::string::npos)
+      database_tools++;
+  EXPECT_EQ(total, database_tools);
   EXPECT_EQ(r["connection"].get<std::string>(), "default");
   EXPECT_FALSE(r["role"].get<std::string>().empty());
 }
@@ -7651,6 +7668,31 @@ TEST_F(TopologyFixture, VerifyTopologyAcceptsATrueInstanceDeclaration) {
   EXPECT_EQ(v["connections"][0]["instance"], "pg-01");
 }
 
+// One postmaster reached directly and through a pooler on its own machine
+// reports two server addresses: inet_server_addr() behind PgBouncer is the
+// pooler's hop, 127.0.0.1. Through 4.4 that read as two servers and a correct
+// instance declaration was an error -- found on a lab declared exactly so.
+TEST_F(TopologyFixture, VerifyTopologyKnowsOneServerReachedThroughItsPooler) {
+  const char* alt = std::getenv("ALT_ADDR_URL");
+  const char* pool = std::getenv("POOLER_PORT");
+  if (!alt || !pool) GTEST_SKIP() << "no ALT_ADDR_URL; run cpp/test/run-pooled-tests.sh";
+  const std::string pooled = "host=127.0.0.1 port=" + std::string(pool) +
+                             " dbname=pglicht user=pglicht";
+  auto s = server_from(section("direct", alt, "instance = pg-01\n") +
+                       section("pooled", pooled, "instance = pg-01\n"));
+  json v = s->call_verify_topology();
+  ASSERT_EQ(v["connections"].size(), 2u) << v.dump(2);
+  const json& d = v["connections"][0];
+  const json& p = v["connections"][1];
+  ASSERT_FALSE(d.contains("error")) << v.dump(2);
+  ASSERT_FALSE(p.contains("error")) << v.dump(2);
+  // The premise: the two report different addresses for one server.
+  ASSERT_NE(d.value("server_addr", ""), p.value("server_addr", "")) << v.dump(2);
+  // And the evidence that settles it is reported beside them.
+  EXPECT_EQ(d["postmaster_start_time"], p["postmaster_start_time"]) << v.dump(2);
+  EXPECT_FALSE(has_topic(v["findings"], "instance")) << v.dump(2);
+}
+
 TEST_F(TopologyFixture, VerifyTopologyFlagsALineageTheConfigDoesNotDeclare) {
   // Same server under two names, declared as two separate instances. They hold
   // the same data and neither declaration ties them together -- the case where
@@ -7661,20 +7703,51 @@ TEST_F(TopologyFixture, VerifyTopologyFlagsALineageTheConfigDoesNotDeclare) {
   ASSERT_TRUE(has_topic(v["findings"], "system_identifier")) << v.dump(2);
 }
 
-TEST_F(TopologyFixture, VerifyTopologyCallsTwoPrimariesSplitBrain) {
-  // Two names for the same primary, declared as a replication group. Exactly
-  // the shape of split brain, and the tool must report both rather than pick.
+// One primary under two names, declared a replication group. Through 4.4 this
+// was the test for split brain, because it was the only way to make two
+// "primaries" -- and so the check called one server listed twice split brain
+// too. It is a configuration mistake, and says so.
+TEST_F(TopologyFixture, VerifyTopologyKnowsOnePrimaryListedTwiceIsNotSplitBrain) {
   auto s = server_from(ini_with("replication_group = ha\n") +
                        section("twin", test_url, "replication_group = ha\n"));
   json v = s->call_verify_topology();
+  bool split = false, twice = false;
+  for (const auto& f : v["findings"]) {
+    if (f["topic"] != "replication_group") continue;
+    const std::string d = f["detail"];
+    if (f["severity"] == "error" && d.find("which is split brain") != std::string::npos)
+      split = true;
+    if (d.find("listed more than once") != std::string::npos) {
+      twice = true;
+      EXPECT_EQ(f["severity"], "warning");
+      EXPECT_NE(d.find("default"), std::string::npos) << d;
+      EXPECT_NE(d.find("twin"), std::string::npos) << d;
+    }
+  }
+  EXPECT_FALSE(split) << v.dump(2);
+  EXPECT_TRUE(twice) << v.dump(2);
+}
+
+// The real thing: a copy of the primary started as a primary of its own. Same
+// system identifier, a different postmaster, both taking writes.
+TEST_F(TopologyFixture, VerifyTopologyCallsTwoPrimariesSplitBrain) {
+  const char* split_url = std::getenv("SPLIT_URL");
+  if (!split_url) GTEST_SKIP() << "no SPLIT_URL; run cpp/test/run-pooled-tests.sh";
+  auto s = server_from(ini_with("replication_group = ha\n") +
+                       section("rogue", split_url, "replication_group = ha\n"));
+  json v = s->call_verify_topology();
+  ASSERT_EQ(v["connections"][0]["system_identifier"], v["connections"][1]["system_identifier"])
+    << v.dump(2);
+  ASSERT_NE(v["connections"][0]["postmaster_start_time"],
+            v["connections"][1]["postmaster_start_time"]) << v.dump(2);
 
   bool split = false;
   for (const auto& f : v["findings"]) {
-    if (f["topic"] == "replication_group" &&
+    if (f["topic"] == "replication_group" && f["severity"] == "error" &&
         f["detail"].get<std::string>().find("split") != std::string::npos) {
       split = true;
       EXPECT_NE(f["detail"].get<std::string>().find("default"), std::string::npos);
-      EXPECT_NE(f["detail"].get<std::string>().find("twin"), std::string::npos);
+      EXPECT_NE(f["detail"].get<std::string>().find("rogue"), std::string::npos);
     }
   }
   EXPECT_TRUE(split) << v.dump(2);
@@ -7693,7 +7766,17 @@ TEST_F(TopologyFixture, VerifyTopologySurvivesAnUnreachableMember) {
   EXPECT_FALSE(dead.contains("role"));
   // The reachable one is still fully reported.
   EXPECT_EQ(v["connections"][0]["role"], "primary");
-  EXPECT_TRUE(has_topic(v["findings"], "reachability")) << v.dump(2);
+  ASSERT_TRUE(has_topic(v["findings"], "reachability")) << v.dump(2);
+  // The finding names the unreached member as unreached -- it once listed them
+  // after "covers only what answered:", which reads as the opposite -- and it
+  // has a name, as every other finding does.
+  for (const auto& f : v["findings"]) {
+    if (f["topic"] != "reachability") continue;
+    EXPECT_EQ(f["name"], "1 of 2 connections unreached") << f.dump(2);
+    const std::string d = f["detail"];
+    EXPECT_EQ(d.rfind("could not connect to dead. ", 0), 0u) << d;
+    EXPECT_NE(d.find("only against the 1 that answered"), std::string::npos) << d;
+  }
 }
 
 TEST_F(TopologyFixture, VerifyTopologyReadsARealStandbyAsAReplica) {
@@ -8114,6 +8197,9 @@ TEST_F(PostgresMCPServerTest, NoSchemaWideAnswerIsRefusedWithoutAWayToNarrowIt) 
     else if (req.empty()) args = json::object();
     else continue;
     const std::string name = t["name"];
+    // A pooler answers about connections, not about a database's schema.
+    if (t.value("description", "").find("Reads a PgBouncer admin console") != std::string::npos)
+      continue;
     json resp = rpc_call(s, name, args);
     // explainQuery needs one of queryid or sql, which a schema cannot say is
     // required; called with neither it rightly refuses, and that is not this
@@ -8142,6 +8228,493 @@ TEST_F(PostgresMCPServerTest, NoSchemaWideAnswerIsRefusedWithoutAWayToNarrowIt) 
   n.exec("DROP SCHEMA " + sch + " CASCADE");
   n.exec("DO $$ BEGIN FOR i IN 1..300 LOOP "
          "EXECUTE format('DROP SCHEMA " + sch + "_tenant_%s CASCADE', i); END LOOP; END $$");
+}
+
+// --- PgBouncer consoles: kind = pgbouncer ---
+
+namespace {
+// A connections-file section for the rig's PgBouncer console, or "" outside
+// the rig. The console is PgBouncer's own listen port and database pgbouncer.
+std::string pooler_section(const std::string& name, const std::string& extra = "") {
+  const char* port = std::getenv("POOLER_PORT");
+  const char* user = std::getenv("POOLER_USER");
+  if (!port || !user) return "";
+  return "[" + name + "]\nkind = pgbouncer\nhost = 127.0.0.1\nport = " + port +
+         "\nuser = " + user + "\n" + extra;
+}
+}  // namespace
+
+// Checked where the file is read, so a mistake names its section at startup
+// instead of surfacing as a connect error on the first call.
+TEST_F(TopologyFixture, APoolerSectionIsValidatedWhereItIsRead) {
+  auto pooler = [](const std::string& extra) {
+    return "[pool]\nkind = pgbouncer\nhost = 127.0.0.1\nport = 6432\n" + extra;
+  };
+  // Each refusal is matched by its message: a bare EXPECT_THROW passed on
+  // whatever else in the section happened to be wrong. A refused section is
+  // skipped rather than fatal since 4.5, so the refusal is read from
+  // listConnections, where the section is listed as invalid with its reason,
+  // while [default] beside it still loads.
+  auto refused = [&](const std::string& body, const std::string& says) {
+    auto s = server_from(ini_with("") + body);
+    json c = s->call_connections("");
+    ASSERT_EQ(c["connections"].size(), 1u) << c.dump(2);
+    EXPECT_EQ(c["connections"][0]["name"], "default");
+    ASSERT_TRUE(c.contains("invalid")) << "accepted:\n" << body;
+    ASSERT_EQ(c["invalid"].size(), 1u) << c.dump(2);
+    EXPECT_NE(c["invalid"][0]["error"].get<std::string>().find(says), std::string::npos)
+      << "refused for another reason: " << c["invalid"][0].dump();
+  };
+  refused("[x]\nkind = pgpool\nhost = h\nport = 1\ndbname = x\n", "kind = pgpool is not known");
+  // The kind decides which tools reach the connection; two would be decided
+  // by whichever line came last.
+  refused(pooler("kind = postgres\n"), "declares 'kind' more than once");
+  // instance and replication_group describe PostgreSQL servers.
+  refused(pooler("instance = pg-01\n"), "instance");
+  refused(pooler("replication_group = ha\n"), "replication_group");
+  // A different dbname is a database reached through the pooler, not the pooler.
+  refused(pooler("dbname = app\n"), "dbname");
+
+  // A console on :6432 and two databases reached through :6432 share host and
+  // port: the databases are inferred to be one instance, the console is not.
+  auto s = server_from(ini_with("") + pooler("group = poolers\n") +
+                       "[a]\nhost = 127.0.0.1\nport = 6432\ndbname = a\n"
+                       "[b]\nhost = 127.0.0.1\nport = 6432\ndbname = b\n");
+  json conns = s->call_connections("");
+  for (const auto& c : conns["connections"]) {
+    if (c["name"] == "pool") {
+      EXPECT_EQ(c["kind"], "pgbouncer");
+      EXPECT_EQ(c["dbname"], "pgbouncer");
+      EXPECT_FALSE(c.contains("instance")) << c.dump();
+    } else {
+      EXPECT_FALSE(c.contains("kind")) << "a database answers as it always has: " << c.dump();
+    }
+    if (c["name"] == "a") {
+      EXPECT_EQ(c.value("instance", ""), "127.0.0.1:6432") << c.dump();
+    }
+  }
+}
+
+// One section that does not validate used to stop the server, and every other
+// connection with it -- found when a PgBouncer console left with an instance
+// key took a whole lab and an unrelated database offline. It is skipped now,
+// and said so everywhere the operator would look.
+TEST_F(TopologyFixture, AnInvalidSectionIsSkippedAndSaysWhy) {
+  const std::string bad = "[broken]\nkind = pgbouncer\nhost = h\nport = 1\ninstance = pg-x\n";
+  // Its instance section is claimed only by the skipped one: still not fatal.
+  auto s = server_from(ini_with("") + bad + "[instance:pg-x]\nhost_ram_mb = 1024\n");
+
+  json c = s->call_connections("");
+  ASSERT_EQ(c["connections"].size(), 1u) << c.dump(2);
+  ASSERT_EQ(c["invalid"].size(), 1u) << c.dump(2);
+  EXPECT_EQ(c["invalid"][0]["name"], "broken");
+
+  // The rest works.
+  json ok = rpc_payload(rpc_call(*s, "listSchemas", json::object()));
+  EXPECT_FALSE(ok.contains("error")) << ok.dump(2);
+
+  // A call naming it gets the reason, not "unknown connection".
+  json named = rpc_call(*s, "listSchemas", {{"connection", "broken"}});
+  const std::string msg = named.dump();
+  EXPECT_NE(msg.find("skipped at startup"), std::string::npos) << msg;
+  EXPECT_NE(msg.find("instance"), std::string::npos) << msg;
+
+  // verifyTopology lists it and raises it as a finding.
+  json v = s->call_verify_topology();
+  ASSERT_EQ(v["invalid"].size(), 1u) << v.dump(2);
+  bool found = false;
+  for (const auto& f : v["findings"])
+    if (f["topic"] == "configuration" && f["name"] == "broken") found = true;
+  EXPECT_TRUE(found) << v.dump(2);
+
+  // A file with nothing usable still stops startup, naming why.
+  try {
+    server_from(bad);
+    ADD_FAILURE() << "a file with no usable section was accepted";
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("no usable connection section"), std::string::npos)
+      << e.what();
+  }
+}
+
+// The console refuses BEGIN, which every database tool opens with, and a
+// database has no SHOW POOLS: each side refuses the other's tools by name,
+// before anything connects -- which is why an unreachable pooler will do here.
+TEST_F(TopologyFixture, APoolerAndADatabaseRefuseEachOthersTools) {
+  auto s = server_from(ini_with("group = both\ninstance = pg-01\n") +
+                       "[pool]\nkind = pgbouncer\nhost = 127.0.0.1\nport = 1\ngroup = both\n");
+  json db_on_pool = rpc_call(*s, "listTables", {{"connection", "pool"}, {"schema", "public"}});
+  ASSERT_TRUE(db_on_pool.contains("error")) << db_on_pool.dump(2);
+  EXPECT_EQ(db_on_pool["error"]["code"], -32602);
+  EXPECT_NE(db_on_pool["error"]["message"].get<std::string>().find("PgBouncer console"),
+            std::string::npos);
+
+  json pool_on_db = rpc_call(*s, "poolerStatus", {{"connection", "default"}});
+  ASSERT_TRUE(pool_on_db.contains("error")) << pool_on_db.dump(2);
+  EXPECT_EQ(pool_on_db["error"]["code"], -32602);
+
+  // Sweeps by instance or replication group describe PostgreSQL servers.
+  json by_instance = rpc_call(*s, "poolerStatus", {{"instance", "pg-01"}});
+  ASSERT_TRUE(by_instance.contains("error")) << by_instance.dump(2);
+  EXPECT_EQ(by_instance["error"]["code"], -32602);
+  EXPECT_NE(by_instance["error"]["message"].get<std::string>().find("group label"),
+            std::string::npos) << by_instance.dump(2);
+
+  // A group holding both skips the member of the other kind, and says so.
+  json swept = rpc_payload(rpc_call(*s, "listSchemas", {{"group", "both"}}));
+  bool skipped_pool = false;
+  for (const auto& k : swept.value("skipped", json::array()))
+    if (k["connection"] == "pool") {
+      skipped_pool = true;
+      EXPECT_NE(k["reason"].get<std::string>().find("PgBouncer console"), std::string::npos);
+    }
+  EXPECT_TRUE(skipped_pool) << swept.dump(2);
+
+  // And beneath dispatch: a pooler call on a database connection is refused
+  // rather than sending SHOW to PostgreSQL, which would be another command.
+  json direct = s->call_pooler_status();
+  ASSERT_TRUE(direct.contains("error")) << direct.dump(2);
+  EXPECT_NE(direct["error"].get<std::string>().find("not a PgBouncer console"),
+            std::string::npos) << direct.dump(2);
+
+  // A pooler has no role; a filter on one would skip every member as
+  // "unknown" and answer with an empty sweep.
+  json with_role = rpc_call(*s, "poolerStatus", {{"group", "both"}, {"role", "primary"}});
+  ASSERT_TRUE(with_role.contains("error")) << with_role.dump(2);
+  EXPECT_EQ(with_role["error"]["code"], -32602);
+
+  // Resources are database documents: none is listed for the console, and
+  // one asked for by URI is refused by name rather than as a failed BEGIN.
+  json listed = rpc1(*s, "resources/list", json::object());
+  for (const auto& r : listed["result"]["resources"])
+    EXPECT_EQ(r["uri"].get<std::string>().find("pglicht://pool/"), std::string::npos) << r.dump();
+  json read = rpc1(*s, "resources/read", {{"uri", "pglicht://pool/server/settings"}});
+  ASSERT_TRUE(read.contains("error")) << read.dump(2);
+  EXPECT_NE(read["error"]["message"].get<std::string>().find("PgBouncer console"),
+            std::string::npos) << read.dump(2);
+
+  // checkPrivileges counts what a database can offer, not the pooler tools.
+  json p = s->call_check_privileges();
+  EXPECT_EQ(p["tools"].get<size_t>(), s->call_tools_list().size() - 3) << p.dump(2);
+}
+
+// The console configured as a database: dbname = pgbouncer, no kind. libpqxx
+// refuses it for its version, and that message named neither the console nor
+// the fix -- found on a lab config written exactly so.
+TEST_F(TopologyFixture, AConsoleConfiguredAsADatabaseIsNamedAsOne) {
+  const char* port = std::getenv("POOLER_PORT");
+  const char* user = std::getenv("POOLER_USER");
+  if (!port || !user) GTEST_SKIP() << "no POOLER_PORT; run cpp/test/run-pooled-tests.sh";
+  auto s = server_from(ini_with("") + "[console]\nhost = 127.0.0.1\nport = " + port +
+                       "\ndbname = pgbouncer\nuser = " + user + "\n");
+
+  json r = rpc_call(*s, "listSchemas", {{"connection", "console"}});
+  ASSERT_TRUE(r.contains("result")) << r.dump(2);
+  EXPECT_TRUE(r["result"].value("isError", false)) << r.dump(2);
+  const std::string text = r["result"]["content"][0]["text"];
+  EXPECT_NE(text.find("add kind = pgbouncer"), std::string::npos) << text;
+  EXPECT_NE(text.find("almost certainly a PgBouncer admin console"), std::string::npos) << text;
+  // libpqxx's own words stay, as the evidence.
+  EXPECT_NE(text.find("Unsupported server version"), std::string::npos) << text;
+
+  // verifyTopology reports it in place, with the same hint.
+  json v = s->call_verify_topology();
+  bool seen = false;
+  for (const auto& c : v["connections"])
+    if (c["connection"] == "console") {
+      seen = true;
+      EXPECT_NE(c.value("error", "").find("add kind = pgbouncer"), std::string::npos) << c.dump(2);
+    }
+  EXPECT_TRUE(seen) << v.dump(2);
+}
+
+// pooler = <console> names a console that survived validation, on a database
+// section only. A route to nothing is skipped like any other invalid section.
+TEST_F(TopologyFixture, APoolerRouteIsValidatedAgainstTheOtherSections) {
+  const std::string console = "[pool]\nkind = pgbouncer\nhost = 127.0.0.1\nport = 6432\n";
+  auto reason = [&](const std::string& body) -> std::string {
+    auto s = server_from(ini_with("") + body);
+    json c = s->call_connections("");
+    return c.contains("invalid") ? c["invalid"].dump() : std::string{};
+  };
+  EXPECT_NE(reason("[p]\nhost = h\ndbname = d\npooler = nowhere\n").find("names no section"),
+            std::string::npos);
+  EXPECT_NE(reason("[p]\nhost = h\ndbname = d\npooler = default\n")
+              .find("not one with kind = pgbouncer"), std::string::npos);
+  EXPECT_NE(reason(console + "[p]\nhost = h\ndbname = d\npooler = pool\npooler = pool\n")
+              .find("more than once"), std::string::npos);
+  EXPECT_NE(reason("[pool]\nkind = pgbouncer\nhost = h\nport = 1\npooler = pool\n")
+              .find("belongs on a database section"), std::string::npos);
+
+  auto s = server_from(ini_with("") + console + "[p]\nhost = 127.0.0.1\nport = 6432\n"
+                       "dbname = d\npooler = pool\n");
+  const json listed = s->call_connections("");
+  for (const auto& c : listed["connections"]) {
+    if (c["name"] == "p") { EXPECT_EQ(c.value("pooler", ""), "pool") << c.dump(); }
+  }
+}
+
+// The route, read from the console and checked against what answered. The
+// rig's PgBouncer routes every name to its same-named database through '*',
+// and licht_saturate to pglicht: an alias.
+TEST_F(TopologyFixture, APooledConnectionIsCheckedAgainstItsRoute) {
+  const char* alt = std::getenv("ALT_ADDR_URL");
+  const char* port = std::getenv("POOLER_PORT");
+  const std::string pool = pooler_section("pool");
+  if (!alt || !port || pool.empty()) GTEST_SKIP() << "run cpp/test/run-pooled-tests.sh";
+  const std::string via = "[pooled]\nhost = 127.0.0.1\nport = " + std::string(port) +
+                          "\ndbname = pglicht\nuser = pglicht\ninstance = pg-01\n"
+                          "pooler = pool\ngroup = g\n";
+  const std::string alias = "[aliased]\nhost = 127.0.0.1\nport = " + std::string(port) +
+                            "\ndbname = licht_saturate\nuser = pglicht\npooler = pool\n";
+  const std::string lost = "[lost]\nhost = 127.0.0.1\nport = " + std::string(port) +
+                           "\ndbname = no_such_route\nuser = pglicht\npooler = pool\n";
+  auto s = server_from(section("direct", alt, "instance = pg-01\ngroup = g\n") + via +
+                       alias + pool);
+
+  json v = s->call_verify_topology();
+  const json* pooled = nullptr;
+  for (const auto& c : v["connections"]) if (c["connection"] == "pooled") pooled = &c;
+  ASSERT_NE(pooled, nullptr) << v.dump(2);
+  ASSERT_TRUE(pooled->contains("route")) << pooled->dump(2);
+  EXPECT_TRUE((*pooled)["route"].value("found", false)) << pooled->dump(2);
+  EXPECT_EQ((*pooled)["route"].value("backend_database", ""), "pglicht") << pooled->dump(2);
+  EXPECT_EQ(count_severity(v["findings"], "error"), 0) << v.dump(2);
+  bool same = false, aliased = false;
+  for (const auto& f : v["findings"]) {
+    const std::string d = f.value("detail", "");
+    if (f["name"] == "pooled" && d.find("reaches the same database as direct") != std::string::npos)
+      same = true;
+    if (f["name"] == "aliased" && d.find("an alias") != std::string::npos) aliased = true;
+  }
+  EXPECT_TRUE(same) << v.dump(2);
+  EXPECT_TRUE(aliased) << v.dump(2);
+
+  // The pool in front of a database, asked by the database's name.
+  json st = rpc_payload(rpc_call(*s, "poolerStatus", {{"connection", "aliased"}}));
+  ASSERT_FALSE(st.contains("error")) << st.dump(2);
+  EXPECT_EQ(st.value("pooler", ""), "pool") << st.dump(2);
+  ASSERT_EQ(st["summary"].size(), 1u) << st.dump(2);
+  EXPECT_EQ(st["summary"][0]["database"], "licht_saturate") << st.dump(2);
+
+  // A per-database sweep answers that database once, and says why it skipped
+  // the pooled twin.
+  json swept = rpc_payload(rpc_call(*s, "listSchemas", {{"group", "g"}}));
+  ASSERT_EQ(swept["members"].size(), 1u) << swept.dump(2);
+  EXPECT_EQ(swept["members"][0]["connection"], "direct");
+  bool twin = false;
+  for (const auto& k : swept.value("skipped", json::array()))
+    if (k["connection"] == "pooled" &&
+        k["reason"].get<std::string>().find("the same database as direct") != std::string::npos)
+      twin = true;
+  EXPECT_TRUE(twin) << swept.dump(2);
+
+  // A route that forces another user keeps both: that user may see another
+  // database's worth of rows, grants and objects.
+  const std::string forced = "[forced]\nhost = 127.0.0.1\nport = " + std::string(port) +
+                             "\ndbname = licht_forced\nuser = pglicht\ninstance = pg-01\n"
+                             "pooler = pool\ngroup = f\n";
+  auto fs = server_from(section("direct", alt, "instance = pg-01\ngroup = f\n") + forced + pool);
+  json fsweep = rpc_call(*fs, "listSchemas", {{"group", "f"}});
+  json fp = rpc_payload(fsweep);
+  EXPECT_EQ(fp["members"].size(), 2u) << "a forced user was collapsed: " << fp.dump(2);
+
+  // A name with no entry of its own is routed by the '*' fallback -- the
+  // rig's PgBouncer has one -- so the connection fails on the server's
+  // "database does not exist", with the route reported beside it. PgBouncer
+  // registers a fallback database as its own entry the moment a client asks
+  // for it, and verifyTopology connects before it reads the route, so the
+  // entry is found by name here rather than through '*'.
+  auto l = server_from(ini_with("") + lost + pool);
+  json lv = l->call_verify_topology();
+  bool reported = false;
+  for (const auto& c : lv["connections"]) {
+    if (c["connection"] != "lost") continue;
+    reported = true;
+    EXPECT_TRUE(c.contains("error")) << c.dump(2);
+    ASSERT_TRUE(c.contains("route")) << c.dump(2);
+    EXPECT_TRUE(c["route"].value("found", false)) << c.dump(2);
+    EXPECT_EQ(c["route"].value("backend_database", ""), "no_such_route") << c.dump(2);
+  }
+  EXPECT_TRUE(reported) << lv.dump(2);
+}
+
+// The console itself, in the rig: the answers are real, the stats user can
+// read them, and a sweep of a group of poolers reports no role for them.
+TEST_F(TopologyFixture, PoolerToolsReadTheConsole) {
+  const std::string pool = pooler_section("pool", "group = poolers\n");
+  if (pool.empty()) GTEST_SKIP() << "no POOLER_PORT; run cpp/test/run-pooled-tests.sh";
+  auto s = server_from(ini_with("group = poolers\n") + pool);
+
+  json st = rpc_payload(rpc_call(s.operator*(), "poolerStatus", {{"connection", "pool"}}));
+  ASSERT_FALSE(st.contains("error")) << st.dump(2);
+  EXPECT_EQ(st["version"].get<std::string>().rfind("PgBouncer ", 0), 0u) << st["version"];
+  EXPECT_TRUE(st["summary"].is_array());
+  EXPECT_TRUE(st["lists"].contains("pools")) << st["lists"].dump();
+
+  json conns = rpc_payload(rpc_call(*s, "poolerConnections", {{"connection", "pool"}}));
+  ASSERT_FALSE(conns.contains("error")) << conns.dump(2);
+  EXPECT_TRUE(conns["clients_by_state"].is_object());
+  // This very call is a client of the console.
+  EXPECT_FALSE(conns["clients"].empty()) << conns.dump(2);
+
+  json cfg = rpc_payload(rpc_call(*s, "poolerConfig", {{"connection", "pool"}}));
+  ASSERT_FALSE(cfg.contains("error")) << cfg.dump(2);
+  // The rig runs transaction pooling, which is not PgBouncer's default.
+  ASSERT_TRUE(cfg["settings"].contains("pool_mode")) << cfg.dump(2);
+  EXPECT_EQ(cfg["settings"]["pool_mode"]["value"], "transaction");
+  json narrowed = rpc_payload(rpc_call(*s, "poolerConfig",
+                                       {{"connection", "pool"}, {"pattern", "POOL_MODE"}}));
+  EXPECT_EQ(narrowed["settings"].size(), 1u) << narrowed.dump(2);
+  // unix_socket_mode is printed in decimal (511) and its default in octal
+  // (0777): the same number, so not a change. And a setting with no default
+  // is not a change either; it is kept under without_default with its value.
+  EXPECT_FALSE(cfg["settings"].contains("unix_socket_mode")) << cfg["settings"].dump(2);
+  EXPECT_FALSE(cfg["settings"].contains("conffile")) << cfg["settings"].dump(2);
+  ASSERT_TRUE(cfg.contains("without_default")) << cfg.dump(2);
+  EXPECT_TRUE(cfg["without_default"].contains("conffile")) << cfg["without_default"].dump(2);
+  for (const auto& [k, e] : cfg["settings"].items())
+    EXPECT_FALSE(e["default"].is_null()) << k << " has no default and was listed as a change";
+
+  // With no connection named, a pooler tool reads the only console -- the
+  // default connection is a database, and it used to be sent there.
+  auto one = server_from(ini_with("") + pool);
+  json by_default = rpc_payload(rpc_call(*one, "poolerConfig", json::object()));
+  EXPECT_FALSE(by_default.contains("error")) << by_default.dump(2);
+  EXPECT_TRUE(by_default.contains("settings")) << by_default.dump(2);
+  for (const auto& t : one->call_tools_list()) {
+    if (t["name"] == "poolerConfig") {
+      EXPECT_NE(t["inputSchema"]["properties"]["connection"]["description"]
+                  .get<std::string>().find("defaults to \"pool\""), std::string::npos)
+        << t["inputSchema"].dump(2);
+    }
+  }
+  // With two, it must be told which.
+  auto two = server_from(ini_with("") + pool + pooler_section("pool2"));
+  json unnamed = rpc_call(*two, "poolerConfig", json::object());
+  ASSERT_TRUE(unnamed.contains("error")) << unnamed.dump(2);
+  EXPECT_NE(unnamed["error"]["message"].get<std::string>().find("pool, pool2"),
+            std::string::npos) << unnamed.dump(2);
+
+  // A pattern matching nothing is an empty answer, not a PgBouncer without
+  // defaults: whether it reports them is read before the pattern narrows.
+  json none = rpc_payload(rpc_call(*s, "poolerConfig",
+                                   {{"connection", "pool"}, {"pattern", "no_such_setting"}}));
+  EXPECT_TRUE(none["settings"].empty()) << none.dump(2);
+  EXPECT_FALSE(none.contains("note")) << none.dump(2);
+
+  json swept = rpc_payload(rpc_call(*s, "poolerStatus", {{"group", "poolers"}}));
+  ASSERT_EQ(swept["members"].size(), 1u) << swept.dump(2);
+  EXPECT_EQ(swept["members"][0]["connection"], "pool");
+  EXPECT_FALSE(swept["members"][0].contains("role")) << "a pooler has no role";
+  ASSERT_EQ(swept["skipped"].size(), 1u) << swept.dump(2);
+  EXPECT_EQ(swept["skipped"][0]["connection"], "default");
+}
+
+// The question poolerStatus exists for: is a client waiting for a server? The
+// rig's licht_saturate database may open one server, so a second client queues.
+TEST_F(TopologyFixture, PoolerStatusSeesAClientWaitingForAServer) {
+  const std::string pool = pooler_section("pool");
+  if (pool.empty()) GTEST_SKIP() << "no POOLER_PORT; run cpp/test/run-pooled-tests.sh";
+  const std::string through = "host=127.0.0.1 port=" + std::string(std::getenv("POOLER_PORT")) +
+                              " dbname=licht_saturate user=pglicht";
+  std::mutex m;
+  std::vector<std::string> failures;
+  auto sleeper = [&]() {
+    try {
+      pqxx::connection c(through);
+      pqxx::nontransaction n(c);
+      n.exec("SELECT pg_sleep(4)");
+    } catch (const std::exception& e) {
+      std::lock_guard<std::mutex> g(m);
+      failures.push_back(e.what());
+    }
+  };
+  // Warm the pool first. With no server open yet both clients queue behind a
+  // server still logging in, and PgBouncer reports that wait as zero -- seen
+  // once in the rig -- so one client must hold a live server for the other's
+  // wait to be the one measured.
+  {
+    pqxx::connection c(through);
+    pqxx::nontransaction n(c);
+    n.exec("SELECT 1");
+  }
+  std::thread a(sleeper), b(sleeper);
+  // Polled rather than slept on: the second client queues only once both have
+  // logged in, which takes as long as the machine does.
+  auto s = server_from(ini_with("") + pool);
+  json st;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  do {
+    st = rpc_payload(rpc_call(*s, "poolerStatus",
+                              {{"connection", "pool"}, {"database", "licht_saturate"}}));
+    // Both, since the queue forms before its wait is measurable: the first
+    // poll that sees a client waiting can read a wait of zero.
+    if (!st.contains("error") && st["summary"].size() == 1 &&
+        st["summary"][0].value("clients_waiting", 0LL) >= 1 &&
+        st["summary"][0].value("longest_wait_s", 0.0) > 0.0)
+      break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  } while (std::chrono::steady_clock::now() < deadline);
+  a.join();
+  b.join();
+  for (const auto& f : failures) ADD_FAILURE() << "a client never reached the pool: " << f;
+  ASSERT_FALSE(st.contains("error")) << st.dump(2);
+  ASSERT_EQ(st["summary"].size(), 1u) << st.dump(2);
+  const json& d = st["summary"][0];
+  // The mode in effect, from SHOW POOLS: SHOW DATABASES has it NULL for a
+  // database that inherits the global pool_mode, as licht_saturate does.
+  EXPECT_EQ(d.value("pool_mode", json()), "transaction") << d.dump(2);
+  EXPECT_EQ(d["pool_size"], 1) << d.dump(2);
+  EXPECT_GE(d["clients_waiting"].get<long long>(), 1) << d.dump(2);
+  EXPECT_TRUE(d["saturated"].get<bool>()) << d.dump(2);
+  EXPECT_GT(d["longest_wait_s"].get<double>(), 0.0) << d.dump(2);
+}
+
+// What a client sent reaches the console unchecked, and json::dump() throws
+// on invalid UTF-8: one bad application_name would fail the whole call.
+TEST(PgBouncerConsole, InvalidUtf8BecomesAReplacementCharacter) {
+  const std::string rep = "\xEF\xBF\xBD";
+  EXPECT_EQ(pgbouncer::valid_utf8("psql"), "psql");
+  EXPECT_EQ(pgbouncer::valid_utf8("caf\xC3\xA9 \xF0\x9F\x90\x98"), "caf\xC3\xA9 \xF0\x9F\x90\x98");
+  EXPECT_EQ(pgbouncer::valid_utf8("a\xFF" "b"), "a" + rep + "b");
+  EXPECT_EQ(pgbouncer::valid_utf8("\xC3"), rep) << "truncated sequence";
+  EXPECT_EQ(pgbouncer::valid_utf8("\xC0\xAF"), rep + rep) << "overlong";
+  EXPECT_EQ(pgbouncer::valid_utf8("\xED\xA0\x80"), rep + rep + rep) << "surrogate";
+  EXPECT_EQ(pgbouncer::valid_utf8("\xF4\x90\x80\x80"), rep + rep + rep + rep) << "past U+10FFFF";
+  EXPECT_NO_THROW(json(pgbouncer::valid_utf8("x\x80\xC3(")).dump());
+}
+
+// The console refuses SET, so no statement_timeout bounds a SHOW there: the
+// deadline is kept on the client side. Proved against PostgreSQL, which will
+// sleep on request -- a well-behaved rig pooler never keeps anyone waiting.
+TEST(PgBouncerConsole, ACommandThatDoesNotAnswerIsCancelledAtTheDeadline) {
+  const char* url = std::getenv("DATABASE_URL");
+  if (!url) GTEST_SKIP() << "no DATABASE_URL";
+  std::unique_ptr<PGconn, decltype(&PQfinish)> c(PQconnectdb(url), &PQfinish);
+  ASSERT_EQ(PQstatus(c.get()), CONNECTION_OK) << PQerrorMessage(c.get());
+
+  std::string why;
+  bool dead = false;
+  const auto t0 = std::chrono::steady_clock::now();
+  json r = pgbouncer::exec(c.get(), "SELECT pg_sleep(5)", 300, why, dead);
+  const auto took = std::chrono::steady_clock::now() - t0;
+  EXPECT_LT(took, std::chrono::seconds(2)) << "the deadline did not hold";
+  EXPECT_TRUE(dead);
+  EXPECT_NE(why.find("300ms"), std::string::npos) << why;
+
+  // An answer inside the deadline is rows, typed; a refusal is `why`, set.
+  std::unique_ptr<PGconn, decltype(&PQfinish)> d(PQconnectdb(url), &PQfinish);
+  why.clear(); dead = false;
+  r = pgbouncer::exec(d.get(), "SELECT 1::int AS n, 2.5::numeric AS x, 3::numeric AS w", 5000, why, dead);
+  EXPECT_TRUE(why.empty()) << why;
+  ASSERT_EQ(r.size(), 1u) << r.dump();
+  EXPECT_TRUE(r[0]["n"].is_number_integer());
+  EXPECT_TRUE(r[0]["x"].is_number_float());
+  EXPECT_TRUE(r[0]["w"].is_number_integer()) << "a whole numeric stays an integer";
+  r = pgbouncer::exec(d.get(), "SELECT no_such_column", 5000, why, dead);
+  EXPECT_FALSE(why.empty());
+  EXPECT_FALSE(dead) << "a refused command leaves the connection usable";
 }
 
 // roleDependencies takes an argument called `role`, and dispatch read every
@@ -8214,7 +8787,16 @@ TEST_F(PostgresMCPServerTest, EveryToolAcceptsItsOwnDocumentedArguments) {
   json examples = json::parse(in);
   ASSERT_FALSE(examples["tools"].empty());
 
-  size_t called = 0;
+  // The pooler tools answer only on a kind = pgbouncer connection, so they
+  // are called on the rig's console where there is one, and counted apart --
+  // not as checked -- where there is not.
+  std::unique_ptr<PostgresMCPServer> pooler;
+  if (const char* port = std::getenv("POOLER_PORT"))
+    if (const char* user = std::getenv("POOLER_USER"))
+      pooler = server_from("[pool]\nkind = pgbouncer\nhost = 127.0.0.1\nport = " +
+                           std::string(port) + "\nuser = " + user + "\n");
+
+  size_t called = 0, pooler_unchecked = 0;
   for (const auto& t : srv->call_tools_list()) {
     const std::string name = t.value("name", "");
     auto ex = examples["tools"].find(name);
@@ -8224,14 +8806,17 @@ TEST_F(PostgresMCPServerTest, EveryToolAcceptsItsOwnDocumentedArguments) {
     // this test is about each tool's OWN arguments.
     for (const char* k : {"connection", "instance", "replication_group", "group"})
       args.erase(k);
-    json r = rpc_call(*srv, name, args);
+    const bool pooler_tool = t.value("description", "").find(
+                               "Reads a PgBouncer admin console") != std::string::npos;
+    if (pooler_tool && !pooler) { pooler_unchecked++; continue; }
+    json r = rpc_call(pooler_tool ? *pooler : *srv, name, args);
     called++;
     if (r.contains("error")) {
       EXPECT_NE(r["error"].value("code", 0), -32602)
           << name << " refused its own documented arguments: " << r["error"].dump();
     }
   }
-  EXPECT_EQ(called, srv->call_tools_list().size())
+  EXPECT_EQ(called + pooler_unchecked, srv->call_tools_list().size())
       << "a tool has no example in tools/reference/examples.json";
 }
 
