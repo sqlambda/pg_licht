@@ -8337,6 +8337,115 @@ TEST_F(TopologyFixture, AnInvalidSectionIsSkippedAndSaysWhy) {
   }
 }
 
+// --- Reloading the connections file without a restart ---
+
+namespace {
+// Rewrites a watched file and moves its modification time on, so the change is
+// seen however coarse the filesystem's timestamps are.
+void rewrite(const std::string& path, const std::string& body) {
+  const auto before = std::filesystem::last_write_time(path);
+  { std::ofstream out(path, std::ios::trunc); out << body; }
+  std::filesystem::last_write_time(path, before + std::chrono::seconds(2));
+}
+
+void handshake(PostgresMCPServer& s) {
+  s.call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"},
+              {"params", {{"protocolVersion", "2025-06-18"}, {"capabilities", json::object()},
+                          {"clientInfo", {{"name", "t"}, {"version", "0"}}}}}});
+  s.call_rpc({{"jsonrpc", "2.0"}, {"method", "notifications/initialized"}});
+}
+
+size_t connection_count(PostgresMCPServer& s) {
+  return rpc_payload(rpc_call(s, "listConnections", json::object()))["connections"].size();
+}
+}  // namespace
+
+// An edit is live at the next request, and the client is told its lists
+// changed -- they embed the configuration.
+TEST_F(TopologyFixture, AnEditedConnectionsFileIsReloadedAtTheNextRequest) {
+  TempIni ini(ini_with(""));
+  PostgresMCPServer s(pglicht::ConnectionRegistry::from_ini(ini.path(), "pg-licht-test"));
+  s.watch_config(ini.path(), "");
+  handshake(s);
+  ASSERT_EQ(connection_count(s), 1u);
+
+  rewrite(ini.path(), ini_with("") + unreachable("extra"));
+  json listed = rpc_payload(rpc_call(s, "listConnections", json::object()));
+  EXPECT_EQ(listed["connections"].size(), 2u) << listed.dump(2);
+  std::set<std::string> told;
+  for (const auto& n : s.last_notifications()) told.insert(n.value("method", ""));
+  EXPECT_TRUE(told.count("notifications/tools/list_changed")) << "no tools/list_changed";
+  EXPECT_TRUE(told.count("notifications/resources/list_changed")) << "no resources/list_changed";
+
+  // Nothing changed since: no reload, no notification.
+  rpc_call(s, "listConnections", json::object());
+  EXPECT_TRUE(s.last_notifications().empty());
+
+  // The capability that promises those notifications.
+  json init = rpc1(s, "initialize", {{"protocolVersion", "2025-06-18"},
+                                     {"capabilities", json::object()},
+                                     {"clientInfo", {{"name", "t"}, {"version", "0"}}}});
+  EXPECT_EQ(init["result"]["capabilities"]["tools"].value("listChanged", false), true);
+  EXPECT_EQ(init["result"]["capabilities"]["resources"].value("listChanged", false), true);
+}
+
+// A file that fails as a whole -- here malformed -- leaves the running
+// configuration in place and says so; the next good edit is loaded.
+TEST_F(TopologyFixture, ABrokenEditKeepsThePreviousConfiguration) {
+  TempIni ini(ini_with("") + unreachable("extra"));
+  PostgresMCPServer s(pglicht::ConnectionRegistry::from_ini(ini.path(), "pg-licht-test"));
+  s.watch_config(ini.path(), "");
+
+  rewrite(ini.path(), "[unterminated\nhost = h\n");
+  json listed = rpc_payload(rpc_call(s, "listConnections", json::object()));
+  EXPECT_EQ(listed["connections"].size(), 2u) << "the previous configuration was lost";
+  ASSERT_TRUE(listed.contains("reload_error")) << listed.dump(2);
+  EXPECT_NE(listed["reload_error"].get<std::string>().find("unterminated"), std::string::npos);
+  json ok = rpc_payload(rpc_call(s, "listSchemas", json::object()));
+  EXPECT_FALSE(ok.contains("error")) << "calls stopped working: " << ok.dump(2);
+  bool flagged = false;
+  const json verified = s.call_verify_topology();
+  for (const auto& f : verified["findings"])
+    if (f["topic"] == "configuration" && f["name"] == "reload") flagged = true;
+  EXPECT_TRUE(flagged);
+
+  rewrite(ini.path(), ini_with(""));
+  listed = rpc_payload(rpc_call(s, "listConnections", json::object()));
+  EXPECT_EQ(listed["connections"].size(), 1u) << listed.dump(2);
+  EXPECT_FALSE(listed.contains("reload_error")) << listed.dump(2);
+}
+
+// A section that changed must not be answered on the connection opened under
+// its old definition: the cache would otherwise hand it back.
+TEST_F(TopologyFixture, AChangedSectionIsNotAnsweredOnItsOldConnection) {
+  TempIni ini(ini_with(""));
+  PostgresMCPServer s(pglicht::ConnectionRegistry::from_ini(ini.path(), "pg-licht-test"));
+  s.watch_config(ini.path(), "");
+  json first = rpc_payload(rpc_call(s, "listSchemas", json::object()));
+  ASSERT_FALSE(first.contains("error")) << first.dump(2);   // a cached connection now
+
+  rewrite(ini.path(), "[default]\nhost = 127.0.0.1\nport = 1\ndbname = nowhere\n");
+  json after = rpc_call(s, "listSchemas", json::object());
+  EXPECT_TRUE(after["result"].value("isError", false))
+    << "answered on the old connection: " << after.dump(2);
+}
+
+// SIGHUP reloads even when the file looks unchanged -- an editor that keeps
+// the timestamp, a mount that does not update it.
+TEST_F(TopologyFixture, ASighupReloadsAFileWhoseTimestampDidNotMove) {
+  TempIni ini(ini_with("group = aaa\n"));
+  PostgresMCPServer s(pglicht::ConnectionRegistry::from_ini(ini.path(), "pg-licht-test"));
+  s.watch_config(ini.path(), "");
+  const auto stamp = std::filesystem::last_write_time(ini.path());
+  { std::ofstream out(ini.path(), std::ios::trunc); out << ini_with("group = bbb\n"); }
+  std::filesystem::last_write_time(ini.path(), stamp);   // same size, same inode, same time
+
+  s.call_maybe_reload();
+  EXPECT_EQ(rpc_payload(rpc_call(s, "listTopology", json::object()))["groups"][0]["name"], "aaa");
+  PostgresMCPServer::request_reload();
+  EXPECT_EQ(rpc_payload(rpc_call(s, "listTopology", json::object()))["groups"][0]["name"], "bbb");
+}
+
 // The console refuses BEGIN, which every database tool opens with, and a
 // database has no SHOW POOLS: each side refuses the other's tools by name,
 // before anything connects -- which is why an unreachable pooler will do here.

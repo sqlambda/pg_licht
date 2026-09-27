@@ -31,6 +31,8 @@
 #include <pqxx/pqxx>
 #include <libpq-fe.h>
 #include <poll.h>
+#include <csignal>
+#include <sys/stat.h>
 #include <cerrno>
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
@@ -147,6 +149,14 @@ public:
     std::lock_guard<std::mutex> lk(m_);
     idle_[name] = Entry{std::move(conn), Clock::now()};
     evict_over_cap();
+  }
+
+  // Closes the idle connection held for `name`, if any. A reloaded config that
+  // changed or removed that section must not be answered on a connection
+  // opened under the old one.
+  void drop(const std::string& name) {
+    std::lock_guard<std::mutex> lk(m_);
+    idle_.erase(name);
   }
 
   // Test hook: how many connections are being held right now.
@@ -896,9 +906,20 @@ public:
       throw;
     }
     std::cout.rdbuf(saved);
-    const std::string line = buf.str();
-    return line.empty() ? json::object() : json::parse(line);
+    // The response is the last line. A reload writes its list_changed
+    // notifications ahead of it, and those are kept for the tests to read.
+    last_notifications_.clear();
+    std::istringstream lines(buf.str());
+    std::string l, last;
+    while (std::getline(lines, l)) {
+      if (l.empty()) continue;
+      if (!last.empty()) last_notifications_.push_back(json::parse(last));
+      last = l;
+    }
+    return last.empty() ? json::object() : json::parse(last);
   }
+  // Test hook: the notifications written before the last call_rpc's response.
+  const std::vector<json>& last_notifications() const { return last_notifications_; }
 
   const json call_connections() { return connections(""); }
   const json call_connections(const std::string& pattern) { return connections(pattern); }
@@ -965,7 +986,122 @@ public:
   void set_budgets(pglicht::Budgets b) { budgets_ = std::move(b); }
   const pglicht::Budgets& budgets() const { return budgets_; }
 
+  // --- Reloading the configuration without a restart ------------------------
+  //
+  // A change to the connections file used to need the MCP client to restart
+  // the server. Now the file is watched: before each request its identity --
+  // modification time, size and inode, so an editor that replaces the file is
+  // seen too -- is compared with what was loaded, and a change reloads it.
+  // SIGHUP forces a reload whatever the file says, for an editor that keeps
+  // the timestamp or a mount that does not update it.
+  //
+  // Safe by construction:
+  //   - the new file is parsed completely before anything is swapped, and a
+  //     file that fails as a whole -- unreadable, wrong mode, malformed, no
+  //     usable section -- leaves the running configuration as it was, the
+  //     error reported on stderr, in listConnections and in verifyTopology;
+  //   - the swap happens between requests, and requests are handled one at a
+  //     time, so no call ever sees half of each configuration;
+  //   - only the connections whose section changed or went away are closed;
+  //   - it reads the same path it started with, and nothing else;
+  //   - tools/list and resources/list embed the configuration (the default
+  //     connection, the only pooler, one resource set per connection), so the
+  //     client is told with list_changed notifications and fetches them anew.
+  //
+  // main() calls this once, only in config-file mode. budgets_path is the
+  // budgets file main resolved, or "" when the built-in limits are in use.
+  void watch_config(const std::string& config_path, const std::string& budgets_path) {
+    config_path_ = config_path;
+    budgets_path_ = budgets_path;
+    config_seen_ = file_identity(config_path_);
+    budgets_seen_ = file_identity(budgets_path_);
+  }
+
+  // Async-signal-safe: sets a flag the request loop reads.
+  static void request_reload() { reload_requested() = 1; }
+
+  // Test hook: run the check now, as the next request would.
+  void call_maybe_reload() { maybe_reload(); }
+
 private:
+  static volatile std::sig_atomic_t& reload_requested() {
+    static volatile std::sig_atomic_t flag = 0;
+    return flag;
+  }
+
+  // What identifies one version of a file: "" when there is none.
+  static std::string file_identity(const std::string& path) {
+    if (path.empty()) return "";
+    struct stat st {};
+    if (::stat(path.c_str(), &st) != 0) return "missing";
+    return std::to_string(st.st_mtim.tv_sec) + "." + std::to_string(st.st_mtim.tv_nsec) +
+           "/" + std::to_string(st.st_size) + "/" + std::to_string(st.st_ino);
+  }
+
+  void maybe_reload() {
+    if (config_path_.empty()) return;
+    const bool forced = reload_requested() != 0;
+    reload_requested() = 0;
+    const std::string cfg_now = file_identity(config_path_);
+    const std::string bud_now = file_identity(budgets_path_);
+    if (!forced && cfg_now == config_seen_ && bud_now == budgets_seen_) return;
+    // Mid-rename, the path can be briefly absent. Not a failure yet: the next
+    // request looks again, and the running configuration stays meanwhile.
+    if (cfg_now == "missing" && !forced) return;
+
+    try {
+      pglicht::ConnectionRegistry fresh =
+        pglicht::ConnectionRegistry::from_ini(config_path_, app_name());
+      pglicht::Budgets fresh_budgets = pglicht::Budgets::load(budgets_path_);
+
+      // Close what the new file no longer describes the same way.
+      for (const auto& name : registry_.names()) {
+        bool same = false;
+        for (const auto& n : fresh.names())
+          if (n == name && fresh.get(n).conninfo == registry_.get(name).conninfo) {
+            same = true;
+            break;
+          }
+        if (!same) {
+          cache_->drop(name);
+          ext_schemas_.erase(name);
+        }
+      }
+      for (const auto& [name, why] : fresh.invalid())
+        std::cerr << "pg_licht_mcp: skipped [" << name << "]: " << why << std::endl;
+
+      registry_ = std::move(fresh);
+      budgets_ = std::move(fresh_budgets);
+      active_.clear();
+      reload_error_.clear();
+      reloads_++;
+      std::cerr << "pg_licht_mcp: reloaded " << config_path_ << std::endl;
+
+      // The lists embed the configuration. Only a client that finished the
+      // handshake is told; one that has not will fetch them anyway.
+      if (initialized_) {
+        std::cout << json{{"jsonrpc", "2.0"},
+                          {"method", "notifications/tools/list_changed"}}.dump() << std::endl;
+        std::cout << json{{"jsonrpc", "2.0"},
+                          {"method", "notifications/resources/list_changed"}}.dump() << std::endl;
+      }
+    } catch (const std::exception& e) {
+      reload_error_ = e.what();
+      std::cerr << "pg_licht_mcp: reload failed, still running the previous "
+                   "configuration: " << e.what() << std::endl;
+    }
+    // Seen either way: a broken file is not re-parsed on every request, only
+    // when it changes again.
+    config_seen_ = cfg_now;
+    budgets_seen_ = bud_now;
+  }
+
+  std::string config_path_, budgets_path_, config_seen_, budgets_seen_;
+  std::string reload_error_;
+  unsigned long long reloads_ = 0;
+  bool initialized_ = false;
+  std::vector<json> last_notifications_;
+
   pglicht::ConnectionRegistry registry_;
   pglicht::Budgets budgets_;
   // shared_ptr because parallel fan-out gives each worker its own server
@@ -1406,6 +1542,13 @@ private:
     // never simply missing from the answer. Only when there are any, so a
     // valid file answers exactly as it always has.
     if (!registry_.invalid().empty()) result["invalid"] = invalid_sections(pattern);
+    // A reload that failed leaves the previous configuration running, which
+    // is safe and invisible: the file on disk says one thing and the server
+    // answers another. Said here, where the operator checks what is loaded.
+    if (!reload_error_.empty())
+      result["reload_error"] = "the connections file changed but could not be "
+                               "loaded, so the previous configuration is still in "
+                               "use: " + reload_error_;
     return result;
   }
 
@@ -1765,6 +1908,11 @@ private:
                   cfg.pooler);
       }
     }
+
+    if (!reload_error_.empty())
+      finding("configuration", "reload", "error",
+              "the connections file changed but could not be loaded, so every "
+              "finding here describes the previous configuration: " + reload_error_);
 
     // --- sections skipped at startup ---
     // Nothing about them could be checked, and the operator may not know they
@@ -2481,7 +2629,8 @@ private:
       {"currentLocks",           schema_fixed("Lock rows, newest blocking chain first.",
                                    {{"locks", "array"}})},
       {"listConnections",        schema_fixed("The configured connection registry.",
-                                   {{"connections", "array"}, {"invalid", "array"}})},
+                                   {{"connections", "array"}, {"invalid", "array"},
+                                    {"reload_error", "string"}})},
       {"listTopology",           schema_fixed("The three configured topology axes.",
                                    {{"instances", "array"}, {"replication_groups", "array"},
                                     {"groups", "array"}, {"unlabelled", "array"}})},
@@ -9776,9 +9925,11 @@ private:
         // 4.0.0 adds resources, prompts and completions. Declared together
         // because they were authored together against the finished tool
         // surface, which is what the statistics split was blocking.
+        // listChanged since 4.5.0: a reloaded connections file changes what
+        // both lists say, and the client is told so.
         {"capabilities", {
-            {"tools", json::object()},
-            {"resources", json::object()},
+            {"tools", {{"listChanged", true}}},
+            {"resources", {{"listChanged", true}}},
             {"prompts", json::object()},
             {"completions", json::object()}
 	  }},
@@ -10135,6 +10286,7 @@ private:
   }
 
   void handle_request(const json& req) {
+    maybe_reload();
     std::string method = req.value("method", "");
     const json params = req.contains("params") && req["params"].is_object()
       ? req["params"] : json::object();
@@ -10185,8 +10337,8 @@ private:
       send_response(req.value("id", json()), cacheable({
           {"resultType", "complete"},
           {"supportedVersions", all_protocols()},
-          {"capabilities", {{"tools", json::object()},
-                            {"resources", json::object()},
+          {"capabilities", {{"tools", {{"listChanged", true}}},
+                            {"resources", {{"listChanged", true}}},
                             {"prompts", json::object()},
                             {"completions", json::object()}}},
           {"instructions", instructions()}
@@ -10200,6 +10352,7 @@ private:
       initialize(req["id"], params);
     }
     else if (method == "notifications/initialized") {
+      initialized_ = true;
       return;
     }
     else if (method == "tools/list") {

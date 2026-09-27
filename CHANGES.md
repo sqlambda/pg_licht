@@ -1,6 +1,6 @@
 # Changelog
 
-## 4.5.0 (unreleased)
+## 4.5.0 (2026-09-27)
 
 ### Added
 
@@ -155,6 +155,19 @@
     another user can make the two answers differ.
   - It must name a console that loaded, only a database section may carry
     it, and it may be given once; otherwise the section is skipped.
+
+- **Editing the connections file no longer needs a restart.** It is
+  watched: before each request its modification time, size and inode are
+  compared with what was loaded, and a change reloads it -- the budgets file
+  too. `SIGHUP` forces a reload; before, it ended the process. The new file
+  is read in full first, and one that fails as a whole leaves the running
+  configuration in place, reported on stderr, as `reload_error` in
+  `listConnections` and as a `configuration` finding in `verifyTopology`.
+  The swap happens between requests; connections whose section changed or
+  went away are closed and the rest kept. The tool and resource lists
+  depend on the configuration, so a reload sends
+  `notifications/tools/list_changed` and `notifications/resources/list_changed`,
+  and both capabilities now declare `listChanged`.
 
 ### Documented
 

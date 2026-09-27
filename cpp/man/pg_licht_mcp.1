@@ -1,7 +1,7 @@
 .\" Copyright (c) 2026 Daniel Cristian.
 .\" Licensed under the Apache License, Version 2.0; see LICENSE.
 .\"
-.Dd September 22, 2026
+.Dd September 27, 2026
 .Dt PG_LICHT_MCP 1
 .Os pg-licht
 .Sh NAME
@@ -582,6 +582,57 @@ Note that libpq enforces that rule on
 but not on
 .Pa pg_service.conf ,
 so if a service file holds a password its permissions are yours to manage.
+.Ss Reloading
+An edit to the connections file, or to the budgets file, takes effect at the
+next request, without restarting the server or the client.
+Before each request
+.Nm
+compares the file's modification time, size and inode with the version it
+loaded, which also catches an editor that replaces the file rather than writing
+it in place.
+.Dv SIGHUP
+forces a reload whatever the file looks like, for an editor that keeps the
+timestamp or a filesystem that does not update it:
+.Bd -literal -offset indent
+pkill -HUP pg_licht_mcp
+.Ed
+.Pp
+The new file is read in full before anything changes.
+If it fails as a whole \(em unreadable, group- or world-accessible, malformed,
+or with no usable section \(em the running configuration stays in use,
+.Ic listConnections
+carries
+.Va reload_error ,
+.Ic verifyTopology
+reports it as a
+.Li configuration
+finding, and the file is read again when it next changes.
+A section that does not validate is skipped, as at startup.
+The swap happens between requests, which are handled one at a time, so no
+call sees part of each configuration.
+Connections whose section changed or was removed are closed; the rest are kept.
+Only the file named at startup is ever read.
+.Pp
+The tool list and the resource list both depend on the configuration \(em the
+default connection, the only pooler, one set of resources per connection \(em
+so after a reload
+.Nm
+sends
+.Li notifications/tools/list_changed
+and
+.Li notifications/resources/list_changed ,
+and declares
+.Va listChanged
+for both at initialisation.
+A client that ignores them keeps working, with descriptions that may name the
+old default.
+A new
+.Nm
+binary still needs the client to restart the server.
+.Pp
+Before 4.5.0,
+.Dv SIGHUP
+took the default action and ended the process.
 .Sh OPERATIONS
 Every operation below except
 .Ic listConnections
@@ -3361,6 +3412,14 @@ Through 4.4 this was reported as
 .It Sy config file ... is group/world accessible
 The connections file has unsafe permissions; see
 .Sx File permissions .
+.It Sy pg_licht_mcp: reloaded Ar file
+The connections or budgets file changed, or
+.Dv SIGHUP
+arrived, and the new configuration is in use; see
+.Sx Reloading .
+.It Sy pg_licht_mcp: reload failed, still running the previous configuration: ...
+The changed file could not be loaded, and nothing was swapped.
+The message follows; fix the file and save it again.
 .It Sy pg_licht_mcp: skipped [section]: ... No at startup
 A section of the connections file did not validate \(em it is incomplete, sets
 an unknown

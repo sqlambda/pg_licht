@@ -1,4 +1,5 @@
 #include <cstdlib>
+#include <signal.h>
 #include <string>
 #include "server.h"
 
@@ -102,9 +103,10 @@ int main(int argc, char *argv[]) {
     // connections file.
     const char* env_budgets = std::getenv("PG_LICHT_BUDGETS");
     const char* home = std::getenv("HOME");
-    const pglicht::Budgets budgets = pglicht::Budgets::load(
+    const std::string budgets_path =
       pglicht::Budgets::resolve_path(env_budgets ? env_budgets : "", config_path,
-                                     home ? home : ""));
+                                     home ? home : "");
+    const pglicht::Budgets budgets = pglicht::Budgets::load(budgets_path);
 
     if (!config_path.empty()) {
       auto registry = pglicht::ConnectionRegistry::from_ini(
@@ -115,6 +117,16 @@ int main(int argc, char *argv[]) {
         std::cerr << "pg_licht_mcp: skipped [" << name << "]: " << why << std::endl;
       PostgresMCPServer server(std::move(registry));
       server.set_budgets(budgets);
+      server.watch_config(config_path, budgets_path);
+      // SIGHUP reloads, as it does for PostgreSQL and PgBouncer. Before this it
+      // was the default action -- the process died, and the client with it.
+      // SA_RESTART: a read blocked on stdin resumes; the reload happens at the
+      // next request, which is when it can be seen.
+      struct sigaction sa {};
+      sa.sa_handler = [](int) { PostgresMCPServer::request_reload(); };
+      sigemptyset(&sa.sa_mask);
+      sa.sa_flags = SA_RESTART;
+      sigaction(SIGHUP, &sa, nullptr);
       configured = true;
       server.run();
     } else {

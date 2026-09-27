@@ -252,6 +252,11 @@ dbname = orders
 pooler = pooler_prod
 ```
 
+Editing the connections file (or `budgets.ini`) needs no restart: the change is picked up at
+the next request, and `SIGHUP` forces it. A file that fails to load leaves the running
+configuration in place and says so under `reload_error` in `listConnections`; the client is
+sent `list_changed` notifications, since the tool and resource lists name connections.
+
 A section that does not validate — an unknown `kind`, a console given an `instance` — is
 skipped with a warning instead of stopping the server: the other connections keep working,
 `listConnections` and `verifyTopology` list it under `invalid` with the reason, and a call
