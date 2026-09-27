@@ -103,7 +103,10 @@
   it. It is now skipped: a line on stderr names it, `listConnections` and
   `verifyTopology` list it under `invalid` with the reason (and
   `verifyTopology` raises it as a `configuration` finding), and a call naming
-  it gets the reason instead of "unknown connection". What is not one
+  it gets the reason instead of "unknown connection". A skipped `[default]`
+  stays the default, so a call naming no connection gets its reason rather
+  than going quietly to another database. `pooler =` requires the section's
+  own `dbname`, which the route is looked up by. What is not one
   section's still stops startup: an unreadable or malformed file, a duplicate
   header, a name reused across two axes, and a file with no usable section.
 
@@ -167,7 +170,12 @@
   went away are closed and the rest kept. The tool and resource lists
   depend on the configuration, so a reload sends
   `notifications/tools/list_changed` and `notifications/resources/list_changed`,
-  and both capabilities now declare `listChanged`.
+  and both capabilities now declare `listChanged` -- a client on the
+  stateless revision is told too, and `tools/list` is cacheable for a minute
+  rather than an hour, since it names connections. A file caught mid-write is
+  not applied; the next request reads the finished one. A budgets file that
+  disappears keeps the limits in force; one created after startup is read at
+  the next start.
 
 ### Documented
 

@@ -40,6 +40,18 @@ void usage(const char* argv0) {
 }  // namespace
 
 int main(int argc, char *argv[]) {
+  // SIGHUP reloads the connections file, as it does for PostgreSQL and
+  // PgBouncer. Through 4.4 it took the default action: the process died, and
+  // the client's session with it. Installed first thing and in every mode --
+  // with a connection string there is nothing to reload, and the signal is
+  // then simply harmless. SA_RESTART: a read blocked on stdin resumes, and the
+  // reload happens at the next request, which is when it can be seen.
+  struct sigaction sa {};
+  sa.sa_handler = [](int) { PostgresMCPServer::request_reload(); };
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = SA_RESTART;
+  sigaction(SIGHUP, &sa, nullptr);
+
   std::string config_path;
   std::string db_url;
 
@@ -118,15 +130,6 @@ int main(int argc, char *argv[]) {
       PostgresMCPServer server(std::move(registry));
       server.set_budgets(budgets);
       server.watch_config(config_path, budgets_path);
-      // SIGHUP reloads, as it does for PostgreSQL and PgBouncer. Before this it
-      // was the default action -- the process died, and the client with it.
-      // SA_RESTART: a read blocked on stdin resumes; the reload happens at the
-      // next request, which is when it can be seen.
-      struct sigaction sa {};
-      sa.sa_handler = [](int) { PostgresMCPServer::request_reload(); };
-      sigemptyset(&sa.sa_mask);
-      sa.sa_flags = SA_RESTART;
-      sigaction(SIGHUP, &sa, nullptr);
       configured = true;
       server.run();
     } else {

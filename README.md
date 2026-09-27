@@ -252,15 +252,20 @@ dbname = orders
 pooler = pooler_prod
 ```
 
-Editing the connections file (or `budgets.ini`) needs no restart: the change is picked up at
-the next request, and `SIGHUP` forces it. A file that fails to load leaves the running
+Editing the connections file (or the `budgets.ini` in use at startup) needs no restart: the
+change is picked up at the next request, and `SIGHUP` forces it. A budgets file created after
+startup is read at the next start. A file that fails to load leaves the running
 configuration in place and says so under `reload_error` in `listConnections`; the client is
 sent `list_changed` notifications, since the tool and resource lists name connections.
 
 A section that does not validate — an unknown `kind`, a console given an `instance` — is
 skipped with a warning instead of stopping the server: the other connections keep working,
 `listConnections` and `verifyTopology` list it under `invalid` with the reason, and a call
-naming it gets the reason back. Only a file with no usable section stops startup.
+naming it gets the reason back. A skipped `[default]` stays the default, so a call naming no
+connection gets its reason instead of going to another database. What still stops startup is
+what is not one section's: an unreadable or group-accessible file, a malformed line, a
+duplicate header, a name used on two topology axes, an unclaimed `[instance:…]` section, or a
+file with no usable section.
 
 **Citus.** On a Citus worker the shards are ordinary tables that Citus hides from any client
 whose `application_name` does not match `citus.show_shards_for_app_name_prefixes`, so

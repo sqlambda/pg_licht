@@ -430,8 +430,16 @@ public:
     // call that names no connection is a database question, and a PgBouncer
     // console listed first would refuse every one of them. Only a file with
     // nothing but poolers defaults to one.
-    reg.default_name_ = reg.conns_.count("default") ? std::string("default") : reg.order_.front();
-    if (!reg.conns_.count("default"))
+    //
+    // A [default] that was itself skipped stays the default, and a call naming
+    // no connection gets its reason. Falling through to the next section would
+    // send "the default" to some other database -- possibly production --
+    // without a word, where through 4.4 the same file refused to start.
+    bool default_skipped = false;
+    for (const auto& [n, e] : reg.invalid_) if (n == "default") default_skipped = true;
+    reg.default_name_ = reg.conns_.count("default") || default_skipped
+                          ? std::string("default") : reg.order_.front();
+    if (!reg.conns_.count("default") && !default_skipped)
       for (const auto& n : reg.order_)
         if (!reg.conns_.at(n).is_pooler()) { reg.default_name_ = n; break; }
 
@@ -440,12 +448,14 @@ public:
   }
 
   const ConnConfig& get(const std::string& name) const {
-    auto it = conns_.find(name.empty() ? default_name_ : name);
+    const std::string& key = name.empty() ? default_name_ : name;
+    auto it = conns_.find(key);
     if (it == conns_.end()) {
       for (const auto& [n, e] : invalid_)
-        if (n == name)
-          throw std::runtime_error("connection \"" + name + "\" was skipped at "
-                                   "startup because its section is invalid: " + e);
+        if (n == key)
+          throw std::runtime_error("connection \"" + key + "\" was skipped when the "
+                                   "connections file was loaded, because its section "
+                                   "is invalid: " + e);
       std::string known;
       for (const auto& n : order_) known += (known.empty() ? "" : ", ") + n;
       throw std::runtime_error("unknown connection \"" + name +
@@ -784,6 +794,14 @@ private:
     // instance and replication_group describe PostgreSQL servers: on a pooler
     // they would put it into database sweeps it can never answer, so only
     // `group` is allowed, and "all my poolers" is a group sweep.
+    // A route is looked up by the name the client asks the pooler for, so a
+    // section declaring one must say that name itself; a service file's dbname
+    // is deliberately never read.
+    if (!cfg.pooler.empty() && cfg.dbname.empty() && !cfg.is_pooler())
+      throw std::runtime_error(
+        path + ": [" + name + "] declares pooler = " + cfg.pooler + " but no dbname; "
+        "the route through a pooler is looked up by the database name, so set "
+        "dbname in this section");
     if (cfg.is_pooler()) {
       if (!cfg.pooler.empty())
         throw std::runtime_error(

@@ -4821,6 +4821,29 @@ TEST(ConnectionConfigTest, UnknownConnectionNameListsConfiguredOnes) {
   }
 }
 
+// A [default] that was skipped stays the default: a call naming no connection
+// gets its reason rather than going quietly to some other database.
+TEST(ConnectionConfigTest, ASkippedDefaultIsNotReplacedByAnotherSection) {
+  auto reg = load("[default]\nkind = pgpool\nhost = h\ndbname = d\n\n[prod]\ndbname = prod\n");
+  EXPECT_EQ(reg.default_name(), "default");
+  try {
+    reg.get("");
+    FAIL() << "the default resolved to another section";
+  } catch (const std::exception& e) {
+    EXPECT_NE(std::string(e.what()).find("pgpool"), std::string::npos) << e.what();
+  }
+}
+
+// A route through a pooler is looked up by the database name, so a section
+// declaring one must set it -- a service's dbname is never read.
+TEST(ConnectionConfigTest, APoolerRouteNeedsItsOwnDbname) {
+  auto reg = load("[pool]\nkind = pgbouncer\nport = 6432\n\n[svc]\nservice = x\npooler = pool\n"
+                  "\n[ok]\ndbname = d\n");
+  ASSERT_EQ(reg.invalid().size(), 1u);
+  EXPECT_EQ(reg.invalid()[0].first, "svc");
+  EXPECT_NE(reg.invalid()[0].second.find("no dbname"), std::string::npos) << reg.invalid()[0].second;
+}
+
 // A call naming no connection is a database question, and a console listed
 // first would refuse every one of them.
 TEST(ConnectionConfigTest, APoolerListedFirstIsNotTheDefault) {
@@ -8316,7 +8339,7 @@ TEST_F(TopologyFixture, AnInvalidSectionIsSkippedAndSaysWhy) {
   // A call naming it gets the reason, not "unknown connection".
   json named = rpc_call(*s, "listSchemas", {{"connection", "broken"}});
   const std::string msg = named.dump();
-  EXPECT_NE(msg.find("skipped at startup"), std::string::npos) << msg;
+  EXPECT_NE(msg.find("skipped when the connections file was loaded"), std::string::npos) << msg;
   EXPECT_NE(msg.find("instance"), std::string::npos) << msg;
 
   // verifyTopology lists it and raises it as a finding.
@@ -8444,6 +8467,75 @@ TEST_F(TopologyFixture, ASighupReloadsAFileWhoseTimestampDidNotMove) {
   EXPECT_EQ(rpc_payload(rpc_call(s, "listTopology", json::object()))["groups"][0]["name"], "aaa");
   PostgresMCPServer::request_reload();
   EXPECT_EQ(rpc_payload(rpc_call(s, "listTopology", json::object()))["groups"][0]["name"], "bbb");
+}
+
+// A client on the stateless revision never sends notifications/initialized;
+// it must still hear that the lists changed, and tools/list -- which names
+// connections -- is not cached for an hour.
+TEST_F(TopologyFixture, AStatelessClientIsToldOfAReloadToo) {
+  TempIni ini(ini_with(""));
+  PostgresMCPServer s(pglicht::ConnectionRegistry::from_ini(ini.path(), "pg-licht-test"));
+  s.watch_config(ini.path(), "");
+  auto modern = [&](const std::string& method) {
+    return s.call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", method},
+                       {"params", {{"_meta", modern_meta()}}}});
+  };
+  json tl = modern("tools/list");
+  ASSERT_TRUE(tl["result"].contains("ttlMs")) << tl.dump().substr(0, 300);
+  EXPECT_LE(tl["result"]["ttlMs"].get<long long>(), 60000) << "tools/list cached past a reload";
+
+  rewrite(ini.path(), ini_with("") + unreachable("extra"));
+  modern("tools/list");
+  std::set<std::string> told;
+  for (const auto& n : s.last_notifications()) told.insert(n.value("method", ""));
+  EXPECT_TRUE(told.count("notifications/tools/list_changed")) << "a stateless client was not told";
+}
+
+// A budgets file that disappears -- deleted, or mid-rename -- keeps the limits
+// in force and does not hold back an edit to the connections file.
+TEST_F(TopologyFixture, AMissingBudgetsFileDoesNotBlockAConnectionsReload) {
+  TempIni ini(ini_with(""));
+  auto budgets = std::make_unique<TempIni>("[payload]\nmax_kb = 0\n");
+  const std::string bpath = budgets->path();
+  PostgresMCPServer s(pglicht::ConnectionRegistry::from_ini(ini.path(), "pg-licht-test"));
+  s.watch_config(ini.path(), bpath);
+  budgets.reset();   // deleted
+  rewrite(ini.path(), ini_with("") + unreachable("extra"));
+  json listed = rpc_payload(rpc_call(s, "listConnections", json::object()));
+  EXPECT_EQ(listed["connections"].size(), 2u) << listed.dump(2);
+  EXPECT_FALSE(listed.contains("reload_error")) << listed.dump(2);
+}
+
+// The start time is compared as text across connections, so it must not
+// depend on the session's TimeZone: one postmaster, two roles with different
+// timezone settings, one instance -- no error.
+TEST_F(TopologyFixture, AnInstanceIsOneInstanceInEveryTimeZone) {
+  const std::string role = "licht_tz_" + std::to_string(::getpid());
+  {
+    pqxx::connection c(test_url);
+    pqxx::nontransaction n(c);
+    n.exec("DROP ROLE IF EXISTS " + role);
+    n.exec("CREATE ROLE " + role + " LOGIN");
+    // A zone that differs from the server's own, whatever that is: the rig
+    // inherits the machine's, and a role set to the same zone proves nothing.
+    const std::string server_tz = n.query_value<std::string>("SHOW timezone");
+    const std::string other = server_tz == "Asia/Kathmandu" ? "Pacific/Chatham" : "Asia/Kathmandu";
+    n.exec("ALTER ROLE " + role + " SET timezone = '" + other + "'");
+  }
+  std::string url = std::regex_replace(test_url, std::regex("user=\\S+"), "user=" + role);
+  if (url == test_url) url += " user=" + role;
+  auto s = server_from(ini_with("instance = pg-01\n") + section("tz", url, "instance = pg-01\n"));
+  json v = s->call_verify_topology();
+  {
+    pqxx::connection c(test_url);
+    pqxx::nontransaction n(c);
+    n.exec("DROP ROLE IF EXISTS " + role);
+  }
+  ASSERT_EQ(v["connections"].size(), 2u) << v.dump(2);
+  ASSERT_FALSE(v["connections"][1].contains("error")) << v.dump(2);
+  EXPECT_EQ(v["connections"][0]["postmaster_start_time"], v["connections"][1]["postmaster_start_time"])
+    << v.dump(2);
+  EXPECT_EQ(count_severity(v["findings"], "error"), 0) << v.dump(2);
 }
 
 // The console refuses BEGIN, which every database tool opens with, and a
@@ -8627,6 +8719,18 @@ TEST_F(TopologyFixture, APooledConnectionIsCheckedAgainstItsRoute) {
   json fsweep = rpc_call(*fs, "listSchemas", {{"group", "f"}});
   json fp = rpc_payload(fsweep);
   EXPECT_EQ(fp["members"].size(), 2u) << "a forced user was collapsed: " << fp.dump(2);
+
+  // An inferred instance is only a shared host and port -- two names on one
+  // PgBouncer port share it while the pooler may route them anywhere -- so it
+  // never licenses the collapse. Neither section declares an instance here.
+  const std::string inferred_pooled = "[ip]\nhost = 127.0.0.1\nport = " + std::string(port) +
+                                      "\ndbname = licht_saturate\nuser = pglicht\npooler = pool\n"
+                                      "group = i\n";
+  const std::string inferred_other = "[io]\nhost = 127.0.0.1\nport = " + std::string(port) +
+                                     "\ndbname = pglicht\nuser = pglicht\ngroup = i\n";
+  auto is = server_from(ini_with("") + inferred_pooled + inferred_other + pool);
+  json ip = rpc_payload(rpc_call(*is, "listSchemas", {{"group", "i"}}));
+  EXPECT_EQ(ip["members"].size(), 2u) << "collapsed on an inferred instance: " << ip.dump(2);
 
   // A name with no entry of its own is routed by the '*' fallback -- the
   // rig's PgBouncer has one -- so the connection fails on the server's

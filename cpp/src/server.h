@@ -1034,7 +1034,14 @@ private:
     if (path.empty()) return "";
     struct stat st {};
     if (::stat(path.c_str(), &st) != 0) return "missing";
-    return std::to_string(st.st_mtim.tv_sec) + "." + std::to_string(st.st_mtim.tv_nsec) +
+    // The nanosecond timestamp is st_mtim on Linux and st_mtimespec on macOS;
+    // POSIX names neither portably.
+#ifdef __APPLE__
+    const struct timespec& mt = st.st_mtimespec;
+#else
+    const struct timespec& mt = st.st_mtim;
+#endif
+    return std::to_string(mt.tv_sec) + "." + std::to_string(mt.tv_nsec) +
            "/" + std::to_string(st.st_size) + "/" + std::to_string(st.st_ino);
   }
 
@@ -1045,14 +1052,34 @@ private:
     const std::string cfg_now = file_identity(config_path_);
     const std::string bud_now = file_identity(budgets_path_);
     if (!forced && cfg_now == config_seen_ && bud_now == budgets_seen_) return;
-    // Mid-rename, the path can be briefly absent. Not a failure yet: the next
-    // request looks again, and the running configuration stays meanwhile.
+    // Mid-rename, the connections file can be briefly absent. Not a failure
+    // yet: the next request looks again, and the running configuration stays
+    // meanwhile. A missing budgets file -- mid-rename or deleted for good --
+    // keeps the limits in force (below) rather than failing a pending
+    // connections edit.
     if (cfg_now == "missing" && !forced) return;
 
     try {
-      pglicht::ConnectionRegistry fresh =
-        pglicht::ConnectionRegistry::from_ini(config_path_, app_name());
-      pglicht::Budgets fresh_budgets = pglicht::Budgets::load(budgets_path_);
+      pglicht::ConnectionRegistry fresh = [&] {
+        try {
+          return pglicht::ConnectionRegistry::from_ini(config_path_, app_name());
+        } catch (const std::exception& e) {
+          throw std::runtime_error(std::string("the connections file: ") + e.what());
+        }
+      }();
+      pglicht::Budgets fresh_budgets = [&] {
+        if (bud_now == "missing") return budgets_;
+        try {
+          return pglicht::Budgets::load(budgets_path_);
+        } catch (const std::exception& e) {
+          throw std::runtime_error(std::string("the budgets file: ") + e.what());
+        }
+      }();
+      // A file written in place -- truncated, then filled -- can be read
+      // halfway, and a prefix can parse. If either file moved while it was
+      // being read, apply nothing: the next request reads the finished one.
+      if (file_identity(config_path_) != cfg_now || file_identity(budgets_path_) != bud_now)
+        return;
 
       // Close what the new file no longer describes the same way.
       for (const auto& name : registry_.names()) {
@@ -1546,9 +1573,9 @@ private:
     // is safe and invisible: the file on disk says one thing and the server
     // answers another. Said here, where the operator checks what is loaded.
     if (!reload_error_.empty())
-      result["reload_error"] = "the connections file changed but could not be "
-                               "loaded, so the previous configuration is still in "
-                               "use: " + reload_error_;
+      result["reload_error"] = "a changed configuration file could not be loaded, "
+                               "so the previous configuration is still in use -- " +
+                               reload_error_;
     return result;
   }
 
@@ -1667,7 +1694,12 @@ private:
       SELECT JSONB_BUILD_OBJECT(
                'system_identifier', (SELECT c.system_identifier::text
                                      FROM pg_control_system() AS c),
-               'postmaster_start_time', pg_postmaster_start_time()::text,
+               -- In UTC, whatever this session's TimeZone: the text is
+               -- compared across connections, and ALTER DATABASE or ALTER
+               -- ROLE ... SET timezone would print one postmaster two ways.
+               'postmaster_start_time',
+                 to_char(pg_postmaster_start_time() AT TIME ZONE 'UTC',
+                         'YYYY-MM-DD HH24:MI:SS.US') || '+00',
                'database',          current_database(),
                'server_addr',       HOST(inet_server_addr()),
                'server_port',       inet_server_port(),
@@ -1810,8 +1842,9 @@ private:
           finding("replication_group", rname, "warning",
                   "these connections reach one primary -- the same system "
                   "identifier and postmaster start time -- so it is listed more "
-                  "than once, not split brain: " + join(same) + ". Declare them "
-                  "one instance");
+                  "than once, not split brain: " + join(same) + ". Keep one of "
+                  "them in the replication_group; to name both, declare them one "
+                  "instance instead");
     }
 
     // --- lineages the config never mentions ---
@@ -1899,7 +1932,12 @@ private:
         if (d.name == o.name || !d.ok) continue;
         const auto& dc = registry_.get(d.name);
         if (!dc.pooler.empty()) continue;
-        if (!d.sysid.empty() && d.sysid == o.sysid && !d.started.empty() &&
+        // A pooler that forces another user answers as that user, so it is
+        // not "one user" whatever the sections say -- the sweep keeps both
+        // members for the same reason.
+        const bool forced = route.contains("force_user") && route["force_user"].is_string() &&
+                            route["force_user"].get<std::string>() != cfg.user;
+        if (!forced && !d.sysid.empty() && d.sysid == o.sysid && !d.started.empty() &&
             d.started == o.started && d.database == o.database &&
             !cfg.user.empty() && dc.user == cfg.user)
           finding("pooler", o.name, "info",
@@ -1911,15 +1949,16 @@ private:
 
     if (!reload_error_.empty())
       finding("configuration", "reload", "error",
-              "the connections file changed but could not be loaded, so every "
-              "finding here describes the previous configuration: " + reload_error_);
+              "a changed configuration file could not be loaded, so every finding "
+              "here describes the previous configuration -- " + reload_error_);
 
     // --- sections skipped at startup ---
     // Nothing about them could be checked, and the operator may not know they
     // were skipped: the server started, which it used not to.
     for (const auto& [name, why] : registry_.invalid())
       finding("configuration", name, "error",
-              "this section was skipped at startup and is not a connection: " + why);
+              "this section was skipped when the connections file was loaded and is "
+              "not a connection: " + why);
 
     // --- what could not be answered ---
     std::vector<std::string> failed;
@@ -10092,19 +10131,29 @@ private:
       for (const auto& m : members) {
         const auto& c = registry_.get(m);
         std::string twin;
+        // Declared: an inferred instance is only a shared host and port, and
+        // two names on one PgBouncer port share that while the pooler routes
+        // them to different servers. Checked on the pooled member only -- an
+        // inferred instance is named host:port and inference never takes a
+        // name already declared, so a twin sharing a declared name is declared.
         auto candidate = [&](const std::string& d) {
           const auto& dc = registry_.get(d);
           return d != m && dc.pooler.empty() && dc.instance == c.instance && dc.user == c.user;
         };
-        if (!c.pooler.empty() && !c.instance.empty() && !c.user.empty() &&
+        if (!c.pooler.empty() && !c.instance.empty() && c.instance_source == "declared" &&
+            !c.user.empty() &&
             std::any_of(members.begin(), members.end(), candidate)) {
           const json route = pooler_route(c);
           const bool forced = route.contains("force_user") && route["force_user"].is_string() &&
                               route["force_user"].get<std::string>() != c.user;
+          // The twin must be one this sweep will visit: the width cap below
+          // keeps the first kMaxSweepMembers, and skipping the pooled member
+          // for a twin beyond it would leave the database unanswered.
           if (!route.contains("error") && route.value("found", false) && !forced)
-            for (const auto& d : members)
-              if (candidate(d) && registry_.get(d).dbname == route.value("backend_database", "")) {
-                twin = d;
+            for (size_t i = 0; i < members.size() && i < kMaxSweepMembers; i++)
+              if (candidate(members[i]) &&
+                  registry_.get(members[i]).dbname == route.value("backend_database", "")) {
+                twin = members[i];
                 break;
               }
         }
@@ -10302,6 +10351,9 @@ private:
     const json meta = params.contains("_meta") && params["_meta"].is_object()
       ? params["_meta"] : json::object();
     modern_ = meta.contains(kMetaProtocolVersion);
+    // A client on the stateless revision never sends notifications/initialized,
+    // and must still hear that the lists changed.
+    if (modern_) initialized_ = true;
 
     if (modern_) {
       // Both keys are required on every modern request; a request missing one
@@ -10369,7 +10421,10 @@ private:
         send_error(req["id"], -32602, "invalid cursor");
         return;
       }
-      send_response(req["id"], cacheable(out, kTtlStatic, "private"));
+      // A minute, not an hour: it names the default connection and the pooler
+      // a pooler tool defaults to, and a reloaded connections file changes
+      // both. A client that ignores list_changed is at most a minute behind.
+      send_response(req["id"], cacheable(out, kTtlCatalog, "private"));
     }
     else if (method == "resources/list") {
       json out = json::object();
@@ -10644,11 +10699,11 @@ private:
   // it whenever it needs the list. That is the largest single payload the
   // server produces and it is entirely static.
 
-  // Everything compiled into the binary or read from the config file at
-  // startup. None of it can change while the process lives: the registry is
-  // built once, the tool table is a static, and no `listChanged` capability is
-  // declared, so there is no mechanism by which a client could be told
-  // otherwise even if it could.
+  // Everything compiled into the binary: versions, capabilities, instructions,
+  // prompts, resource templates. None of it can change while the process
+  // lives. tools/list is NOT here since 4.5.0: it names configured
+  // connections, and the connections file is reloaded when it changes -- the
+  // client is told with list_changed, and the list is cached for a minute.
   static constexpr int kTtlStatic = 3600000;   // 1 hour
   // Anything derived from a live catalog. Structure changes only when someone
   // issues DDL -- that is the whole premise of serving it as a resource -- but

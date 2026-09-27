@@ -583,8 +583,10 @@ but not on
 .Pa pg_service.conf ,
 so if a service file holds a password its permissions are yours to manage.
 .Ss Reloading
-An edit to the connections file, or to the budgets file, takes effect at the
-next request, without restarting the server or the client.
+An edit to the connections file, or to the budgets file in use at startup, takes
+effect at the next request, without restarting the server or the client.
+A budgets file created after startup is read at the next start, and one that
+disappears leaves the limits in force as they were.
 Before each request
 .Nm
 compares the file's modification time, size and inode with the version it
@@ -613,6 +615,9 @@ call sees part of each configuration.
 Connections whose section changed or was removed are closed; the rest are kept.
 Only the file named at startup is ever read.
 .Pp
+If a file changes while it is being read, nothing is applied, and the next
+request reads it again.
+.Pp
 The tool list and the resource list both depend on the configuration \(em the
 default connection, the only pooler, one set of resources per connection \(em
 so after a reload
@@ -624,8 +629,13 @@ and
 and declares
 .Va listChanged
 for both at initialisation.
+A client on the stateless revision, which never sends
+.Li notifications/initialized ,
+is sent them too, and
+.Li tools/list
+is marked cacheable for one minute rather than an hour.
 A client that ignores them keeps working, with descriptions that may name the
-old default.
+old default for at most that minute.
 A new
 .Nm
 binary still needs the client to restart the server.
@@ -633,6 +643,8 @@ binary still needs the client to restart the server.
 Before 4.5.0,
 .Dv SIGHUP
 took the default action and ended the process.
+It no longer does in any mode; with a connection string instead of a file there
+is nothing to reload, and the signal is ignored.
 .Sh OPERATIONS
 Every operation below except
 .Ic listConnections
