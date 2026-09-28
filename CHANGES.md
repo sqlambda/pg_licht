@@ -1,5 +1,29 @@
 # Changelog
 
+## 4.5.1 (unreleased)
+
+### Fixed
+
+- **pg_licht did not link on FreeBSD.** The server starts threads -- the
+  connection cache's reaper, parallel sweeps -- but the build never asked
+  for the threads library. glibc 2.34+ has pthreads in libc and macOS links
+  them implicitly, so neither noticed; FreeBSD keeps them in libthr, and the
+  link failed on `pthread_create`. CMake now links `Threads::Threads`. With
+  that, FreeBSD 14.5 (clang 21) and 15.1 (clang 19) build with no warnings
+  under `-Werror`, and the full suite passes on both, directly and through
+  PgBouncer, against packaged PostgreSQL 18 and PgBouncer 1.25.1.
+
+- **The test rig assumed Linux's loopback.** A connection to 127.0.0.2
+  comes from 127.0.0.1 on Linux and from 127.0.0.2 on FreeBSD, which
+  `initdb`'s `pg_hba.conf` does not trust; the rig now trusts it. Where
+  127.0.0.2 is not configured at all, the tests that need it skip with the
+  command that adds it, instead of failing.
+
+### Documented
+
+- **Building on FreeBSD**, in INSTALL.md: the packages, the build, and the
+  loopback alias the test suite wants.
+
 ## 4.5.0 (2026-09-27)
 
 ### Added

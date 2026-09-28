@@ -88,6 +88,26 @@ Add `~/.local/bin` to your `PATH` if it is not already there. Most distributions
 `~/.local/share/man` to the man search path automatically; if `man pg_licht_mcp` does not
 find it, export `MANPATH="$HOME/.local/share/man:$MANPATH"`.
 
+## FreeBSD (build from source)
+
+There is no FreeBSD package yet. It builds and passes the full test suite on FreeBSD
+14.5 and 15.1, with the base system's clang and packaged dependencies:
+
+```sh
+sudo pkg install cmake pkgconf nlohmann-json postgresql18-client postgresql-libpqxx
+git clone https://github.com/sqlambda/pg_licht && cd pg_licht/cpp
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+cmake --build build --target pg_licht_mcp
+sudo cmake --install build --prefix /usr/local
+```
+
+`/usr/local/bin/pg_licht_mcp` and `man pg_licht_mcp` then work as on Linux. To run the
+test suite as well, add `googletest bash postgresql18-server postgresql18-contrib
+pgbouncer`, drop `-DBUILD_TESTING=OFF`, and run
+`PG_BINDIR=/usr/local/bin bash test/run-pooled-tests.sh`. A few tests need a second
+loopback address, which FreeBSD does not route by default:
+`sudo ifconfig lo0 alias 127.0.0.2/32`; without it they skip and say so.
+
 ## Verify the installation
 
 ```bash
