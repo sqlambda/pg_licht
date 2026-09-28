@@ -276,7 +276,10 @@ jobs:
           # PGDG's package by name, never the distribution's libpq.
           rpm -qpR "$pkg" | grep -qx 'libpq5'
           dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-$(uname -m)/pgdg-redhat-repo-latest.noarch.rpm
-          dnf install -y "$pkg"
+          # Rocky's own image sets tsflags=nodocs, which a real install does
+          # not; without this the man page check below fails on a package
+          # that ships it.
+          dnf install -y --setopt=tsflags= "$pkg"
           provider=$(rpm -q --whatprovides libpq5)
           echo "libpq5 provided by: $provider"
           echo "$provider" | grep -q PGDG
