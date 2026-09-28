@@ -1,4 +1,5 @@
 #include <cstdlib>
+#include <signal.h>
 #include <string>
 #include "server.h"
 
@@ -39,6 +40,18 @@ void usage(const char* argv0) {
 }  // namespace
 
 int main(int argc, char *argv[]) {
+  // SIGHUP reloads the connections file, as it does for PostgreSQL and
+  // PgBouncer. Through 4.4 it took the default action: the process died, and
+  // the client's session with it. Installed first thing and in every mode --
+  // with a connection string there is nothing to reload, and the signal is
+  // then simply harmless. SA_RESTART: a read blocked on stdin resumes, and the
+  // reload happens at the next request, which is when it can be seen.
+  struct sigaction sa {};
+  sa.sa_handler = [](int) { PostgresMCPServer::request_reload(); };
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = SA_RESTART;
+  sigaction(SIGHUP, &sa, nullptr);
+
   std::string config_path;
   std::string db_url;
 
@@ -90,6 +103,11 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  // Everything before run() is reading configuration: the budgets file, the
+  // connections file, a connection string. Nothing has connected yet --
+  // connections open on the first call that needs one -- so a failure here was
+  // reported as "Fatal DB Error" about a database nobody had reached.
+  bool configured = false;
   try {
     // Loaded here and only here, so a server built any other way -- the test
     // fixture above all -- keeps the built-in limits and never reads a
@@ -97,23 +115,32 @@ int main(int argc, char *argv[]) {
     // connections file.
     const char* env_budgets = std::getenv("PG_LICHT_BUDGETS");
     const char* home = std::getenv("HOME");
-    const pglicht::Budgets budgets = pglicht::Budgets::load(
+    const std::string budgets_path =
       pglicht::Budgets::resolve_path(env_budgets ? env_budgets : "", config_path,
-                                     home ? home : ""));
+                                     home ? home : "");
+    const pglicht::Budgets budgets = pglicht::Budgets::load(budgets_path);
 
     if (!config_path.empty()) {
       auto registry = pglicht::ConnectionRegistry::from_ini(
         config_path, std::string("pg-licht-cpp/") + PGLICHT_VERSION);
+      // A skipped section is reported where the operator looks first: the
+      // client's MCP server log, which is where stderr goes.
+      for (const auto& [name, why] : registry.invalid())
+        std::cerr << "pg_licht_mcp: skipped [" << name << "]: " << why << std::endl;
       PostgresMCPServer server(std::move(registry));
       server.set_budgets(budgets);
+      server.watch_config(config_path, budgets_path);
+      configured = true;
       server.run();
     } else {
       PostgresMCPServer server(db_url);
       server.set_budgets(budgets);
+      configured = true;
       server.run();
     }
   } catch (const std::exception& e) {
-    std::cerr << "Fatal DB Error: " << e.what() << std::endl;
+    std::cerr << (configured ? "Fatal error: " : "Configuration error: ") << e.what()
+              << std::endl;
     return 1;
   }
 

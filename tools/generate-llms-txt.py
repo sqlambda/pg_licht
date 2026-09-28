@@ -150,13 +150,15 @@ def render(version, tools, prompts, base_url, ref, man_anchors):
         f"{len(tools)} tools and {len(prompts)} guided prompts for exploring "
         f"schemas, reading statistics and diagnosing a live server. Version {version}.",
         "",
-        "Every tool call runs in its own READ ONLY transaction bounded by "
+        "Every call to a database runs in its own READ ONLY transaction bounded by "
         "statement_timeout, and every catalog query is parameterized, so no "
         "argument is ever concatenated into SQL. The one operation that can "
         "execute a statement, explainQuery with analyze, does so only after "
         "the plan is proven free of any data-modifying node. It speaks MCP over "
         "stdio and runs as a single binary; connections are libpq connection "
-        "strings or a connections file.",
+        "strings or a connections file. The pooler tools send a PgBouncer "
+        "admin console only SHOW commands, as the user configured for it, which "
+        "should be one of its stats_users.",
         "",
         "Install with `brew tap sqlambda/pg-licht && brew install pg-licht`, "
         f"or from the Debian, Rocky Linux and tarball packages on the releases page: {REPO}/releases",

@@ -126,16 +126,23 @@ docs = {"README.md": (os.path.join(repo, "README.md"), False),
         "the landing page": (os.path.join(site, "index.html"), True)}
 # "N operations" and "N of M" are the forms a total is written in by hand;
 # "N tools" is a subset -- "(10 tools, each marked)" -- or a generated count.
-counts = [r"(?<![\d.,])(\d{2,3}) (?:read-only )?operations\b",
-          r"\b\d{2} of (?:the )?(\d{2,3})\b"]
+#
+# Two totals are true since 4.5: every operation, and the operations a
+# database can run -- which is what checkPrivileges counts, so "59 of 72" is a
+# statement about a database connection. The pooler tools are the difference,
+# recognised by the scope note the server itself appends to their descriptions.
+db_total = sum(1 for t in res[2]["tools"]
+               if "Reads a PgBouncer admin console" not in t.get("description", ""))
+counts = [(r"(?<![\d.,])(\d{2,3}) (?:read-only )?operations\b", {total}),
+          (r"\b\d{2} of (?:the )?(\d{2,3})\b", {total, db_total})]
 wrong = []
 for label, (path, markup) in docs.items():
     if not os.path.isfile(path):
         continue
     t = text_of(path, markup)
-    for p in counts:
+    for p, allowed in counts:
         for m in re.finditer(p, t):
-            if int(m.group(1)) != total:
+            if int(m.group(1)) not in allowed:
                 wrong.append(f"{label}: \"{t[max(0, m.start() - 40):m.end() + 10].strip()}\"")
 assert not wrong, (f"the binary lists {total} tools, but these say otherwise:\n  "
                    + "\n  ".join(wrong))

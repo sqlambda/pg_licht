@@ -58,12 +58,16 @@ jobs:
             distro: debian
             extension: deb
           - os: ubuntu-latest
-            container: rockylinux:9
+            # Rocky's own image. The Docker Hub library image rockylinux:9 stopped at
+            # 9.3, and since pgdg-redhat-repo 42.0-70 (2026-09-27) PGDG builds its
+            # URLs from the minor release, rhel-9.3-* included, which it no longer
+            # serves: every Rocky job failed on a 404 for pgdg18's repomd.xml.
+            container: rockylinux/rockylinux:9
             artifact: pg_licht_mcp-linux-x86_64-rocky9
             distro: rocky
             extension: rpm
           - os: ubuntu-24.04-arm
-            container: rockylinux:9
+            container: rockylinux/rockylinux:9
             artifact: pg_licht_mcp-linux-arm64-rocky9
             distro: rocky
             extension: rpm
@@ -224,11 +228,11 @@ jobs:
             artifact: pg_licht_mcp-linux-arm64-debian13
             extension: deb
           - os: ubuntu-latest
-            container: rockylinux:9
+            container: rockylinux/rockylinux:9
             artifact: pg_licht_mcp-linux-x86_64-rocky9
             extension: rpm
           - os: ubuntu-24.04-arm
-            container: rockylinux:9
+            container: rockylinux/rockylinux:9
             artifact: pg_licht_mcp-linux-arm64-rocky9
             extension: rpm
 
@@ -272,7 +276,10 @@ jobs:
           # PGDG's package by name, never the distribution's libpq.
           rpm -qpR "$pkg" | grep -qx 'libpq5'
           dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-$(uname -m)/pgdg-redhat-repo-latest.noarch.rpm
-          dnf install -y "$pkg"
+          # Rocky's own image sets tsflags=nodocs, which a real install does
+          # not; without this the man page check below fails on a package
+          # that ships it.
+          dnf install -y --setopt=tsflags= "$pkg"
           provider=$(rpm -q --whatprovides libpq5)
           echo "libpq5 provided by: $provider"
           echo "$provider" | grep -q PGDG

@@ -23,6 +23,7 @@
 #   STANDBY_PORT port for the streaming standby           (default: 57432)
 #   SUBSCRIBER_PORT port for the logical subscriber       (default: 58432)
 #   CASCADE_PORT port for the cascading standby           (default: 59432)
+#   SPLIT_PORT  port for the second primary (split brain) (default: 54432)
 #
 # A physical standby is streamed off the primary with pg_basebackup and its
 # conninfo is exported as STANDBY_URL. The role and topology tests use it to
@@ -35,6 +36,18 @@
 # conninfo is exported as CASCADE_URL. That is the one configuration where
 # replicationStats cannot use pg_current_wal_lsn(), which raises in recovery,
 # and it was verified only by hand until the rig built one.
+#
+# The primary also listens on 127.0.0.2, exported as ALT_ADDR_URL. PgBouncer
+# reaches it on 127.0.0.1, so a connection made directly to 127.0.0.2 and one
+# made through the pooler report two server addresses for one postmaster --
+# the shape of a pooler on the database's own machine, which verifyTopology
+# read as two servers through 4.4.
+#
+# A second PRIMARY is copied off the first with pg_basebackup and started
+# without standby.signal, exported as SPLIT_URL: the same system identifier on
+# a different postmaster, both accepting writes. That is split brain, and the
+# one case verifyTopology must still call so once it stopped mistaking one
+# server listed twice for it.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -67,6 +80,7 @@ BOUNCER_PORT="${BOUNCER_PORT:-56432}"
 STANDBY_PORT="${STANDBY_PORT:-57432}"
 SUBSCRIBER_PORT="${SUBSCRIBER_PORT:-58432}"
 CASCADE_PORT="${CASCADE_PORT:-59432}"
+SPLIT_PORT="${SPLIT_PORT:-54432}"
 
 for req in "$PG_BINDIR/initdb" "$PG_BINDIR/pg_ctl" "$PG_BINDIR/createdb" \
            "$PG_BINDIR/pg_basebackup" "$PG_BINDIR/psql" "$PGBOUNCER" "$TEST_BIN"; do
@@ -82,6 +96,7 @@ PGDATA="$work/pg"
 SBDATA="$work/standby"
 SUBDATA="$work/subscriber"
 CADATA="$work/cascade"
+SPDATA="$work/split"
 BDIR="$work/bouncer"
 mkdir -p "$PGDATA" "$BDIR"
 
@@ -89,6 +104,7 @@ cleanup() {
   [ -f "$BDIR/pgbouncer.pid" ] && kill "$(cat "$BDIR/pgbouncer.pid")" 2>/dev/null || true
   "$PG_BINDIR/pg_ctl" -D "$SUBDATA" -m immediate stop >/dev/null 2>&1 || true
   "$PG_BINDIR/pg_ctl" -D "$CADATA" -m immediate stop >/dev/null 2>&1 || true
+  "$PG_BINDIR/pg_ctl" -D "$SPDATA" -m immediate stop >/dev/null 2>&1 || true
   "$PG_BINDIR/pg_ctl" -D "$SBDATA" -m immediate stop >/dev/null 2>&1 || true
   "$PG_BINDIR/pg_ctl" -D "$PGDATA" -m immediate stop >/dev/null 2>&1 || true
   rm -rf "$work"
@@ -120,7 +136,7 @@ done
 
 cat >> "$PGDATA/postgresql.conf" <<CONF
 port = $PG_PORT
-listen_addresses = '127.0.0.1'
+listen_addresses = '127.0.0.1,127.0.0.2'
 unix_socket_directories = '$work'
 shared_preload_libraries = '$PRELOAD'
 # pg_qualstats samples one statement in max_connections by default, which
@@ -199,6 +215,18 @@ done
 CASCADE_URL="host=127.0.0.1 port=$CASCADE_PORT dbname=pglicht user=pglicht"
 export CASCADE_URL
 
+# --- a second primary of the same lineage: split brain ---------------------
+echo "--- pg_basebackup a second primary on $SPLIT_PORT (split brain)"
+"$PG_BINDIR/pg_basebackup" -h 127.0.0.1 -p "$PG_PORT" -U pglicht \
+    -D "$SPDATA" -X stream >/dev/null
+cat >> "$SPDATA/postgresql.conf" <<CONF
+port = $SPLIT_PORT
+unix_socket_directories = '$work'
+CONF
+"$PG_BINDIR/pg_ctl" -D "$SPDATA" -l "$SPDATA/pg.log" -w start >/dev/null
+SPLIT_URL="host=127.0.0.1 port=$SPLIT_PORT dbname=pglicht user=pglicht"
+export SPLIT_URL
+
 # --- logical subscriber ----------------------------------------------------
 # A separate cluster, and it has to be: logical replication between two
 # databases of one cluster deadlocks on itself. CREATE SUBSCRIPTION creates the
@@ -260,6 +288,11 @@ export SUBSCRIBER_URL
 cat > "$BDIR/pgbouncer.ini" <<INI
 [databases]
 * = host=127.0.0.1 port=$PG_PORT user=pglicht
+; One server only, so the pooler tests can make a client wait for real.
+licht_saturate = host=127.0.0.1 port=$PG_PORT dbname=pglicht user=pglicht pool_size=1
+; Routes to pglicht as another user. Never connected to: the tests read the
+; route only, to prove a sweep keeps a member whose pooler forces a user.
+licht_forced = host=127.0.0.1 port=$PG_PORT dbname=pglicht user=licht_somebody_else
 
 [pgbouncer]
 listen_addr = 127.0.0.1
@@ -268,6 +301,9 @@ unix_socket_dir = $work
 auth_type = any
 pool_mode = transaction
 server_reset_query = DISCARD ALL
+; The pooler tools' login: PgBouncer lets a stats user run SHOW and nothing
+; else, which is the guarantee those tools rest on.
+stats_users = pglicht_stats
 max_client_conn = 200
 default_pool_size = 25
 logfile = $BDIR/pgbouncer.log
@@ -280,6 +316,15 @@ for _ in $(seq 1 20); do
   grep -q "listening on 127.0.0.1:$BOUNCER_PORT" "$BDIR/pgbouncer.log" 2>/dev/null && break
   sleep 0.2
 done
+
+# The pooler tools read this PgBouncer's admin console; the tests find it here.
+POOLER_PORT=$BOUNCER_PORT
+POOLER_USER=pglicht_stats
+export POOLER_PORT POOLER_USER
+
+# The primary under a second address; see the header.
+ALT_ADDR_URL="host=127.0.0.2 port=$PG_PORT dbname=pglicht user=pglicht"
+export ALT_ADDR_URL
 
 # --- run the suite both ways -----------------------------------------------
 rc=0

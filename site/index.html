@@ -189,8 +189,10 @@
     assistant behaves.</p>
     <div class="grid">
       <div class="feature"><h3>A read-only transaction per call</h3>
-        <p>Every tool runs inside its own <code>READ ONLY</code> transaction. A write, even one
-        reached through a bug, fails in PostgreSQL rather than succeeding.</p></div>
+        <p>Every call to a database runs inside its own <code>READ ONLY</code> transaction. A
+        write, even one reached through a bug, fails in PostgreSQL rather than succeeding. The
+        pooler tools send PgBouncer only <code>SHOW</code>, as the stats user you give them,
+        which PgBouncer allows nothing else.</p></div>
       <div class="feature"><h3>A timeout on every statement</h3>
         <p><code>statement_timeout</code> is set on the same transaction, two minutes by
         default and set per connection, so no call can hold a backend indefinitely.</p></div>
@@ -206,7 +208,7 @@
         whole suite runs through a real PgBouncer on every change.</p></div>
       <div class="feature"><h3>Honest about privileges</h3>
         <p><code>checkPrivileges</code> says which tools the connecting role can really use:
-        59 of 72 for a bare login role, 67 with <code>pg_monitor</code>.</p></div>
+        59 of 72 database tools for a bare login role, 67 with <code>pg_monitor</code>.</p></div>
     </div>
   </section>
 
@@ -266,6 +268,11 @@
         a narrower search, and the largest answers narrow themselves by default. Set a cap in
         <code>budgets.ini</code> and an answer past it is refused with the arguments that
         make it smaller, rather than returned.</p></div>
+      <div class="feature"><h3>The pooler too</h3>
+        <p>Point a section at PgBouncer's admin console and ask whether the pools keep up:
+        clients waiting for a server and for how long, servers in use against each pool's
+        size, and the connections and settings behind them &mdash; read with
+        <code>SHOW</code> alone, as the stats user you give them.</p></div>
       <div class="feature"><h3>Topology aware</h3>
         <p>Label connections by instance and replication group. Roles are observed on each
         call, never configured, and <code>verifyTopology</code> checks the labels against the
