@@ -334,6 +334,11 @@ if "$PG_BINDIR/psql" -X -qtA -h 127.0.0.2 -p "$PG_PORT" -U pglicht -d pglicht \
      -c 'SELECT 1' >/dev/null 2>&1; then
   ALT_ADDR_URL="host=127.0.0.2 port=$PG_PORT dbname=pglicht user=pglicht"
   export ALT_ADDR_URL
+elif [ "$(uname -s)" = Linux ]; then
+  # Linux always has it, so its absence is a broken rig, not a missing alias:
+  # fail, rather than let two tests become silent skips in CI.
+  echo "ERROR: 127.0.0.2 is not reachable, and on Linux it always is" >&2
+  exit 1
 else
   echo "--- 127.0.0.2 is not reachable here; the second-address tests will skip" \
        "(FreeBSD: ifconfig lo0 alias 127.0.0.2/32)"

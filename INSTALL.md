@@ -93,20 +93,31 @@ find it, export `MANPATH="$HOME/.local/share/man:$MANPATH"`.
 There is no FreeBSD package yet. It builds and passes the full test suite on FreeBSD
 14.5 and 15.1, with the base system's clang and packaged dependencies:
 
+As root (a stock FreeBSD has neither `sudo` nor `git`, so install them here if you want
+them):
+
 ```sh
-sudo pkg install cmake pkgconf nlohmann-json postgresql18-client postgresql-libpqxx
+pkg install git cmake pkgconf nlohmann-json postgresql-libpqxx
+```
+
+`postgresql-libpqxx` pulls in `postgresql18-client`, which provides libpq. Then, as any
+user:
+
+```sh
 git clone https://github.com/sqlambda/pg_licht && cd pg_licht/cpp
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
 cmake --build build --target pg_licht_mcp
-sudo cmake --install build --prefix /usr/local
 ```
+
+and, as root again, `cmake --install build --prefix /usr/local`.
 
 `/usr/local/bin/pg_licht_mcp` and `man pg_licht_mcp` then work as on Linux. To run the
 test suite as well, add `googletest bash postgresql18-server postgresql18-contrib
 pgbouncer`, drop `-DBUILD_TESTING=OFF`, and run
 `PG_BINDIR=/usr/local/bin bash test/run-pooled-tests.sh`. A few tests need a second
-loopback address, which FreeBSD does not route by default:
-`sudo ifconfig lo0 alias 127.0.0.2/32`; without it they skip and say so.
+loopback address, which FreeBSD does not route by default: as root,
+`ifconfig lo0 alias 127.0.0.2/32`. Without it those tests skip, and their message says
+so; on Linux, where the address always exists, the rig fails instead.
 
 ## Verify the installation
 

@@ -7698,7 +7698,9 @@ TEST_F(TopologyFixture, VerifyTopologyAcceptsATrueInstanceDeclaration) {
 TEST_F(TopologyFixture, VerifyTopologyKnowsOneServerReachedThroughItsPooler) {
   const char* alt = std::getenv("ALT_ADDR_URL");
   const char* pool = std::getenv("POOLER_PORT");
-  if (!alt || !pool) GTEST_SKIP() << "no ALT_ADDR_URL; run cpp/test/run-pooled-tests.sh";
+  if (!alt || !pool)
+    GTEST_SKIP() << "no ALT_ADDR_URL: run cpp/test/run-pooled-tests.sh, and on FreeBSD first "
+                    "ifconfig lo0 alias 127.0.0.2/32";
   const std::string pooled = "host=127.0.0.1 port=" + std::string(pool) +
                              " dbname=pglicht user=pglicht";
   auto s = server_from(section("direct", alt, "instance = pg-01\n") +
@@ -8670,7 +8672,9 @@ TEST_F(TopologyFixture, APooledConnectionIsCheckedAgainstItsRoute) {
   const char* alt = std::getenv("ALT_ADDR_URL");
   const char* port = std::getenv("POOLER_PORT");
   const std::string pool = pooler_section("pool");
-  if (!alt || !port || pool.empty()) GTEST_SKIP() << "run cpp/test/run-pooled-tests.sh";
+  if (!alt || !port || pool.empty())
+    GTEST_SKIP() << "no ALT_ADDR_URL or pooler: run cpp/test/run-pooled-tests.sh, and on "
+                    "FreeBSD first ifconfig lo0 alias 127.0.0.2/32";
   const std::string via = "[pooled]\nhost = 127.0.0.1\nport = " + std::string(port) +
                           "\ndbname = pglicht\nuser = pglicht\ninstance = pg-01\n"
                           "pooler = pool\ngroup = g\n";

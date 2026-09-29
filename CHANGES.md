@@ -16,8 +16,11 @@
 - **The test rig assumed Linux's loopback.** A connection to 127.0.0.2
   comes from 127.0.0.1 on Linux and from 127.0.0.2 on FreeBSD, which
   `initdb`'s `pg_hba.conf` does not trust; the rig now trusts it. Where
-  127.0.0.2 is not configured at all, the tests that need it skip with the
-  command that adds it, instead of failing.
+  127.0.0.2 is not configured at all -- FreeBSD without the `lo0` alias --
+  the two tests that need it skip, and the rig and the skip messages name
+  the command that adds it. On Linux, which always has it, its absence
+  fails the rig instead, so a broken rig cannot turn them into silent
+  skips in CI.
 
 ### Documented
 
