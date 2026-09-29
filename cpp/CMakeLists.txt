@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pg_licht_mcp VERSION 4.5.0 LANGUAGES CXX)
+project(pg_licht_mcp VERSION 4.5.1 LANGUAGES CXX)
 
 # Standard bin/ and share/man/ layout, so `cmake --install` produces a tree that
 # can be dropped onto a prefix as-is: the release tarballs are staged this way,
@@ -22,6 +22,12 @@ pkg_check_modules(PQXX REQUIRED IMPORTED_TARGET libpqxx)
 # runtime dependency there) and required when it's static.
 pkg_check_modules(LIBPQ REQUIRED IMPORTED_TARGET libpq)
 find_package(nlohmann_json REQUIRED)
+# The server starts threads -- the connection cache's reaper, parallel sweeps,
+# the pooler tests' clients -- and must say so at link time. glibc 2.34+ has
+# pthreads in libc and macOS links them implicitly, so neither ever noticed;
+# FreeBSD keeps them in libthr, and the link failed there on pthread_create.
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/SafetyFlags.cmake)
 
@@ -37,6 +43,7 @@ target_link_libraries(pg_licht_mcp
         nlohmann_json::nlohmann_json
         PkgConfig::PQXX
         PkgConfig::LIBPQ
+        Threads::Threads
 )
 pglicht_harden(pg_licht_mcp)
 pglicht_apply_sanitizers(pg_licht_mcp)
@@ -68,7 +75,8 @@ if(BUILD_TESTING)
             GTest::gtest_main
             nlohmann_json::nlohmann_json
             PkgConfig::PQXX
-            PkgConfig::LIBPQ)
+            PkgConfig::LIBPQ
+            Threads::Threads)
     pglicht_harden(pg_licht_mcp_test)
     pglicht_apply_sanitizers(pg_licht_mcp_test)
     add_test(NAME mcp_test COMMAND pg_licht_mcp_test)

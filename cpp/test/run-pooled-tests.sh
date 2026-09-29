@@ -151,6 +151,10 @@ full_page_writes = off
 CONF
 
 echo "--- start postgres on $PG_PORT (preloaded: $PRELOAD)"
+# initdb trusts 127.0.0.1 only. Linux sends a connection to 127.0.0.2 from
+# 127.0.0.1, so that sufficed there; FreeBSD sends it from 127.0.0.2 itself,
+# and the rule is needed for the second address to be reachable at all.
+echo "host all all 127.0.0.2/32 trust" >> "$PGDATA/pg_hba.conf"
 "$PG_BINDIR/pg_ctl" -D "$PGDATA" -l "$PGDATA/pg.log" -w start >/dev/null
 "$PG_BINDIR/createdb" -h 127.0.0.1 -p "$PG_PORT" -U pglicht pglicht
 
@@ -322,9 +326,23 @@ POOLER_PORT=$BOUNCER_PORT
 POOLER_USER=pglicht_stats
 export POOLER_PORT POOLER_USER
 
-# The primary under a second address; see the header.
-ALT_ADDR_URL="host=127.0.0.2 port=$PG_PORT dbname=pglicht user=pglicht"
-export ALT_ADDR_URL
+# The primary under a second address; see the header. Linux routes all of
+# 127/8 to the loopback interface; FreeBSD needs it added first
+# (ifconfig lo0 alias 127.0.0.2/32). Without it the tests that need the
+# address skip, saying why, rather than fail on a connect error.
+if "$PG_BINDIR/psql" -X -qtA -h 127.0.0.2 -p "$PG_PORT" -U pglicht -d pglicht \
+     -c 'SELECT 1' >/dev/null 2>&1; then
+  ALT_ADDR_URL="host=127.0.0.2 port=$PG_PORT dbname=pglicht user=pglicht"
+  export ALT_ADDR_URL
+elif [ "$(uname -s)" = Linux ]; then
+  # Linux always has it, so its absence is a broken rig, not a missing alias:
+  # fail, rather than let two tests become silent skips in CI.
+  echo "ERROR: 127.0.0.2 is not reachable, and on Linux it always is" >&2
+  exit 1
+else
+  echo "--- 127.0.0.2 is not reachable here; the second-address tests will skip" \
+       "(FreeBSD: ifconfig lo0 alias 127.0.0.2/32)"
+fi
 
 # --- run the suite both ways -----------------------------------------------
 rc=0
