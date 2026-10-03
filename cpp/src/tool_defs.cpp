@@ -68,7 +68,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		{"required", {"sql"}}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         json settings = a.contains("settings") ? a["settings"] : json::object();
+         json const settings = a.contains("settings") ? a["settings"] : json::object();
          return s.evaluate_index(a.str("sql", ""), a.arr("create"), a.arr("hide"),
                                  settings, a.str("plan_as_role")); }},
       {"predicateStats",
@@ -564,13 +564,13 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         int pid = a.contains("pid") && a["pid"].is_number_integer()
+         int const pid = a.contains("pid") && a["pid"].is_number_integer()
            ? a["pid"].get<int>() : 0;
-         std::string qid = a.contains("query_id") && a["query_id"].is_string()
+         std::string const qid = a.contains("query_id") && a["query_id"].is_string()
            ? a["query_id"].get<std::string>() : "";
-         double min_dur = a.contains("min_duration_s") && a["min_duration_s"].is_number()
+         double const min_dur = a.contains("min_duration_s") && a["min_duration_s"].is_number()
            ? a["min_duration_s"].get<double>() : 0;
-         std::string st = a.contains("state") && a["state"].is_string()
+         std::string const st = a.contains("state") && a["state"].is_string()
            ? a["state"].get<std::string>() : "";
          return s.activity(pid, qid, min_dur, st); }},
       {"currentLocks",
@@ -585,7 +585,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         int pid = a.contains("pid") && a["pid"].is_number_integer()
+         int const pid = a.contains("pid") && a["pid"].is_number_integer()
            ? a["pid"].get<int>() : 0;
          return s.locks(pid); }},
       {"replicationSlots",
@@ -625,16 +625,16 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         int limit = a.contains("limit") ? a["limit"].get<int>() : 20;
+         int const limit = a.contains("limit") ? a["limit"].get<int>() : 20;
          std::string qid;
          if (a.contains("query_id")) {
            if (a["query_id"].is_string()) qid = a["query_id"].get<std::string>();
            else if (a["query_id"].is_number_integer())
              qid = std::to_string(a["query_id"].get<long long>());
          }
-         std::string ord = a.contains("order_by") && a["order_by"].is_string()
+         std::string const ord = a.contains("order_by") && a["order_by"].is_string()
            ? a["order_by"].get<std::string>() : "";
-         long long min_calls = a.contains("min_calls") && a["min_calls"].is_number_integer()
+         long long const min_calls = a.contains("min_calls") && a["min_calls"].is_number_integer()
            ? a["min_calls"].get<long long>() : 0;
          return s.statement_stats(limit, qid, ord, min_calls); }},
       {"waitEventProfile",
@@ -701,9 +701,9 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         int pid = a.contains("pid") && a["pid"].is_number_integer()
+         int const pid = a.contains("pid") && a["pid"].is_number_integer()
            ? a["pid"].get<int>() : 0;
-         std::string rel = a.contains("relation") && a["relation"].is_string()
+         std::string const rel = a.contains("relation") && a["relation"].is_string()
            ? a["relation"].get<std::string>() : "";
          return s.progress_stats(pid, rel); }},
       {"ioStats",
@@ -730,13 +730,13 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         int pid = a.contains("pid") && a["pid"].is_number_integer()
+         int const pid = a.contains("pid") && a["pid"].is_number_integer()
            ? a["pid"].get<int>() : 0;
-         std::string bt = a.contains("backend_type") && a["backend_type"].is_string()
+         std::string const bt = a.contains("backend_type") && a["backend_type"].is_string()
            ? a["backend_type"].get<std::string>() : "";
-         std::string ob = a.contains("object") && a["object"].is_string()
+         std::string const ob = a.contains("object") && a["object"].is_string()
            ? a["object"].get<std::string>() : "";
-         std::string cx = a.contains("context") && a["context"].is_string()
+         std::string const cx = a.contains("context") && a["context"].is_string()
            ? a["context"].get<std::string>() : "";
          return s.io_stats(pid, bt, ob, cx); }},
       {"checkpointStats",
@@ -786,11 +786,11 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         long long ram_mb = a.contains("ram_mb") && a["ram_mb"].is_number_integer()
+         long long const ram_mb = a.contains("ram_mb") && a["ram_mb"].is_number_integer()
            ? a["ram_mb"].get<long long>() : 0;
-         int vcpus = a.contains("vcpus") && a["vcpus"].is_number_integer()
+         int const vcpus = a.contains("vcpus") && a["vcpus"].is_number_integer()
            ? a["vcpus"].get<int>() : 0;
-         std::string storage = a.contains("storage") && a["storage"].is_string()
+         std::string const storage = a.contains("storage") && a["storage"].is_string()
            ? a["storage"].get<std::string>() : "";
          return s.host_capacity(ram_mb, vcpus, storage); }},
       {"duplicateIndexes",
@@ -889,12 +889,12 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
            else if (a["queryid"].is_number_integer())
              qid = std::to_string(a["queryid"].get<long long>());
          }
-         std::string sql = a.contains("sql") ? a["sql"].get<std::string>() : "";
-         json prms = a.contains("params") ? a["params"] : json::array();
-         bool do_analyze = a.contains("analyze") ? a["analyze"].get<bool>() : false;
-         int tmo = a.contains("timeout_ms") ? a["timeout_ms"].get<int>() : 0;
-         json settings = a.contains("settings") ? a["settings"] : json::object();
-         std::string as_role = a.str("plan_as_role");
+         std::string const sql = a.contains("sql") ? a["sql"].get<std::string>() : "";
+         json const prms = a.contains("params") ? a["params"] : json::array();
+         bool const do_analyze = a.contains("analyze") ? a["analyze"].get<bool>() : false;
+         int const tmo = a.contains("timeout_ms") ? a["timeout_ms"].get<int>() : 0;
+         json const settings = a.contains("settings") ? a["settings"] : json::object();
+         std::string const as_role = a.str("plan_as_role");
          return s.explain_query(qid, sql, prms, do_analyze, tmo, settings, as_role); }},
       {"verifyTopology",
        "connect to every configured connection and report what each server actually is: its role (primary or replica, from pg_is_in_recovery(), observed now rather than configured), its system identifier, postmaster start time, database, address, port and version -- then check the declared topology against them. A physical replica carries the same system identifier as its primary forever, so the identifier alone cannot separate the two axes: the same identifier and the same postmaster start time is one instance however it was reached -- directly or through a pooler, whose reported address is its own hop to the server -- and the same identifier with a different start time is another server of the lineage, a replication group. Reports declarations the servers contradict, connections that share an identifier but are not declared together (an undeclared replica is where 'is this index used?' quietly gets the wrong answer), a replication group with no primary, and split brain. Logical replication cannot be verified this way and is reported as such rather than as a mismatch. A connection declaring pooler = <console> is checked against that console's own routing (SHOW DATABASES): the route is reported beside it, a name the pooler cannot route or routes to another database or port is an error, an alias is noted, and the direct connection that is the same database -- one postmaster, one database, one user -- is named. Connects once per configured connection, several at a time, with a short connect timeout; a connection that fails is reported and does not abort the rest",
@@ -921,7 +921,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         int limit = a.contains("limit") && a["limit"].is_number_integer()
+         int const limit = a.contains("limit") && a["limit"].is_number_integer()
            ? a["limit"].get<int>() : 20;
          return s.buffer_cache_contents(limit); }},
       {"listTopology",

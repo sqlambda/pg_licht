@@ -153,7 +153,9 @@
   deliberate empty catches and one assignment-in-if now carry a `NOLINT`
   that says why, two transaction accesses clang-tidy could not prove safe
   are now guarded, `checkKey`'s type check lost a branch that duplicated its
-  default, and a copy became a reference.
+  default, and a copy became a reference. `misc-const-correctness` is on as
+  well: its 664 findings -- locals that could be `const` -- were fixed, so new
+  code is held to it.
 
 ### Build
 

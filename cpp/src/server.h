@@ -119,7 +119,7 @@ public:
   // and it would show up in CI long before anyone reproduced it by hand.
   ~ConnectionCache() {
     {
-      std::lock_guard<std::mutex> lk(m_);
+      std::lock_guard<std::mutex> const lk(m_);
       stop_ = true;
     }
     cv_.notify_all();
@@ -132,7 +132,7 @@ public:
   // Takes the cached connection for `name` if one is idle, else nothing. The
   // caller owns it until it calls release(); it is out of the map meanwhile.
   std::unique_ptr<pqxx::connection> take(const std::string& name) {
-    std::lock_guard<std::mutex> lk(m_);
+    std::lock_guard<std::mutex> const lk(m_);
     auto it = idle_.find(name);
     if (it == idle_.end()) return nullptr;
     auto conn = std::move(it->second.conn);
@@ -146,7 +146,7 @@ public:
     // caller; dropping it here means the next take() misses and reconnects,
     // rather than handing out a corpse.
     if (!conn->is_open()) return;
-    std::lock_guard<std::mutex> lk(m_);
+    std::lock_guard<std::mutex> const lk(m_);
     idle_[name] = Entry{std::move(conn), Clock::now()};
     evict_over_cap();
   }
@@ -155,19 +155,19 @@ public:
   // changed or removed that section must not be answered on a connection
   // opened under the old one.
   void drop(const std::string& name) {
-    std::lock_guard<std::mutex> lk(m_);
+    std::lock_guard<std::mutex> const lk(m_);
     idle_.erase(name);
   }
 
   // Test hook: how many connections are being held right now.
   size_t idle_count() {
-    std::lock_guard<std::mutex> lk(m_);
+    std::lock_guard<std::mutex> const lk(m_);
     return idle_.size();
   }
 
   // Test hook: close everything now, without waiting for the TTL.
   void reap_now() {
-    std::lock_guard<std::mutex> lk(m_);
+    std::lock_guard<std::mutex> const lk(m_);
     idle_.clear();
   }
 
@@ -377,7 +377,7 @@ public:
     // The retry loop above either opened the transaction or threw; this
     // states it where a reader -- and clang-tidy -- can see it.
     if (!txn_) throw std::logic_error("Session: no transaction after connect");
-    pqxx::result role = txn_->exec(setup);
+    pqxx::result const role = txn_->exec(setup);
     if (!role.empty() && !role[0][0].is_null())
       in_recovery_ = role[0][0].as<bool>();
     last_observed_role() = this->role();
@@ -573,7 +573,7 @@ inline std::string valid_utf8(const std::string& in) {
   const size_t n = in.size();
   for (size_t i = 0; i < n;) {
     const unsigned char c = b[i];
-    size_t len = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 0;
+    size_t const len = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 0;
     bool ok = len > 0 && i + len <= n;
     for (size_t k = 1; ok && k < len; k++) ok = (b[i + k] & 0xC0) == 0x80;
     if (ok && len > 1) {
@@ -661,7 +661,7 @@ inline json exec(PGconn* conn, const std::string& cmd, int timeout_ms,
   json result;
   bool first = true;
   while (PGresult* raw = PQgetResult(conn)) {
-    std::unique_ptr<PGresult, decltype(&PQclear)> r(raw, &PQclear);
+    std::unique_ptr<PGresult, decltype(&PQclear)> const r(raw, &PQclear);
     if (!first) continue;   // drain: the next command needs an idle connection
     first = false;
     if (PQresultStatus(r.get()) != PGRES_TUPLES_OK) why = PQresultErrorMessage(r.get());
@@ -905,7 +905,7 @@ public:
   // transport layer rather than a query method -- argument validation, error
   // codes and the fan-out envelope all live there.
   json call_rpc(const json& request) {
-    std::ostringstream buf;
+    std::ostringstream const buf;
     std::streambuf* saved = std::cout.rdbuf(buf.rdbuf());
     try {
       handle_request(request);
@@ -1237,7 +1237,7 @@ private:
     auto it = per_conn.find(extname);
     if (it != per_conn.end()) return it->second;
 
-    pqxx::result r = pqxx_exec(
+    pqxx::result const r = pqxx_exec(
       txn,
       "SELECT QUOTE_IDENT(n.nspname)"
       " FROM pg_extension AS e"
@@ -1387,7 +1387,7 @@ private:
   // schema this is not cached: ALTER EXTENSION ... UPDATE is the fix these
   // tools' hints name, and a cached version would keep refusing after it.
   std::string extension_version(pqxx::work& txn, const std::string& extname) {
-    pqxx::result r = pqxx_exec(
+    pqxx::result const r = pqxx_exec(
       txn, "SELECT extversion FROM pg_extension WHERE extname = $1",
       pqxx::params{extname});
     return r.empty() || r[0][0].is_null() ? std::string{} : r[0][0].as<std::string>();
@@ -1412,7 +1412,7 @@ private:
   // null rather than false.
   static json preload_state(pqxx::work& txn, const std::string& lib,
                             const std::string& probe_setting) {
-    pqxx::result r = pqxx_exec(txn, R"(
+    pqxx::result const r = pqxx_exec(txn, R"(
       SELECT (SELECT (SELECT COALESCE(bool_or(regexp_replace(btrim(x, ' "'), '^.*/|\.so$', '', 'g') = $1), false)
                       FROM unnest(string_to_array(s.setting, ',')) AS x)
               FROM pg_settings AS s WHERE s.name = 'shared_preload_libraries'),
@@ -1744,7 +1744,7 @@ private:
         const auto& cfg = registry_.get(names[i]);
         Session sess{with_connect_timeout(cfg, kSweepConnectTimeoutSeconds)};
         o.role = sess.role();
-        pqxx::result r = pqxx_exec(sess.txn(), q, pqxx::params{});
+        pqxx::result const r = pqxx_exec(sess.txn(), q, pqxx::params{});
         json row = json::parse(r[0][0].as<std::string>());
         // As text: a system identifier is a 64-bit value and does not survive
         // JSON number precision, the same reason query_id is a string.
@@ -2309,7 +2309,7 @@ private:
   static std::string uri_encode(const std::string& s) {
     static const char* hex = "0123456789ABCDEF";
     std::string out;
-    for (char raw : s) {
+    for (char const raw : s) {
       const unsigned char c = static_cast<unsigned char>(raw);
       if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') out += raw;
       else { out += '%'; out += hex[c >> 4]; out += hex[c & 0x0F]; }
@@ -2397,8 +2397,9 @@ private:
 
     std::vector<std::string> seg;
     {
-      std::string rest = uri.substr(prefix.size()), cur;
-      for (char ch : rest) {
+      const std::string rest = uri.substr(prefix.size());
+      std::string cur;
+      for (char const ch : rest) {
         if (ch == '/') { seg.push_back(uri_decode(cur)); cur.clear(); }
         else cur += ch;
       }
@@ -2417,7 +2418,7 @@ private:
     struct Restore {
       std::string& slot; std::string prev;
       ~Restore() { slot = prev; }
-    } restore{active_, active_};
+    } const restore{active_, active_};
     active_ = conn;
 
     if (seg.size() == 2 && seg[1] == "schemas")               return schemas();
@@ -2510,7 +2511,7 @@ private:
         for (const auto& n : registry_.names()) if (starts_with(n)) values.push_back(n);
       } else if (arg_name == "schema") {
         const std::string prev = active_;
-        struct R { std::string& s; std::string p; ~R(){ s = p; } } r{active_, prev};
+        struct R { std::string& s; std::string p; ~R(){ s = p; } } const r{active_, prev};
         // A resource template carries the connection in the same URI, but the
         // completion request does not pass sibling variables, so this can only
         // complete against the default connection. Better than nothing, and it
@@ -2521,7 +2522,7 @@ private:
             if (starts_with(it.key())) values.push_back(it.key());
       } else if (arg_name == "table") {
         const std::string prev = active_;
-        struct R { std::string& s; std::string p; ~R(){ s = p; } } r{active_, prev};
+        struct R { std::string& s; std::string p; ~R(){ s = p; } } const r{active_, prev};
         const json all = tables("public");
         if (all.is_object())
           for (const auto& it : all.items())
@@ -2819,7 +2820,7 @@ private:
     // Every tool accepts an optional `connection`. Injecting it here keeps the
     // ~40 tool definitions and their method signatures untouched; the name is
     // resolved once per request in handle_request.
-    json conn_prop = {
+    json const conn_prop = {
       {"type", "string"},
       {"description", "name of a configured connection (see listConnections); "
                       "defaults to \"" + registry_.default_name() + "\""}
@@ -2966,7 +2967,7 @@ private:
   // reasonably conclude the schema is clean. Silence that reads as a healthy
   // answer is the defect this release keeps finding, so it is named instead.
   json no_such_schema(pqxx::work& txn, const std::string& schema) {
-    pqxx::result r = pqxx_exec(
+    pqxx::result const r = pqxx_exec(
       txn, "SELECT 1 FROM pg_namespace WHERE nspname = $1", pqxx::params{schema});
     if (!r.empty()) return {};
     return {
@@ -2993,7 +2994,7 @@ private:
     // tool. The count is what the summary question needs ("how big is this
     // schema"); listTables is the tool that names them, and it takes one
     // schema at a time precisely so its size is bounded by the caller.
-    std::string query = std::string(R"(
+    std::string const query = std::string(R"(
       SELECT JSONB_OBJECT_AGG(nspname,
               JSONB_BUILD_OBJECT(
                'table_count', table_count,
@@ -3019,10 +3020,10 @@ private:
         AND ($1 = '' OR strpos(lower(nspname), lower($1)) > 0);
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{pattern});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{pattern});
 
     if (!res.empty() && !res[0][0].is_null()) {
-      std::string pgsql_schemas = res[0][0].as<std::string>();
+      std::string const pgsql_schemas = res[0][0].as<std::string>();
       return json::parse(pgsql_schemas);
     } else {
       return {};
@@ -3044,7 +3045,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(c.relname,
               JSONB_BUILD_OBJECT(
                'kind', CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table'
@@ -3075,13 +3076,13 @@ private:
         AND ($2 = '' OR strpos(lower(c.relname), lower($2)) > 0);
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, pattern});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema, pattern});
 
     if (!res.empty() && !res[0][0].is_null()) {
-      std::string pgsql_tables = res[0][0].as<std::string>();
+      std::string const pgsql_tables = res[0][0].as<std::string>();
       return json::parse(pgsql_tables);
     } else {
-      json missing = no_such_schema(txn, schema);
+      json const missing = no_such_schema(txn, schema);
       return missing.is_null() ? json::object() : missing;
     }
   }
@@ -3094,7 +3095,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(c.relnamespace::regnamespace::name || '.' || c.relname,
               JSONB_BUILD_OBJECT(
                'kind', CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table'
@@ -3159,10 +3160,10 @@ private:
             WHERE nspname LIKE 'pg_%' OR nspname = 'information_schema');
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{web_search});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{web_search});
 
     if (!res.empty() && !res[0][0].is_null()) {
-      std::string pgsql_tables = res[0][0].as<std::string>();
+      std::string const pgsql_tables = res[0][0].as<std::string>();
       return json::parse(pgsql_tables);
     } else {
       return {};
@@ -3175,7 +3176,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(
                p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')',
                JSONB_BUILD_OBJECT(
@@ -3196,10 +3197,10 @@ private:
         AND ($2 = '' OR strpos(lower(p.proname), lower($2)) > 0);
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, pattern});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema, pattern});
 
     if (!res.empty() && !res[0][0].is_null()) {
-      std::string pgsql_functions = res[0][0].as<std::string>();
+      std::string const pgsql_functions = res[0][0].as<std::string>();
       return json::parse(pgsql_functions);
     } else {
       return {};
@@ -3210,7 +3211,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(
                p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')',
                JSONB_BUILD_OBJECT(
@@ -3249,10 +3250,10 @@ private:
         AND  p.prokind IN ('f', 'p');
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, func_name});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema, func_name});
 
     if (!res.empty() && !res[0][0].is_null()) {
-      std::string pgsql_function = res[0][0].as<std::string>();
+      std::string const pgsql_function = res[0][0].as<std::string>();
       return json::parse(pgsql_function);
     } else {
       return {};
@@ -3274,7 +3275,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(
                p.pronamespace::regnamespace::text || '.' ||
                  p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')',
@@ -3320,10 +3321,10 @@ private:
         );
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{web_search, schema, include_system});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{web_search, schema, include_system});
 
     if (!res.empty() && !res[0][0].is_null()) {
-      std::string pgsql_functions = res[0][0].as<std::string>();
+      std::string const pgsql_functions = res[0][0].as<std::string>();
       return json::parse(pgsql_functions);
     }
     // An empty map is the answer for "nothing matched"; a schema that does not
@@ -3347,7 +3348,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(category, settings ORDER BY category)
       FROM (
         SELECT category,
@@ -3369,7 +3370,7 @@ private:
       ) s;
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{pattern, all});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{pattern, all});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -3382,7 +3383,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(
                e.extname,
                JSONB_BUILD_OBJECT(
@@ -3396,7 +3397,7 @@ private:
       JOIN pg_namespace AS n ON n.oid = e.extnamespace;
     )";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result const res = txn.exec(query);
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -3431,7 +3432,7 @@ private:
     //
     // It is null unless compute_query_id is on (the default, 'auto', enables it
     // when pg_stat_statements is loaded); serverSettings reports that GUC.
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(a.pid::text,
                JSONB_BUILD_OBJECT(
                  'database',         a.datname,
@@ -3474,7 +3475,7 @@ private:
         AND ($4 = '' OR a.state = $4);
     )";
 
-    pqxx::result res = pqxx_exec(
+    pqxx::result const res = pqxx_exec(
       txn, query,
       pqxx::params{pid > 0 ? std::to_string(pid) : std::string{},
                    query_id,
@@ -3526,7 +3527,7 @@ private:
       ? "ORDER BY ch.depth, l.granted ASC, l.pid"
       : "ORDER BY l.granted ASC, l.pid";
 
-    std::string query = chain_cte + R"(
+    std::string const query = chain_cte + R"(
       SELECT JSONB_AGG(
                JSONB_BUILD_OBJECT(
                  'pid',              l.pid,
@@ -3556,7 +3557,7 @@ private:
       WHERE l.pid != pg_backend_pid();
     )";
 
-    pqxx::result res = pid > 0
+    pqxx::result const res = pid > 0
       ? pqxx_exec(txn, query, pqxx::params{pid})
       : txn.exec(query);
 
@@ -3593,7 +3594,7 @@ private:
       ? ", 'invalidation_reason', s.invalidation_reason, 'inactive_since', s.inactive_since"
       : "";
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(s.slot_name,
                JSONB_BUILD_OBJECT(
                  'plugin',              s.plugin,
@@ -3624,7 +3625,7 @@ private:
       LEFT JOIN pg_stat_replication_slots AS st ON st.slot_name = s.slot_name;
     )";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result const res = txn.exec(query);
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -3650,7 +3651,7 @@ private:
             'parallel_workers_launched',  parallel_workers_launched)"
       : "";
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(datname,
                JSONB_BUILD_OBJECT(
                  'numbackends',       numbackends,
@@ -3684,7 +3685,7 @@ private:
       WHERE datname IS NOT NULL;
     )";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result const res = txn.exec(query);
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -3774,7 +3775,7 @@ private:
             'parallel_workers_launched', pss.parallel_workers_launched)"
       : "";
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_BUILD_OBJECT(
         'statements', COALESCE((
           SELECT JSONB_AGG(row_json)
@@ -3828,7 +3829,7 @@ private:
     )";
 
     try {
-      pqxx::result res = pqxx_exec(
+      pqxx::result const res = pqxx_exec(
         txn, query,
         pqxx::params{std::to_string(limit), query_id,
                      min_calls > 0 ? std::to_string(min_calls) : std::string{}});
@@ -3953,7 +3954,7 @@ private:
       FROM tot)";
 
     try {
-      pqxx::result res = pqxx_exec(
+      pqxx::result const res = pqxx_exec(
         txn, query, pqxx::params{query_id, include_idle, std::to_string(limit)});
       json out = json::parse(res[0][0].as<std::string>());
       out["group_by"] = by_query ? "query" : "event";
@@ -4070,7 +4071,7 @@ private:
     // toplevel, the join's fourth key, is pg_stat_statements 1.9 (PostgreSQL
     // 14). A 1.8 left behind by pg_upgrade without ALTER EXTENSION UPDATE is
     // joined without it rather than failing on the column.
-    std::string pgss = extension_schema(txn, "pg_stat_statements");
+    std::string const pgss = extension_schema(txn, "pg_stat_statements");
     const bool pgss_toplevel = !pgss.empty() &&
       extversion_at_least(extension_version(txn, "pg_stat_statements"), 1, 9);
     const std::string pgss_fields = pgss.empty() ? "" : R"(
@@ -4121,7 +4122,7 @@ private:
         'server_version', version()))";
 
     try {
-      pqxx::result res = pqxx_exec(txn, query, pqxx::params{std::to_string(limit), query_id});
+      pqxx::result const res = pqxx_exec(txn, query, pqxx::params{std::to_string(limit), query_id});
       json out = json::parse(res[0][0].as<std::string>());
       out["order_by"] = key;
       out["preloaded"] = preloaded;
@@ -4248,7 +4249,7 @@ private:
       LEFT JOIN pg_operator AS o ON o.oid = g.opno)";
 
     try {
-      pqxx::result res = pqxx_exec(txn, query, pqxx::params{std::to_string(limit), query_id});
+      pqxx::result const res = pqxx_exec(txn, query, pqxx::params{std::to_string(limit), query_id});
       json out = json::parse(res[0][0].as<std::string>());
       // Loaded in this backend now, whatever it was before, so the setting's
       // context settles what an unprivileged role could not see up front.
@@ -4264,7 +4265,7 @@ private:
       out["extension_version"] = ver;
       out["settings"] = {
         {"sample_rate", nullptr}, {"enabled", nullptr}, {"max", nullptr}};
-      pqxx::result s = txn.exec(
+      pqxx::result const s = txn.exec(
         "SELECT current_setting('pg_qualstats.sample_rate', true),"
         "       current_setting('pg_qualstats.enabled', true),"
         "       current_setting('pg_qualstats.max', true)");
@@ -4332,7 +4333,7 @@ private:
                      ARRAY(SELECT JSONB_ARRAY_ELEMENTS_TEXT($3::jsonb))) AS r) AS a)";
 
     try {
-      pqxx::result res = pqxx_exec(
+      pqxx::result const res = pqxx_exec(
         txn, query, pqxx::params{std::to_string(min_filter), std::to_string(min_selectivity),
                                  forbidden_am.dump()});
       json out = json::parse(res[0][0].as<std::string>());
@@ -4399,7 +4400,7 @@ private:
                        "kind = pgbouncer"}};
     const std::string conninfo =
       with_connect_timeout(active_cfg(), kSweepConnectTimeoutSeconds).conninfo;
-    std::unique_ptr<PGconn, decltype(&PQfinish)> conn(PQconnectdb(conninfo.c_str()), &PQfinish);
+    std::unique_ptr<PGconn, decltype(&PQfinish)> const conn(PQconnectdb(conninfo.c_str()), &PQfinish);
     if (!conn || PQstatus(conn.get()) != CONNECTION_OK) {
       const std::string w = conn ? PQerrorMessage(conn.get()) : "out of memory";
       const bool refused = w.find("not allowed") != std::string::npos ||
@@ -4476,7 +4477,7 @@ private:
     struct Restore {
       std::string& slot; std::string prev;
       ~Restore() { slot = prev; }
-    } restore{active_, active_};
+    } const restore{active_, active_};
     active_ = db.pooler;
     json r = pooler_show({"SHOW DATABASES"});
     if (r.contains("error")) return r;
@@ -4733,7 +4734,7 @@ private:
 
     // Percentages are the point of a progress view: "1.2 million of 4 million
     // blocks" is only useful once it is 30%.
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_BUILD_OBJECT(
         'vacuum', COALESCE((
           SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
@@ -4845,7 +4846,7 @@ private:
       );
     )";
 
-    pqxx::result res = pqxx_exec(
+    pqxx::result const res = pqxx_exec(
       txn, query,
       pqxx::params{pid > 0 ? std::to_string(pid) : std::string{}, relation});
 
@@ -4919,7 +4920,7 @@ private:
                   OR COALESCE(evictions, 0) > 0 OR COALESCE(fsyncs, 0) > 0))"
         : "";
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT COALESCE(JSONB_AGG(JSONB_BUILD_OBJECT(
                'backend_type', backend_type,
                'object',       object,
@@ -4947,7 +4948,7 @@ private:
         AND ($4 = '' OR context = $4)
       )" + pid_guard + activity_filter + ";";
 
-    pqxx::result res = pqxx_exec(
+    pqxx::result const res = pqxx_exec(
       txn, query,
       pqxx::params{pid > 0 ? std::to_string(pid) : std::string{},
                    backend_type, object, context});
@@ -4961,7 +4962,7 @@ private:
     // is this backend doing to the disk": a backend can be quiet in pg_stat_io
     // and still be generating WAL heavily.
     if (pid > 0) {
-      pqxx::result w = pqxx_exec(
+      pqxx::result const w = pqxx_exec(
         txn,
         R"(SELECT JSONB_BUILD_OBJECT(
              'wal_records',      wal_records,
@@ -5022,7 +5023,7 @@ private:
             s.total_vacuum_time, s.total_autovacuum_time)"
       : "";
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_BUILD_OBJECT(
         'limits',
           (SELECT JSONB_OBJECT_AGG(name, setting::bigint)
@@ -5113,7 +5114,7 @@ private:
       );
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, limit});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema, limit});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -5137,7 +5138,7 @@ private:
     // what the INCLUDE coverage test compares against: an included column is
     // covered by a key column of the wider index regardless of how that key is
     // sorted or compared.
-    std::string query = R"(
+    std::string const query = R"(
       WITH idx AS (
         SELECT i.indexrelid,
                i.indrelid,
@@ -5248,7 +5249,7 @@ private:
       );
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, table_name});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema, table_name});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -5357,7 +5358,7 @@ private:
            ) FROM pg_stat_bgwriter AS b),
     )";
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_BUILD_OBJECT(
     )" + checkpointer + R"(
         'wal', (SELECT JSONB_BUILD_OBJECT(
@@ -5383,7 +5384,7 @@ private:
       );
     )";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result const res = txn.exec(query);
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -5402,7 +5403,7 @@ private:
     //
     // Ratios are null rather than 0 when nothing has been read yet, so "no
     // traffic" is never mistaken for "every read missed the cache".
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(r.schemaname || '.' || r.relname, JSONB_BUILD_OBJECT(
                'heap_blks_read', r.heap_blks_read,
                'heap_blks_hit',  r.heap_blks_hit,
@@ -5464,7 +5465,7 @@ private:
       ) AS r;
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, table_name, limit});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema, table_name, limit});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -5501,7 +5502,7 @@ private:
     // rather than leaving every caller to rediscover it. A negative setting
     // means "derive from another GUC" (autovacuum_work_mem = -1) and yields a
     // null byte count rather than a negative one.
-    std::string query = R"(
+    std::string const query = R"(
       WITH host AS (
         SELECT NULLIF($1, '')::bigint AS ram_bytes,
                NULLIF($2, '')::int    AS vcpus
@@ -5665,7 +5666,7 @@ private:
       );
     )";
 
-    pqxx::result res = pqxx_exec(
+    pqxx::result const res = pqxx_exec(
       txn, query,
       pqxx::params{cap.ram_mb > 0 ? std::to_string(cap.ram_mb * 1048576LL) : std::string{},
                    cap.vcpus  > 0 ? std::to_string(cap.vcpus)              : std::string{}});
@@ -5723,7 +5724,7 @@ private:
       if (i + 1 < sql.size() && sql[i] == '-' && sql[i + 1] == '-') {
         while (i < sql.size() && sql[i] != '\n') i++;
       } else if (i + 1 < sql.size() && sql[i] == '/' && sql[i + 1] == '*') {
-        size_t e = sql.find("*/", i + 2);
+        size_t const e = sql.find("*/", i + 2);
         if (e == std::string::npos) return "";
         i = e + 2;
       } else {
@@ -5732,7 +5733,7 @@ private:
     }
     // A leading "(" means a parenthesised SELECT, e.g. (SELECT ...) UNION ...
     if (i < sql.size() && sql[i] == '(') return "SELECT";
-    size_t s = i;
+    size_t const s = i;
     while (i < sql.size() && std::isalpha(static_cast<unsigned char>(sql[i]))) i++;
     std::string kw = sql.substr(s, i - s);
     for (char& c : kw) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
@@ -5745,11 +5746,11 @@ private:
   // EXPLAIN, so caller-supplied text must be proven to be a single statement.
   static std::string require_single_statement(const std::string& sql) {
     std::string t = sql;
-    size_t end = t.find_last_not_of(" \t\r\n");
+    size_t const end = t.find_last_not_of(" \t\r\n");
     if (end != std::string::npos) t = t.substr(0, end + 1);
     if (!t.empty() && t.back() == ';') {
       t.pop_back();
-      size_t e2 = t.find_last_not_of(" \t\r\n");
+      size_t const e2 = t.find_last_not_of(" \t\r\n");
       t = (e2 == std::string::npos) ? "" : t.substr(0, e2 + 1);
     }
     if (t.find(';') != std::string::npos)
@@ -5874,7 +5875,7 @@ private:
     out["host"] = host;
 
     if (cap.ram_mb <= 0 || cap.vcpus <= 0) {
-      std::string missing = cap.ram_mb <= 0 && cap.vcpus <= 0 ? "host_ram_mb and host_vcpus"
+      std::string const missing = cap.ram_mb <= 0 && cap.vcpus <= 0 ? "host_ram_mb and host_vcpus"
                           : cap.ram_mb <= 0 ? "host_ram_mb" : "host_vcpus";
       out["allowed"] = false;
       out["reason"] =
@@ -5889,7 +5890,7 @@ private:
       return out;
     }
 
-    pqxx::result r = txn.exec(
+    pqxx::result const r = txn.exec(
         "SELECT pg_size_bytes(current_setting('work_mem'))::float8, "
         "       current_setting('hash_mem_multiplier')::float8");
     const double work_mem = r[0][0].as<double>();
@@ -6042,7 +6043,7 @@ private:
     // text alone, "work_mem=1GB" sorts before "work_mem=64MB" and the role-wide
     // 64MB would be what got planned under, in the one configuration where the
     // tool's promise of "the plan the application gets" matters most.
-    pqxx::result r = pqxx_exec(txn,
+    pqxx::result const r = pqxx_exec(txn,
       "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1),"
       "       COALESCE((SELECT JSONB_AGG(cfg ORDER BY s.setdatabase, cfg)"
       "                   FROM pg_db_role_setting s"
@@ -6171,7 +6172,7 @@ private:
 
       // Full, untruncated text: recovering it is the whole point of the
       // queryid path, so this deliberately omits statementStats' LEFT(query,500).
-      std::string q = R"(
+      std::string const q = R"(
         SELECT JSONB_BUILD_OBJECT(
                  'query',            pss.query,
                  -- text for the same reason as in statementStats
@@ -6201,7 +6202,7 @@ private:
       )";
 
       try {
-        pqxx::result res = pqxx_exec(txn, q, pqxx::params{queryid});
+        pqxx::result const res = pqxx_exec(txn, q, pqxx::params{queryid});
         if (res.empty() || res[0][0].is_null()) {
           return {
             {"error", "no pg_stat_statements entry for queryid " + queryid},
@@ -6224,8 +6225,8 @@ private:
       if (!stats.value("is_current_db", false)) {
         // A null name means the database has since been dropped;
         // pg_stat_statements keeps the entry regardless.
-        std::string db = json_str(stats, "database");
-        bool dropped = db.empty();
+        std::string const db = json_str(stats, "database");
+        bool const dropped = db.empty();
         return {
           {"error", "queryid " + queryid + " belongs to " +
                     (dropped ? "a database that no longer exists (oid " +
@@ -6260,7 +6261,7 @@ private:
     static const std::set<std::string> EXPLAINABLE = {
       "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "WITH", "TABLE", "VALUES"
     };
-    std::string kw = leading_keyword(sql);
+    std::string const kw = leading_keyword(sql);
     if (!EXPLAINABLE.count(kw))
       throw std::runtime_error(
         "statement cannot be EXPLAINed: it starts with \"" +
@@ -6301,7 +6302,7 @@ private:
           // A savepoint, so that the expected failure below leaves the
           // transaction usable rather than aborted.
           pqxx::subtransaction sub{txn};
-          pqxx::result r = sub.exec("EXPLAIN (SETTINGS, FORMAT JSON) " + sql);
+          pqxx::result const r = sub.exec("EXPLAIN (SETTINGS, FORMAT JSON) " + sql);
           plan = json::parse(r[0][0].as<std::string>());
           sub.commit();
         } catch (const pqxx::sql_error& e) {
@@ -6326,7 +6327,7 @@ private:
             if (!plan_env.is_null()) out["planning_environment"] = plan_env;
             return out;
           }
-          pqxx::result r = txn.exec("EXPLAIN (SETTINGS, GENERIC_PLAN, FORMAT JSON) " + sql);
+          pqxx::result const r = txn.exec("EXPLAIN (SETTINGS, GENERIC_PLAN, FORMAT JSON) " + sql);
           plan = json::parse(r[0][0].as<std::string>());
           generic = true;
         }
@@ -6335,19 +6336,19 @@ private:
                    "_" + std::to_string(++explain_seq_);
         txn.exec("PREPARE " + prepared + " AS " + sql);
 
-        pqxx::result pr = pqxx_exec(
+        pqxx::result const pr = pqxx_exec(
           txn,
           "SELECT COALESCE(array_length(parameter_types, 1), 0) "
           "FROM pg_prepared_statements WHERE name = $1",
           pqxx::params{prepared});
-        size_t want = (pr.empty() || pr[0][0].is_null())
+        size_t const want = (pr.empty() || pr[0][0].is_null())
                         ? 0u : static_cast<size_t>(pr[0][0].as<long long>());
         if (want != params.size())
           throw std::runtime_error("statement takes " + std::to_string(want) +
                                    " parameter(s), got " + std::to_string(params.size()));
 
         lits = build_execute_literals(txn, params);
-        pqxx::result r = txn.exec(
+        pqxx::result const r = txn.exec(
           "EXPLAIN (SETTINGS, FORMAT JSON) EXECUTE " + prepared + "(" + lits + ")");
         plan = json::parse(r[0][0].as<std::string>());
       }
@@ -6380,9 +6381,9 @@ private:
           // into planning_environment so a refusal can be checked.
           note = exec_budget.value("reason", std::string("not analyzed"));
         } else {
-          std::string target = prepared.empty()
+          std::string const target = prepared.empty()
             ? sql : ("EXECUTE " + prepared + "(" + lits + ")");
-          pqxx::result r = txn.exec(
+          pqxx::result const r = txn.exec(
             "EXPLAIN (SETTINGS, ANALYZE, BUFFERS, FORMAT JSON) " + target);
           plan = json::parse(r[0][0].as<std::string>());
           analyzed = true;
@@ -6501,7 +6502,7 @@ private:
     // Field names are normalized across both so callers don't need to branch
     // on 'method' to know what to read; 'method' and (approx-only)
     // 'scanned_percent' disclose which one produced the numbers.
-    std::string query = exact ? R"(
+    std::string const query = exact ? R"(
       SELECT CASE WHEN bt.table_len IS NOT NULL THEN
                JSONB_BUILD_OBJECT(
                  'method',             'exact',
@@ -6541,7 +6542,7 @@ private:
     )";
 
     try {
-      pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, table_name});
+      pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema, table_name});
 
       if (!res.empty() && !res[0][0].is_null()) {
         return json::parse(res[0][0].as<std::string>());
@@ -6646,7 +6647,7 @@ private:
       WHERE n.nspname = $1 AND c.relname = $2;
     )";
 
-    pqxx::result mres = pqxx_exec(txn, meta_q, pqxx::params{schema, index_name});
+    pqxx::result const mres = pqxx_exec(txn, meta_q, pqxx::params{schema, index_name});
     if (mres.empty() || mres[0][0].is_null()) {
       return {
         {"error", "no relation named \"" + schema + "\".\"" + index_name + "\""},
@@ -6741,7 +6742,7 @@ private:
       " FROM " + pgst + "." + fn->second + "($1::oid::regclass) AS s;";
 
     try {
-      pqxx::result res = pqxx_exec(txn, stat_q, pqxx::params{json_str(meta, "oid")});
+      pqxx::result const res = pqxx_exec(txn, stat_q, pqxx::params{json_str(meta, "oid")});
       if (res.empty() || res[0][0].is_null()) return {};
 
       json out = json::parse(res[0][0].as<std::string>());
@@ -6793,7 +6794,7 @@ private:
     // created before 1.4 and never ALTER EXTENSION ... UPDATE'd is a live
     // catalog entry missing exactly these two functions, which would otherwise
     // surface as the extension being absent -- it is not, it is out of date.
-    pqxx::result ver = pqxx_exec(
+    pqxx::result const ver = pqxx_exec(
       txn, "SELECT extversion FROM pg_extension WHERE extname = 'pg_buffercache'",
       pqxx::params{});
     const std::string extver = ver.empty() || ver[0][0].is_null()
@@ -6846,7 +6847,7 @@ private:
     )";
 
     try {
-      pqxx::result res = pqxx_exec(txn, query, pqxx::params{extver});
+      pqxx::result const res = pqxx_exec(txn, query, pqxx::params{extver});
       if (res.empty() || res[0][0].is_null()) return {};
       return json::parse(res[0][0].as<std::string>());
     } catch (const pqxx::insufficient_privilege& e) {
@@ -6947,7 +6948,7 @@ private:
     )";
 
     try {
-      pqxx::result res = pqxx_exec(txn, query, pqxx::params{limit});
+      pqxx::result const res = pqxx_exec(txn, query, pqxx::params{limit});
       json rows = (res.empty() || res[0][0].is_null())
         ? json::array() : json::parse(res[0][0].as<std::string>());
       return {
@@ -6969,14 +6970,14 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_BUILD_OBJECT(
                'database', current_database(),
                'size',     pg_database_size(current_database())
              );
     )";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result const res = txn.exec(query);
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -6993,7 +6994,7 @@ private:
     pqxx::work& txn = sess.txn();
 
     // Step 1: fetch PK column names, types, and type schemas
-    pqxx::result pk_res = txn.exec(
+    pqxx::result const pk_res = txn.exec(
       "SELECT a.attname, t.typname, n.nspname "
       "FROM pg_constraint pk "
       "JOIN pg_attribute a ON a.attrelid = pk.conrelid AND a.attnum = ANY(pk.conkey) "
@@ -7019,8 +7020,8 @@ private:
     // branch for them repeated it exactly (clang-tidy bugprone-branch-clone).
 
     for (pqxx::result::size_type i = 0; i < pk_res.size(); i++) {
-      std::string col  = pk_res[i][0].as<std::string>();
-      std::string type = pk_res[i][1].as<std::string>();
+      std::string const col  = pk_res[i][0].as<std::string>();
+      std::string const type = pk_res[i][1].as<std::string>();
       const json& v    = values[static_cast<size_t>(i)];
 
       if (INT_TYPES.count(type)) {
@@ -7047,7 +7048,7 @@ private:
     // Step 3: build quoted identifier helper, WHERE clause, and params
     auto qi = [](const std::string& s) {
       std::string r = "\"";
-      for (char c : s) { if (c == '"') r += "\"\""; else r += c; }
+      for (char const c : s) { if (c == '"') r += "\"\""; else r += c; }
       return r + "\"";
     };
 
@@ -7055,8 +7056,8 @@ private:
     pqxx::params params;
     for (pqxx::result::size_type i = 0; i < pk_res.size(); i++) {
       if (i > 0) where += " AND ";
-      std::string type_schema = pk_res[i][2].as<std::string>();
-      std::string cast = type_schema != "pg_catalog"
+      std::string const type_schema = pk_res[i][2].as<std::string>();
+      std::string const cast = type_schema != "pg_catalog"
         ? "::" + qi(type_schema) + "." + qi(pk_res[i][1].as<std::string>())
         : "";
       where += qi(pk_res[i][0].as<std::string>()) + " = $" + std::to_string(i + 1) + cast;
@@ -7068,11 +7069,11 @@ private:
       else                           params.append(v.dump());
     }
 
-    std::string sql = "SELECT EXISTS(SELECT 1 FROM " +
+    std::string const sql = "SELECT EXISTS(SELECT 1 FROM " +
                       qi(schema) + "." + qi(table_name) +
                       " WHERE " + where + ")";
 
-    pqxx::result res = pqxx_exec(txn, sql, params);
+    pqxx::result const res = pqxx_exec(txn, sql, params);
     bool exists = res[0][0].as<bool>();
     return {{"exists", exists}};
   }
@@ -7081,7 +7082,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(
                t.typname,
                JSONB_BUILD_OBJECT(
@@ -7099,7 +7100,7 @@ private:
         AND t.typtype = 'e';
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -7112,7 +7113,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_BUILD_OBJECT(
                'description', COALESCE(obj_description(t.oid, 'pg_type'), ''),
                'values', values,
@@ -7141,7 +7142,7 @@ private:
         AND t.typtype = 'e';
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, enum_name});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema, enum_name});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -7158,7 +7159,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(
                t.typnamespace::regnamespace::text || '.' || t.typname,
                JSONB_BUILD_OBJECT(
@@ -7188,7 +7189,7 @@ private:
         );
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{web_search});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{web_search});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -7201,7 +7202,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(
                t.typname,
                JSONB_BUILD_OBJECT(
@@ -7250,7 +7251,7 @@ private:
         );
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -7263,7 +7264,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_BUILD_OBJECT(
                'kind',            CASE t.typtype WHEN 'c' THEN 'composite' WHEN 'd' THEN 'domain' WHEN 'r' THEN 'range' END,
                'description',     COALESCE(obj_description(t.oid, 'pg_type'), ''),
@@ -7323,7 +7324,7 @@ private:
         );
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, type_name});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema, type_name});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -7345,7 +7346,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = std::string(R"(
+    std::string const query = std::string(R"(
       SELECT JSONB_OBJECT_AGG(
                r.rolname,
                JSONB_BUILD_OBJECT(
@@ -7381,7 +7382,7 @@ private:
       ) _lat24 ON true;
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{pattern});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{pattern});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -7397,7 +7398,7 @@ private:
     // Deliberately excludes user mapping options: pg_user_mapping/pg_user_mappings
     // expose credentials (e.g. password) in cleartext to superusers, which would
     // contradict this tool's catalog-only, low-data-leak-risk design.
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(
                c.relname,
                JSONB_BUILD_OBJECT(
@@ -7422,7 +7423,7 @@ private:
       WHERE c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1);
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -7436,7 +7437,7 @@ private:
     pqxx::work& txn = sess.txn();
 
     // Server options only (host/port/dbname-style); never user mapping credentials.
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(
                fs.srvname,
                JSONB_BUILD_OBJECT(
@@ -7451,7 +7452,7 @@ private:
       JOIN pg_foreign_data_wrapper AS fdw ON fdw.oid = fs.srvfdw;
     )";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result const res = txn.exec(query);
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -7464,7 +7465,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(
                spcname,
                JSONB_BUILD_OBJECT(
@@ -7485,7 +7486,7 @@ private:
       FROM pg_tablespace;
     )";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result const res = txn.exec(query);
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -7501,7 +7502,7 @@ private:
     // Restrict to collations usable in this database's encoding (collencoding = -1
     // means "any encoding"); otherwise libc ships many same-named rows per locale,
     // one per encoding variant, which would silently collide in the result map.
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(
                collname,
                JSONB_BUILD_OBJECT(
@@ -7518,7 +7519,7 @@ private:
         AND collencoding IN (-1, (SELECT encoding FROM pg_database WHERE datname = current_database()));
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -7531,7 +7532,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(
                evtname,
                JSONB_BUILD_OBJECT(
@@ -7546,7 +7547,7 @@ private:
       FROM pg_event_trigger;
     )";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result const res = txn.exec(query);
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -7580,7 +7581,7 @@ private:
     //
     // table_count is what the question needs -- "is this publication carrying
     // what I think" -- and all_tables already says the list is the catalog.
-    std::string query = std::string(R"(
+    std::string const query = std::string(R"(
       SELECT JSONB_OBJECT_AGG(
                p.pubname,
                JSONB_BUILD_OBJECT(
@@ -7606,7 +7607,7 @@ private:
       ) _lat26 ON true;
     )";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result const res = txn.exec(query);
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -7640,7 +7641,7 @@ private:
                  (sess.has(Feature::SubOrigin) ? ", 'origin', suborigin"
                                 ", 'run_as_owner', subrunasowner" : "") +
                  (sess.has(Feature::SubFailover) ? ", 'failover', subfailover" : "");
-    std::string query =
+    std::string const query =
       "SELECT JSONB_OBJECT_AGG(subname, JSONB_BUILD_OBJECT("
       "  'owner',              subowner::regrole::text"
       ", 'enabled',            subenabled"
@@ -7653,7 +7654,7 @@ private:
       "FROM pg_subscription "
       "WHERE subdbid = (SELECT oid FROM pg_database WHERE datname = current_database());";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result const res = txn.exec(query);
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -7783,7 +7784,7 @@ private:
       "   FROM sub LEFT JOIN w ON w.subid   = sub.oid"
       "            LEFT JOIN r ON r.srsubid = sub.oid" + errors_join + ";";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result const res = txn.exec(query);
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -7826,7 +7827,7 @@ private:
     // A role that does not exist makes every has_*_privilege call raise, so it
     // is established first and reported as a fact rather than an error: "no
     // such role" is an answer to the question that was asked.
-    pqxx::result who = pqxx_exec(txn,
+    pqxx::result const who = pqxx_exec(txn,
       "SELECT JSONB_BUILD_OBJECT("
       "  'name', r.rolname, 'exists', true"
       ", 'can_login', r.rolcanlogin, 'superuser', r.rolsuper"
@@ -7849,7 +7850,7 @@ private:
     const std::string maintain =
       sess.has(Feature::MaintainPrivilege) ? ", 'MAINTAIN', has_table_privilege($1, c.oid, 'MAINTAIN')" : "";
 
-    pqxx::result rel = pqxx_exec(txn,
+    pqxx::result const rel = pqxx_exec(txn,
       "SELECT JSONB_BUILD_OBJECT("
       "  'object', JSONB_BUILD_OBJECT("
       "      'schema', n.nspname, 'name', c.relname"
@@ -7923,7 +7924,7 @@ private:
 
     // Not a relation. Functions and procedures overload, so every signature of
     // that name is reported rather than one guessed at.
-    pqxx::result fn = pqxx_exec(txn,
+    pqxx::result const fn = pqxx_exec(txn,
       "SELECT JSONB_BUILD_OBJECT("
       "  'schema_access', JSONB_BUILD_OBJECT("
       "      'usage', has_schema_privilege($1, n.oid, 'USAGE'))"
@@ -7984,7 +7985,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    pqxx::result res = pqxx_exec(txn,
+    pqxx::result const res = pqxx_exec(txn,
       "SELECT JSONB_BUILD_OBJECT("
       "  'schema', $1::text, 'table', $2::text, 'column', $3::text"
       ", 'null_frac', ps.null_frac"
@@ -8110,7 +8111,7 @@ private:
     auto section = [&](const char* key, const std::string& sql) {
       try {
         pqxx::subtransaction sub{txn};
-        pqxx::result r = sub.exec(sql);
+        pqxx::result const r = sub.exec(sql);
         sub.commit();
         if (!r.empty() && !r[0][0].is_null())
           out[key] = json::parse(r[0][0].as<std::string>());
@@ -8181,7 +8182,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(
                l.lanname,
                JSONB_BUILD_OBJECT(
@@ -8195,7 +8196,7 @@ private:
       FROM pg_language AS l;
     )";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result const res = txn.exec(query);
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -8269,7 +8270,7 @@ private:
       "  ) built ON true"
       " WHERE s.stxnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1);";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -8282,7 +8283,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(
                o.oprname || '(' || COALESCE(NULLIF(o.oprleft, 0)::regtype::text, 'NONE') || ',' ||
                                     COALESCE(NULLIF(o.oprright, 0)::regtype::text, 'NONE') || ')',
@@ -8298,7 +8299,7 @@ private:
       WHERE o.oprnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1);
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -8311,7 +8312,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(
                oc.opcname || ' (' || am.amname || ')',
                JSONB_BUILD_OBJECT(
@@ -8326,7 +8327,7 @@ private:
       WHERE oc.opcnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1);
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -8339,7 +8340,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(
                amname,
                JSONB_BUILD_OBJECT(
@@ -8351,7 +8352,7 @@ private:
       FROM pg_am;
     )";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result const res = txn.exec(query);
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -8367,7 +8368,7 @@ private:
     // Filtered to casts involving at least one user-defined type; unfiltered this
     // returns hundreds of built-in numeric/string coercions that are pure noise
     // for exploring an application schema.
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(
                st.oid::regtype::text || '->' || tt.oid::regtype::text,
                JSONB_BUILD_OBJECT(
@@ -8385,7 +8386,7 @@ private:
          OR tt.typnamespace NOT IN (SELECT oid FROM pg_namespace WHERE nspname LIKE 'pg\_%' ESCAPE '\' OR nspname = 'information_schema');
     )";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result const res = txn.exec(query);
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -8398,7 +8399,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(
                c.cfgname,
                JSONB_BUILD_OBJECT(
@@ -8424,7 +8425,7 @@ private:
       WHERE c.cfgnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1);
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -8438,7 +8439,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(
                ps.sequencename,
                JSONB_BUILD_OBJECT(
@@ -8470,7 +8471,7 @@ private:
         AND ($2 = '' OR strpos(lower(ps.sequencename), lower($2)) > 0);
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, pattern});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema, pattern});
 
     if (!res.empty() && !res[0][0].is_null()) {
       return json::parse(res[0][0].as<std::string>());
@@ -8494,7 +8495,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_BUILD_OBJECT(
                'table', c.relname,
                'description', COALESCE(obj_description(c.oid, 'pg_class'), ''),
@@ -8645,10 +8646,10 @@ private:
         AND c.relname = $2;
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, table});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema, table});
 
     if (!res.empty() && !res[0][0].is_null()) {
-      std::string pgsql_table = res[0][0].as<std::string>();
+      std::string const pgsql_table = res[0][0].as<std::string>();
       return json::parse(pgsql_table);
     } else {
       return {};
@@ -8737,7 +8738,7 @@ private:
     // needed the same treatment: the two move independently.
     std::string ver;
     {
-      pqxx::result r = pqxx_exec(
+      pqxx::result const r = pqxx_exec(
         txn, "SELECT extversion FROM pg_extension WHERE extname = 'hypopg'", pqxx::params{});
       if (!r.empty() && !r[0][0].is_null()) ver = r[0][0].as<std::string>();
     }
@@ -8759,7 +8760,7 @@ private:
     struct Guard {
       std::function<void()> f;
       ~Guard() { f(); }
-    } guard{reset};
+    } const guard{reset};
 
     // Each EXPLAIN runs inside a savepoint so that a failing statement leaves
     // the transaction usable -- the reset on the way out needs it alive.
@@ -8767,7 +8768,7 @@ private:
     auto plan_of = [&]() -> json {
       try {
         pqxx::subtransaction sub{txn};
-        pqxx::result r = sub.exec("EXPLAIN (SETTINGS, FORMAT JSON) " + sql);
+        pqxx::result const r = sub.exec("EXPLAIN (SETTINGS, FORMAT JSON) " + sql);
         json p = json::parse(r[0][0].as<std::string>());
         sub.commit();
         return p;
@@ -8776,7 +8777,7 @@ private:
         // same fallback explainQuery uses, and it is PostgreSQL 16+.
         if (e.sqlstate() != "42P02" || !pg16) throw;
         pqxx::subtransaction sub{txn};
-        pqxx::result r = sub.exec("EXPLAIN (SETTINGS, FORMAT JSON, GENERIC_PLAN) " + sql);
+        pqxx::result const r = sub.exec("EXPLAIN (SETTINGS, FORMAT JSON, GENERIC_PLAN) " + sql);
         json p = json::parse(r[0][0].as<std::string>());
         sub.commit();
         return p;
@@ -8797,13 +8798,13 @@ private:
         throw std::runtime_error("every entry of create must be a CREATE INDEX statement");
       const std::string def = d.get<std::string>();
       try {
-        pqxx::result r = pqxx_exec(
+        pqxx::result const r = pqxx_exec(
           txn, "SELECT indexrelid::text, indexname FROM " + hypo + ".hypopg_create_index($1)",
           pqxx::params{def});
         if (r.empty()) continue;
         const std::string oid = r[0][0].as<std::string>();
         const std::string nm  = r[0][1].as<std::string>();
-        pqxx::result sz = pqxx_exec(
+        pqxx::result const sz = pqxx_exec(
           txn, "SELECT " + hypo + ".hypopg_relation_size($1::oid)", pqxx::params{oid});
         indexes.push_back({{"definition", def},
                            {"name", nm},
@@ -8822,7 +8823,7 @@ private:
         throw std::runtime_error("every entry of hide must be an index name");
       const std::string nm = h.get<std::string>();
       try {
-        pqxx::result r = pqxx_exec(
+        pqxx::result const r = pqxx_exec(
           txn,
           // to_regclass rather than a ::regclass cast: the cast raises on an
           // unknown name, which would surface a raw server error instead of
@@ -8921,7 +8922,7 @@ private:
       " 'origin_status', has_table_privilege("
       "     'pg_catalog.pg_replication_origin_status', 'SELECT'))";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result const res = txn.exec(query);
     const json p = json::parse(res[0][0].as<std::string>());
 
     const bool super     = p.value("superuser", false);
@@ -9219,7 +9220,7 @@ private:
     const std::string idx_pg16 = sess.has(Feature::IndexLastScan)
       ? R"(, 'last_use', si.last_idx_scan)" : "";
 
-    std::string query = std::string(R"(
+    std::string const query = std::string(R"(
       SELECT JSONB_BUILD_OBJECT(
                'table', c.relname,)") + kCountersSince + "," + kTableStatsCommon + pg16 + R"(,
                'columns', COALESCE(columns, '{}'::jsonb),
@@ -9294,7 +9295,7 @@ private:
         AND c.relname = $2;
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, table});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema, table});
 
     if (!res.empty() && !res[0][0].is_null())
       return json::parse(res[0][0].as<std::string>());
@@ -9453,7 +9454,7 @@ private:
                                  WHERE datname = current_database()))), '[]'::jsonb));
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{role});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{role});
     if (!res.empty() && !res[0][0].is_null())
       return json::parse(res[0][0].as<std::string>());
     return {};
@@ -9508,7 +9509,7 @@ private:
        WHERE $1 = '' OR n.nspname = $1 OR d.defaclnamespace = 0;
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema});
     if (!res.empty() && !res[0][0].is_null())
       return {{"default_privileges", json::parse(res[0][0].as<std::string>())}};
     return {{"default_privileges", json::array()}};
@@ -9549,7 +9550,7 @@ private:
                 'application before deleting anything.');
     )";
 
-    pqxx::result res = txn.exec(query);
+    pqxx::result const res = txn.exec(query);
     if (!res.empty() && !res[0][0].is_null())
       return json::parse(res[0][0].as<std::string>());
     return {};
@@ -9582,7 +9583,7 @@ private:
     // state.
     try {
       pqxx::subtransaction sub{txn};
-      pqxx::result r = sub.exec(R"(
+      pqxx::result const r = sub.exec(R"(
         SELECT COALESCE(JSONB_OBJECT_AGG(key, obj), '{}'::jsonb) FROM (
           -- Keyed by application_name AND pid, never by name alone. A
           -- walreceiver's default application_name is the standby's
@@ -9643,7 +9644,7 @@ private:
 
     try {
       pqxx::subtransaction sub{txn};
-      pqxx::result r = sub.exec(R"(
+      pqxx::result const r = sub.exec(R"(
         SELECT COALESCE(JSONB_OBJECT_AGG(external_id, JSONB_BUILD_OBJECT(
                  'local_id',   local_id,
                  'remote_lsn', remote_lsn::text,
@@ -9774,10 +9775,10 @@ private:
                     lv.n, lv.never_analyzed, lv.rows, lv.pages) AS s;
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema});
     if (!res.empty() && !res[0][0].is_null())
       return json::parse(res[0][0].as<std::string>());
-    json missing = no_such_schema(txn, schema);
+    json const missing = no_such_schema(txn, schema);
     return missing.is_null() ? json::object() : missing;
   }
 
@@ -9879,7 +9880,7 @@ private:
          AND c.relname = $2;
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, table, std::to_string(limit)});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema, table, std::to_string(limit)});
     if (!res.empty() && !res[0][0].is_null()) {
       json out = json::parse(res[0][0].as<std::string>());
       out["order_by"] = key;
@@ -9888,7 +9889,7 @@ private:
 
     // Not partitioned and does not exist are different answers, and the first
     // is the one a caller reaches by habit after listTables named the relation.
-    pqxx::result k = pqxx_exec(
+    pqxx::result const k = pqxx_exec(
       txn, "SELECT c.relkind::text FROM pg_class c JOIN pg_namespace n "
            "ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2",
       pqxx::params{schema, table});
@@ -9914,7 +9915,7 @@ private:
     // them in the schema-wide form either, and default_statistics_target
     // sample values for every column of every table in a schema is a payload
     // nobody asked for. Name a table to tableStats to get them.
-    std::string query = std::string(R"(
+    std::string const query = std::string(R"(
       SELECT JSONB_OBJECT_AGG(c.relname,
               JSONB_BUILD_OBJECT()") + kTableStatsCommon + pg16 + R"(
                ))
@@ -9925,11 +9926,11 @@ private:
         AND ($2 = '' OR strpos(lower(c.relname), lower($2)) > 0);
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, pattern});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema, pattern});
 
     if (!res.empty() && !res[0][0].is_null())
       return json::parse(res[0][0].as<std::string>());
-    json missing = no_such_schema(txn, schema);
+    json const missing = no_such_schema(txn, schema);
     return missing.is_null() ? json::object() : missing;
   }
 
@@ -9951,7 +9952,7 @@ private:
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_BUILD_OBJECT(
                'table', c.relname,
                'kind', CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table'
@@ -9977,7 +9978,7 @@ private:
         AND c.relname = $2;
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, table});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema, table});
 
     if (!res.empty() && !res[0][0].is_null())
       return json::parse(res[0][0].as<std::string>());
@@ -9992,7 +9993,7 @@ private:
     // This is the form the lock caveat is really about: one relation_open per
     // table in the schema, so a single table under AccessExclusiveLock blocks
     // the whole call rather than one row of it.
-    std::string query = R"(
+    std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(c.relname,
               JSONB_BUILD_OBJECT(
                'kind', CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table'
@@ -10006,11 +10007,11 @@ private:
         AND ($2 = '' OR strpos(lower(c.relname), lower($2)) > 0);
     )";
 
-    pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, pattern});
+    pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema, pattern});
 
     if (!res.empty() && !res[0][0].is_null())
       return json::parse(res[0][0].as<std::string>());
-    json missing = no_such_schema(txn, schema);
+    json const missing = no_such_schema(txn, schema);
     return missing.is_null() ? json::object() : missing;
   }
 
@@ -10338,7 +10339,7 @@ private:
       std::vector<std::string> observed(members.size());
       parallel_for(members.size(), [&](size_t i) {
         try {
-          Session probe{with_connect_timeout(registry_.get(members[i]),
+          Session const probe{with_connect_timeout(registry_.get(members[i]),
                                              kSweepConnectTimeoutSeconds)};
           observed[i] = probe.role();
         } catch (const std::exception&) {
@@ -10383,7 +10384,7 @@ private:
     struct SweepScope {
       std::optional<pglicht::ConnConfig>& slot;
       ~SweepScope() { slot.reset(); }
-    } sweep_scope{sweep_cfg_};
+    } const sweep_scope{sweep_cfg_};
 
     // Members run concurrently, one connection each -- which is the same rule
     // a single-connection call obeys, applied to several connections at once.
@@ -10498,7 +10499,7 @@ private:
     // method that way) read freed memory. Found by the JSON-RPC fuzzer in
     // 4.6, two seconds in, on an initialize carrying no id.
     const json id = req.is_object() && req.contains("id") ? req["id"] : json();
-    std::string method = req.value("method", "");
+    std::string const method = req.value("method", "");
     const json params = req.contains("params") && req["params"].is_object()
       ? req["params"] : json::object();
 
@@ -10886,7 +10887,7 @@ private:
     std::string out;
     unsigned val = 0;
     int valb = -6;
-    for (char raw : in) {
+    for (char const raw : in) {
       val = (val << 8) + static_cast<unsigned char>(raw);
       valb += 8;
       while (valb >= 0) { out += t[(val >> static_cast<unsigned>(valb)) & 0x3Fu]; valb -= 6; }
@@ -10904,7 +10905,7 @@ private:
     unsigned val = 0;
     int valb = -8;
     out.clear();
-    for (char raw : in) {
+    for (char const raw : in) {
       const unsigned char c = static_cast<unsigned char>(raw);
       if (c == '=') break;
       if (rev[c] == -1) return false;
@@ -10932,7 +10933,7 @@ private:
     if (plain.rfind(prefix, 0) != 0) return false;
     const std::string digits = plain.substr(prefix.size());
     if (digits.empty()) return false;
-    for (char c : digits) if (c < '0' || c > '9') return false;
+    for (char const c : digits) if (c < '0' || c > '9') return false;
     try { offset = static_cast<size_t>(std::stoull(digits)); }
     catch (const std::exception&) { return false; }
     return true;
@@ -11089,19 +11090,19 @@ private:
         {"name", "pg-licht-cpp"}, {"version", PGLICHT_VERSION}
       };
     }
-    json res = {{"jsonrpc", "2.0"}, {"id", id}, {"result", body}};
+    json const res = {{"jsonrpc", "2.0"}, {"id", id}, {"result", body}};
     std::cout << res.dump() << std::endl;
   }
 
   void send_error_with_data(const json& id, int code, const std::string& msg,
                             const json& data) {
-    json res = {{"jsonrpc", "2.0"}, {"id", id},
+    json const res = {{"jsonrpc", "2.0"}, {"id", id},
                 {"error", {{"code", code}, {"message", msg}, {"data", data}}}};
     std::cout << res.dump() << std::endl;
   }
 
   void send_error(const json& id, int code, const std::string& msg) {
-    json err = {{"jsonrpc", "2.0"}, {"id", id}, {"error", {{"code", code}, {"message", msg}}}};
+    json const err = {{"jsonrpc", "2.0"}, {"id", id}, {"error", {{"code", code}, {"message", msg}}}};
     std::cout << err.dump() << std::endl;
   }
 };

@@ -3,8 +3,9 @@
 # and fails on any finding: WarningsAsErrors is everything enabled here.
 #
 # Every exclusion says why. They were decided from a measured first run
-# (2026-10-02, clang-tidy 19): 899 findings, of which 869 were the four
-# style checks below, and none of the remaining 30 was a bug -- six deliberate
+# (2026-10-02, clang-tidy 19): 899 findings, of which 664 were locals that
+# could be const (since fixed, and the check enabled), 205 the three style
+# checks excluded below, and none of the remaining 30 was a bug -- six deliberate
 # empty catches and one deliberate assignment-in-if (now NOLINT with the
 # reason), two optional accesses clang-tidy could not prove safe (now
 # guarded), one branch that duplicated another, one needless copy.
@@ -15,6 +16,7 @@ Checks: >
   clang-analyzer-*,
   performance-*,
   cppcoreguidelines-pro-type-cstyle-cast,
+  misc-const-correctness,
   -bugprone-easily-swappable-parameters,
   -performance-avoid-endl,
   -performance-inefficient-string-concatenation,
@@ -30,9 +32,9 @@ Checks: >
 #       once per call, where readability matters and the cost does not
 #       (114 findings).
 #   performance-enum-size  an int-sized enum is not a cost worth a finding.
-#   misc-const-correctness  not enabled: 664 findings of local variables that
-#       could be const. Worth having, but as its own change rather than buried
-#       in this one.
+#   misc-const-correctness  enabled in 4.6 once its 664 findings were fixed
+#       (clang-tidy --fix, then seven scope guards by hand), so new code stays
+#       const-correct.
 
 WarningsAsErrors: '*'
 HeaderFilterRegex: '.*/cpp/src/.*'
