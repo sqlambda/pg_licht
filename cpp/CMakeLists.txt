@@ -56,6 +56,32 @@ install(TARGETS pg_licht_mcp RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/man/pg_licht_mcp.1
         DESTINATION ${CMAKE_INSTALL_MANDIR}/man1)
 
+# libFuzzer targets for the inputs that come from outside the process:
+# fuzz_jsonrpc (a client message, through the real dispatch),
+# fuzz_connections and fuzz_budgets (the two INI parsers). clang only, built
+# with ASan and UBSan; CI runs each for a minute on pull requests. Seeds:
+# tools/fuzz-seeds.py.
+option(PGLICHT_FUZZ "Build the libFuzzer targets (clang only)" OFF)
+if(PGLICHT_FUZZ)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "PGLICHT_FUZZ needs clang (libFuzzer); this is ${CMAKE_CXX_COMPILER_ID}")
+    endif()
+    foreach(_fuzz connections budgets jsonrpc)
+        set(_sources fuzz/fuzz_${_fuzz}.cpp)
+        if(_fuzz STREQUAL "jsonrpc")
+            list(APPEND _sources ${PGLICHT_REGISTRY_SOURCES})
+        endif()
+        add_executable(fuzz_${_fuzz} ${_sources})
+        target_compile_definitions(fuzz_${_fuzz} PRIVATE PGLICHT_VERSION="${PROJECT_VERSION}")
+        target_link_libraries(fuzz_${_fuzz} PRIVATE
+            nlohmann_json::nlohmann_json PkgConfig::PQXX PkgConfig::LIBPQ Threads::Threads)
+        pglicht_harden(fuzz_${_fuzz})
+        target_compile_options(fuzz_${_fuzz} PRIVATE
+            -g -fno-omit-frame-pointer -fsanitize=fuzzer,address,undefined)
+        target_link_options(fuzz_${_fuzz} PRIVATE -fsanitize=fuzzer,address,undefined)
+    endforeach()
+endif()
+
 option(BUILD_TESTING "Build the test suite" ON)
 if(BUILD_TESTING)
     enable_testing()

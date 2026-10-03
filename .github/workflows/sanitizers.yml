@@ -149,6 +149,36 @@ jobs:
           printf '%s\n' cpp/src/main.cpp cpp/src/tool_defs.cpp cpp/src/prompt_defs.cpp \
             | xargs -P 3 -I{} clang-tidy -p cpp/build --quiet {}
 
+      # libFuzzer, a minute per target: the JSON-RPC dispatch (the input from
+      # outside the operator's control) and the two INI parsers, seeded by
+      # tools/fuzz-seeds.py. Its first local run found a use-after-free in
+      # 4.5's request handling in two seconds. A crash fails the job and its
+      # input is uploaded below, so it can be reproduced with
+      #   ./fuzz_<target> <the artifact>
+      - name: Fuzz
+        if: matrix.config == 'plain-clang'
+        run: |
+          # libFuzzer's runtime ships apart from the compiler on Ubuntu.
+          sudo apt-get install -y -q "libclang-rt-$(clang++ -dumpversion | cut -d. -f1)-dev"
+          export PKG_CONFIG_PATH="$HOME/pqxx/lib/pkgconfig:$HOME/pqxx/lib64/pkgconfig"
+          cmake -S cpp -B cpp/fuzz-build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_COMPILER=clang++ -DPGLICHT_FUZZ=ON -DBUILD_TESTING=OFF \
+            -DPGLICHT_WERROR=ON
+          cmake --build cpp/fuzz-build --target fuzz_jsonrpc fuzz_connections fuzz_budgets
+          python3 tools/fuzz-seeds.py fuzz-corpus
+          mkdir -p fuzz-crashes
+          for t in jsonrpc connections budgets; do
+            cpp/fuzz-build/fuzz_$t -max_total_time=60 -print_final_stats=1 \
+              -artifact_prefix=fuzz-crashes/$t- fuzz-corpus/$t
+          done
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: failure() && matrix.config == 'plain-clang'
+        with:
+          name: fuzz-crashes
+          path: fuzz-crashes/
+          if-no-files-found: ignore
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: matrix.config != 'plain-clang'
         with:

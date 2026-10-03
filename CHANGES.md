@@ -2,6 +2,32 @@
 
 ## 4.6.0 (unreleased)
 
+### Fixed
+
+- **A request without an id read invalid memory.** The server built every
+  response from `req["id"]` on a const JSON object, where a missing key is
+  undefined behaviour: nlohmann dereferences the map's end. A request with no
+  id -- a notification, in JSON-RPC terms, which a client may send for any
+  method -- therefore read freed memory (under ASan, a heap-use-after-free in
+  `send_response`). Present in every release before this one; found by the
+  new JSON-RPC fuzzer within two seconds of its first run, on an
+  `initialize` carrying no id. Such a request is now answered with a null id.
+
+### Fuzzing
+
+- **libFuzzer targets for the inputs from outside the process:**
+  `fuzz_jsonrpc`, a client message through the real dispatch against a
+  server whose only connections cannot be reached (so it exercises parsing,
+  argument validation, sweep selection and the error paths, not a database);
+  and `fuzz_connections` and `fuzz_budgets`, the two INI parsers. Built with
+  `-DPGLICHT_FUZZ=ON` (clang), under ASan and UBSan, and seeded by
+  `tools/fuzz-seeds.py`: every protocol method in both eras, and one
+  `tools/call` per tool, plain and as a sweep, from the arguments the
+  reference shows. CI runs each for a minute on the clang job and uploads
+  any crashing input. The parsers gain `from_ini_text` and
+  `Budgets::parse_text`, so text is parsed without a file; the file paths
+  keep their permission rules, and a test holds the two to the same result.
+
 ### Hardening
 
 - **The release binaries are hardened.** CMake never applied a

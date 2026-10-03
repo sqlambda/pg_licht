@@ -6,6 +6,7 @@
 #include <fstream>
 #include <map>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -295,7 +296,21 @@ public:
 
     std::ifstream in(path);
     if (!in) throw std::runtime_error("cannot open config file: " + path);
+    return from_ini_stream(in, path, app_name);
+  }
 
+  // The parser itself, from any stream: `path` only labels the messages. Split
+  // from from_ini in 4.6 so text can be parsed without a file -- the fuzzer
+  // feeds it bytes, and a test can hand it a string -- while the file rules
+  // (the mode check above) stay on the one path that reads a file.
+  static ConnectionRegistry from_ini_text(const std::string& text, const std::string& label,
+                                          const std::string& app_name) {
+    std::istringstream in(text);
+    return from_ini_stream(in, label, app_name);
+  }
+
+  static ConnectionRegistry from_ini_stream(std::istream& in, const std::string& path,
+                                            const std::string& app_name) {
     ConnectionRegistry reg;
     std::string line, section;
     std::map<std::string, std::vector<std::pair<std::string, std::string>>> raw;
@@ -921,7 +936,17 @@ struct Budgets {
 
     std::ifstream in(path);
     if (!in) throw std::runtime_error("cannot open budgets file: " + path);
+    return parse(in, path, b);
+  }
 
+  // The parser itself, from any stream; `path` only labels the messages. See
+  // ConnectionRegistry::from_ini_text for why it is split from the file.
+  static Budgets parse_text(const std::string& text, const std::string& label) {
+    std::istringstream in(text);
+    return parse(in, label, Budgets{});
+  }
+
+  static Budgets parse(std::istream& in, const std::string& path, Budgets b) {
     std::string line, section;
     size_t lineno = 0;
     while (std::getline(in, line)) {

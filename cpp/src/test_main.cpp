@@ -4844,6 +4844,35 @@ TEST(ConnectionConfigTest, APoolerRouteNeedsItsOwnDbname) {
   EXPECT_NE(reg.invalid()[0].second.find("no dbname"), std::string::npos) << reg.invalid()[0].second;
 }
 
+// The text entry points the fuzzers use parse exactly as the file ones do --
+// shown on the files the project ships.
+TEST(ConnectionConfigTest, TextAndFileParsingAgree) {
+  std::ifstream f(PGLICHT_EXAMPLE_INI);
+  std::stringstream text;
+  text << f.rdbuf();
+  // Through a private copy: the checked-out example is group-readable, which
+  // the file path rightly refuses.
+  TempIni copy(text.str());
+  auto from_file = pglicht::ConnectionRegistry::from_ini(copy.path(), "t");
+  auto from_text = pglicht::ConnectionRegistry::from_ini_text(text.str(), "example.ini", "t");
+  EXPECT_EQ(from_file.names(), from_text.names());
+  EXPECT_EQ(from_file.default_name(), from_text.default_name());
+  for (const auto& n : from_file.names())
+    EXPECT_EQ(from_file.get(n).conninfo, from_text.get(n).conninfo) << n;
+
+  std::ifstream bf(PGLICHT_EXAMPLE_BUDGETS);
+  std::stringstream btext;
+  btext << bf.rdbuf();
+  TempIni bcopy(btext.str());   // the checkout's copy is group-writable
+  const auto b1 = pglicht::Budgets::load(bcopy.path());
+  const auto b2 = pglicht::Budgets::parse_text(btext.str(), "budgets.example.ini");
+  EXPECT_EQ(b1.payload_max_kb, b2.payload_max_kb);
+  EXPECT_EQ(b1.analyze_memory_percent, b2.analyze_memory_percent);
+  EXPECT_EQ(b1.analyze_vcpus_per_worker, b2.analyze_vcpus_per_worker);
+  // The file path keeps its own rules: text has no mode to check.
+  EXPECT_THROW(pglicht::ConnectionRegistry::from_ini_text("", "empty", "t"), std::runtime_error);
+}
+
 // A call naming no connection is a database question, and a console listed
 // first would refuse every one of them.
 TEST(ConnectionConfigTest, APoolerListedFirstIsNotTheDefault) {
