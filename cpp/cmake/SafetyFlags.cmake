@@ -81,7 +81,8 @@ check_pie_supported(OUTPUT_VARIABLE _pglicht_pie_msg LANGUAGES CXX)
 # first push. A flag the compiler would only warn about is unsupported here.
 set(_pglicht_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
 set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -Werror")
-foreach(_flag -fstack-protector-strong -fstack-clash-protection -fcf-protection)
+foreach(_flag -fstack-protector-strong -fstack-clash-protection -fcf-protection
+              -ftrivial-auto-var-init=zero)
     string(MAKE_C_IDENTIFIER "PGLICHT_HAS${_flag}" _var)
     check_cxx_compiler_flag(${_flag} ${_var})
 endforeach()
@@ -120,6 +121,16 @@ function(pglicht_harden_binary target)
     if(PGLICHT_SANITIZER STREQUAL "NONE")
         target_compile_options(${target} PRIVATE
             $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3>)
+    endif()
+    # Locals the code never initialises start as zero rather than as whatever
+    # the stack held, so a read the code gets wrong is a predictable zero, not
+    # stale data from an earlier call. Release and MinSizeRel only -- what the
+    # release workflow builds. Never RelWithDebInfo, which CI's valgrind job
+    # runs, nor Debug or a sanitizer build: there it would hide the
+    # uninitialised reads those tools exist to find.
+    if(PGLICHT_SANITIZER STREQUAL "NONE" AND PGLICHT_HAS_ftrivial_auto_var_init_zero)
+        target_compile_options(${target} PRIVATE
+            $<$<CONFIG:Release,MinSizeRel>:-ftrivial-auto-var-init=zero>)
     endif()
 endfunction()
 

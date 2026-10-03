@@ -109,6 +109,15 @@
   `_FORTIFY_SOURCE=3` in optimised builds without a sanitizer. The static
   libpqxx the release links is now built position-independent, which Rocky's
   gcc-toolset does not do by default.
+- **Uninitialised locals start as zero in Release builds**
+  (`-ftrivial-auto-var-init=zero`), so a read the code gets wrong is a
+  predictable zero rather than stale stack data from an earlier call.
+  Release and MinSizeRel only: never RelWithDebInfo, which CI's valgrind job
+  runs, nor Debug or a sanitizer build, where it would hide the very reads
+  those tools find. Measured cost: +2.6% on the server's own CPU work (3,000
+  requests with no database, median of seven interleaved runs), about 25 us
+  a request, against milliseconds a real call spends on the database; 12 kB
+  of binary.
 - **Hardening flags are checked with `-Werror`.** Apple clang accepts
   `-fstack-clash-protection` on arm64 with only "argument unused during
   compilation", so a plain check passed and the `-Werror` build failed on
