@@ -113,7 +113,7 @@ cmake --build build --target pg_licht_mcp
 project's own policy, enforced in CI -- and a newer compiler than CI's can add a warning
 that is not yours to fix. A source tarball defaults to off.
 
-and, as root again, `cmake --install build --prefix /usr/local`.
+Then, as root again, `cmake --install build --prefix /usr/local`.
 
 `/usr/local/bin/pg_licht_mcp` and `man pg_licht_mcp` then work as on Linux. To run the
 test suite as well, add `googletest bash postgresql18-server postgresql18-contrib
@@ -142,7 +142,7 @@ gh attestation verify pg_licht_mcp-linux-x86_64-debian13.deb --repo sqlambda/pg_
 Or, without it, against the `SHA256SUMS` file published beside the assets:
 
 ```bash
-sha256sum -c --ignore-missing SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS      # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS
 ```
 
 Then point it at a database:

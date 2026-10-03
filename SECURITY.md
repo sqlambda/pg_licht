@@ -53,7 +53,7 @@ case. Run pg_licht as a role whose visibility you are content to hand to the cli
 
 ## The build
 
-Release binaries are built with PIE, full RELRO, a non-executable stack, the stack
-protector and, against glibc, `_FORTIFY_SOURCE=3`; `cpp/test/hardening-check.sh` checks
+The Linux release binaries are built with PIE, full RELRO, a non-executable stack, the
+stack protector and, against glibc, `_FORTIFY_SOURCE=3`; `cpp/test/hardening-check.sh` checks
 each property on every Linux binary the release ships. GitHub Actions are pinned to
 commit SHAs and kept current by Dependabot.

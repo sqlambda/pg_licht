@@ -77,7 +77,8 @@ if(PGLICHT_FUZZ)
             nlohmann_json::nlohmann_json PkgConfig::PQXX PkgConfig::LIBPQ Threads::Threads)
         pglicht_harden(fuzz_${_fuzz})
         target_compile_options(fuzz_${_fuzz} PRIVATE
-            -g -fno-omit-frame-pointer -fsanitize=fuzzer,address,undefined)
+            -g -fno-omit-frame-pointer -fsanitize=fuzzer,address,undefined
+            -fno-sanitize-recover=undefined)
         target_link_options(fuzz_${_fuzz} PRIVATE -fsanitize=fuzzer,address,undefined)
     endforeach()
 endif()

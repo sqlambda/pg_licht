@@ -5725,6 +5725,14 @@ TEST_F(PostgresMCPServerTest, AnIntegerArgumentTooLargeForAnIntIsNotConverted) {
     // Answered as a tool result, whatever it says: not a protocol error.
     ASSERT_TRUE(r.contains("result")) << r.dump().substr(0, 300);
   }
+  // An integer that is one, but too large: clamped, never wrapped. 2^32 + 1
+  // used to arrive as 1 -- as a pid, somebody else's backend.
+  EXPECT_EQ(Args(json{{"pid", 4294967297LL}}).num("pid", 0), std::numeric_limits<int>::max());
+  EXPECT_EQ(Args(json{{"pid", -4294967297LL}}).num("pid", 0), std::numeric_limits<int>::min());
+  EXPECT_EQ(Args(json{{"limit", 7}}).num("limit", 20), 7);
+  EXPECT_EQ(Args(json{{"limit", "7"}}).num("limit", 20), 20);
+  EXPECT_EQ(Args(json{{"n", 18446744073709551615ULL}}).bignum("n", 0),
+            std::numeric_limits<long long>::max());
 }
 
 TEST_F(PostgresMCPServerTest, CapabilitiesDeclareTheThreeNewSurfaces) {

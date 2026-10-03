@@ -520,8 +520,8 @@ private:
 //
 // The semantics are deliberately the ones that were already there rather than
 // stricter ones: a missing key yields the default, and a key of the wrong type
-// still throws, because handle_request already turns that into -32602 and
-// silently substituting a default would hide a caller's bug.
+// still throws, because tools/call already turns that into an error result
+// and silently substituting a default would hide a caller's bug.
 class Args {
 public:
   explicit Args(const json& a) : a_(a) {}
@@ -536,11 +536,23 @@ public:
   // Integers check their type rather than throwing: `limit` is the argument a
   // model is most likely to send as a string, and a default is a better answer
   // there than an error about JSON types.
+  // An integer no int can hold is clamped to the nearest one that can, not
+  // wrapped: 4294967297 is not pid 1, and a limit of 3000000000 is a large
+  // limit, which the tool then bounds like any other.
   int num(const char* k, int d) const {
-    return a_.contains(k) && a_[k].is_number_integer() ? a_[k].get<int>() : d;
+    if (!a_.contains(k) || !a_[k].is_number_integer()) return d;
+    const long long v = bignum(k, d);
+    return static_cast<int>(std::clamp<long long>(v, std::numeric_limits<int>::min(),
+                                                  std::numeric_limits<int>::max()));
   }
   long long bignum(const char* k, long long d) const {
-    return a_.contains(k) && a_[k].is_number_integer() ? a_[k].get<long long>() : d;
+    if (!a_.contains(k) || !a_[k].is_number_integer()) return d;
+    if (a_[k].is_number_unsigned()) {
+      const auto u = a_[k].get<unsigned long long>();
+      const auto top = static_cast<unsigned long long>(std::numeric_limits<long long>::max());
+      return u > top ? std::numeric_limits<long long>::max() : static_cast<long long>(u);
+    }
+    return a_[k].get<long long>();
   }
   bool flag(const char* k, bool d) const {
     return a_.contains(k) ? a_[k].get<bool>() : d;
@@ -708,12 +720,27 @@ public:
   void run() {
     std::string line;
     while (std::getline(std::cin, line)) {
+      json request;
       try {
-        auto request = json::parse(line);
-        handle_request(request);
+        request = json::parse(line);
       } catch (const std::exception& e) {
         std::cerr << "Standard Exception: " << e.what() << std::endl;
         std::cout << json{{"jsonrpc", "2.0"}, {"error", {{"code", -32700}, {"message", "Parse error"}}}}.dump() << std::endl;
+        continue;
+      }
+      // Valid JSON that is not a valid request -- a method that is a number,
+      // a protocolVersion that is not a string -- is not a parse error, and
+      // the answer carries the request's id: through 4.5 it was -32700 with
+      // none, which a client waiting on that id never matched to its call.
+      const json id = request.is_object() && request.contains("id") ? request["id"] : json();
+      try {
+        handle_request(request);
+      } catch (const json::exception& e) {
+        std::cerr << "Invalid request: " << e.what() << std::endl;
+        send_error(id, -32600, std::string("Invalid request: ") + e.what());
+      } catch (const std::exception& e) {
+        std::cerr << "Standard Exception: " << e.what() << std::endl;
+        send_error(id, -32603, std::string("Internal error: ") + e.what());
       }
     }
   }
@@ -1446,7 +1473,10 @@ private:
     if (loaded.is_boolean() && loaded.get<bool>())
       return {{"error", lib + " is preloaded but not created in this database"},
               {"hint", "The library is already loaded, so no restart is needed: run, "
-                       "in this database, CREATE EXTENSION " + lib + ";"},
+                       "in this database, CREATE EXTENSION " + lib +
+                       (lib == "pg_stat_kcache" ? " CASCADE; (it requires pg_stat_statements, "
+                                                  "which CASCADE creates if it is missing)"
+                                                : ";")},
               {"library_loaded", true}, {"extension_created", false}};
     json out = lib == "pg_stat_statements" ? pgss_missing() : preload_missing(lib, after_pgss);
     out["library_loaded"] = loaded;
@@ -1932,7 +1962,7 @@ private:
       }
       // Not listed is not "no route". PgBouncer's SHOW DATABASES never lists
       // a '*' fallback -- only explicit entries, and names the fallback has
-      // created, which it may drop again after a failed login -- so a name
+      // created, which it drops again once their pool is empty -- so a name
       // missing here may still be routed. Through 4.5.1 this was an error
       // saying there was no fallback, which the console cannot know; found
       // on the rig, whose PgBouncer has one. The connection's own outcome is
@@ -8981,7 +9011,8 @@ private:
       for (const char* t : tools) {
         if (!installed && loaded.is_boolean() && loaded.get<bool>())
           deny(t, std::string("the ") + ext + " library is preloaded, but the extension "
-                  "is not created in this database: CREATE EXTENSION " + ext + ";");
+                  "is not created in this database: CREATE EXTENSION " + ext +
+                  (std::string(ext) == "pg_stat_kcache" ? " CASCADE;" : ";"));
         else if (!installed)
           deny(t, std::string("the ") + ext + " extension is not installed");
         else if (loaded.is_boolean() && !loaded.get<bool>())
@@ -9115,9 +9146,20 @@ private:
           sub.exec("SELECT 1 FROM " + sch + "." + pr.read + " LIMIT 1");
           sub.commit();
           e["functional"] = true;
+        } catch (const pqxx::sql_error& ex) {
+          // Only "the object is not there" or "not loaded" is a state of the
+          // extension. A timeout, a lock or a lost connection is this probe
+          // failing, and says nothing about it: functional is then unknown.
+          const std::string state = ex.sqlstate();
+          const bool about_ext = state.rfind("42", 0) == 0 || state == "3F000" ||
+                                 state == "55000" || state == "0A000";
+          e["functional"] = about_ext ? json(false) : json();
+          e[about_ext ? "reason" : "probe_error"] = pgbouncer::valid_utf8(std::string(ex.what()).substr(0, 300));
+          // The cached schema may be what was wrong: resolve it afresh next time.
+          if (about_ext) forget_extension_schema(pr.lib);
         } catch (const std::exception& ex) {
-          e["functional"] = false;
-          e["reason"] = std::string(ex.what()).substr(0, 300);
+          e["functional"] = json();
+          e["probe_error"] = pgbouncer::valid_utf8(std::string(ex.what()).substr(0, 300));
         }
       }
       exts[pr.lib] = e;

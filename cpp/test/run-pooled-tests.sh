@@ -38,8 +38,12 @@
 # the FreeBSD client against this Linux rig (pg_licht is a client; the server
 # features under test are all here). With RIG_HOST other than 127.0.0.1, every
 # cluster and PgBouncer also listen there, every URL handed out uses it, and
-# pg_hba.conf trusts RIG_TRUST_NET. Trust over a network is acceptable only
-# because this is a throwaway rig on a private bridge, and only that subnet.
+# pg_hba.conf trusts RIG_TRUST_NET. That limits the clusters' own ports only:
+# PgBouncer admits anyone who can reach its port (auth_type = any) and reaches
+# the primary over loopback, which is trusted -- so whoever can reach
+# BOUNCER_PORT on RIG_HOST is the cluster's superuser. Serve the rig only on
+# a network where that is acceptable: a CI runner with no inbound traffic, or
+# a private bridge to a VM. Never on a LAN address.
 #
 # A physical standby is streamed off the primary with pg_basebackup and its
 # conninfo is exported as STANDBY_URL. The role and topology tests use it to

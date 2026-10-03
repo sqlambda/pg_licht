@@ -7,10 +7,9 @@ on:
   workflow_dispatch:
 
 # A second push supersedes the first, so a force-push or a quick follow-up
-# commit does not leave a full 20-job matrix running against a commit nobody
-# will look at. Only pull_request runs are cancelled: a push to main or a tag
-# must finish, because its result is what the branch protection and the release
-# read.
+# commit does not leave the whole matrix running against a commit nobody
+# will look at. Only pull_request runs are cancelled: a push to main must
+# finish, because its result is what the branch protection reads.
 # Least privilege for every job that does not say otherwise: checkout needs to
 # read the repository, and artifacts and caches use the runner's own token,
 # not GITHUB_TOKEN. A job-level block replaces this one entirely, which is how
@@ -32,7 +31,7 @@ jobs:
   # Compile each distinct configuration once and hand the binary to the jobs
   # that run it.
   #
-  # There are three configurations and twenty test jobs: valgrind and pooled
+  # There are few configurations and many test jobs: valgrind and pooled
   # both want the plain RelWithDebInfo build, and the five PostgreSQL majors of
   # each differ only in the server they talk to, not in the binary. Compiling
   # per test job spent roughly 40 minutes of runner time re-deriving three

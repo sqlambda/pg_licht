@@ -403,14 +403,22 @@ jobs:
 
       # One file a user can check every download against without the GitHub
       # CLI: sha256sum -c --ignore-missing SHA256SUMS. The source tarball is
-      # in it too, under the name GitHub serves it by; it exists as soon as
-      # the tag does.
+      # in it too, under both names it arrives by -- v4.6.0.tar.gz from the URL
+      # (curl -O, wget) and pg_licht-4.6.0.tar.gz from the header a browser
+      # obeys; it exists as soon as the tag does. Downloaded to a file first:
+      # in a pipe, a failed curl would leave sha256sum hashing nothing, and
+      # the hash of nothing looks like any other.
       - name: Write SHA256SUMS
         run: |
+          set -euo pipefail
           sha256sum pg_licht_mcp-*.tar.gz pg_licht_mcp-*.deb pg_licht_mcp-*.rpm > SHA256SUMS
-          src=$(curl -fsSL "https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.ref_name }}.tar.gz" | sha256sum | cut -d' ' -f1)
-          echo "$src  ${{ github.ref_name }}.tar.gz" >> SHA256SUMS
-          test "$(wc -l < SHA256SUMS)" -eq 8
+          curl -fsSL -o source.tar.gz "https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.ref_name }}.tar.gz"
+          test -s source.tar.gz
+          src=$(sha256sum source.tar.gz | cut -d' ' -f1)
+          tag="${{ github.ref_name }}"
+          echo "$src  $tag.tar.gz" >> SHA256SUMS
+          echo "$src  ${{ github.event.repository.name }}-${tag#v}.tar.gz" >> SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 9
           cat SHA256SUMS
 
       - name: Create GitHub release
@@ -453,7 +461,12 @@ jobs:
       - name: Compute source tarball SHA256
         id: sha
         run: |
-          SHA=$(curl -sL "https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.ref_name }}.tar.gz" | sha256sum | cut -d' ' -f1)
+          # To a file, and -f: in a pipe a failed download, or a 404 page,
+          # would be hashed into the formula like any tarball.
+          set -euo pipefail
+          curl -fsSL -o source.tar.gz "https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.ref_name }}.tar.gz"
+          test -s source.tar.gz
+          SHA=$(sha256sum source.tar.gz | cut -d' ' -f1)
           echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
 
       - name: Update Homebrew formula

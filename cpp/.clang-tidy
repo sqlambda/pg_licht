@@ -4,10 +4,10 @@
 #
 # Every exclusion says why. They were decided from a measured first run
 # (2026-10-02, clang-tidy 19): 899 findings, of which 664 were locals that
-# could be const (since fixed, and the check enabled), 205 the three style
+# could be const (since fixed, and the check enabled), 205 three of the style
 # checks excluded below, and none of the remaining 30 was a bug -- six deliberate
 # empty catches and one deliberate assignment-in-if (now NOLINT with the
-# reason), two optional accesses clang-tidy could not prove safe (now
+# reason), two transaction accesses clang-tidy could not prove safe (now
 # guarded), one branch that duplicated another, one needless copy.
 Checks: >
   -*,

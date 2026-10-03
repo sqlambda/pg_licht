@@ -1,6 +1,6 @@
 # Changelog
 
-## 4.6.0 (unreleased)
+## 4.6.0 (2026-10-03)
 
 ### Fixed
 
@@ -17,8 +17,8 @@
   section declaring `pooler =` whose name the console did not list was
   reported as an error: "no `[databases]` entry ... and no `*` fallback".
   But PgBouncer's `SHOW DATABASES` never lists a `*` fallback -- only
-  explicit entries, and names a fallback has created, which it may drop again
-  after a failed login -- so the console cannot say there is none. It is now
+  explicit entries, and names a fallback has created, which it drops again
+  once their pool is empty -- so the console cannot say there is none. It is now
   information when the connection works, and a warning
   naming the connection's own error when it does not. The `via_fallback`
   field, which could never be set, is gone. Found by the rig, whose PgBouncer
@@ -30,9 +30,19 @@
   checking the JSON type, and converting a number such as `1e80` to `int` is
   undefined behaviour. Found by an hour of the JSON-RPC fuzzer. Both now
   take their default for anything that is not an integer, as every other
-  tool already did. The sanitizer builds now add
-  `-fsanitize=float-cast-overflow`, which clang's `undefined` includes and
-  GCC's does not: without it the GCC jobs could not see this at all.
+  tool already did. And an integer that is one but does not fit -- a `pid`
+  of 4294967297 arrived as pid 1 -- is clamped to the nearest `int`, never
+  wrapped. The sanitizer builds now add `-fsanitize=float-cast-overflow`,
+  which clang's `undefined` includes and GCC's does not, and
+  `-fno-sanitize-recover`: by default UBSan prints its finding and carries
+  on, so a test that provoked one passed.
+
+- **A request that was valid JSON but not a valid request was answered as a
+  parse error, without its id.** A `method` that is a number, a
+  `protocolVersion` or a tool `name` that is not a string: `-32700` with no
+  id, which a client waiting on that id never matched to its call. It is now
+  `-32600` carrying the request's id; `-32700` is kept for text that is not
+  JSON.
 
 ### Extension state
 
@@ -40,7 +50,7 @@
   extension operations answered a library that was preloaded but whose
   extension was never created with "not installed" and a hint to add it to
   `shared_preload_libraries` -- where it already was. The pgshard
-  measurement campaign (October 2026) ran FreeBSD cells for weeks in exactly
+  measurement campaign ran FreeBSD cells for weeks in exactly
   that state with pg_wait_sampling, giving up wait data for nothing. Now
   `waitEventProfile`, `statementKernelStats`, `predicateStats`,
   `suggestIndexes`, `statementStats` and `explainQuery` say "preloaded but not
@@ -50,7 +60,9 @@
 - **`checkPrivileges` reports `extensions`**: for each of the four
   preload-backed extensions, `library_loaded`, `extension_created` and
   `functional` (its view answers a read, probed in a savepoint, with the
-  reason when not), so a mismatch between them is visible in one call.
+  reason when not), so a mismatch between them is visible in one call. A
+  probe that fails for a reason of its own -- a timeout, a lock -- reports
+  `functional` as null with a `probe_error`, not as false.
 
 - **`statementKernelStats` no longer reports platform-shaped zeros.** The
   pgshard campaign found pg_stat_kcache's `exec_system_time` at 0.000 on
@@ -102,8 +114,9 @@
 - **The rig can be served.** `run-pooled-tests.sh` gains `RIG_HOST` (every
   cluster and PgBouncer also listen there, and the URLs it hands out use it;
   `0.0.0.0` for a client that substitutes its own route), `RIG_TRUST_NET`
-  (the subnets trusted from there, for a throwaway rig on a private network
-  only) and `RIG_SERVE` (write the tests' environment to a file and wait).
+  (the subnets the clusters trust from there; PgBouncer admits anyone who
+  reaches its port, so serve the rig only on a CI runner or a private
+  bridge, never a LAN address) and `RIG_SERVE` (write the tests' environment to a file and wait).
   The tests take PgBouncer's host from `POOLER_HOST`.
 
 ### Fuzzing
@@ -114,7 +127,8 @@
   argument validation, sweep selection and the error paths, not a database);
   and `fuzz_connections` and `fuzz_budgets`, the two INI parsers. Built with
   `-DPGLICHT_FUZZ=ON` (clang), under ASan and UBSan, and seeded by
-  `tools/fuzz-seeds.py`: every protocol method in both eras, and one
+  `tools/fuzz-seeds.py`: every protocol method, the list methods in both
+  eras, and one
   `tools/call` per tool, plain and as a sweep, from the arguments the
   reference shows. CI runs each for a minute on the clang job and uploads
   any crashing input. The parsers gain `from_ini_text` and
@@ -168,7 +182,8 @@
   download against it, which tells a release asset from a file of the same
   name that came from somewhere else. INSTALL.md says how.
 - **A `SHA256SUMS` file is published with every release**, covering each
-  asset and the source tarball, for a check that needs no GitHub CLI:
+  asset and the source tarball (under both names it downloads as), for a
+  check that needs no GitHub CLI:
   `sha256sum -c --ignore-missing SHA256SUMS`.
 - **A package's version is asserted, not trusted.** The install check for
   each `.deb` and `.rpm` compares the package's own version with what the
@@ -186,8 +201,9 @@
 - **clang-tidy runs in CI and fails on any finding**, from a checked-in
   `cpp/.clang-tidy` (`bugprone-*`, `cert-*`, `clang-analyzer-*`,
   `performance-*`, `cppcoreguidelines-pro-type-cstyle-cast`, each exclusion
-  commented). Its first run reported 899 findings; 869 were four style
-  checks, excluded with their reasons, and none of the other 30 was a bug:
+  commented). Its first run reported 899 findings: 664 were locals that
+  could be const (fixed, see below), 205 were three style checks, excluded
+  with their reasons, and none of the other 30 was a bug:
   deliberate empty catches and one assignment-in-if now carry a `NOLINT`
   that says why, two transaction accesses clang-tidy could not prove safe
   are now guarded, `checkKey`'s type check lost a branch that duplicated its
@@ -202,7 +218,8 @@
   building from source -- a Homebrew user on a new Xcode, since the formula
   builds the release tarball on the user's machine, or a FreeBSD user. It now
   defaults to on in a git checkout, where a warning can be fixed, and off in
-  a source tarball; CI passes `-DPGLICHT_WERROR=ON` in every job, so the
+  a source tarball; CI passes `-DPGLICHT_WERROR=ON` in every job but the one that
+  builds through the Homebrew formula, which builds as a user does, so the
   zero-warning policy is unchanged where it is enforced.
 
 - **More warnings, all clean:** `-Wnull-dereference`, `-Wformat=2`,

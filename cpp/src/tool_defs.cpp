@@ -564,8 +564,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         int const pid = a.contains("pid") && a["pid"].is_number_integer()
-           ? a["pid"].get<int>() : 0;
+         int const pid = a.num("pid", 0);
          std::string const qid = a.contains("query_id") && a["query_id"].is_string()
            ? a["query_id"].get<std::string>() : "";
          double const min_dur = a.contains("min_duration_s") && a["min_duration_s"].is_number()
@@ -585,8 +584,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         int const pid = a.contains("pid") && a["pid"].is_number_integer()
-           ? a["pid"].get<int>() : 0;
+         int const pid = a.num("pid", 0);
          return s.locks(pid); }},
       {"replicationSlots",
        "return replication slots with retained WAL bytes; a lagging or unused slot holds back WAL indefinitely and is a common cause of disk bloat incidents. A logical slot's consumer is a subscriber on another server: call subscriptionStats there to see whether it is stuck, and note that retained_wal_bytes here is the byte lag that a subscriber cannot measure for itself",
@@ -634,8 +632,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
          }
          std::string const ord = a.contains("order_by") && a["order_by"].is_string()
            ? a["order_by"].get<std::string>() : "";
-         long long const min_calls = a.contains("min_calls") && a["min_calls"].is_number_integer()
-           ? a["min_calls"].get<long long>() : 0;
+         long long const min_calls = a.bignum("min_calls", 0);
          return s.statement_stats(limit, qid, ord, min_calls); }},
       {"waitEventProfile",
        "return what this instance has spent its time waiting on, from pg_wait_sampling's accumulated profile: one entry per wait event (or per query_id and wait event with group_by=\"query\"), with its sample count, its percent of the samples counted (the idle ones below are not), and estimated_ms. currentActivity is a single sample of what is waiting now; this is the answer to what the server has been waiting on -- IO/DataFileRead dominating and LWLock/WALWrite dominating are opposite stories that look identical in a throughput figure. samples are collector ticks, every profile_period_ms per backend, so estimated_ms is backend-time summed over all backends rather than wall-clock time, and the counts accumulate from the last reset or server start: this server never resets them, so a window is the difference between two readings. Activity samples -- background processes idling in their main loops -- are excluded unless include_idle is true and counted in excluded_idle_samples. Client/ClientRead is kept, and it includes idle connections waiting for their next statement, so on a pooled server it measures connections times time as much as anything. An entry whose event_type and event are null is a backend sampled while not waiting at all -- running, which usually means on CPU -- and on a busy server it is often the largest entry. query_id is null for samples with no statement, and every query_id is 0 (so null) when pg_wait_sampling.profile_queries is off. Requires pg_wait_sampling in shared_preload_libraries, and says so as an error when it is installed without it; preloaded is null only when neither shared_preload_libraries nor the extension's own settings could tell",
@@ -653,7 +650,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
          return s.wait_event_profile(a.str("group_by"), a.str("query_id"),
                                      a.num("limit", 30), a.flag("include_idle", false)); }},
       {"statementKernelStats",
-       "return what the operating system measured each tracked statement costing, from pg_stat_kcache: CPU time split into user and system, bytes actually read from and written to storage, page faults, and context switches, separately for planning and execution, per query_id. What the counters mean depends on the server's platform, named in 'platform': cpu_time_s (user + system) is exact everywhere; on Linux the user/system split and the byte counts are as measured, and elsewhere those four are null with the reason under 'unavailable' -- FreeBSD splits CPU time by sampling, so a short statement reads as all user time, and does not charge buffered writes to the process at all. PostgreSQL's own counters cannot see this: a shared_blks_read in statementStats is a request to the kernel, answered from its page cache or from the device, and only exec.reads_bytes says which -- compare it with shared_blks_read times block_size, both returned here. A high nivcsws (involuntary context switches) is CPU contention; majflts is memory pressure reaching disk. Counters are cumulative from stats_since or the last reset. query_id joins to statementStats and explainQuery; for a role without pg_read_all_stats, pg_stat_statements hides the queryid of other roles' statements, so their calls, total_exec_ms and shared_blks_read are null while the kernel counters stay complete. Requires pg_stat_kcache in shared_preload_libraries after pg_stat_statements, at version 2.2 or later",
+       "return what the operating system measured each tracked statement costing, from pg_stat_kcache: CPU time split into user and system, bytes actually read from and written to storage, page faults, and context switches, separately for planning and execution, per query_id. What the counters mean depends on the server's platform, named in 'platform': cpu_time_s (user + system) is the kernel's own total, checked on Linux and FreeBSD; on Linux the user/system split and the byte counts are as measured, and elsewhere those four are null with the reason under 'unavailable' -- FreeBSD splits CPU time by sampling, so a short statement reads as all user time, and does not charge buffered writes to the process at all. PostgreSQL's own counters cannot see this: a shared_blks_read in statementStats is a request to the kernel, answered from its page cache or from the device, and only exec.reads_bytes says which -- compare it with shared_blks_read times block_size, both returned here. A high nivcsws (involuntary context switches) is CPU contention; majflts is memory pressure reaching disk. Counters are cumulative from stats_since or the last reset. query_id joins to statementStats and explainQuery; for a role without pg_read_all_stats, pg_stat_statements hides the queryid of other roles' statements, so their calls, total_exec_ms and shared_blks_read are null while the kernel counters stay complete. Requires pg_stat_kcache in shared_preload_libraries after pg_stat_statements, at version 2.2 or later",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
@@ -701,8 +698,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         int const pid = a.contains("pid") && a["pid"].is_number_integer()
-           ? a["pid"].get<int>() : 0;
+         int const pid = a.num("pid", 0);
          std::string const rel = a.contains("relation") && a["relation"].is_string()
            ? a["relation"].get<std::string>() : "";
          return s.progress_stats(pid, rel); }},
@@ -730,8 +726,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         int const pid = a.contains("pid") && a["pid"].is_number_integer()
-           ? a["pid"].get<int>() : 0;
+         int const pid = a.num("pid", 0);
          std::string const bt = a.contains("backend_type") && a["backend_type"].is_string()
            ? a["backend_type"].get<std::string>() : "";
          std::string const ob = a.contains("object") && a["object"].is_string()
@@ -786,10 +781,8 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         long long const ram_mb = a.contains("ram_mb") && a["ram_mb"].is_number_integer()
-           ? a["ram_mb"].get<long long>() : 0;
-         int const vcpus = a.contains("vcpus") && a["vcpus"].is_number_integer()
-           ? a["vcpus"].get<int>() : 0;
+         long long const ram_mb = a.bignum("ram_mb", 0);
+         int const vcpus = a.num("vcpus", 0);
          std::string const storage = a.contains("storage") && a["storage"].is_string()
            ? a["storage"].get<std::string>() : "";
          return s.host_capacity(ram_mb, vcpus, storage); }},
@@ -921,8 +914,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         int const limit = a.contains("limit") && a["limit"].is_number_integer()
-           ? a["limit"].get<int>() : 20;
+         int const limit = a.num("limit", 20);
          return s.buffer_cache_contents(limit); }},
       {"listTopology",
        "return the configured topology: which connections share an instance (one postmaster, so they share shared_buffers, WAL, autovacuum workers and disk), which belong to the same replication_group (a primary and its replicas, holding the same data on different servers), and which carry each operator group label. Reads the config file only and opens no database connection, so it is cheap to call before deciding how wide a sweep to run. An instance whose source is \"inferred\" was derived from an identical host and port rather than declared, and is a hint for grouping output, not evidence of shared memory. Roles are not here: primary or replica is observed per call, never configured -- use verifyTopology. Pass 'pattern' to narrow it: a case-insensitive substring matched against each topology name AND its member connection names, so \"where does billing_prod live\" and \"show me the ha group\" are the same argument. A pattern that matches nothing returns empty lists rather than an error",

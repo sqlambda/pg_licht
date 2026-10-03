@@ -36,6 +36,7 @@ check() {
 }
 has() { grep -qE "$1" && echo yes || echo no; }
 
+command -v readelf >/dev/null || { echo "hardening-check: readelf not found (binutils)" >&2; exit 1; }
 dyn=$(readelf -d "$bin" 2>/dev/null)
 hdr=$(readelf -h "$bin" 2>/dev/null)
 seg=$(readelf -lW "$bin" 2>/dev/null)

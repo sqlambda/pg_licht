@@ -1,7 +1,7 @@
 .\" Copyright (c) 2026 Daniel Cristian.
 .\" Licensed under the Apache License, Version 2.0; see LICENSE.
 .\"
-.Dd September 28, 2026
+.Dd October 3, 2026
 .Dt PG_LICHT_MCP 1
 .Os pg-licht
 .Sh NAME
@@ -829,6 +829,10 @@ and
 in this database, and
 .Va functional ,
 whether its view answers a read, with the reason when it does not.
+A probe that fails for a reason of its own, such as a timeout, leaves
+.Va functional
+null and says why under
+.Va probe_error .
 The state that goes unnoticed is a mismatch between them: a library preloaded
 whose extension was never created needs only
 .Ic CREATE EXTENSION ,
@@ -1717,7 +1721,7 @@ What these counters mean depends on the platform the server runs on, which the
 answer names as
 .Va platform .
 .Va cpu_time_s ,
-user plus system, is exact everywhere.
+user plus system, is the kernel's own total, checked on Linux and FreeBSD.
 On Linux the user and system split and the byte counts are given as measured.
 Elsewhere those four are null and
 .Va unavailable
@@ -2625,7 +2629,7 @@ PgBouncer's
 never lists a
 .Ql *
 fallback, only explicit entries and the names a fallback has created \(em which
-it may drop again after a failed login \(em so a name it does not list may still
+it drops again once their pool is empty \(em so a name it does not list may still
 be routed.
 When the connection through the pooler works, that is reported as information;
 when it fails, as a warning that names the connection's own error, which is what
