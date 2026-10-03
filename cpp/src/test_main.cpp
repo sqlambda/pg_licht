@@ -7748,6 +7748,16 @@ TEST_F(TopologyFixture, VerifyTopologyAcceptsATrueInstanceDeclaration) {
   EXPECT_EQ(v["connections"][0]["instance"], "pg-01");
 }
 
+namespace {
+// The rig's PgBouncer host: 127.0.0.1 when the rig runs the suite itself, the
+// rig's address when it is served to a client elsewhere (RIG_HOST, written as
+// POOLER_HOST) -- the FreeBSD client against the Linux rig.
+std::string pooler_host() {
+  const char* h = std::getenv("POOLER_HOST");
+  return h && *h ? h : "127.0.0.1";
+}
+}  // namespace
+
 // One postmaster reached directly and through a pooler on its own machine
 // reports two server addresses: inet_server_addr() behind PgBouncer is the
 // pooler's hop, 127.0.0.1. Through 4.4 that read as two servers and a correct
@@ -7758,7 +7768,7 @@ TEST_F(TopologyFixture, VerifyTopologyKnowsOneServerReachedThroughItsPooler) {
   if (!alt || !pool)
     GTEST_SKIP() << "no ALT_ADDR_URL: run cpp/test/run-pooled-tests.sh, and on FreeBSD first "
                     "ifconfig lo0 alias 127.0.0.2/32";
-  const std::string pooled = "host=127.0.0.1 port=" + std::string(pool) +
+  const std::string pooled = "host=" + pooler_host() + " port=" + std::string(pool) +
                              " dbname=pglicht user=pglicht";
   auto s = server_from(section("direct", alt, "instance = pg-01\n") +
                        section("pooled", pooled, "instance = pg-01\n"));
@@ -8321,7 +8331,7 @@ std::string pooler_section(const std::string& name, const std::string& extra = "
   const char* port = std::getenv("POOLER_PORT");
   const char* user = std::getenv("POOLER_USER");
   if (!port || !user) return "";
-  return "[" + name + "]\nkind = pgbouncer\nhost = 127.0.0.1\nport = " + port +
+  return "[" + name + "]\nkind = pgbouncer\nhost = " + pooler_host() + "\nport = " + port +
          "\nuser = " + user + "\n" + extra;
 }
 }  // namespace
@@ -8673,7 +8683,7 @@ TEST_F(TopologyFixture, AConsoleConfiguredAsADatabaseIsNamedAsOne) {
   const char* port = std::getenv("POOLER_PORT");
   const char* user = std::getenv("POOLER_USER");
   if (!port || !user) GTEST_SKIP() << "no POOLER_PORT; run cpp/test/run-pooled-tests.sh";
-  auto s = server_from(ini_with("") + "[console]\nhost = 127.0.0.1\nport = " + port +
+  auto s = server_from(ini_with("") + "[console]\nhost = " + pooler_host() + "\nport = " + port +
                        "\ndbname = pgbouncer\nuser = " + user + "\n");
 
   json r = rpc_call(*s, "listSchemas", {{"connection", "console"}});
@@ -8732,12 +8742,12 @@ TEST_F(TopologyFixture, APooledConnectionIsCheckedAgainstItsRoute) {
   if (!alt || !port || pool.empty())
     GTEST_SKIP() << "no ALT_ADDR_URL or pooler: run cpp/test/run-pooled-tests.sh, and on "
                     "FreeBSD first ifconfig lo0 alias 127.0.0.2/32";
-  const std::string via = "[pooled]\nhost = 127.0.0.1\nport = " + std::string(port) +
+  const std::string via = "[pooled]\nhost = " + pooler_host() + "\nport = " + std::string(port) +
                           "\ndbname = pglicht\nuser = pglicht\ninstance = pg-01\n"
                           "pooler = pool\ngroup = g\n";
-  const std::string alias = "[aliased]\nhost = 127.0.0.1\nport = " + std::string(port) +
+  const std::string alias = "[aliased]\nhost = " + pooler_host() + "\nport = " + std::string(port) +
                             "\ndbname = licht_saturate\nuser = pglicht\npooler = pool\n";
-  const std::string lost = "[lost]\nhost = 127.0.0.1\nport = " + std::string(port) +
+  const std::string lost = "[lost]\nhost = " + pooler_host() + "\nport = " + std::string(port) +
                            "\ndbname = no_such_route\nuser = pglicht\npooler = pool\n";
   auto s = server_from(section("direct", alt, "instance = pg-01\ngroup = g\n") + via +
                        alias + pool);
@@ -8781,7 +8791,7 @@ TEST_F(TopologyFixture, APooledConnectionIsCheckedAgainstItsRoute) {
 
   // A route that forces another user keeps both: that user may see another
   // database's worth of rows, grants and objects.
-  const std::string forced = "[forced]\nhost = 127.0.0.1\nport = " + std::string(port) +
+  const std::string forced = "[forced]\nhost = " + pooler_host() + "\nport = " + std::string(port) +
                              "\ndbname = licht_forced\nuser = pglicht\ninstance = pg-01\n"
                              "pooler = pool\ngroup = f\n";
   auto fs = server_from(section("direct", alt, "instance = pg-01\ngroup = f\n") + forced + pool);
@@ -8792,33 +8802,40 @@ TEST_F(TopologyFixture, APooledConnectionIsCheckedAgainstItsRoute) {
   // An inferred instance is only a shared host and port -- two names on one
   // PgBouncer port share it while the pooler may route them anywhere -- so it
   // never licenses the collapse. Neither section declares an instance here.
-  const std::string inferred_pooled = "[ip]\nhost = 127.0.0.1\nport = " + std::string(port) +
+  const std::string inferred_pooled = "[ip]\nhost = " + pooler_host() + "\nport = " + std::string(port) +
                                       "\ndbname = licht_saturate\nuser = pglicht\npooler = pool\n"
                                       "group = i\n";
-  const std::string inferred_other = "[io]\nhost = 127.0.0.1\nport = " + std::string(port) +
+  const std::string inferred_other = "[io]\nhost = " + pooler_host() + "\nport = " + std::string(port) +
                                      "\ndbname = pglicht\nuser = pglicht\ngroup = i\n";
   auto is = server_from(ini_with("") + inferred_pooled + inferred_other + pool);
   json ip = rpc_payload(rpc_call(*is, "listSchemas", {{"group", "i"}}));
   EXPECT_EQ(ip["members"].size(), 2u) << "collapsed on an inferred instance: " << ip.dump(2);
 
-  // A name with no entry of its own is routed by the '*' fallback -- the
-  // rig's PgBouncer has one -- so the connection fails on the server's
-  // "database does not exist", with the route reported beside it. PgBouncer
-  // registers a fallback database as its own entry the moment a client asks
-  // for it, and verifyTopology connects before it reads the route, so the
-  // entry is found by name here rather than through '*'.
+  // A name with no entry of its own, behind a PgBouncer with a '*' fallback
+  // (the rig's). SHOW DATABASES never lists the fallback, and lists the name
+  // only while PgBouncer keeps the database it created for it -- which it may
+  // drop after the failed login. Either way it must not be called unroutable:
+  // through 4.5 it was an error saying there was no fallback, which the
+  // console cannot know.
   auto l = server_from(ini_with("") + lost + pool);
   json lv = l->call_verify_topology();
   bool reported = false;
   for (const auto& c : lv["connections"]) {
     if (c["connection"] != "lost") continue;
     reported = true;
-    EXPECT_TRUE(c.contains("error")) << c.dump(2);
+    EXPECT_TRUE(c.contains("error")) << c.dump(2);   // the database does not exist
     ASSERT_TRUE(c.contains("route")) << c.dump(2);
-    EXPECT_TRUE(c["route"].value("found", false)) << c.dump(2);
-    EXPECT_EQ(c["route"].value("backend_database", ""), "no_such_route") << c.dump(2);
+    if (c["route"].value("found", false)) {
+      EXPECT_EQ(c["route"].value("backend_database", ""), "no_such_route") << c.dump(2);
+    }
+    EXPECT_FALSE(c["route"].contains("via_fallback")) << c.dump(2);
   }
   EXPECT_TRUE(reported) << lv.dump(2);
+  for (const auto& f : lv["findings"]) {
+    if (f["name"] != "lost" || f["topic"] != "pooler") continue;
+    EXPECT_NE(f["severity"], "error") << "a route the console cannot see called an error: " << f.dump(2);
+    EXPECT_EQ(f["detail"].get<std::string>().find("no '*' fallback"), std::string::npos) << f.dump(2);
+  }
 }
 
 // The console itself, in the rig: the answers are real, the stats user can
@@ -8898,7 +8915,7 @@ TEST_F(TopologyFixture, PoolerToolsReadTheConsole) {
 TEST_F(TopologyFixture, PoolerStatusSeesAClientWaitingForAServer) {
   const std::string pool = pooler_section("pool");
   if (pool.empty()) GTEST_SKIP() << "no POOLER_PORT; run cpp/test/run-pooled-tests.sh";
-  const std::string through = "host=127.0.0.1 port=" + std::string(std::getenv("POOLER_PORT")) +
+  const std::string through = "host=" + pooler_host() + " port=" + std::string(std::getenv("POOLER_PORT")) +
                               " dbname=licht_saturate user=pglicht";
   std::mutex m;
   std::vector<std::string> failures;
@@ -9075,7 +9092,7 @@ TEST_F(PostgresMCPServerTest, EveryToolAcceptsItsOwnDocumentedArguments) {
   std::unique_ptr<PostgresMCPServer> pooler;
   if (const char* port = std::getenv("POOLER_PORT"))
     if (const char* user = std::getenv("POOLER_USER"))
-      pooler = server_from("[pool]\nkind = pgbouncer\nhost = 127.0.0.1\nport = " +
+      pooler = server_from("[pool]\nkind = pgbouncer\nhost = " + pooler_host() + "\nport = " +
                            std::string(port) + "\nuser = " + user + "\n");
 
   size_t called = 0, pooler_unchecked = 0;
