@@ -406,6 +406,7 @@ jobs:
           copyback: false
           prepare: |
             pkg install -y cmake pkgconf nlohmann-json postgresql-libpqxx googletest
+            pkg install -y postgresql18-server postgresql18-contrib pg_stat_kcache
           run: |
             set -e
             # The URLs say 0.0.0.0; the rig is reached at the VM's gateway.
@@ -425,6 +426,9 @@ jobs:
             export PGLICHT_REQUIRE_HYPOPG=1 PGLICHT_REQUIRE_PRELOAD_EXTENSIONS=1
             DATABASE_URL="$DATABASE_URL_DIRECT" ./build/pg_licht_mcp_test
             DATABASE_URL="$DATABASE_URL_POOLED" ./build/pg_licht_mcp_test
+            # And the one thing that depends on the SERVER's platform: the
+            # kernel counters, against a PostgreSQL running in this VM.
+            sh ../.github/scripts/freebsd-server.sh "$PWD/build/pg_licht_mcp_test"
 
       - name: Rig log
         if: always()

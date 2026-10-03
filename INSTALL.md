@@ -131,6 +131,14 @@ pg_licht_mcp --help         # usage and connection resolution order
 man pg_licht_mcp            # the full manual
 ```
 
+A file downloaded from the releases page can be checked against its build provenance,
+from 4.6.0 on: a signed statement that it was built by this repository's release workflow
+from the tagged commit. It needs the GitHub CLI:
+
+```bash
+gh attestation verify pg_licht_mcp-linux-x86_64-debian13.deb --repo sqlambda/pg_licht
+```
+
 Then point it at a database:
 
 ```bash

@@ -75,6 +75,21 @@
   that 4.5.1 had to skip on FreeBSD (it packages neither hypopg nor
   pg_wait_sampling for PostgreSQL 18) now run there. Rehearsed against the
   libvirt bridge first: 485 direct, 480 through PgBouncer.
+- **And a FreeBSD server, for the one tool that depends on it.**
+  `statementKernelStats` is the only answer that varies with the server's
+  platform, and its FreeBSD side was tested by hand. The same CI job now
+  starts PostgreSQL 18 in the FreeBSD VM with `pg_stat_statements` and
+  `pg_stat_kcache` preloaded (`.github/scripts/freebsd-server.sh`) and runs
+  the kernel-counter tests against it, required rather than skipped, so
+  "null with a reason outside Linux" is checked against a real FreeBSD
+  kernel on 14.5 and 15.1.
+- **The Homebrew formula is built before the tag, not after.** The tap's
+  formula is rewritten only once a release exists, so nothing built through
+  it beforehand: the macOS release job installs the same dependencies but
+  runs cmake itself. A new job takes the tap's real formula, points it at a
+  tarball of the commit, and runs `brew install --build-from-source` and
+  `brew test`, then checks the installed binary's version and man page. It
+  runs on every pull request, and the release waits for it.
 - **The rig can be served.** `run-pooled-tests.sh` gains `RIG_HOST` (every
   cluster and PgBouncer also listen there, and the URLs it hands out use it;
   `0.0.0.0` for a client that substitutes its own route), `RIG_TRUST_NET`
@@ -136,6 +151,13 @@
   write permissions, and a moving tag such as `actions/checkout@v4` could be
   re-pointed under it. The `actions_pinned` ctest fails on any unpinned
   `uses:`, and CI runs it.
+- **Release assets carry build provenance.** Each tarball, `.deb` and `.rpm`
+  is attested (`actions/attest-build-provenance`) before the release is
+  created: a signed statement, kept by GitHub and logged publicly, that the
+  file was built by this repository's release workflow from the tagged
+  commit. `gh attestation verify <file> --repo sqlambda/pg_licht` checks a
+  download against it, which tells a release asset from a file of the same
+  name that came from somewhere else. INSTALL.md says how.
 - **`SECURITY.md`**: how to report a vulnerability (GitHub's private
   reporting), and what pg_licht guarantees -- the READ ONLY transaction per
   database call, the bounded `explainQuery` exception, the pooler tools'
