@@ -158,6 +158,13 @@
   commit. `gh attestation verify <file> --repo sqlambda/pg_licht` checks a
   download against it, which tells a release asset from a file of the same
   name that came from somewhere else. INSTALL.md says how.
+- **A `SHA256SUMS` file is published with every release**, covering each
+  asset and the source tarball, for a check that needs no GitHub CLI:
+  `sha256sum -c --ignore-missing SHA256SUMS`.
+- **A package's version is asserted, not trusted.** The install check for
+  each `.deb` and `.rpm` compares the package's own version with what the
+  installed binary reports, and on a tag both with the tag; the Homebrew job
+  does the same for the formula build.
 - **`SECURITY.md`**: how to report a vulnerability (GitHub's private
   reporting), and what pg_licht guarantees -- the READ ONLY transaction per
   database call, the bounded `explainQuery` exception, the pooler tools'

@@ -139,6 +139,12 @@ from the tagged commit. It needs the GitHub CLI:
 gh attestation verify pg_licht_mcp-linux-x86_64-debian13.deb --repo sqlambda/pg_licht
 ```
 
+Or, without it, against the `SHA256SUMS` file published beside the assets:
+
+```bash
+sha256sum -c --ignore-missing SHA256SUMS
+```
+
 Then point it at a database:
 
 ```bash

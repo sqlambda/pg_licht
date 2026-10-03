@@ -277,6 +277,14 @@ jobs:
             exit 1
           fi
           pg_licht_mcp --help
+          # The package says one version and the binary inside it another only
+          # when something was packaged that was not just built; on a tag,
+          # both must also be the tag.
+          pkg_version=$(dpkg-deb -f "$pkg" Version)
+          bin_version=$(pg_licht_mcp --version)
+          echo "package $pkg_version, binary: $bin_version"
+          [ "$bin_version" = "pg_licht_mcp ${pkg_version%%-*}" ]
+          case "$GITHUB_REF" in refs/tags/v*) [ "v${pkg_version%%-*}" = "$GITHUB_REF_NAME" ] ;; esac
           ls /usr/share/man/man1/pg_licht_mcp.1*
           dpkg -L pg-licht
 
@@ -297,6 +305,12 @@ jobs:
           echo "libpq5 provided by: $provider"
           echo "$provider" | grep -q PGDG
           pg_licht_mcp --help
+          # As for the .deb: package, binary and (on a tag) the tag agree.
+          pkg_version=$(rpm -qp --qf '%{VERSION}' "$pkg")
+          bin_version=$(pg_licht_mcp --version)
+          echo "package $pkg_version, binary: $bin_version"
+          [ "$bin_version" = "pg_licht_mcp $pkg_version" ]
+          case "$GITHUB_REF" in refs/tags/v*) [ "v$pkg_version" = "$GITHUB_REF_NAME" ] ;; esac
           # rpmbuild may compress man pages, hence the glob.
           ls /usr/share/man/man1/pg_licht_mcp.1*
           rpm -ql pg-licht
@@ -387,6 +401,18 @@ jobs:
             pg_licht_mcp-*.deb
             pg_licht_mcp-*.rpm
 
+      # One file a user can check every download against without the GitHub
+      # CLI: sha256sum -c --ignore-missing SHA256SUMS. The source tarball is
+      # in it too, under the name GitHub serves it by; it exists as soon as
+      # the tag does.
+      - name: Write SHA256SUMS
+        run: |
+          sha256sum pg_licht_mcp-*.tar.gz pg_licht_mcp-*.deb pg_licht_mcp-*.rpm > SHA256SUMS
+          src=$(curl -fsSL "https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.ref_name }}.tar.gz" | sha256sum | cut -d' ' -f1)
+          echo "$src  ${{ github.ref_name }}.tar.gz" >> SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 8
+          cat SHA256SUMS
+
       - name: Create GitHub release
         run: |
           # Idempotent, so re-running this job after a later step fails does not
@@ -405,7 +431,8 @@ jobs:
               pg_licht_mcp-linux-arm64-debian13.deb \
               pg_licht_mcp-linux-x86_64-rocky9.rpm \
               pg_licht_mcp-linux-arm64-rocky9.rpm \
-              pg_licht_mcp-macos-arm64.tar.gz
+              pg_licht_mcp-macos-arm64.tar.gz \
+              SHA256SUMS
             exit 0
           fi
           gh release create ${{ github.ref_name }} \
@@ -418,7 +445,8 @@ jobs:
             pg_licht_mcp-linux-arm64-debian13.deb \
             pg_licht_mcp-linux-x86_64-rocky9.rpm \
             pg_licht_mcp-linux-arm64-rocky9.rpm \
-            pg_licht_mcp-macos-arm64.tar.gz
+            pg_licht_mcp-macos-arm64.tar.gz \
+            SHA256SUMS
         env:
           GH_TOKEN: ${{ github.token }}
 
