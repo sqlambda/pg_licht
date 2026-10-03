@@ -9150,7 +9150,7 @@ private:
           // Only "the object is not there" or "not loaded" is a state of the
           // extension. A timeout, a lock or a lost connection is this probe
           // failing, and says nothing about it: functional is then unknown.
-          const std::string state = ex.sqlstate();
+          const std::string state{ex.sqlstate()};   // a string_view in libpqxx 8
           const bool about_ext = state.rfind("42", 0) == 0 || state == "3F000" ||
                                  state == "55000" || state == "0A000";
           e["functional"] = about_ext ? json(false) : json();
