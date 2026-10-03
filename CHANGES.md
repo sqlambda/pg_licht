@@ -43,6 +43,19 @@
   `functional` (its view answers a read, probed in a savepoint, with the
   reason when not), so a mismatch between them is visible in one call.
 
+- **`statementKernelStats` no longer reports platform-shaped zeros.** The
+  pgshard campaign found pg_stat_kcache's `exec_system_time` at 0.000 on
+  FreeBSD and built two in-guest agents to work around it. Measured on
+  PostgreSQL 18.6 with pg_stat_kcache 2.3.2: FreeBSD splits a thread's CPU
+  time into user and system by sampling (~7.9 ms), so 567,895 short updates
+  reported 9.0 s of user time and 0.000 s of system time, though each wrote
+  WAL; and it charges a process only the I/O it did synchronously, so three
+  sorts that spilled 1.08 GB of temp files reported 0.47 MB written, where
+  Linux charged 257 MB. Each answer now names its `platform`, always gives
+  `cpu_time_s` (user + system, exact everywhere), and outside Linux sets the
+  split and the byte counts to null with the measured reason under
+  `unavailable`, so a caller cannot mistake them for data. Tested against
+  both a Linux and a FreeBSD server.
 - **A failed query is never reported as an extension state.** The manual
   now states it, and a test holds the extension operations to it: with the
   extension's view locked by another session and a short statement

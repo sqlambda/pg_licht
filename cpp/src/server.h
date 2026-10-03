@@ -2749,7 +2749,8 @@ private:
                                     {"settings", "object"}, {"group_by", "string"}})},
       {"statementKernelStats",   schema_fixed("Per-statement CPU and storage I/O from pg_stat_kcache.",
                                    {{"statements", "array"}, {"order_by", "string"},
-                                    {"block_size", "integer"}})},
+                                    {"block_size", "integer"}, {"platform", "string"},
+                                    {"unavailable", "object"}})},
       {"predicateStats",         schema_fixed("Per-predicate statistics from pg_qualstats, without constants.",
                                    {{"predicates", "array"}, {"order_by", "string"},
                                     {"settings", "object"}})},
@@ -3975,6 +3976,63 @@ private:
   // storage. Read from the pg_stat_kcache() function, which is per queryid --
   // not from the pg_stat_kcache view, which is summed per database, nor
   // pg_stat_kcache_detail, which joins in the statement text.
+  // What pg_stat_kcache's counters mean depends on the platform the server
+  // runs on, and a zero that looks like a measurement is worse than an error
+  // -- the pgshard campaign (October 2026) built two in-guest agents to get
+  // around one. Measured on PostgreSQL 18.6, pg_stat_kcache 2.3.2, 2026-10-03:
+  //
+  //   CPU: FreeBSD accounts a thread's total CPU time exactly but splits it
+  //   into user and system by statistical sampling (stathz 127, ~7.9 ms), so
+  //   a statement much shorter than a sample is all "user": 567,895 short
+  //   UPDATEs gave user 9.036 s, system 0.000 s, though each wrote WAL. The
+  //   total is right; the split is not a measurement.
+  //
+  //   I/O: three sorts that spilled 1.08 GB of temp files reported 257 MB of
+  //   writes on Linux (xfs) -- the buffered writes the kernel charged to the
+  //   process -- and 0.47 MB on FreeBSD (UFS), which charges only what the
+  //   process wrote synchronously and never the syncer's flushing. Reads were
+  //   0 on both, correctly: the data came back from the page cache.
+  //
+  // So cpu_time_s (user + system) is given everywhere, and on Linux the
+  // split and the byte counts are as reported. Elsewhere those four are null,
+  // under `unavailable` with the reason -- measured on FreeBSD, not verified
+  // anywhere else -- so a caller cannot read one as data.
+  static void kernel_counters_for_platform(json& out) {
+    const std::string v = out.value("server_version", "");
+    out.erase("server_version");
+    const auto on = v.find(" on ");
+    std::string triple = on == std::string::npos ? std::string{} : v.substr(on + 4);
+    if (const auto comma = triple.find(','); comma != std::string::npos) triple.resize(comma);
+    const bool linux_ = triple.find("linux") != std::string::npos;
+    const bool freebsd = triple.find("freebsd") != std::string::npos;
+    out["platform"] = triple.empty() ? json() : json(triple);
+    for (auto& st : out["statements"])
+      for (const char* phase : {"exec", "plan"}) {
+        if (!st.contains(phase) || !st[phase].is_object()) continue;
+        json& p = st[phase];
+        if (p["user_time_s"].is_number() && p["system_time_s"].is_number())
+          p["cpu_time_s"] = p["user_time_s"].get<double>() + p["system_time_s"].get<double>();
+        if (!linux_)
+          for (const char* f : {"user_time_s", "system_time_s", "reads_bytes", "writes_bytes"})
+            p[f] = nullptr;
+      }
+    if (linux_) return;
+    const std::string where = freebsd ? "FreeBSD" : (triple.empty() ? "this platform" : triple);
+    out["unavailable"] = {
+      {"user_time_s, system_time_s", freebsd
+        ? "FreeBSD splits a thread's CPU time into user and system by sampling at "
+          "stathz (~7.9 ms), so a statement shorter than a sample is reported as all "
+          "user time: 567,895 short UPDATEs measured user 9.0 s, system 0.000 s. "
+          "cpu_time_s, their sum, is exact"
+        : "the user/system split is verified on Linux only, not on " + where +
+          "; cpu_time_s, their sum, is reported"},
+      {"reads_bytes, writes_bytes", freebsd
+        ? "FreeBSD charges a process only the storage I/O it performed synchronously, "
+          "not buffered writes the syncer flushes later: 1.08 GB of temp-file writes "
+          "measured as 0.47 MB. The block counts do not describe the statement's I/O"
+        : "what these byte counts include is verified on Linux only, not on " + where}};
+  }
+
   const json statement_kernel_stats(int limit, const std::string& query_id,
                                     const std::string& order_by) {
     static const std::map<std::string, std::string> ORDERINGS = {
@@ -4059,7 +4117,8 @@ private:
             ORDER BY )" + ord + R"(
             LIMIT $1::int
           ) sub), '[]'::jsonb),
-        'block_size', current_setting('block_size')::int))";
+        'block_size', current_setting('block_size')::int,
+        'server_version', version()))";
 
     try {
       pqxx::result res = pqxx_exec(txn, query, pqxx::params{std::to_string(limit), query_id});
@@ -4067,6 +4126,7 @@ private:
       out["order_by"] = key;
       out["preloaded"] = preloaded;
       out["extension_version"] = ver;
+      kernel_counters_for_platform(out);
       if (pgss.empty())
         out["note"] = "pg_stat_statements is not installed as an extension here, so "
                       "calls, total_exec_ms and shared_blks_read are absent";

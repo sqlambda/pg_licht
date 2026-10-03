@@ -6847,6 +6847,46 @@ TEST_F(PreloadExtTest, AFailedQueryIsAnErrorNeverAnExtensionState) {
     EXPECT_EQ(text.find(state), std::string::npos) << "reported as an extension state: " << state;
 }
 
+// pg_stat_kcache's counters mean what the platform makes them mean (see
+// kernel_counters_for_platform): on Linux the user/system split and the byte
+// counts are reported; elsewhere they are null with the reason, so a sampled
+// 0.000 cannot be read as a measurement. cpu_time_s, their sum, everywhere.
+// The platform is the server's, so this checks whichever one it runs against
+// -- the rig is Linux; a FreeBSD server is the other half.
+TEST_F(PreloadExtTest, KernelCountersAreReportedOnlyWhereThePlatformMeasuresThem) {
+  if (!have("pg_stat_kcache")) return;
+  {
+    pqxx::connection c(url);
+    pqxx::nontransaction n(c);
+    n.exec("SELECT count(*) FROM generate_series(1, 2000000)");
+  }
+  json k = srv->call_statement_kernel_stats(50);
+  ASSERT_FALSE(k.contains("error")) << k.dump(2);
+  ASSERT_TRUE(k.contains("platform")) << k.dump(2);
+  const std::string platform = k["platform"].get<std::string>();
+  const bool linux_server = platform.find("linux") != std::string::npos;
+  ASSERT_FALSE(k["statements"].empty()) << k.dump(2);
+  for (const auto& st : k["statements"]) {
+    const json& e = st["exec"];
+    ASSERT_TRUE(e.contains("cpu_time_s")) << e.dump();
+    if (linux_server) {
+      ASSERT_TRUE(e["user_time_s"].is_number()) << e.dump();
+      EXPECT_NEAR(e["cpu_time_s"].get<double>(),
+                  e["user_time_s"].get<double>() + e["system_time_s"].get<double>(), 1e-9);
+    } else {
+      for (const char* f : {"user_time_s", "system_time_s", "reads_bytes", "writes_bytes"})
+        EXPECT_TRUE(e[f].is_null()) << platform << ": " << f << " arrived as data: " << e.dump();
+    }
+  }
+  if (linux_server) {
+    EXPECT_FALSE(k.contains("unavailable")) << k.dump(2);
+  } else {
+    ASSERT_TRUE(k.contains("unavailable")) << k.dump(2);
+    EXPECT_TRUE(k["unavailable"].contains("user_time_s, system_time_s")) << k.dump(2);
+    EXPECT_TRUE(k["unavailable"].contains("reads_bytes, writes_bytes")) << k.dump(2);
+  }
+}
+
 // The profile is summed, not returned raw -- one row per pid, event and
 // queryid grows for as long as the server runs -- and a sample count is only
 // a time once multiplied by the collector's period, so both must agree.

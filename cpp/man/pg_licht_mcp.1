@@ -1713,6 +1713,24 @@ A high
 .Va majflts
 is memory pressure reaching the disk.
 .Pp
+What these counters mean depends on the platform the server runs on, which the
+answer names as
+.Va platform .
+.Va cpu_time_s ,
+user plus system, is exact everywhere.
+On Linux the user and system split and the byte counts are given as measured.
+Elsewhere those four are null and
+.Va unavailable
+says why, because they are not what they look like.
+FreeBSD splits a thread's CPU time into user and system by statistical
+sampling, about every 7.9 ms, so a short statement is reported as all user
+time: 567,895 short updates measured 9.0 s of user time and 0.000 s of system
+time.
+It also charges a process only the storage I/O it performed synchronously, not
+the buffered writes flushed later: three sorts that spilled 1.08 GB of temporary
+files measured 0.47 MB written, where Linux charged 257 MB.
+Other platforms are not verified, and are treated the same way.
+.Pp
 Read from the
 .Fn pg_stat_kcache
 function, which is per statement \(em not the view of the same name, which is
