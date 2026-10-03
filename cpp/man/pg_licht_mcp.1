@@ -2813,6 +2813,21 @@ Errors remain a text block in both eras:
 is the format for a tool's answer, and an error is a message about why there is
 no answer.
 .Pp
+Two kinds of failure are kept apart, and never share a message.
+An answer carrying
+.Va error
+and
+.Va hint
+is a fact about the database: an extension that is absent, too old, preloaded
+but not created, or not preloaded; a grant that is missing.
+A statement that fails for any other reason \(em a timeout, a lock, a lost
+connection, a query this server got wrong \(em is reported as the failure it
+is, a call result with
+.Va isError
+set and the server's own message, and is never turned into a statement about
+what the database lacks.
+An empty result is an answer; a failed statement is not.
+.Pp
 Every operation declares an
 .Va outputSchema
 to clients that negotiated the revision defining it.

@@ -6808,6 +6808,45 @@ TEST_F(PreloadExtTest, APreloadedLibraryWithoutItsExtensionSaysOnlyCreateIsMissi
   }
 }
 
+// A query that fails is reported as failing, never as a fact about the
+// extension. pgshard's own script printed "wait sampling unavailable" when its
+// query broke against a server where wait sampling worked (October 2026); this
+// server's promise is the opposite, and this holds it to it. The failure here
+// is real and deterministic: another session holds the extension's view under
+// ACCESS EXCLUSIVE, and the tool's connection has a short statement_timeout.
+TEST_F(PreloadExtTest, AFailedQueryIsAnErrorNeverAnExtensionState) {
+  if (!have("pg_wait_sampling")) return;
+  pqxx::connection holder(url);
+  pqxx::work h(holder);
+  const std::string sch = h.query_value<std::string>(
+    "SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace "
+    "WHERE e.extname = 'pg_wait_sampling'");
+  h.exec("LOCK TABLE " + h.quote_name(sch) + ".pg_wait_sampling_profile IN ACCESS EXCLUSIVE MODE");
+
+  std::string ini;
+  {
+    std::istringstream in(url);
+    std::string tok;
+    ini = "[default]\nstatement_timeout_ms = 300\n";
+    while (in >> tok) {
+      const auto eq = tok.find('=');
+      if (eq != std::string::npos) ini += tok.substr(0, eq) + " = " + tok.substr(eq + 1) + "\n";
+    }
+  }
+  TempIni f(ini);
+  PostgresMCPServer s(pglicht::ConnectionRegistry::from_ini(f.path(), "pg-licht-test"));
+  json r = s.call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                       {"params", {{"name", "waitEventProfile"}, {"arguments", json::object()}}}});
+  h.abort();
+  const std::string text = r.dump();
+  ASSERT_TRUE(r.contains("result")) << text;
+  EXPECT_TRUE(r["result"].value("isError", false)) << "a failed query was not an error: " << text;
+  EXPECT_NE(text.find("statement_timeout"), std::string::npos) << text;
+  for (const char* state : {"not installed", "not created", "not in shared_preload_libraries",
+                            "too old", "unavailable"})
+    EXPECT_EQ(text.find(state), std::string::npos) << "reported as an extension state: " << state;
+}
+
 // The profile is summed, not returned raw -- one row per pid, event and
 // queryid grows for as long as the server runs -- and a sample count is only
 // a time once multiplied by the collector's period, so both must agree.

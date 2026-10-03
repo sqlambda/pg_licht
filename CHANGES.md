@@ -43,6 +43,14 @@
   `functional` (its view answers a read, probed in a savepoint, with the
   reason when not), so a mismatch between them is visible in one call.
 
+- **A failed query is never reported as an extension state.** The manual
+  now states it, and a test holds the extension operations to it: with the
+  extension's view locked by another session and a short statement
+  timeout, `waitEventProfile` must answer with the timeout, as an error, and
+  not as "not installed" or "not preloaded". It already behaved this way;
+  the pgshard campaign's script did not, printing "wait sampling
+  unavailable" when its own query broke.
+
 ### Testing
 
 - **FreeBSD 14.5 and 15.1 are tested in CI, against the full Linux rig.**
