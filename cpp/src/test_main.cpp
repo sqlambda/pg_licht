@@ -5631,6 +5631,34 @@ json rpc1(PostgresMCPServer& s, const std::string& method, const json& params) {
 }
 }  // namespace
 
+// A request without an id. Every response was built from req["id"] on a
+// const json, where operator[] on a missing key is undefined behaviour --
+// nlohmann dereferences the map's end -- so such a request read freed memory.
+// The JSON-RPC fuzzer found it in 4.6 within two seconds, on an initialize
+// carrying no id. nlohmann asserts on it in a debug build, so this test aborts
+// there on the old code, and ASan reports it in the sanitizer job.
+TEST_F(PostgresMCPServerTest, ARequestWithoutAnIdIsAnsweredWithANullId) {
+  PostgresMCPServer own(test_url);
+  for (const json& params : {json{{"protocolVersion", "2025-06-18"}, {"capabilities", json::object()},
+                                  {"clientInfo", {{"name", "t"}, {"version", "0"}}}},
+                             json::object()}) {
+    for (const char* method : {"initialize", "tools/list", "no/such/method"}) {
+      json r = own.call_rpc({{"jsonrpc", "2.0"}, {"method", method}, {"params", params}});
+      if (r.contains("id")) {
+        EXPECT_TRUE(r["id"].is_null()) << method << ": " << r.dump().substr(0, 200);
+      }
+    }
+  }
+  json call = own.call_rpc({{"jsonrpc", "2.0"}, {"method", "tools/call"},
+                            {"params", {{"name", "listSchemas"}, {"arguments", json::object()}}}});
+  if (call.contains("id")) {
+    EXPECT_TRUE(call["id"].is_null()) << call.dump().substr(0, 200);
+  }
+  // An id of any JSON type is echoed as sent.
+  json r = own.call_rpc({{"jsonrpc", "2.0"}, {"id", "abc"}, {"method", "tools/list"}});
+  EXPECT_EQ(r.value("id", json()), "abc");
+}
+
 TEST_F(PostgresMCPServerTest, CapabilitiesDeclareTheThreeNewSurfaces) {
   // A private server: initialize sets the negotiated revision for the rest of
   // that server's life, and the fixture's is shared by every test in the suite.

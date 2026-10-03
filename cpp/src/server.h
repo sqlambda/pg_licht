@@ -10347,6 +10347,13 @@ private:
 
   void handle_request(const json& req) {
     maybe_reload();
+    // The request id, read once. On a const json, operator[] with a key that
+    // is not there is undefined behaviour -- nlohmann dereferences the map's
+    // end -- and every response below was built from req["id"], so a request
+    // without one (which is a notification, and a client may send any
+    // method that way) read freed memory. Found by the JSON-RPC fuzzer in
+    // 4.6, two seconds in, on an initialize carrying no id.
+    const json id = req.is_object() && req.contains("id") ? req["id"] : json();
     std::string method = req.value("method", "");
     const json params = req.contains("params") && req["params"].is_object()
       ? req["params"] : json::object();
@@ -10412,7 +10419,7 @@ private:
     }
 
     if (method == "initialize") {
-      initialize(req["id"], params);
+      initialize(id, params);
     }
     else if (method == "notifications/initialized") {
       initialized_ = true;
@@ -10429,33 +10436,33 @@ private:
       // another caller. A private cache still gives this client the full
       // benefit, which is where the ~93 kB saving actually lands.
       if (!paginate(get_tools_list(request_protocol_)["tools"], params, "tools", out)) {
-        send_error(req["id"], -32602, "invalid cursor");
+        send_error(id, -32602, "invalid cursor");
         return;
       }
       // A minute, not an hour: it names the default connection and the pooler
       // a pooler tool defaults to, and a reloaded connections file changes
       // both. A client that ignores list_changed is at most a minute behind.
-      send_response(req["id"], cacheable(out, kTtlCatalog, "private"));
+      send_response(id, cacheable(out, kTtlCatalog, "private"));
     }
     else if (method == "resources/list") {
       json out = json::object();
       // Connection names and a live schema enumeration: deployment-specific,
       // and short-lived because CREATE SCHEMA changes it.
       if (!paginate(get_resources_list()["resources"], params, "resources", out)) {
-        send_error(req["id"], -32602, "invalid cursor");
+        send_error(id, -32602, "invalid cursor");
         return;
       }
-      send_response(req["id"], cacheable(out, kTtlCatalog, "private"));
+      send_response(id, cacheable(out, kTtlCatalog, "private"));
     }
     else if (method == "resources/templates/list") {
       json out = json::object();
       if (!paginate(get_resource_templates_list()["resourceTemplates"], params,
                     "resourceTemplates", out)) {
-        send_error(req["id"], -32602, "invalid cursor");
+        send_error(id, -32602, "invalid cursor");
         return;
       }
       // Static URI templates, identical for every caller.
-      send_response(req["id"], cacheable(out, kTtlStatic, "public"));
+      send_response(id, cacheable(out, kTtlStatic, "public"));
     }
     else if (method == "resources/read") {
       const std::string uri = params.value("uri", "");
@@ -10468,37 +10475,37 @@ private:
         // same reason a tool result is.
         // Structure changes only on DDL, but it does change, so the hint is
         // short. Private: this is the content of the operator's database.
-        send_response(req["id"], cacheable({
+        send_response(id, cacheable({
             {"contents", {{{"uri", uri},
                            {"mimeType", "application/json"},
                            {"text", body.dump()}}}}
           }, kTtlCatalog, "private"));
       } catch (const std::invalid_argument& e) {
-        send_error(req["id"], -32602, e.what());
+        send_error(id, -32602, e.what());
       } catch (const std::exception& e) {
-        send_error(req["id"], -32603, std::string("resource read failed: ") + e.what());
+        send_error(id, -32603, std::string("resource read failed: ") + e.what());
       }
     }
     else if (method == "prompts/list") {
       json out = json::object();
       if (!paginate(get_prompts_list()["prompts"], params, "prompts", out)) {
-        send_error(req["id"], -32602, "invalid cursor");
+        send_error(id, -32602, "invalid cursor");
         return;
       }
       // Compiled-in templates with no configuration in them.
-      send_response(req["id"], cacheable(out, kTtlStatic, "public"));
+      send_response(id, cacheable(out, kTtlStatic, "public"));
     }
     else if (method == "prompts/get") {
       try {
-        send_response(req["id"], get_prompt(params.value("name", ""),
+        send_response(id, get_prompt(params.value("name", ""),
                                             params.contains("arguments")
                                               ? params["arguments"] : json::object()));
       } catch (const std::invalid_argument& e) {
-        send_error(req["id"], -32602, e.what());
+        send_error(id, -32602, e.what());
       }
     }
     else if (method == "completion/complete") {
-      send_response(req["id"], complete(params.contains("ref") ? params["ref"] : json::object(),
+      send_response(id, complete(params.contains("ref") ? params["ref"] : json::object(),
                                         params.contains("argument") ? params["argument"]
                                                                     : json::object()));
     }
@@ -10545,7 +10552,7 @@ private:
 	if (given.size() > 1) {
 	  std::string names;
 	  for (const auto& g : given) names += (names.empty() ? "" : ", ") + g;
-	  send_error(req["id"], -32602,
+	  send_error(id, -32602,
 		     "at most one target may be given, but got: " + names);
 	  return;
 	}
@@ -10557,14 +10564,14 @@ private:
 
 	if (!want_role.empty()) {
 	  if (want_role != "primary" && want_role != "replica") {
-	    send_error(req["id"], -32602,
+	    send_error(id, -32602,
 		       "role must be \"primary\" or \"replica\", got \"" + want_role + "\"");
 	    return;
 	  }
 	  // Filtering by role only means something across servers. Within one
 	  // instance every database has the same role by definition.
 	  if (axis != "replication_group" && axis != "group") {
-	    send_error(req["id"], -32602,
+	    send_error(id, -32602,
 		       "role applies only to a replication_group or group sweep; "
 		       "every database of one instance has the same role");
 	    return;
@@ -10572,7 +10579,7 @@ private:
 	  // A pooler has no role to observe: filtering on one would skip every
 	  // member as "unknown" and return an empty sweep that looks like an answer.
 	  if (tool_scopes().count(tool_name) && tool_scopes().at(tool_name).pooler) {
-	    send_error(req["id"], -32602,
+	    send_error(id, -32602,
 		       tool_name + " reads PgBouncer consoles, which are neither "
 		       "primary nor replica; drop role");
 	    return;
@@ -10586,13 +10593,13 @@ private:
 					       : axis == "replication_group" ? want_repl
 									     : want_group);
 	  const std::string why = sweep_rejection(axis, tool_name, members);
-	  if (!why.empty()) { send_error(req["id"], -32602, why); return; }
+	  if (!why.empty()) { send_error(id, -32602, why); return; }
 
 	  result_content = fan_out(axis,
 				   axis == "instance" ? want_instance
 				 : axis == "replication_group" ? want_repl : want_group,
 				   want_role, tool_name, arguments);
-	  send_response(req["id"], tool_result(payload_guard(tool_name, result_content, true)));
+	  send_response(id, tool_result(payload_guard(tool_name, result_content, true)));
 	  return;
 	}
 
@@ -10612,7 +10619,7 @@ private:
 	    const auto p = pooler_names();
 	    std::string names;
 	    for (const auto& n : p) names += (names.empty() ? "" : ", ") + n;
-	    send_error(req["id"], -32602, p.empty()
+	    send_error(id, -32602, p.empty()
 	      ? tool_name + " reads a PgBouncer admin console, and no connection "
 	        "has kind = pgbouncer"
 	      : tool_name + " needs 'connection' naming one PgBouncer console, or "
@@ -10628,7 +10635,7 @@ private:
 	if (tool_scopes().count(tool_name) && !tool_scopes().at(tool_name).registry) {
 	  const bool pooler_tool = tool_scopes().at(tool_name).pooler;
 	  if (target_is_pooler && !pooler_tool) {
-	    send_error(req["id"], -32602, "connection " + active_ + " is a PgBouncer "
+	    send_error(id, -32602, "connection " + active_ + " is a PgBouncer "
 	               "console (kind = pgbouncer), which answers only the pooler "
 	               "tools: poolerStatus, poolerConnections and poolerConfig");
 	    return;
@@ -10639,7 +10646,7 @@ private:
 	    // front of this database doing" asked by the name the caller knows.
 	    const auto& db = registry_.get(active_);
 	    if (db.pooler.empty()) {
-	      send_error(req["id"], -32602, tool_name + " reads a PgBouncer admin "
+	      send_error(id, -32602, tool_name + " reads a PgBouncer admin "
 	                 "console, and connection " + active_ + " is a database; name "
 	                 "a connections-file section with kind = pgbouncer, or declare "
 	                 "pooler = <that section> on this one");
@@ -10653,20 +10660,20 @@ private:
 	}
 
 	if (!dispatch_tool(tool_name, arguments, result_content)) {
-	  send_error(req["id"], -32601, "Tool not found: " + tool_name);
+	  send_error(id, -32601, "Tool not found: " + tool_name);
 	  return;
 	}
 	if (!answered_by.empty() && result_content.is_object())
 	  result_content["pooler"] = answered_by;
 
-	send_response(req["id"], tool_result(payload_guard(tool_name, result_content, false)));
+	send_response(id, tool_result(payload_guard(tool_name, result_content, false)));
 
       } catch (const pqxx::sql_error& e) {
 	// Hitting the ceiling is reported as a result rather than an execution
 	// error: nothing went wrong, the answer just needs longer than this
 	// connection allows, and the caller can act on that.
 	if (is_statement_timeout(e)) {
-	  send_response(req["id"], {
+	  send_response(id, {
 	      // Errors stay a text block in both eras. `structuredContent` is the
 	      // format for a tool's answer; an error is a message about why there
 	      // is no answer, and the spec pairs isError with content.
@@ -10676,13 +10683,13 @@ private:
 	      {"isError", true}
 	    });
 	} else {
-	  send_response(req["id"], {
+	  send_response(id, {
 	      {"content", {{{"type", "text"}, {"text", std::string("Execution error: ") + e.what()}}}},
 	      {"isError", true}
 	    });
 	}
       } catch (const std::exception& e) {
-	send_response(req["id"], {
+	send_response(id, {
 	    {"content", {{{"type", "text"}, {"text", std::string("Execution error: ") + e.what()}}}},
 	    {"isError", true}
           });
@@ -10690,7 +10697,7 @@ private:
     }
     else {
       if (req.contains("id")) {
-        send_error(req["id"], -32601, "Method not available");
+        send_error(id, -32601, "Method not available");
       }
     }
   }
