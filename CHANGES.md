@@ -25,6 +25,15 @@
   has a `*` fallback, once a test happened to read the route after PgBouncer
   had dropped the name.
 
+- **An integer argument too large for an `int` was converted anyway.**
+  `statementStats` read `limit` and `explainQuery` read `timeout_ms` without
+  checking the JSON type, and converting a number such as `1e80` to `int` is
+  undefined behaviour. Found by an hour of the JSON-RPC fuzzer. Both now
+  take their default for anything that is not an integer, as every other
+  tool already did. The sanitizer builds now add
+  `-fsanitize=float-cast-overflow`, which clang's `undefined` includes and
+  GCC's does not: without it the GCC jobs could not see this at all.
+
 ### Extension state
 
 - **"Preloaded but not created" is told apart from "not installed".** The

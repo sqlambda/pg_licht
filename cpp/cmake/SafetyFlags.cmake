@@ -166,9 +166,11 @@ function(pglicht_apply_sanitizers target)
     elseif(PGLICHT_SANITIZER STREQUAL "ADDRESS")
         set(_flags -fsanitize=address)
     elseif(PGLICHT_SANITIZER STREQUAL "UNDEFINED")
-        set(_flags -fsanitize=undefined)
+        set(_flags -fsanitize=undefined,float-cast-overflow)
     elseif(PGLICHT_SANITIZER STREQUAL "ADDRESS_UNDEFINED")
-        set(_flags -fsanitize=address,undefined)
+        # float-cast-overflow is in clang's `undefined` and not in GCC's, and a
+        # double that no int can hold arrives in one JSON number from a client.
+        set(_flags -fsanitize=address,undefined,float-cast-overflow)
     elseif(PGLICHT_SANITIZER STREQUAL "THREAD")
         set(_flags -fsanitize=thread)
     else()

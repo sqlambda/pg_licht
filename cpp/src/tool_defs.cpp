@@ -625,7 +625,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    		  }}
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
-         int const limit = a.contains("limit") ? a["limit"].get<int>() : 20;
+         int const limit = a.num("limit", 20);
          std::string qid;
          if (a.contains("query_id")) {
            if (a["query_id"].is_string()) qid = a["query_id"].get<std::string>();
@@ -892,7 +892,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
          std::string const sql = a.contains("sql") ? a["sql"].get<std::string>() : "";
          json const prms = a.contains("params") ? a["params"] : json::array();
          bool const do_analyze = a.contains("analyze") ? a["analyze"].get<bool>() : false;
-         int const tmo = a.contains("timeout_ms") ? a["timeout_ms"].get<int>() : 0;
+         int const tmo = a.num("timeout_ms", 0);
          json const settings = a.contains("settings") ? a["settings"] : json::object();
          std::string const as_role = a.str("plan_as_role");
          return s.explain_query(qid, sql, prms, do_analyze, tmo, settings, as_role); }},

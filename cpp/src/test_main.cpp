@@ -5704,6 +5704,23 @@ TEST_F(PostgresMCPServerTest, ARequestWithoutAnIdIsAnsweredWithANullId) {
   EXPECT_EQ(r.value("id", json()), "abc");
 }
 
+// An integer argument sent as a number no int can hold. Two tools read theirs
+// with get<int>() unchecked -- statementStats' limit and explainQuery's
+// timeout_ms -- and converting a double outside int's range is undefined
+// behaviour; an hour of the JSON-RPC fuzzer found it. Every other tool takes
+// the default for a non-integer, and now these do. The old code fails this
+// under UBSan, in the sanitizer job.
+TEST_F(PostgresMCPServerTest, AnIntegerArgumentTooLargeForAnIntIsNotConverted) {
+  PostgresMCPServer own(test_url);
+  for (const json& params : {
+           json{{"name", "statementStats"}, {"arguments", {{"limit", 2.9e74}}}},
+           json{{"name", "explainQuery"}, {"arguments", {{"sql", "SELECT 1"}, {"timeout_ms", 2.9e74}}}}}) {
+    json r = own.call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"}, {"params", params}});
+    // Answered as a tool result, whatever it says: not a protocol error.
+    ASSERT_TRUE(r.contains("result")) << r.dump().substr(0, 300);
+  }
+}
+
 TEST_F(PostgresMCPServerTest, CapabilitiesDeclareTheThreeNewSurfaces) {
   // A private server: initialize sets the negotiated revision for the rest of
   // that server's life, and the fixture's is shared by every test in the suite.
