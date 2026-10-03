@@ -20,6 +20,16 @@
   Fortified calls are required where libc is glibc: FreeBSD's libc fortifies
   C only, so a C++ binary there has none whatever the flags.
 
+### Build
+
+- **`-Werror` is an option, `PGLICHT_WERROR`.** It was hard-coded, so a
+  warning from a compiler newer than CI's failed the build for anyone
+  building from source -- a Homebrew user on a new Xcode, since the formula
+  builds the release tarball on the user's machine, or a FreeBSD user. It now
+  defaults to on in a git checkout, where a warning can be fixed, and off in
+  a source tarball; CI passes `-DPGLICHT_WERROR=ON` in every job, so the
+  zero-warning policy is unchanged where it is enforced.
+
 ## 4.5.1 (2026-09-28)
 
 ### Fixed

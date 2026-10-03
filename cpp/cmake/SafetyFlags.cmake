@@ -16,12 +16,31 @@ set_property(CACHE PGLICHT_SANITIZER PROPERTY STRINGS
 
 find_program(VALGRIND_EXECUTABLE valgrind)
 
-# Always-on static hygiene: warnings-as-errors + hardened standard library.
+# Warnings as errors: on by default in a git checkout, off otherwise.
+#
+# Hard-coded until 4.6, which made a new warning in a compiler newer than CI's
+# a build that fails for whoever builds from source -- a Homebrew user on a new
+# Xcode (the formula builds the release tarball on the user's machine), or a
+# FreeBSD user on a newer clang. Neither can act on a warning. A checkout is
+# where someone can, so that is where the zero-warning policy is enforced; and
+# CI passes -DPGLICHT_WERROR=ON explicitly in every job, so the policy does not
+# hang on how the runner checks the repository out.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../.git")
+    set(_pglicht_werror_default ON)
+else()
+    set(_pglicht_werror_default OFF)
+endif()
+option(PGLICHT_WERROR "Treat compiler warnings as errors" ${_pglicht_werror_default})
+
+# Always-on static hygiene: the warning set + hardened standard library.
 function(pglicht_harden target)
     target_compile_options(${target} PRIVATE
         -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion
-        -Wuninitialized -Wshadow -Werror
+        -Wuninitialized -Wshadow
     )
+    if(PGLICHT_WERROR)
+        target_compile_options(${target} PRIVATE -Werror)
+    endif()
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         # ~zero-cost bounds/precondition checks in libstdc++ (e.g. vector::operator[]).
         target_compile_definitions(${target} PRIVATE _GLIBCXX_ASSERTIONS)

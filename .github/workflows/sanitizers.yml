@@ -114,8 +114,11 @@ jobs:
           cmake -S cpp -B cpp/build \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DPGLICHT_SANITIZER=${{ matrix.sanitizer }} \
+            -DPGLICHT_WERROR=ON \
             ${{ matrix.cxx && format('-DCMAKE_CXX_COMPILER={0}', matrix.cxx) || '' }}
           grep -E '^CMAKE_CXX_COMPILER:' cpp/build/CMakeCache.txt
+          # Warnings are errors in CI whatever the checkout looks like.
+          grep -qx 'PGLICHT_WERROR:BOOL=ON' cpp/build/CMakeCache.txt
           cmake --build cpp/build --target pg_licht_mcp_test
 
       # Neither needs a database nor varies by PostgreSQL version, so they run

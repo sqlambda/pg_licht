@@ -105,9 +105,13 @@ user:
 
 ```sh
 git clone https://github.com/sqlambda/pg_licht && cd pg_licht/cpp
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DPGLICHT_WERROR=OFF
 cmake --build build --target pg_licht_mcp
 ```
+
+`-DPGLICHT_WERROR=OFF` because a git checkout treats warnings as errors by default -- the
+project's own policy, enforced in CI -- and a newer compiler than CI's can add a warning
+that is not yours to fix. A source tarball defaults to off.
 
 and, as root again, `cmake --install build --prefix /usr/local`.
 

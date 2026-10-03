@@ -157,7 +157,9 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          # -Werror explicitly: the packages ship from these toolchains, and
+          # a warning here is one to fix before release, not to ship past.
+          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DPGLICHT_WERROR=ON
           cmake --build cpp/build --target pg_licht_mcp
           strip cpp/build/pg_licht_mcp
 
