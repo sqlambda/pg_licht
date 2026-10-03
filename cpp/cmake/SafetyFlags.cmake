@@ -137,8 +137,15 @@ function(pglicht_add_hardening_test target)
     if(NOT CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$")
         return()
     endif()
+    # Fortified calls are required of GCC builds only: which calls qualify is
+    # the compiler's choice (see the script), and the release ships GCC's.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        set(_fortify "")
+    else()
+        set(_fortify "--fortify-optional")
+    endif()
     add_test(NAME ${target}_hardening
-        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/hardening-check.sh $<TARGET_FILE:${target}>)
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/hardening-check.sh ${_fortify} $<TARGET_FILE:${target}>)
 endfunction()
 
 # Opt-in dynamic bug detection, selected via -DPGLICHT_SANITIZER=<value>.
