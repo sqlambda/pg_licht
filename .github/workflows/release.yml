@@ -91,7 +91,8 @@ jobs:
           sudo apt-get install -y cmake libpq-dev nlohmann-json3-dev pkg-config
           curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
           cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
           cmake --build /tmp/libpqxx-build -j"$(nproc)"
           sudo cmake --install /tmp/libpqxx-build
           echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
@@ -111,7 +112,8 @@ jobs:
           apt-get install -y libpq-dev nlohmann-json3-dev python3
           curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
           cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
           cmake --build /tmp/libpqxx-build -j"$(nproc)"
           cmake --install /tmp/libpqxx-build
           echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
@@ -141,7 +143,8 @@ jobs:
           export CXX=/opt/rh/gcc-toolset-13/root/usr/bin/g++
           curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
           cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
           cmake --build /tmp/libpqxx-build -j"$(nproc)"
           cmake --install /tmp/libpqxx-build
           echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
@@ -157,6 +160,14 @@ jobs:
           cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
           cmake --build cpp/build --target pg_licht_mcp
           strip cpp/build/pg_licht_mcp
+
+      # The hardening SafetyFlags.cmake asks for, checked on the binary that
+      # ships -- after strip, which must not take any of it away. The release
+      # build has no tests, so this is the one place it is checked on every
+      # toolchain in the matrix. ELF only: macOS has no readelf.
+      - name: Check the binary's hardening
+        if: matrix.distro != 'macos'
+        run: cpp/test/hardening-check.sh cpp/build/pg_licht_mcp
 
       - name: Package (tar.gz)
         if: matrix.extension == 'tar.gz'

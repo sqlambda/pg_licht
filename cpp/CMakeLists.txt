@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pg_licht_mcp VERSION 4.5.1 LANGUAGES CXX)
+project(pg_licht_mcp VERSION 4.6.0 LANGUAGES CXX)
 
 # Standard bin/ and share/man/ layout, so `cmake --install` produces a tree that
 # can be dropped onto a prefix as-is: the release tarballs are staged this way,
@@ -46,6 +46,7 @@ target_link_libraries(pg_licht_mcp
         Threads::Threads
 )
 pglicht_harden(pg_licht_mcp)
+pglicht_harden_binary(pg_licht_mcp)
 pglicht_apply_sanitizers(pg_licht_mcp)
 install(TARGETS pg_licht_mcp RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 # The man page is checked in rather than generated: the release containers
@@ -78,6 +79,7 @@ if(BUILD_TESTING)
             PkgConfig::LIBPQ
             Threads::Threads)
     pglicht_harden(pg_licht_mcp_test)
+    pglicht_harden_binary(pg_licht_mcp_test)
     pglicht_apply_sanitizers(pg_licht_mcp_test)
     add_test(NAME mcp_test COMMAND pg_licht_mcp_test)
     pglicht_add_valgrind_test(pg_licht_mcp_test)
@@ -102,6 +104,7 @@ if(BUILD_TESTING)
     add_test(NAME cli_version COMMAND $<TARGET_FILE:pg_licht_mcp> --version)
     set_tests_properties(cli_version PROPERTIES
         PASS_REGULAR_EXPRESSION "^pg_licht_mcp ${PROJECT_VERSION}\n$")
+    pglicht_add_hardening_test(pg_licht_mcp)
     add_test(NAME cli_unknown_option COMMAND $<TARGET_FILE:pg_licht_mcp> --no-such-option)
     set_tests_properties(cli_unknown_option PROPERTIES
         PASS_REGULAR_EXPRESSION "unknown option: --no-such-option")

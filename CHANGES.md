@@ -1,5 +1,25 @@
 # Changelog
 
+## 4.6.0 (unreleased)
+
+### Hardening
+
+- **The release binaries are hardened.** CMake never applied a
+  distribution's default flags, so the 4.5 binaries were PIE only because
+  Debian's GCC defaults to it, had RELRO without `BIND_NOW`, and had no
+  stack protector and no fortified calls -- in every deb, rpm and tarball.
+  Now, each behind a check that the toolchain accepts it: PIE always,
+  `-fstack-protector-strong`, `-fstack-clash-protection`, `-fcf-protection`
+  (x86-64), full RELRO (`-z relro -z now`), a non-executable stack, and
+  `_FORTIFY_SOURCE=3` in optimised builds without a sanitizer. The static
+  libpqxx the release links is now built position-independent, which Rocky's
+  gcc-toolset does not do by default.
+- **`cpp/test/hardening-check.sh`** reads the binary with `readelf` and `nm`
+  and fails unless all of it is there. It is a ctest in optimised builds, and
+  the release workflow runs it on every Linux binary it ships, after `strip`.
+  Fortified calls are required where libc is glibc: FreeBSD's libc fortifies
+  C only, so a C++ binary there has none whatever the flags.
+
 ## 4.5.1 (2026-09-28)
 
 ### Fixed

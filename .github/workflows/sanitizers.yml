@@ -87,7 +87,10 @@ jobs:
           # The compiler is part of the key: clang and g++ mangle constrained
           # templates differently, so clang code cannot link a g++-built
           # libpqxx (undefined pqxx::internal::to_string_float<...> at link).
-          key: pqxx-${{ env.PQXX_VERSION }}-${{ runner.os }}-${{ runner.arch }}-libpq-${{ env.LIBPQ_VERSION }}-${{ matrix.cxx || 'gcc' }}
+          # pic: since 4.6 pg_licht links as PIE whatever the compiler's
+          # default, so the archive it links must be position-independent;
+          # an object cached before that must not be reused.
+          key: pqxx-${{ env.PQXX_VERSION }}-${{ runner.os }}-${{ runner.arch }}-libpq-${{ env.LIBPQ_VERSION }}-${{ matrix.cxx || 'gcc' }}-pic
 
       - name: Build libpqxx
         if: steps.pqxx.outputs.cache-hit != 'true'
@@ -96,6 +99,7 @@ jobs:
           # Built by the same compiler as pg_licht, for the reason in the key.
           cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             -DCMAKE_INSTALL_PREFIX="$HOME/pqxx" \
             ${{ matrix.cxx && format('-DCMAKE_CXX_COMPILER={0}', matrix.cxx) || '' }}
           cmake --build /tmp/libpqxx-build

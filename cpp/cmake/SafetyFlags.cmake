@@ -30,6 +30,81 @@ function(pglicht_harden target)
     endif()
 endfunction()
 
+# Hardening the binary itself: what the compiler and linker can add so a memory
+# bug that slips past the tests is harder to exploit. Until 4.6 none of it was
+# set, because CMake does not apply a distribution's default flags the way a
+# package build does -- measured on the 4.5 release binary: PIE only because
+# Debian's GCC defaults to it, GNU_RELRO without BIND_NOW, no fortified calls
+# and no stack protector, in every deb, rpm and tarball.
+#
+# Every flag goes through a check, because the release matrix is three
+# toolchains on two architectures: -fcf-protection is x86-64 only, Apple's ld
+# rejects every -z option, and a flag a compiler does not know would fail the
+# build under -Werror rather than be ignored.
+include(CheckCXXCompilerFlag)
+include(CheckLinkerFlag)
+include(CheckPIESupported)
+check_pie_supported(OUTPUT_VARIABLE _pglicht_pie_msg LANGUAGES CXX)
+
+foreach(_flag -fstack-protector-strong -fstack-clash-protection -fcf-protection)
+    string(MAKE_C_IDENTIFIER "PGLICHT_HAS${_flag}" _var)
+    check_cxx_compiler_flag(${_flag} ${_var})
+endforeach()
+foreach(_flag -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack)
+    string(MAKE_C_IDENTIFIER "PGLICHT_HAS${_flag}" _var)
+    check_linker_flag(CXX ${_flag} ${_var})
+endforeach()
+
+function(pglicht_harden_binary target)
+    # PIE whether or not the compiler defaults to it. CMake adds -fPIE and
+    # -pie only once check_pie_supported has run, above. Everything linked in
+    # must be position-independent too, which is why the workflows build
+    # their static libpqxx with CMAKE_POSITION_INDEPENDENT_CODE=ON: Rocky's
+    # gcc-toolset does not default to PIE the way Debian's GCC does.
+    set_property(TARGET ${target} PROPERTY POSITION_INDEPENDENT_CODE ON)
+    foreach(_flag -fstack-protector-strong -fstack-clash-protection -fcf-protection)
+        string(MAKE_C_IDENTIFIER "PGLICHT_HAS${_flag}" _var)
+        if(${_var})
+            target_compile_options(${target} PRIVATE ${_flag})
+        endif()
+    endforeach()
+    foreach(_flag -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack)
+        string(MAKE_C_IDENTIFIER "PGLICHT_HAS${_flag}" _var)
+        if(${_var})
+            target_link_options(${target} PRIVATE ${_flag})
+        endif()
+    endforeach()
+    # Fortified string and memory calls, checked against the object sizes the
+    # compiler can see. Optimised builds only: glibc warns without
+    # optimisation, which -Werror makes fatal. Never with a sanitizer: ASan
+    # intercepts the same calls, and the two get in each other's way. -U first,
+    # so a packager who already sets it gets no redefinition warning. Level 3
+    # needs GCC 12 or clang 16 for __builtin_dynamic_object_size; older ones
+    # fall back to level 2 on their own.
+    if(PGLICHT_SANITIZER STREQUAL "NONE")
+        target_compile_options(${target} PRIVATE
+            $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3>)
+    endif()
+endfunction()
+
+# Registers the check that the hardening above actually reached the binary:
+# readelf and nm on what was linked, failing unless every property is there.
+# Only where it can hold -- an optimised build (fortify needs one), no
+# sanitizer, and an ELF platform with the tools -- so a Debug developer build
+# or macOS does not register a test that cannot pass.
+find_program(READELF_EXECUTABLE readelf)
+find_program(NM_EXECUTABLE nm)
+function(pglicht_add_hardening_test target)
+    if(NOT PGLICHT_SANITIZER STREQUAL "NONE" OR APPLE OR NOT READELF_EXECUTABLE OR NOT NM_EXECUTABLE)
+        return()
+    endif()
+    if(NOT CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$")
+        return()
+    endif()
+    add_test(NAME ${target}_hardening
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/hardening-check.sh $<TARGET_FILE:${target}>)
+endfunction()
+
 # Opt-in dynamic bug detection, selected via -DPGLICHT_SANITIZER=<value>.
 function(pglicht_apply_sanitizers target)
     if(PGLICHT_SANITIZER STREQUAL "NONE")
