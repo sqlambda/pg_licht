@@ -1,0 +1,14 @@
+# Keeps the GitHub Actions pins current. Every `uses:` is pinned to a full
+# commit SHA with its version in a comment (SECURITY.md, "The build"), because
+# release.yml publishes packages, the site and a Homebrew formula bump with
+# write permissions, and a moving tag could be re-pointed under it. Dependabot
+# proposes the new SHA and updates the comment.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

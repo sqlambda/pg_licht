@@ -24,6 +24,21 @@
   Fortified calls are required where libc is glibc: FreeBSD's libc fortifies
   C only, so a C++ binary there has none whatever the flags.
 
+### Supply chain
+
+- **Every GitHub Action is pinned to a commit SHA**, its version in a
+  comment, and `.github/dependabot.yml` keeps the pins current. The release
+  workflow publishes packages, the site and a Homebrew formula bump with
+  write permissions, and a moving tag such as `actions/checkout@v4` could be
+  re-pointed under it. The `actions_pinned` ctest fails on any unpinned
+  `uses:`, and CI runs it.
+- **`SECURITY.md`**: how to report a vulnerability (GitHub's private
+  reporting), and what pg_licht guarantees -- the READ ONLY transaction per
+  database call, the bounded `explainQuery` exception, the pooler tools'
+  fixed `SHOW` commands and the `stats_users` guard pg_licht cannot verify,
+  no table rows and no held passwords returned -- with what can still reach
+  the caller.
+
 ### Build
 
 - **`-Werror` is an option, `PGLICHT_WERROR`.** It was hard-coded, so a

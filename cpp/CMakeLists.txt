@@ -105,6 +105,9 @@ if(BUILD_TESTING)
     set_tests_properties(cli_version PROPERTIES
         PASS_REGULAR_EXPRESSION "^pg_licht_mcp ${PROJECT_VERSION}\n$")
     pglicht_add_hardening_test(pg_licht_mcp)
+    # Every GitHub Action pinned to a commit SHA (SECURITY.md, "The build").
+    add_test(NAME actions_pinned
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/actions-pinned.sh ${CMAKE_CURRENT_SOURCE_DIR}/..)
     add_test(NAME cli_unknown_option COMMAND $<TARGET_FILE:pg_licht_mcp> --no-such-option)
     set_tests_properties(cli_unknown_option PROPERTIES
         PASS_REGULAR_EXPRESSION "unknown option: --no-such-option")
