@@ -374,6 +374,9 @@ public:
     }
     setup += "; SELECT pg_is_in_recovery()";
 
+    // The retry loop above either opened the transaction or threw; this
+    // states it where a reader -- and clang-tidy -- can see it.
+    if (!txn_) throw std::logic_error("Session: no transaction after connect");
     pqxx::result role = txn_->exec(setup);
     if (!role.empty() && !role[0][0].is_null())
       in_recovery_ = role[0][0].as<bool>();
@@ -384,7 +387,10 @@ public:
   // limit being reached rather than as an unexplained error. 0 means none.
   int statement_timeout_ms() const { return statement_timeout_ms_; }
 
-  pqxx::work& txn() { return *txn_; }
+  pqxx::work& txn() {
+    if (!txn_) throw std::logic_error("Session: no transaction");
+    return *txn_;
+  }
 
   // Whether this server is a standby, observed on connect rather than declared.
   //
@@ -458,7 +464,7 @@ public:
   ~Session() {
     // A destructor must not throw, and a connection already gone is not an
     // error worth reporting: the transaction dies with it either way.
-    try { if (txn_) txn_->abort(); } catch (...) {}
+    try { if (txn_) txn_->abort(); } catch (...) {}  // NOLINT(bugprone-empty-catch): see above
     // End the transaction before handing the connection back, so what returns
     // to the cache is idle and clean. txn_ is destroyed here rather than left
     // to member order, because it holds a reference to *conn_.
@@ -605,6 +611,8 @@ inline json rows(const PGresult* r) {
           o[col] = std::stoll(v); continue;
         }
         if (t == 700 || t == 701 || t == 1700) { o[col] = std::stod(v); continue; }
+      // A value that does not parse as its type stays text: the line below.
+      // NOLINTNEXTLINE(bugprone-empty-catch)
       } catch (const std::exception&) {}
       o[col] = v;
     }
@@ -5894,7 +5902,7 @@ private:
   json apply_planner_settings(pqxx::work& txn, const json& settings, json& applied) {
     if (!settings.is_object()) return {};
     for (auto it = settings.begin(); it != settings.end(); ++it) {
-      const std::string name = it.key();
+      const std::string& name = it.key();
       if (!is_planner_setting(name))
         return {{"error", "\"" + name + "\" is not a planner setting and will not be applied"},
                 {"hint", "only settings that change a PLAN are accepted: work_mem, "
@@ -6267,6 +6275,9 @@ private:
                  "were supplied, so only a generic plan could be produced; supply "
                  "params to get a real plan and enable ANALYZE";
         } else if (explicit_settings &&
+                   // The budget is computed only on this branch, and reported
+                   // below either way.
+                   // NOLINTNEXTLINE(bugprone-assignment-in-if-condition)
                    !(exec_budget = analyze_budget(txn, plan)).value("allowed", false)) {
           // Refused the way the other two are: the plan is still returned,
           // analyzed stays false, and the note says why. The arithmetic goes
@@ -6907,7 +6918,9 @@ private:
     // Step 2: validate value types
     static const std::set<std::string> INT_TYPES   = {"int2","int4","int8","oid","xid","cid"};
     static const std::set<std::string> FLOAT_TYPES = {"float4","float8","numeric","money"};
-    static const std::set<std::string> STR_TYPES   = {"text","varchar","bpchar","char","name","citext"};
+    // Text types -- text, varchar, bpchar, char, name, citext -- need no list
+    // of their own: they take the final branch, which expects a string. A
+    // branch for them repeated it exactly (clang-tidy bugprone-branch-clone).
 
     for (pqxx::result::size_type i = 0; i < pk_res.size(); i++) {
       std::string col  = pk_res[i][0].as<std::string>();
@@ -6920,9 +6933,6 @@ private:
       } else if (FLOAT_TYPES.count(type)) {
         if (!v.is_number())
           throw std::runtime_error("column \"" + col + "\" (" + type + ") expects a number");
-      } else if (STR_TYPES.count(type)) {
-        if (!v.is_string())
-          throw std::runtime_error("column \"" + col + "\" (" + type + ") expects a string");
       } else if (type == "uuid") {
         if (!v.is_string())
           throw std::runtime_error("column \"" + col + "\" (uuid) expects a string");
@@ -8644,9 +8654,10 @@ private:
               {"hypopg_version", ver}};
 
     auto reset = [&]() {
-      try { txn.exec("SELECT " + hypo + ".hypopg_reset()"); } catch (...) {}
+      // Best effort, and the cleanup must not mask the error it runs after.
+      try { txn.exec("SELECT " + hypo + ".hypopg_reset()"); } catch (...) {}  // NOLINT(bugprone-empty-catch)
       if (can_hide)
-        try { txn.exec("SELECT " + hypo + ".hypopg_unhide_all_indexes()"); } catch (...) {}
+        try { txn.exec("SELECT " + hypo + ".hypopg_unhide_all_indexes()"); } catch (...) {}  // NOLINT(bugprone-empty-catch)
     };
     reset();
     struct Guard {

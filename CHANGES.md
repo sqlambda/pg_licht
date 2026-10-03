@@ -39,6 +39,18 @@
   no table rows and no held passwords returned -- with what can still reach
   the caller.
 
+### Static analysis
+
+- **clang-tidy runs in CI and fails on any finding**, from a checked-in
+  `cpp/.clang-tidy` (`bugprone-*`, `cert-*`, `clang-analyzer-*`,
+  `performance-*`, `cppcoreguidelines-pro-type-cstyle-cast`, each exclusion
+  commented). Its first run reported 899 findings; 869 were four style
+  checks, excluded with their reasons, and none of the other 30 was a bug:
+  deliberate empty catches and one assignment-in-if now carry a `NOLINT`
+  that says why, two transaction accesses clang-tidy could not prove safe
+  are now guarded, `checkKey`'s type check lost a branch that duplicated its
+  default, and a copy became a reference.
+
 ### Build
 
 - **`-Werror` is an option, `PGLICHT_WERROR`.** It was hard-coded, so a

@@ -1,0 +1,39 @@
+# clang-tidy for pg_licht. CI runs it on the server's translation units
+# (main.cpp pulls in server.h and config.h; tool_defs.cpp and prompt_defs.cpp)
+# and fails on any finding: WarningsAsErrors is everything enabled here.
+#
+# Every exclusion says why. They were decided from a measured first run
+# (2026-10-02, clang-tidy 19): 899 findings, of which 869 were the four
+# style checks below, and none of the remaining 30 was a bug -- six deliberate
+# empty catches and one deliberate assignment-in-if (now NOLINT with the
+# reason), two optional accesses clang-tidy could not prove safe (now
+# guarded), one branch that duplicated another, one needless copy.
+Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  performance-*,
+  cppcoreguidelines-pro-type-cstyle-cast,
+  -bugprone-easily-swappable-parameters,
+  -performance-avoid-endl,
+  -performance-inefficient-string-concatenation,
+  -performance-enum-size
+
+# Why each exclusion:
+#   bugprone-easily-swappable-parameters  a heuristic about adjacent
+#       parameters of one type (39 findings): every tool takes several
+#       strings, and naming is the defence, not reordering.
+#   performance-avoid-endl  std::endl is deliberate: each JSON-RPC message
+#       must be flushed to stdout at once, or the client waits for it.
+#   performance-inefficient-string-concatenation  SQL is assembled with +,
+#       once per call, where readability matters and the cost does not
+#       (114 findings).
+#   performance-enum-size  an int-sized enum is not a cost worth a finding.
+#   misc-const-correctness  not enabled: 664 findings of local variables that
+#       could be const. Worth having, but as its own change rather than buried
+#       in this one.
+
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*/cpp/src/.*'
+FormatStyle: none

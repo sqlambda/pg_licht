@@ -115,6 +115,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DPGLICHT_SANITIZER=${{ matrix.sanitizer }} \
             -DPGLICHT_WERROR=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             ${{ matrix.cxx && format('-DCMAKE_CXX_COMPILER={0}', matrix.cxx) || '' }}
           grep -E '^CMAKE_CXX_COMPILER:' cpp/build/CMakeCache.txt
           # Warnings are errors in CI whatever the checkout looks like.
@@ -135,6 +136,18 @@ jobs:
           # pg_licht_mcp_hardening: an optimised build without a sanitizer,
           # which this is, on both compilers. actions_pinned: SECURITY.md.
           ctest -R "manpage_lint|protocol_compat|llms_txt|reference|cli_|pg_licht_mcp_hardening|actions_pinned" --output-on-failure
+
+      # clang-tidy from cpp/.clang-tidy, which fails on any finding. On the
+      # clang job only: it reads the compile commands of a clang build. The
+      # three translation units cover the server -- main.cpp pulls in
+      # server.h and config.h -- and run in parallel.
+      - name: clang-tidy
+        if: matrix.config == 'plain-clang'
+        run: |
+          sudo apt-get install -y -q clang-tidy
+          clang-tidy --version
+          printf '%s\n' cpp/src/main.cpp cpp/src/tool_defs.cpp cpp/src/prompt_defs.cpp \
+            | xargs -P 3 -I{} clang-tidy -p cpp/build --quiet {}
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: matrix.config != 'plain-clang'
