@@ -37,7 +37,17 @@ function(pglicht_harden target)
     target_compile_options(${target} PRIVATE
         -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion
         -Wuninitialized -Wshadow
+        # Added in 4.6, measured first: on GCC 14 and clang 22 they found
+        # three casts to std::string of an expression that already was one,
+        # and two C-style casts in the tests -- fixed in the same change.
+        -Wnull-dereference -Wformat=2 -Wimplicit-fallthrough -Wold-style-cast
+        -Wnon-virtual-dtor -Woverloaded-virtual -Wcast-qual -Wdouble-promotion
     )
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(${target} PRIVATE -Wuseless-cast)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        target_compile_options(${target} PRIVATE -Wextra-semi)
+    endif()
     if(PGLICHT_WERROR)
         target_compile_options(${target} PRIVATE -Werror)
     endif()
@@ -65,10 +75,17 @@ include(CheckLinkerFlag)
 include(CheckPIESupported)
 check_pie_supported(OUTPUT_VARIABLE _pglicht_pie_msg LANGUAGES CXX)
 
+# Checked with -Werror: Apple clang accepts -fstack-clash-protection on arm64
+# with only "argument unused during compilation", so a plain check passed and
+# the -Werror build then failed on it -- found by CI's macOS job on 4.6's
+# first push. A flag the compiler would only warn about is unsupported here.
+set(_pglicht_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
+set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -Werror")
 foreach(_flag -fstack-protector-strong -fstack-clash-protection -fcf-protection)
     string(MAKE_C_IDENTIFIER "PGLICHT_HAS${_flag}" _var)
     check_cxx_compiler_flag(${_flag} ${_var})
 endforeach()
+set(CMAKE_REQUIRED_FLAGS "${_pglicht_saved_required_flags}")
 foreach(_flag -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack)
     string(MAKE_C_IDENTIFIER "PGLICHT_HAS${_flag}" _var)
     check_linker_flag(CXX ${_flag} ${_var})

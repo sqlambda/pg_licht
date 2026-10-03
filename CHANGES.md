@@ -14,6 +14,10 @@
   `_FORTIFY_SOURCE=3` in optimised builds without a sanitizer. The static
   libpqxx the release links is now built position-independent, which Rocky's
   gcc-toolset does not do by default.
+- **Hardening flags are checked with `-Werror`.** Apple clang accepts
+  `-fstack-clash-protection` on arm64 with only "argument unused during
+  compilation", so a plain check passed and the `-Werror` build failed on
+  macOS -- found by CI on this release's first push.
 - **`cpp/test/hardening-check.sh`** reads the binary with `readelf` and `nm`
   and fails unless all of it is there. It is a ctest in optimised builds, and
   the release workflow runs it on every Linux binary it ships, after `strip`.
@@ -29,6 +33,14 @@
   defaults to on in a git checkout, where a warning can be fixed, and off in
   a source tarball; CI passes `-DPGLICHT_WERROR=ON` in every job, so the
   zero-warning policy is unchanged where it is enforced.
+
+- **More warnings, all clean:** `-Wnull-dereference`, `-Wformat=2`,
+  `-Wimplicit-fallthrough`, `-Wold-style-cast`, `-Wnon-virtual-dtor`,
+  `-Woverloaded-virtual`, `-Wcast-qual` and `-Wdouble-promotion`, plus
+  `-Wuseless-cast` on GCC and `-Wextra-semi` on clang. Measured first: GCC 14
+  found three casts to `std::string` of an expression that already was one,
+  clang 22 found nothing new, and both found two C-style casts in the tests;
+  all fixed in the same change.
 
 ## 4.5.1 (2026-09-28)
 

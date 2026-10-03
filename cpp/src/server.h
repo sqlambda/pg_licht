@@ -5034,7 +5034,7 @@ private:
     // what the INCLUDE coverage test compares against: an included column is
     // covered by a key column of the wider index regardless of how that key is
     // sorted or compared.
-    std::string query = std::string(R"(
+    std::string query = R"(
       WITH idx AS (
         SELECT i.indexrelid,
                i.indrelid,
@@ -5143,7 +5143,7 @@ private:
             ORDER BY a.indexrelid, b.size
           ) AS red), '[]'::jsonb)
       );
-    )");
+    )";
 
     pqxx::result res = pqxx_exec(txn, query, pqxx::params{schema, table_name});
 
@@ -5398,7 +5398,7 @@ private:
     // rather than leaving every caller to rediscover it. A negative setting
     // means "derive from another GUC" (autovacuum_work_mem = -1) and yields a
     // null byte count rather than a negative one.
-    std::string query = std::string(R"(
+    std::string query = R"(
       WITH host AS (
         SELECT NULLIF($1, '')::bigint AS ram_bytes,
                NULLIF($2, '')::int    AS vcpus
@@ -5560,7 +5560,7 @@ private:
           'application". committed_worst_case uses the largest work_mem any role is '
           'configured with, not this session''s.')
       );
-    )");
+    )";
 
     pqxx::result res = pqxx_exec(
       txn, query,
@@ -9182,7 +9182,7 @@ private:
         "THEN (SELECT parname FROM pg_parameter_acl WHERE oid = d.objid)"
       : "";
 
-    const std::string query = std::string(R"(
+    const std::string query = R"(
       WITH d AS (
         SELECT s.dbid, s.classid, s.objid, s.objsubid, s.deptype
           FROM pg_shdepend AS s
@@ -9296,7 +9296,7 @@ private:
             FROM d JOIN pg_class AS c ON c.oid = d.classid
            WHERE d.dbid IN (0, (SELECT oid FROM pg_database
                                  WHERE datname = current_database()))), '[]'::jsonb));
-    )");
+    )";
 
     pqxx::result res = pqxx_exec(txn, query, pqxx::params{role});
     if (!res.empty() && !res[0][0].is_null())

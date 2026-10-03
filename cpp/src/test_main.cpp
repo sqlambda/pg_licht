@@ -1738,7 +1738,7 @@ TEST_F(PostgresMCPServerTest, ListSchemasCountsTablesRatherThanNamingThemAll) {
   EXPECT_EQ(g["tables_truncated"].get<bool>(), g["table_count"].get<int>() > 25);
   // The count and the names agree when nothing was dropped.
   if (!g["tables_truncated"].get<bool>()) {
-    EXPECT_EQ(g["tables"].size(), (size_t)g["table_count"].get<int>());
+    EXPECT_EQ(g["tables"].size(), static_cast<size_t>(g["table_count"].get<int>()));
   }
 }
 
@@ -1820,7 +1820,7 @@ TEST_F(PostgresMCPServerTest, PublicationsCountMembersRatherThanNamingThemAll) {
     EXPECT_LE(p["tables"].size(), 50u) << name << " must cap its member names";
     EXPECT_EQ(p["tables_truncated"].get<bool>(), p["table_count"].get<int>() > 50);
     if (!p["tables_truncated"].get<bool>()) {
-      EXPECT_EQ(p["tables"].size(), (size_t)p["table_count"].get<int>()) << name;
+      EXPECT_EQ(p["tables"].size(), static_cast<size_t>(p["table_count"].get<int>())) << name;
     }
   }
 }
