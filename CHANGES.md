@@ -211,6 +211,15 @@
   well: its 664 findings -- locals that could be `const` -- were fixed, so new
   code is held to it.
 
+### Documented
+
+- **The landing page says what a release now guarantees**: downloads that
+  can be verified, hardened binaries, the wider test matrix (UBSan, split
+  brain, FreeBSD, fuzzing, clang-tidy), the formula built on every change,
+  and that a counter the platform does not measure is never a zero.
+- **BUILD.md** is brought up to date with the options, checks and CI jobs
+  this release adds.
+
 ### Build
 
 - **`-Werror` is an option, `PGLICHT_WERROR`.** It was hard-coded, so a
