@@ -13,6 +13,18 @@
   new JSON-RPC fuzzer within two seconds of its first run, on an
   `initialize` carrying no id. Such a request is now answered with a null id.
 
+- **`verifyTopology` called a working route "unroutable".** A database
+  section declaring `pooler =` whose name the console did not list was
+  reported as an error: "no `[databases]` entry ... and no `*` fallback".
+  But PgBouncer's `SHOW DATABASES` never lists a `*` fallback -- only
+  explicit entries, and names a fallback has created, which it may drop again
+  after a failed login -- so the console cannot say there is none. It is now
+  information when the connection through the pooler works, and a warning
+  naming the connection's own error when it does not. The `via_fallback`
+  field, which could never be set, is gone. Found by the rig, whose PgBouncer
+  has a `*` fallback, once a test happened to read the route after PgBouncer
+  had dropped the name.
+
 ### Fuzzing
 
 - **libFuzzer targets for the inputs from outside the process:**

@@ -1908,11 +1908,25 @@ private:
                 "not verified: " + route.value("error", ""));
         continue;
       }
+      // Not listed is not "no route". PgBouncer's SHOW DATABASES never lists
+      // a '*' fallback -- only explicit entries, and names the fallback has
+      // created, which it may drop again after a failed login -- so a name
+      // missing here may still be routed. Through 4.5 this was an error
+      // saying there was no fallback, which the console cannot know; found
+      // on the rig, whose PgBouncer has one. The connection's own outcome is
+      // the evidence that decides it.
       if (!route.value("found", false)) {
-        finding("pooler", o.name, "error",
-                cfg.pooler + " has no [databases] entry for " + cfg.dbname +
-                " and no '*' fallback, so a connection to it through the pooler "
-                "cannot be routed");
+        if (o.ok)
+          finding("pooler", o.name, "info",
+                  cfg.pooler + " lists no [databases] entry for " + cfg.dbname +
+                  ", yet the connection through it works: it is routed by a '*' "
+                  "fallback, which SHOW DATABASES does not show");
+        else
+          finding("pooler", o.name, "warning",
+                  cfg.pooler + " lists no [databases] entry for " + cfg.dbname +
+                  ". SHOW DATABASES does not show a '*' fallback, so this cannot "
+                  "tell \"not routed\" from \"routed by a fallback\"; the "
+                  "connection's own error says which: " + o.error);
         continue;
       }
       if (!o.ok) continue;
@@ -4368,13 +4382,9 @@ private:
   // pooler the bottleneck" -- and the raw rows are kept beside it, since their
   // columns vary by version and a summary can only use what every version has.
   // Where a database connection that declares `pooler` is routed: the entry
-  // for its dbname in that console's SHOW DATABASES -- or PgBouncer's "*"
-  // fallback, which routes any name to the same-named database. A name routed
-  // by the fallback is listed as an entry of its own once any client has asked
-  // for it, so via_fallback is seen only before the first connection. One console
+  // for its dbname in that console's SHOW DATABASES. One console
   // read. Returns {error, hint, detail} when the console cannot be read, and
-  // found:false when it has no route for the name, which is a connection that
-  // cannot work.
+  // found:false when the console lists no entry for the name.
   json pooler_route(const pglicht::ConnConfig& db) {
     struct Restore {
       std::string& slot; std::string prev;
@@ -4384,21 +4394,19 @@ private:
     json r = pooler_show({"SHOW DATABASES"});
     if (r.contains("error")) return r;
     json route = {{"pooler", db.pooler}, {"pooler_database", db.dbname}, {"found", false}};
+    // Only listed entries can be found: SHOW DATABASES never shows a '*'
+    // fallback (checked against PgBouncer 1.25), only the names it has
+    // created, so found:false does not mean unroutable -- verifyTopology
+    // weighs it against whether the connection worked.
     const json* hit = nullptr;
-    const json* wildcard = nullptr;
-    for (const auto& row : r["SHOW DATABASES"]) {
-      const std::string n = text_of(row, "name");
-      if (n == db.dbname) { hit = &row; break; }
-      if (n == "*") wildcard = &row;
-    }
-    if (!hit) hit = wildcard;
+    for (const auto& row : r["SHOW DATABASES"])
+      if (text_of(row, "name") == db.dbname) { hit = &row; break; }
     if (!hit) return route;
     route["found"] = true;
-    if (hit == wildcard) route["via_fallback"] = true;
-    // The backend database: the entry's own dbname, or -- when it sets none,
-    // and always for the fallback -- the name the client asked for.
+    // The backend database: the entry's own dbname, or the name the client
+    // asked for when it sets none.
     const std::string backend_db = text_of(*hit, "database");
-    route["backend_database"] = backend_db.empty() || hit == wildcard ? db.dbname : backend_db;
+    route["backend_database"] = backend_db.empty() ? db.dbname : backend_db;
     for (const auto& [from, to] : {std::pair<const char*, const char*>{"host", "backend_host"},
                                    {"port", "backend_port"}, {"force_user", "force_user"},
                                    {"pool_mode", "pool_mode"}, {"pool_size", "pool_size"}})
