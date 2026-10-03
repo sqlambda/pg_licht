@@ -5679,26 +5679,32 @@ json rpc1(PostgresMCPServer& s, const std::string& method, const json& params) {
 // A request without an id. Every response was built from req["id"] on a
 // const json, where operator[] on a missing key is undefined behaviour --
 // nlohmann dereferences the map's end -- so such a request read freed memory.
-// The JSON-RPC fuzzer found it in 4.6 within two seconds, on an initialize
-// carrying no id. nlohmann asserts on it in a debug build, so this test aborts
-// there on the old code, and ASan reports it in the sanitizer job.
+// A JSON-RPC fuzzer found it within two seconds, on an initialize carrying no
+// id. Being undefined, the old code fails this reliably only under ASan, which
+// reports the read in the sanitizer job; elsewhere it fails when the stray
+// memory does not happen to decode as null.
 TEST_F(PostgresMCPServerTest, ARequestWithoutAnIdIsAnsweredWithANullId) {
   PostgresMCPServer own(test_url);
   for (const json& params : {json{{"protocolVersion", "2025-06-18"}, {"capabilities", json::object()},
                                   {"clientInfo", {{"name", "t"}, {"version", "0"}}}},
                              json::object()}) {
-    for (const char* method : {"initialize", "tools/list", "no/such/method"}) {
+    for (const char* method : {"initialize", "tools/list"}) {
       json r = own.call_rpc({{"jsonrpc", "2.0"}, {"method", method}, {"params", params}});
-      if (r.contains("id")) {
-        EXPECT_TRUE(r["id"].is_null()) << method << ": " << r.dump().substr(0, 200);
-      }
+      ASSERT_TRUE(r.contains("result")) << method << ": " << r.dump().substr(0, 200);
+      ASSERT_TRUE(r.contains("id")) << method << ": " << r.dump().substr(0, 200);
+      EXPECT_TRUE(r["id"].is_null()) << method << ": " << r.dump().substr(0, 200);
+    }
+    // An unknown method without an id is a notification nobody handles.
+    json none = own.call_rpc({{"jsonrpc", "2.0"}, {"method", "no/such/method"}, {"params", params}});
+    if (none.contains("id")) {
+      EXPECT_TRUE(none["id"].is_null()) << none.dump().substr(0, 200);
     }
   }
   json call = own.call_rpc({{"jsonrpc", "2.0"}, {"method", "tools/call"},
                             {"params", {{"name", "listSchemas"}, {"arguments", json::object()}}}});
-  if (call.contains("id")) {
-    EXPECT_TRUE(call["id"].is_null()) << call.dump().substr(0, 200);
-  }
+  ASSERT_TRUE(call.contains("result")) << call.dump().substr(0, 200);
+  ASSERT_TRUE(call.contains("id")) << call.dump().substr(0, 200);
+  EXPECT_TRUE(call["id"].is_null()) << call.dump().substr(0, 200);
   // An id of any JSON type is echoed as sent.
   json r = own.call_rpc({{"jsonrpc", "2.0"}, {"id", "abc"}, {"method", "tools/list"}});
   EXPECT_EQ(r.value("id", json()), "abc");
@@ -9005,6 +9011,33 @@ TEST_F(TopologyFixture, APooledConnectionIsCheckedAgainstItsRoute) {
     EXPECT_NE(f["severity"], "error") << "a route the console cannot see called an error: " << f.dump(2);
     EXPECT_EQ(f["detail"].get<std::string>().find("no '*' fallback"), std::string::npos) << f.dump(2);
   }
+
+  // The same, where it does not depend on what PgBouncer still remembers: a
+  // name nobody ever asked the pooler for, on a connection that works. The
+  // section goes straight to the server -- which earns its own warning -- so
+  // the console cannot have created an entry for template1, and through 4.5.1
+  // this was, every time, the error that there was no fallback.
+  const std::string direct_t1 =
+      std::regex_replace(std::string(alt), std::regex(R"(\bdbname=\S+)"), "dbname=template1");
+  ASSERT_NE(direct_t1.find("dbname=template1"), std::string::npos) << direct_t1;
+  auto u = server_from(ini_with("") + section("unlisted", direct_t1, "pooler = pool\n") + pool);
+  json uv = u->call_verify_topology();
+  bool said = false;
+  for (const auto& c : uv["connections"]) {
+    if (c["connection"] != "unlisted") continue;
+    EXPECT_FALSE(c.contains("error")) << c.dump(2);
+    ASSERT_TRUE(c.contains("route")) << c.dump(2);
+    EXPECT_FALSE(c["route"].value("found", true)) << c.dump(2);
+  }
+  for (const auto& f : uv["findings"]) {
+    if (f["name"] != "unlisted" || f["topic"] != "pooler") continue;
+    EXPECT_NE(f["severity"], "error") << f.dump(2);
+    if (f["detail"].get<std::string>().find("lists no [databases] entry") != std::string::npos) {
+      EXPECT_EQ(f["severity"], "info") << f.dump(2);
+      said = true;
+    }
+  }
+  EXPECT_TRUE(said) << "an unlisted name on a working connection was not reported: " << uv.dump(2);
 }
 
 // The console itself, in the rig: the answers are real, the stats user can
