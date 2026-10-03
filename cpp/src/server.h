@@ -1903,16 +1903,18 @@ private:
       // Not listed is not "no route". PgBouncer's SHOW DATABASES never lists
       // a '*' fallback -- only explicit entries, and names the fallback has
       // created, which it may drop again after a failed login -- so a name
-      // missing here may still be routed. Through 4.5 this was an error
+      // missing here may still be routed. Through 4.5.1 this was an error
       // saying there was no fallback, which the console cannot know; found
       // on the rig, whose PgBouncer has one. The connection's own outcome is
-      // the evidence that decides it.
+      // the evidence, and even a working one is only probably the fallback:
+      // the section may not connect through this console at all.
       if (!route.value("found", false)) {
         if (o.ok)
           finding("pooler", o.name, "info",
                   cfg.pooler + " lists no [databases] entry for " + cfg.dbname +
-                  ", yet the connection through it works: it is routed by a '*' "
-                  "fallback, which SHOW DATABASES does not show");
+                  ", yet the connection works: most likely it is routed by a '*' "
+                  "fallback, which SHOW DATABASES does not show -- unless this "
+                  "connection does not go through that pooler at all");
         else
           finding("pooler", o.name, "warning",
                   cfg.pooler + " lists no [databases] entry for " + cfg.dbname +
@@ -10348,8 +10350,8 @@ private:
     // is not there is undefined behaviour -- nlohmann dereferences the map's
     // end -- and every response below was built from req["id"], so a request
     // without one (which is a notification, and a client may send any
-    // method that way) read freed memory. Found by the JSON-RPC fuzzer in
-    // 4.6, two seconds in, on an initialize carrying no id.
+    // method that way) read freed memory. Found by a JSON-RPC fuzzer,
+    // two seconds in, on an initialize carrying no id.
     const json id = req.is_object() && req.contains("id") ? req["id"] : json();
     std::string method = req.value("method", "");
     const json params = req.contains("params") && req["params"].is_object()

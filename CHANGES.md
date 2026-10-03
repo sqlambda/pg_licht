@@ -19,7 +19,7 @@
   But PgBouncer's `SHOW DATABASES` never lists a `*` fallback -- only
   explicit entries, and names a fallback has created, which it may drop again
   after a failed login -- so the console cannot say there is none. It is now
-  information when the connection through the pooler works, and a warning
+  information when the connection works, and a warning
   naming the connection's own error when it does not. The `via_fallback`
   field, which could never be set, is gone.
 
