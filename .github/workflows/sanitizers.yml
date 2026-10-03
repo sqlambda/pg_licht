@@ -7,10 +7,9 @@ on:
   workflow_dispatch:
 
 # A second push supersedes the first, so a force-push or a quick follow-up
-# commit does not leave a full 20-job matrix running against a commit nobody
-# will look at. Only pull_request runs are cancelled: a push to main or a tag
-# must finish, because its result is what the branch protection and the release
-# read.
+# commit does not leave the whole matrix running against a commit nobody
+# will look at. Only pull_request runs are cancelled: a push to main must
+# finish, because its result is what the branch protection reads.
 # Least privilege for every job that does not say otherwise: checkout needs to
 # read the repository, and artifacts and caches use the runner's own token,
 # not GITHUB_TOKEN. A job-level block replaces this one entirely, which is how
@@ -32,7 +31,7 @@ jobs:
   # Compile each distinct configuration once and hand the binary to the jobs
   # that run it.
   #
-  # There are three configurations and twenty test jobs: valgrind and pooled
+  # There are few configurations and many test jobs: valgrind and pooled
   # both want the plain RelWithDebInfo build, and the five PostgreSQL majors of
   # each differ only in the server they talk to, not in the binary. Compiling
   # per test job spent roughly 40 minutes of runner time re-deriving three
@@ -64,7 +63,7 @@ jobs:
             cxx: clang++
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install build dependencies
         run: |
@@ -81,13 +80,16 @@ jobs:
       # path has to match the install path exactly.
       - name: Cache libpqxx
         id: pqxx
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/pqxx
           # The compiler is part of the key: clang and g++ mangle constrained
           # templates differently, so clang code cannot link a g++-built
           # libpqxx (undefined pqxx::internal::to_string_float<...> at link).
-          key: pqxx-${{ env.PQXX_VERSION }}-${{ runner.os }}-${{ runner.arch }}-libpq-${{ env.LIBPQ_VERSION }}-${{ matrix.cxx || 'gcc' }}
+          # pic: since 4.6 pg_licht links as PIE whatever the compiler's
+          # default, so the archive it links must be position-independent;
+          # an object cached before that must not be reused.
+          key: pqxx-${{ env.PQXX_VERSION }}-${{ runner.os }}-${{ runner.arch }}-libpq-${{ env.LIBPQ_VERSION }}-${{ matrix.cxx || 'gcc' }}-pic
 
       - name: Build libpqxx
         if: steps.pqxx.outputs.cache-hit != 'true'
@@ -96,6 +98,7 @@ jobs:
           # Built by the same compiler as pg_licht, for the reason in the key.
           cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             -DCMAKE_INSTALL_PREFIX="$HOME/pqxx" \
             ${{ matrix.cxx && format('-DCMAKE_CXX_COMPILER={0}', matrix.cxx) || '' }}
           cmake --build /tmp/libpqxx-build
@@ -110,8 +113,12 @@ jobs:
           cmake -S cpp -B cpp/build \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DPGLICHT_SANITIZER=${{ matrix.sanitizer }} \
+            -DPGLICHT_WERROR=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             ${{ matrix.cxx && format('-DCMAKE_CXX_COMPILER={0}', matrix.cxx) || '' }}
           grep -E '^CMAKE_CXX_COMPILER:' cpp/build/CMakeCache.txt
+          # Warnings are errors in CI whatever the checkout looks like.
+          grep -qx 'PGLICHT_WERROR:BOOL=ON' cpp/build/CMakeCache.txt
           cmake --build cpp/build --target pg_licht_mcp_test
 
       # Neither needs a database nor varies by PostgreSQL version, so they run
@@ -125,9 +132,53 @@ jobs:
         working-directory: cpp/build
         run: |
           cmake --build . --target pg_licht_mcp
-          ctest -R "manpage_lint|protocol_compat|llms_txt|reference|cli_" --output-on-failure
+          # pg_licht_mcp_hardening: an optimised build without a sanitizer,
+          # which this is, on both compilers. actions_pinned: SECURITY.md.
+          ctest -R "manpage_lint|protocol_compat|llms_txt|reference|cli_|pg_licht_mcp_hardening|actions_pinned" --output-on-failure
 
-      - uses: actions/upload-artifact@v4
+      # clang-tidy from cpp/.clang-tidy, which fails on any finding. On the
+      # clang job only: it reads the compile commands of a clang build. The
+      # three translation units cover the server -- main.cpp pulls in
+      # server.h and config.h -- and run in parallel.
+      - name: clang-tidy
+        if: matrix.config == 'plain-clang'
+        run: |
+          sudo apt-get install -y -q clang-tidy
+          clang-tidy --version
+          printf '%s\n' cpp/src/main.cpp cpp/src/tool_defs.cpp cpp/src/prompt_defs.cpp \
+            | xargs -P 3 -I{} clang-tidy -p cpp/build --quiet {}
+
+      # libFuzzer, a minute per target: the JSON-RPC dispatch (the input from
+      # outside the operator's control) and the two INI parsers, seeded by
+      # tools/fuzz-seeds.py. Its first local run found a use-after-free in
+      # 4.5's request handling in two seconds. A crash fails the job and its
+      # input is uploaded below, so it can be reproduced with
+      #   ./fuzz_<target> <the artifact>
+      - name: Fuzz
+        if: matrix.config == 'plain-clang'
+        run: |
+          # libFuzzer's runtime ships apart from the compiler on Ubuntu.
+          sudo apt-get install -y -q "libclang-rt-$(clang++ -dumpversion | cut -d. -f1)-dev"
+          export PKG_CONFIG_PATH="$HOME/pqxx/lib/pkgconfig:$HOME/pqxx/lib64/pkgconfig"
+          cmake -S cpp -B cpp/fuzz-build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_COMPILER=clang++ -DPGLICHT_FUZZ=ON -DBUILD_TESTING=OFF \
+            -DPGLICHT_WERROR=ON
+          cmake --build cpp/fuzz-build --target fuzz_jsonrpc fuzz_connections fuzz_budgets
+          python3 tools/fuzz-seeds.py fuzz-corpus
+          mkdir -p fuzz-crashes
+          for t in jsonrpc connections budgets; do
+            cpp/fuzz-build/fuzz_$t -max_total_time=60 -print_final_stats=1 \
+              -artifact_prefix=fuzz-crashes/$t- fuzz-corpus/$t
+          done
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: failure() && matrix.config == 'plain-clang'
+        with:
+          name: fuzz-crashes
+          path: fuzz-crashes/
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: matrix.config != 'plain-clang'
         with:
           name: test-binary-${{ matrix.config }}
@@ -169,7 +220,7 @@ jobs:
       # pg_stat_statements, so the code behind evaluateIndex, the queryid path
       # and the four preload-backed tools runs under the sanitizers too rather
       # than being skipped. Their pooling behaviour is still the pooled job's.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Preload the extensions in the service container
         run: .github/scripts/prepare-service-postgres.sh ${{ job.services.postgres.id }}
@@ -177,7 +228,7 @@ jobs:
       - name: Install runtime dependencies
         run: .github/scripts/apt-pgdg.sh libpq5
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: test-binary-${{ matrix.sanitizer }}
           path: cpp/build
@@ -217,7 +268,7 @@ jobs:
           --health-retries 10
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # As in the sanitizer jobs: without it the extension-backed code is
       # skipped rather than checked for leaks.
@@ -227,7 +278,7 @@ jobs:
       - name: Install runtime dependencies
         run: .github/scripts/apt-pgdg.sh libpq5 valgrind
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: test-binary-plain
           path: cpp/build
@@ -264,7 +315,7 @@ jobs:
         pg: [14, 15, 16, 17, 18]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install runtime dependencies
         # postgresql-${{ matrix.pg }} brings initdb/pg_ctl/pg_basebackup and the
@@ -289,7 +340,7 @@ jobs:
         # cluster sets -- the rig preloads each one it finds installed.
         run: .github/scripts/apt-pgdg.sh libpq5 postgresql-${{ matrix.pg }} postgresql-${{ matrix.pg }}-hypopg postgresql-${{ matrix.pg }}-pg-wait-sampling postgresql-${{ matrix.pg }}-pg-stat-kcache postgresql-${{ matrix.pg }}-pg-qualstats pgbouncer
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: test-binary-plain
           path: cpp/build
@@ -309,3 +360,75 @@ jobs:
         run: |
           chmod +x cpp/build/pg_licht_mcp_test
           cpp/test/run-pooled-tests.sh
+
+  # The FreeBSD client against the Linux rig. pg_licht is a client: what varies
+  # by platform -- the build, the threads link, libpq and libpqxx as FreeBSD
+  # ships them -- is all on its side, while the server features under test are
+  # in the rig: every extension preloaded (FreeBSD packages neither hypopg nor
+  # pg_wait_sampling for PostgreSQL 18), a standby, a cascade, a subscriber,
+  # split brain and a PgBouncer console. So the rig runs here, on the runner,
+  # served (RIG_SERVE), and the test binary is built and run in a FreeBSD VM
+  # against it, with the require flags set: an extension test that skips
+  # fails the job, as it does on Linux.
+  freebsd-client:
+    name: freebsd-${{ matrix.release }}-client
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ["14.5", "15.1"]
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install the rig's server side
+        run: .github/scripts/apt-pgdg.sh libpq5 postgresql-18 postgresql-18-hypopg postgresql-18-pg-wait-sampling postgresql-18-pg-stat-kcache postgresql-18-pg-qualstats pgbouncer
+
+      # Every address, since the VM's route to the runner is only known inside
+      # it; trust the private ranges a VM network can use, on a runner that
+      # lives for this job alone.
+      - name: Serve the rig
+        run: |
+          RIG_HOST=0.0.0.0 RIG_TRUST_NET=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16 \
+            RIG_SERVE="$GITHUB_WORKSPACE/rig.env" PG_BINDIR=/usr/lib/postgresql/18/bin \
+            nohup cpp/test/run-pooled-tests.sh > rig.log 2>&1 &
+          for _ in $(seq 1 150); do [ -f rig.env ] && break; sleep 2; done
+          cat rig.log
+          test -f rig.env
+
+      - uses: vmactions/freebsd-vm@a2f9a41fa97f6848b8c3b791087dfcdaa5b473ff # v1.5.8
+        with:
+          release: ${{ matrix.release }}
+          usesh: true
+          sync: rsync
+          copyback: false
+          prepare: |
+            pkg install -y cmake pkgconf nlohmann-json postgresql-libpqxx googletest
+            pkg install -y postgresql18-server postgresql18-contrib pg_stat_kcache
+          run: |
+            set -e
+            # The URLs say 0.0.0.0; the rig is reached at the VM's gateway.
+            gw=$(netstat -rn -f inet | awk '$1 == "default" {print $2; exit}')
+            sed "s/0\.0\.0\.0/$gw/g" rig.env > rig.vm.env
+            . ./rig.vm.env
+            seen=$(psql -X -qtA "$DATABASE_URL_DIRECT" -c "SELECT host(inet_server_addr())")
+            echo "rig reached at $gw; the server sees the connection at $seen"
+            # The second-address tests need the server to see the client at an
+            # address other than PgBouncer's 127.0.0.1 hop. Through a NAT that
+            # forwards to the runner's loopback it sees 127.0.0.1 for both, so
+            # those two tests skip here rather than fail on their premise.
+            if [ "$seen" = 127.0.0.1 ]; then unset ALT_ADDR_URL; echo "second-address tests skip: NAT to loopback"; fi
+            cd cpp
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPGLICHT_WERROR=ON
+            cmake --build build --target pg_licht_mcp_test
+            export PGLICHT_REQUIRE_HYPOPG=1 PGLICHT_REQUIRE_PRELOAD_EXTENSIONS=1
+            DATABASE_URL="$DATABASE_URL_DIRECT" ./build/pg_licht_mcp_test
+            DATABASE_URL="$DATABASE_URL_POOLED" ./build/pg_licht_mcp_test
+            # And the one thing that depends on the SERVER's platform: the
+            # kernel counters, against a PostgreSQL running in this VM.
+            sh ../.github/scripts/freebsd-server.sh "$PWD/build/pg_licht_mcp_test"
+
+      - name: Rig log
+        if: always()
+        run: tail -40 rig.log; rm -f rig.env

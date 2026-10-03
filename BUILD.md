@@ -32,12 +32,25 @@ builds use whatever libpqxx your system provides — dynamic or static both work
 | `BUILD_TESTING` | `ON` | Build `pg_licht_mcp_test` and register the ctest suite. Requires GoogleTest. |
 | `CMAKE_BUILD_TYPE` | *(unset)* | `Release` for packaging, `RelWithDebInfo` for debugging and sanitizers. |
 | `PGLICHT_SANITIZER` | `NONE` | `ADDRESS`, `UNDEFINED`, `ADDRESS_UNDEFINED`, or `THREAD`. |
+| `PGLICHT_WERROR` | `ON` in a git checkout, `OFF` in a source tarball | Treat warnings as errors. CI passes `ON`. |
+| `PGLICHT_FUZZ` | `OFF` | Build the libFuzzer targets `fuzz_jsonrpc`, `fuzz_connections` and `fuzz_budgets`. Needs clang. |
 | `CMAKE_INSTALL_PREFIX` | `/usr/local` | Install destination. |
 
-Hardening flags are always on, not opt-in: `-Wall -Wextra -Wpedantic -Wconversion
--Wsign-conversion -Wshadow -Werror`, plus `_GLIBCXX_ASSERTIONS` / `_LIBCPP_HARDENING_MODE`.
-Expect to add explicit `static_cast`s for any `size_t` / `int` / `pqxx::result::size_type`
-conversion.
+The warning set is always on, not opt-in: `-Wall -Wextra -Wpedantic -Wconversion
+-Wsign-conversion -Wuninitialized -Wshadow -Wnull-dereference -Wformat=2
+-Wimplicit-fallthrough -Wold-style-cast -Wnon-virtual-dtor -Woverloaded-virtual -Wcast-qual
+-Wdouble-promotion`, plus `_GLIBCXX_ASSERTIONS` / `_LIBCPP_HARDENING_MODE`. Whether a
+warning is an error is `PGLICHT_WERROR`. Expect to add explicit `static_cast`s for any
+`size_t` / `int` / `pqxx::result::size_type` conversion.
+
+The binary is also hardened wherever the toolchain supports each flag: PIE, full RELRO, a
+non-executable stack, `-fstack-protector-strong`, `-fstack-clash-protection`,
+`-fcf-protection`, and in a Release build `_FORTIFY_SOURCE=3` and
+`-ftrivial-auto-var-init=zero`. PIE has one consequence for a build against a **static**
+libpqxx you compiled yourself: that library must be position-independent too
+(`-DCMAKE_POSITION_INDEPENDENT_CODE=ON` when building it), or the link fails asking to
+"recompile with -fPIE". A shared libpqxx, which is what distributions and Homebrew ship,
+needs nothing.
 
 ### Installing a local build
 
@@ -69,6 +82,9 @@ order to issue `CREATE DATABASE`. Installing the `pg_stat_statements`, `postgres
 - `protocol_compat` — the response-shape contract end to end against the real binary.
 - `llms_txt` and `reference` — `llms.txt`, the HTML reference and the landing page, built
   as the release builds them, with every mocked example checked against its tool's schema.
+- `pg_licht_mcp_hardening` — `cpp/test/hardening-check.sh` reads the built binary with
+  `readelf` and fails if the hardening that was asked for did not reach it (Linux).
+- `actions_pinned` — every `uses:` in `.github/workflows` names a full commit SHA.
 - `cli_version` and `cli_unknown_option` — `--version` prints the version it was built
   as, and an unknown option is refused rather than taken for a connection string.
 
@@ -85,7 +101,8 @@ and tears everything down — touching nothing else on the machine:
 | a `pg_basebackup` streaming standby | shares the primary's system identifier, which is the only way to check that the topology tools tell a replica from a second instance rather than trusting the config |
 | a cascading standby streaming from the first | `replicationStats` on a standby that is itself a sender, where the primary-only WAL functions raise |
 | a separately `initdb`-ed logical subscriber | `subscriptionStats` has nothing to report on a server that subscribes to nothing. It has to be a third cluster: logical replication between two databases of one cluster deadlocks, because `CREATE SUBSCRIPTION` waits for the slot it is creating and slot creation waits for every transaction older than itself — including that one |
-| PgBouncer, `pool_mode=transaction`, `server_reset_query=DISCARD ALL` | the deployment a session-scoped guard fails on silently |
+| a second primary, cloned from the first and promoted | split brain: two primaries sharing one system identifier, which `verifyTopology` must call what it is |
+| PgBouncer, `pool_mode=transaction`, `server_reset_query=DISCARD ALL` | the deployment a session-scoped guard fails on silently, and the console the pooler tools read |
 
 Tests that need a server other than the primary are skipped when it is absent, so the
 binary still runs against a plain `DATABASE_URL`; the rig exports `STANDBY_URL` and
@@ -99,7 +116,8 @@ cpp/test/run-pooled-tests.sh
 Requires `initdb`, `pg_ctl`, `createdb`, `pg_basebackup` and `psql` (PostgreSQL 14+) plus
 `pgbouncer`. It picks the newest installed PostgreSQL and free default ports, all
 overridable via the environment: `PG_BINDIR`, `PGBOUNCER`, `TEST_BIN`, `PG_PORT`,
-`BOUNCER_PORT`, `STANDBY_PORT`, `SUBSCRIBER_PORT`, `CASCADE_PORT`. To pin a specific major:
+`BOUNCER_PORT`, `STANDBY_PORT`, `SUBSCRIBER_PORT`, `CASCADE_PORT`, `SPLIT_PORT`. To pin a
+specific major:
 
 ```bash
 PG_BINDIR=/usr/lib/postgresql/16/bin cpp/test/run-pooled-tests.sh
@@ -151,13 +169,9 @@ groff -mdoc -Tascii -ww cpp/man/pg_licht_mcp.1 >/dev/null   # second renderer
 man --local-file cpp/man/pg_licht_mcp.1          # preview
 ```
 
-Adding a tool to `get_tools_list()` in `cpp/src/server.h` means adding a matching
-`.It Ic <name>` entry under the right `.Ss` group. This check keeps the two in sync:
-
-```bash
-diff <(grep -oE '\{"name", "[A-Za-z]+"' cpp/src/server.h | sed 's/.*"name", "//; s/"//' | sort) \
-     <(grep -oE '^\.It Ic [A-Za-z]+' cpp/man/pg_licht_mcp.1 | awk '{print $3}' | sort -u)
-```
+Adding a tool in `cpp/src/tool_defs.cpp` means adding a matching `.It Ic <name>` entry
+under the right `.Ss` group. The `reference` and `llms_txt` ctests keep the two in sync:
+both read the tool list from the built binary and fail on a tool with no man page entry.
 
 Keep the tools table wording in the man page authoritative; `README.md` deliberately does
 not duplicate it.
@@ -167,15 +181,21 @@ not duplicate it.
 - `.github/workflows/sanitizers.yml` — ASan/UBSan, TSan, Valgrind, and the pooled-connection
   job, each across PostgreSQL 14, 15, 16, 17, and 18.
 - `.github/workflows/sanitizers.yml` also builds with clang (`plain-clang`), so a warning
-  only clang raises fails under `-Werror`.
+  only clang raises fails under `-Werror`. That job runs clang-tidy over the server
+  (`cpp/.clang-tidy`, any finding fails) and each fuzz target for a minute.
+- `freebsd-*-client` builds the test binary in a FreeBSD 14 and a FreeBSD 15 VM and runs the
+  whole suite against the rig served from the Linux runner, then the kernel-counter tests
+  against a PostgreSQL started inside the VM (`.github/scripts/freebsd-server.sh`).
 - `.github/workflows/release.yml` — 7 build targets (Linux x86_64/arm64, Debian 13 deb,
   Rocky 9 rpm, macOS arm64). Tarballs are staged through `cmake --install`; deb and rpm are
   produced by CPack, which picks up the same install rules. libpqxx is pinned via
   `PQXX_VERSION`. The `.deb` Depends is derived by `dpkg-shlibdeps`; the `.rpm` requires
   PGDG's `libpq5` by name.
 - `verify-packages` then installs every `.deb` on plain Debian 13 and every `.rpm` on Rocky
-  Linux 9 with PGDG enabled, runs the binary and finds the man page. The release waits for
-  it.
+  Linux 9 with PGDG enabled, runs the binary, finds the man page, and checks that the
+  package's version is the binary's (and, on a tag, the tag's). The release waits for it.
+- `homebrew` builds through the tap's real formula, pointed at a tarball of the commit. The
+  release waits for it too.
 - `site` builds the GitHub Pages site on every run: the landing page filled in from
   `site/index.html`, the man page rendered by `mandoc -T html`, the HTML reference from
   `tools/gen-reference.py`, and `llms.txt` from `tools/generate-llms-txt.py`, all from the
@@ -192,7 +212,8 @@ not duplicate it.
 ## Release process
 
 Push a `v*` tag on `main`. The release workflow builds all seven artifacts, installs each
-package in its target distribution, creates the GitHub release, and bumps the Homebrew tap
+package in its target distribution, attests the build provenance of every asset, writes
+`SHA256SUMS`, creates the GitHub release, and bumps the Homebrew tap
 formula (URL and sha256) automatically. After the release succeeds, `deploy-site` publishes
 the site and `llms.txt` to https://sqlambda.github.io/pg_licht/, so both always describe a
 released version. Nothing about the site or `llms.txt` is edited by hand.

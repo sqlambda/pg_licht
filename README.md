@@ -44,7 +44,8 @@ returned. Connect as the narrowest role that answers the question; `checkPrivile
 reports what it can reach.
 
 Full rationale, including the guarded exception for `explainQuery` and the complete list of
-what reaches the caller, is in the SECURITY CONSIDERATIONS section of `man pg_licht_mcp`.
+what reaches the caller, is in the SECURITY CONSIDERATIONS section of `man pg_licht_mcp`;
+[SECURITY.md](SECURITY.md) summarises it and says how to report a vulnerability.
 
 ## Quick start
 

@@ -105,11 +105,15 @@ user:
 
 ```sh
 git clone https://github.com/sqlambda/pg_licht && cd pg_licht/cpp
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DPGLICHT_WERROR=OFF
 cmake --build build --target pg_licht_mcp
 ```
 
-and, as root again, `cmake --install build --prefix /usr/local`.
+`-DPGLICHT_WERROR=OFF` because a git checkout treats warnings as errors by default -- the
+project's own policy, enforced in CI -- and a newer compiler than CI's can add a warning
+that is not yours to fix. A source tarball defaults to off.
+
+Then, as root again, `cmake --install build --prefix /usr/local`.
 
 `/usr/local/bin/pg_licht_mcp` and `man pg_licht_mcp` then work as on Linux. To run the
 test suite as well, add `googletest bash postgresql18-server postgresql18-contrib
@@ -125,6 +129,20 @@ so; on Linux, where the address always exists, the rig fails instead.
 command -v pg_licht_mcp     # where it landed
 pg_licht_mcp --help         # usage and connection resolution order
 man pg_licht_mcp            # the full manual
+```
+
+A file downloaded from the releases page can be checked against its build provenance,
+from 4.6.0 on: a signed statement that it was built by this repository's release workflow
+from the tagged commit. It needs the GitHub CLI:
+
+```bash
+gh attestation verify pg_licht_mcp-linux-x86_64-debian13.deb --repo sqlambda/pg_licht
+```
+
+Or, without it, against the `SHA256SUMS` file published beside the assets:
+
+```bash
+sha256sum -c --ignore-missing SHA256SUMS      # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS
 ```
 
 Then point it at a database:

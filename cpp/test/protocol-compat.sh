@@ -69,4 +69,20 @@ r=$(probe 2025-06-18); check "2025-06-18 still negotiated" "2025-06-18" "${r%%|*
 unset PG_LICHT_MAX_PROTOCOL
 
 echo
+echo "valid JSON that is not a valid request is answered with its id, not as a parse error"
+bad() {  # bad <request line>  ->  "<id>|<code>"
+  printf '%s\n' "$1" | "$BIN" "$URL" 2>/dev/null | python3 -c '
+import json,sys
+for line in sys.stdin:
+    line=line.strip()
+    if not line.startswith("{"): continue
+    o=json.loads(line)
+    if "error" in o: print(str(o.get("id"))+"|"+str(o["error"]["code"])); break'
+}
+check "a method that is a number"        "7|-32600"    "$(bad '{"jsonrpc":"2.0","id":7,"method":5}')"
+check "a protocolVersion that is one"    "8|-32600"    "$(bad '{"jsonrpc":"2.0","id":8,"method":"initialize","params":{"protocolVersion":1}}')"
+check "a tool name that is one"          "9|-32600"    "$(bad '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":1}}')"
+check "text that is not JSON"            "None|-32700" "$(bad 'not json')"
+
+echo
 [ "$fail" -eq 0 ] && echo "OK: response-shape contract holds" || { echo "protocol-compat FAILED"; exit 1; }

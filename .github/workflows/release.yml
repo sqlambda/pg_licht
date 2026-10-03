@@ -77,7 +77,7 @@ jobs:
             extension: tar.gz
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install dependencies (Ubuntu)
         if: matrix.distro == 'ubuntu'
@@ -91,7 +91,8 @@ jobs:
           sudo apt-get install -y cmake libpq-dev nlohmann-json3-dev pkg-config
           curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
           cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
           cmake --build /tmp/libpqxx-build -j"$(nproc)"
           sudo cmake --install /tmp/libpqxx-build
           echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
@@ -111,7 +112,8 @@ jobs:
           apt-get install -y libpq-dev nlohmann-json3-dev python3
           curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
           cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
           cmake --build /tmp/libpqxx-build -j"$(nproc)"
           cmake --install /tmp/libpqxx-build
           echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
@@ -141,7 +143,8 @@ jobs:
           export CXX=/opt/rh/gcc-toolset-13/root/usr/bin/g++
           curl -fsSL "https://github.com/jtv/libpqxx/archive/refs/tags/${PQXX_VERSION}.tar.gz" | tar -xz -C /tmp
           cmake -S "/tmp/libpqxx-${PQXX_VERSION}" -B /tmp/libpqxx-build \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DSKIP_BUILD_TEST=ON \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
           cmake --build /tmp/libpqxx-build -j"$(nproc)"
           cmake --install /tmp/libpqxx-build
           echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig" >> $GITHUB_ENV
@@ -154,9 +157,19 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          # -Werror explicitly: the packages ship from these toolchains, and
+          # a warning here is one to fix before release, not to ship past.
+          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DPGLICHT_WERROR=ON
           cmake --build cpp/build --target pg_licht_mcp
           strip cpp/build/pg_licht_mcp
+
+      # The hardening SafetyFlags.cmake asks for, checked on the binary that
+      # ships -- after strip, which must not take any of it away. The release
+      # build has no tests, so this is the one place it is checked on every
+      # toolchain in the matrix. ELF only: macOS has no readelf.
+      - name: Check the binary's hardening
+        if: matrix.distro != 'macos'
+        run: cpp/test/hardening-check.sh cpp/build/pg_licht_mcp
 
       - name: Package (tar.gz)
         if: matrix.extension == 'tar.gz'
@@ -190,7 +203,7 @@ jobs:
           cd cpp/build && cpack -G RPM
           mv pg-licht-*.rpm ../../${{ matrix.artifact }}.rpm
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.${{ matrix.extension }}
@@ -237,7 +250,7 @@ jobs:
             extension: rpm
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ${{ matrix.artifact }}
 
@@ -264,6 +277,14 @@ jobs:
             exit 1
           fi
           pg_licht_mcp --help
+          # The package says one version and the binary inside it another only
+          # when something was packaged that was not just built; on a tag,
+          # both must also be the tag.
+          pkg_version=$(dpkg-deb -f "$pkg" Version)
+          bin_version=$(pg_licht_mcp --version)
+          echo "package $pkg_version, binary: $bin_version"
+          [ "$bin_version" = "pg_licht_mcp ${pkg_version%%-*}" ]
+          case "$GITHUB_REF" in refs/tags/v*) [ "v${pkg_version%%-*}" = "$GITHUB_REF_NAME" ] ;; esac
           ls /usr/share/man/man1/pg_licht_mcp.1*
           dpkg -L pg-licht
 
@@ -284,24 +305,121 @@ jobs:
           echo "libpq5 provided by: $provider"
           echo "$provider" | grep -q PGDG
           pg_licht_mcp --help
+          # As for the .deb: package, binary and (on a tag) the tag agree.
+          pkg_version=$(rpm -qp --qf '%{VERSION}' "$pkg")
+          bin_version=$(pg_licht_mcp --version)
+          echo "package $pkg_version, binary: $bin_version"
+          [ "$bin_version" = "pg_licht_mcp $pkg_version" ]
+          case "$GITHUB_REF" in refs/tags/v*) [ "v$pkg_version" = "$GITHUB_REF_NAME" ] ;; esac
           # rpmbuild may compress man pages, hence the glob.
           ls /usr/share/man/man1/pg_licht_mcp.1*
           rpm -ql pg-licht
 
+  # The Homebrew formula lives in another repository and is only rewritten
+  # after a release exists, so until 4.6 nothing built through it before the
+  # tag: the macOS job above installs the same dependencies but runs cmake
+  # itself, with its own flags. This job takes the tap's real formula, points
+  # it at a tarball of this commit, and lets brew build it from source -- so a
+  # change that breaks `brew install` (a flag Homebrew's compiler shim
+  # rejects, a file the install rules miss, a warning that is only an error
+  # outside a git checkout) fails the pull request, not the user.
+  homebrew:
+    name: Build through the Homebrew formula
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_ENV_HINTS: 1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Point the tap's formula at this commit
+        run: |
+          # The same shape as the tag tarball the formula normally downloads:
+          # one top-level directory, and no .git -- which is what turns
+          # PGLICHT_WERROR off, as it is for a user.
+          git archive --format=tar.gz --prefix=pg_licht-ci/ -o "$RUNNER_TEMP/pg_licht-ci.tar.gz" HEAD
+          sha=$(shasum -a 256 "$RUNNER_TEMP/pg_licht-ci.tar.gz" | cut -d' ' -f1)
+          brew tap-new --no-git pglicht/ci
+          formula="$(brew --repository pglicht/ci)/Formula/pg-licht.rb"
+          curl -fsSL -o "$formula" \
+            https://raw.githubusercontent.com/sqlambda/homebrew-pg-licht/HEAD/Formula/pg-licht.rb
+          # Only the source changes; everything brew does with it is the tap's.
+          sed -i '' -E \
+            -e "s|^  url \".*\"|  url \"file://$RUNNER_TEMP/pg_licht-ci.tar.gz\"\\
+            version \"0.0.0-ci\"|" \
+            -e "s|^  sha256 \".*\"|  sha256 \"$sha\"|" "$formula"
+          grep -q "file://$RUNNER_TEMP/pg_licht-ci.tar.gz" "$formula"
+          grep -q "$sha" "$formula"
+          cat "$formula"
+
+      - name: brew install --build-from-source
+        run: brew install --build-from-source --verbose pglicht/ci/pg-licht
+
+      - name: Run what was installed
+        run: |
+          brew test pglicht/ci/pg-licht
+          want=$(sed -nE 's/^project\(.* VERSION ([0-9.]+).*/\1/p' cpp/CMakeLists.txt)
+          got=$("$(brew --prefix)/bin/pg_licht_mcp" --version)
+          echo "$got"
+          [ "$got" = "pg_licht_mcp $want" ]
+          test -f "$(brew --prefix)/share/man/man1/pg_licht_mcp.1"
+
   release:
     name: Create release and update Homebrew formula
     # A package that does not install blocks the release rather than shipping.
-    needs: [build, verify-packages]
+    needs: [build, verify-packages, homebrew]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # id-token and attestations are what the provenance step needs: the first
+    # lets the job prove to Sigstore which workflow run it is, the second lets
+    # it store the signed statement on this repository.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
+
+      # A signed statement, per asset, that this file was built by this
+      # workflow, from this commit, on a GitHub-hosted runner. It is what lets
+      # a user tell a release asset from a file somebody else uploaded under
+      # the same name:
+      #   gh attestation verify <file> --repo sqlambda/pg_licht
+      # Before the release is created, so that no asset is ever published
+      # without one.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            pg_licht_mcp-*.tar.gz
+            pg_licht_mcp-*.deb
+            pg_licht_mcp-*.rpm
+
+      # One file a user can check every download against without the GitHub
+      # CLI: sha256sum -c --ignore-missing SHA256SUMS. The source tarball is
+      # in it too, under both names it arrives by -- v4.6.0.tar.gz from the URL
+      # (curl -O, wget) and pg_licht-4.6.0.tar.gz from the header a browser
+      # obeys; it exists as soon as the tag does. Downloaded to a file first:
+      # in a pipe, a failed curl would leave sha256sum hashing nothing, and
+      # the hash of nothing looks like any other.
+      - name: Write SHA256SUMS
+        run: |
+          set -euo pipefail
+          sha256sum pg_licht_mcp-*.tar.gz pg_licht_mcp-*.deb pg_licht_mcp-*.rpm > SHA256SUMS
+          curl -fsSL -o source.tar.gz "https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.ref_name }}.tar.gz"
+          test -s source.tar.gz
+          src=$(sha256sum source.tar.gz | cut -d' ' -f1)
+          tag="${{ github.ref_name }}"
+          echo "$src  $tag.tar.gz" >> SHA256SUMS
+          echo "$src  ${{ github.event.repository.name }}-${tag#v}.tar.gz" >> SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 9
+          cat SHA256SUMS
 
       - name: Create GitHub release
         run: |
@@ -321,7 +439,8 @@ jobs:
               pg_licht_mcp-linux-arm64-debian13.deb \
               pg_licht_mcp-linux-x86_64-rocky9.rpm \
               pg_licht_mcp-linux-arm64-rocky9.rpm \
-              pg_licht_mcp-macos-arm64.tar.gz
+              pg_licht_mcp-macos-arm64.tar.gz \
+              SHA256SUMS
             exit 0
           fi
           gh release create ${{ github.ref_name }} \
@@ -334,14 +453,20 @@ jobs:
             pg_licht_mcp-linux-arm64-debian13.deb \
             pg_licht_mcp-linux-x86_64-rocky9.rpm \
             pg_licht_mcp-linux-arm64-rocky9.rpm \
-            pg_licht_mcp-macos-arm64.tar.gz
+            pg_licht_mcp-macos-arm64.tar.gz \
+            SHA256SUMS
         env:
           GH_TOKEN: ${{ github.token }}
 
       - name: Compute source tarball SHA256
         id: sha
         run: |
-          SHA=$(curl -sL "https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.ref_name }}.tar.gz" | sha256sum | cut -d' ' -f1)
+          # To a file, and -f: in a pipe a failed download, or a 404 page,
+          # would be hashed into the formula like any tarball.
+          set -euo pipefail
+          curl -fsSL -o source.tar.gz "https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.ref_name }}.tar.gz"
+          test -s source.tar.gz
+          SHA=$(sha256sum source.tar.gz | cut -d' ' -f1)
           echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
 
       - name: Update Homebrew formula
@@ -403,11 +528,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # The shipped Linux binary, not a rebuild: llms.txt is generated from
       # what the release actually contains.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: pg_licht_mcp-linux-x86_64
 
@@ -435,7 +560,7 @@ jobs:
           head -3 _site/llms.txt
           ls -la _site
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
         with:
           path: _site
 
@@ -453,4 +578,4 @@ jobs:
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - id: deploy
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5

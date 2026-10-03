@@ -6,6 +6,7 @@
 #include <fstream>
 #include <map>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -155,7 +156,7 @@ inline std::string trim(const std::string& s) {
 // single-quoted, and embedded quotes/backslashes escaped.
 inline std::string quote_conninfo(const std::string& v) {
   bool needs_quotes = v.empty();
-  for (char c : v) {
+  for (char const c : v) {
     if (std::isspace(static_cast<unsigned char>(c)) || c == '\'' || c == '\\') {
       needs_quotes = true;
       break;
@@ -164,7 +165,7 @@ inline std::string quote_conninfo(const std::string& v) {
   if (!needs_quotes) return v;
 
   std::string out = "'";
-  for (char c : v) {
+  for (char const c : v) {
     if (c == '\'' || c == '\\') out += '\\';
     out += c;
   }
@@ -179,8 +180,8 @@ inline std::vector<std::string> split_list(const std::string& v,
   std::vector<std::string> out;
   size_t b = 0;
   while (true) {
-    size_t c = v.find(',', b);
-    std::string item = trim(c == std::string::npos ? v.substr(b)
+    size_t const c = v.find(',', b);
+    std::string const item = trim(c == std::string::npos ? v.substr(b)
                                                    : v.substr(b, c - b));
     if (item.empty())
       throw std::runtime_error(where + ": empty entry in the list \"" + v + "\"");
@@ -199,12 +200,12 @@ inline std::vector<std::string> split_list(const std::string& v,
 inline long long positive_int(const std::string& v, const std::string& where) {
   if (v.empty())
     throw std::runtime_error(where + ": expected a positive integer, got an empty value");
-  for (char c : v) {
+  for (char const c : v) {
     if (!std::isdigit(static_cast<unsigned char>(c)))
       throw std::runtime_error(where + ": expected a positive integer, got \"" + v + "\"");
   }
   try {
-    long long n = std::stoll(v);
+    long long const n = std::stoll(v);
     if (n <= 0)
       throw std::runtime_error(where + ": expected a positive integer, got \"" + v + "\"");
     return n;
@@ -221,7 +222,7 @@ inline long long positive_int(const std::string& v, const std::string& where) {
 inline long long non_negative_int(const std::string& v, const std::string& where) {
   if (v.empty())
     throw std::runtime_error(where + ": expected a non-negative integer, got an empty value");
-  for (char c : v) {
+  for (char const c : v) {
     if (!std::isdigit(static_cast<unsigned char>(c)))
       throw std::runtime_error(where + ": expected a non-negative integer, got \"" + v + "\"");
   }
@@ -295,7 +296,21 @@ public:
 
     std::ifstream in(path);
     if (!in) throw std::runtime_error("cannot open config file: " + path);
+    return from_ini_stream(in, path, app_name);
+  }
 
+  // The parser itself, from any stream: `path` only labels the messages. Split
+  // from from_ini in 4.6 so text can be parsed without a file -- the fuzzer
+  // feeds it bytes, and a test can hand it a string -- while the file rules
+  // (the mode check above) stay on the one path that reads a file.
+  static ConnectionRegistry from_ini_text(const std::string& text, const std::string& label,
+                                          const std::string& app_name) {
+    std::istringstream in(text);
+    return from_ini_stream(in, label, app_name);
+  }
+
+  static ConnectionRegistry from_ini_stream(std::istream& in, const std::string& path,
+                                            const std::string& app_name) {
     ConnectionRegistry reg;
     std::string line, section;
     std::map<std::string, std::vector<std::pair<std::string, std::string>>> raw;
@@ -308,7 +323,7 @@ public:
       if (t.empty() || t[0] == ';' || t[0] == '#') continue;
 
       if (t[0] == '[') {
-        size_t close = t.find(']');
+        size_t const close = t.find(']');
         if (close == std::string::npos)
           throw std::runtime_error(path + ":" + std::to_string(lineno) +
                                    ": unterminated section header");
@@ -324,7 +339,7 @@ public:
         continue;
       }
 
-      size_t eq = t.find('=');
+      size_t const eq = t.find('=');
       if (eq == std::string::npos)
         throw std::runtime_error(path + ":" + std::to_string(lineno) +
                                  ": expected key = value");
@@ -338,7 +353,7 @@ public:
       // Strip an inline comment, but only when unquoted -- a password or an
       // options value may legitimately contain ; or #.
       if (!val.empty() && val.front() != '\'' && val.front() != '"') {
-        size_t c = val.find_first_of(";#");
+        size_t const c = val.find_first_of(";#");
         if (c != std::string::npos) val = detail::trim(val.substr(0, c));
       }
       if (val.size() >= 2 && (val.front() == '\'' || val.front() == '"') &&
@@ -362,7 +377,7 @@ public:
         reg.order_.push_back(sec);
         continue;
       }
-      std::string iname = detail::trim(sec.substr(prefix.size()));
+      std::string const iname = detail::trim(sec.substr(prefix.size()));
       if (iname.empty())
         throw std::runtime_error(path + ": [" + sec + "] has an empty instance name");
       reg.instance_caps_[iname] = build_instance_capacity(iname, raw[sec], path);
@@ -510,8 +525,8 @@ public:
       const char* v = std::getenv(n);
       return v ? detail::trim(v) : std::string{};
     };
-    std::string ram = env("PG_LICHT_HOST_RAM_MB");
-    std::string cpu = env("PG_LICHT_HOST_VCPUS");
+    std::string const ram = env("PG_LICHT_HOST_RAM_MB");
+    std::string const cpu = env("PG_LICHT_HOST_VCPUS");
     if (!ram.empty()) cap.ram_mb = detail::positive_int(ram, "PG_LICHT_HOST_RAM_MB");
     if (!cpu.empty()) cap.vcpus = static_cast<int>(
                         detail::positive_int(cpu, "PG_LICHT_HOST_VCPUS"));
@@ -921,7 +936,17 @@ struct Budgets {
 
     std::ifstream in(path);
     if (!in) throw std::runtime_error("cannot open budgets file: " + path);
+    return parse(in, path, b);
+  }
 
+  // The parser itself, from any stream; `path` only labels the messages. See
+  // ConnectionRegistry::from_ini_text for why it is split from the file.
+  static Budgets parse_text(const std::string& text, const std::string& label) {
+    std::istringstream in(text);
+    return parse(in, label, Budgets{});
+  }
+
+  static Budgets parse(std::istream& in, const std::string& path, Budgets b) {
     std::string line, section;
     size_t lineno = 0;
     while (std::getline(in, line)) {

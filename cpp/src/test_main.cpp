@@ -1738,7 +1738,7 @@ TEST_F(PostgresMCPServerTest, ListSchemasCountsTablesRatherThanNamingThemAll) {
   EXPECT_EQ(g["tables_truncated"].get<bool>(), g["table_count"].get<int>() > 25);
   // The count and the names agree when nothing was dropped.
   if (!g["tables_truncated"].get<bool>()) {
-    EXPECT_EQ(g["tables"].size(), (size_t)g["table_count"].get<int>());
+    EXPECT_EQ(g["tables"].size(), static_cast<size_t>(g["table_count"].get<int>()));
   }
 }
 
@@ -1820,7 +1820,7 @@ TEST_F(PostgresMCPServerTest, PublicationsCountMembersRatherThanNamingThemAll) {
     EXPECT_LE(p["tables"].size(), 50u) << name << " must cap its member names";
     EXPECT_EQ(p["tables_truncated"].get<bool>(), p["table_count"].get<int>() > 50);
     if (!p["tables_truncated"].get<bool>()) {
-      EXPECT_EQ(p["tables"].size(), (size_t)p["table_count"].get<int>()) << name;
+      EXPECT_EQ(p["tables"].size(), static_cast<size_t>(p["table_count"].get<int>())) << name;
     }
   }
 }
@@ -3034,10 +3034,20 @@ TEST_F(PostgresMCPServerTest, DatabaseStatsIncludesCurrentDatabase) {
 
 TEST_F(PostgresMCPServerTest, StatementStatsReturnsHintWhenNotInstalled) {
   json result = srv->call_statement_stats(20);
-  // pg_stat_statements is not in shared_preload_libraries in the test environment.
+  // The fixture's database never creates the extension. Whether the library
+  // is preloaded depends on the server -- the rig preloads it -- and the
+  // answer must say which, since the two have different fixes: CREATE
+  // EXTENSION alone, or a restart first.
   ASSERT_TRUE(result.contains("error"));
-  EXPECT_EQ(result["error"].get<std::string>(), "pg_stat_statements is not installed");
   EXPECT_TRUE(result.contains("hint"));
+  EXPECT_EQ(result.value("extension_created", json()), false) << result.dump(2);
+  if (result.value("library_loaded", json()) == json(true)) {
+    EXPECT_EQ(result["error"].get<std::string>(),
+              "pg_stat_statements is preloaded but not created in this database");
+    EXPECT_EQ(result["hint"].get<std::string>().find("shared_preload_libraries"), std::string::npos);
+  } else {
+    EXPECT_EQ(result["error"].get<std::string>(), "pg_stat_statements is not installed");
+  }
 }
 
 // --- tableBloat ---
@@ -4380,8 +4390,14 @@ TEST_F(PostgresMCPServerTest, ExplainQueryByQueryIdReportsMissingExtension) {
   // StatementStatsReturnsHintWhenNotInstalled passes.
   json r = srv->call_explain_query("123456789", "", json::array(), false, 0);
   ASSERT_TRUE(r.contains("error")) << r.dump(2);
-  EXPECT_EQ(r["error"].get<std::string>(), "pg_stat_statements is not installed");
   EXPECT_TRUE(r.contains("hint"));
+  // Preloaded or not depends on the server (the rig preloads it); either way
+  // the extension is not created here, and the message says which case it is.
+  EXPECT_EQ(r.value("extension_created", json()), false) << r.dump(2);
+  EXPECT_EQ(r["error"].get<std::string>(),
+            r.value("library_loaded", json()) == json(true)
+              ? "pg_stat_statements is preloaded but not created in this database"
+              : "pg_stat_statements is not installed");
 }
 
 // --- explainQuery against a real pg_stat_statements ---
@@ -4842,6 +4858,35 @@ TEST(ConnectionConfigTest, APoolerRouteNeedsItsOwnDbname) {
   ASSERT_EQ(reg.invalid().size(), 1u);
   EXPECT_EQ(reg.invalid()[0].first, "svc");
   EXPECT_NE(reg.invalid()[0].second.find("no dbname"), std::string::npos) << reg.invalid()[0].second;
+}
+
+// The text entry points the fuzzers use parse exactly as the file ones do --
+// shown on the files the project ships.
+TEST(ConnectionConfigTest, TextAndFileParsingAgree) {
+  std::ifstream f(PGLICHT_EXAMPLE_INI);
+  std::stringstream text;
+  text << f.rdbuf();
+  // Through a private copy: the checked-out example is group-readable, which
+  // the file path rightly refuses.
+  TempIni copy(text.str());
+  auto from_file = pglicht::ConnectionRegistry::from_ini(copy.path(), "t");
+  auto from_text = pglicht::ConnectionRegistry::from_ini_text(text.str(), "example.ini", "t");
+  EXPECT_EQ(from_file.names(), from_text.names());
+  EXPECT_EQ(from_file.default_name(), from_text.default_name());
+  for (const auto& n : from_file.names())
+    EXPECT_EQ(from_file.get(n).conninfo, from_text.get(n).conninfo) << n;
+
+  std::ifstream bf(PGLICHT_EXAMPLE_BUDGETS);
+  std::stringstream btext;
+  btext << bf.rdbuf();
+  TempIni bcopy(btext.str());   // the checkout's copy is group-writable
+  const auto b1 = pglicht::Budgets::load(bcopy.path());
+  const auto b2 = pglicht::Budgets::parse_text(btext.str(), "budgets.example.ini");
+  EXPECT_EQ(b1.payload_max_kb, b2.payload_max_kb);
+  EXPECT_EQ(b1.analyze_memory_percent, b2.analyze_memory_percent);
+  EXPECT_EQ(b1.analyze_vcpus_per_worker, b2.analyze_vcpus_per_worker);
+  // The file path keeps its own rules: text has no mode to check.
+  EXPECT_THROW(pglicht::ConnectionRegistry::from_ini_text("", "empty", "t"), std::runtime_error);
 }
 
 // A call naming no connection is a database question, and a console listed
@@ -5630,6 +5675,65 @@ json rpc1(PostgresMCPServer& s, const std::string& method, const json& params) {
   return s.call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", method}, {"params", params}});
 }
 }  // namespace
+
+// A request without an id. Every response was built from req["id"] on a
+// const json, where operator[] on a missing key is undefined behaviour --
+// nlohmann dereferences the map's end -- so such a request read freed memory.
+// A JSON-RPC fuzzer found it within two seconds, on an initialize carrying no
+// id. Being undefined, the old code fails this reliably only under ASan, which
+// reports the read in the sanitizer job; elsewhere it fails when the stray
+// memory does not happen to decode as null.
+TEST_F(PostgresMCPServerTest, ARequestWithoutAnIdIsAnsweredWithANullId) {
+  PostgresMCPServer own(test_url);
+  for (const json& params : {json{{"protocolVersion", "2025-06-18"}, {"capabilities", json::object()},
+                                  {"clientInfo", {{"name", "t"}, {"version", "0"}}}},
+                             json::object()}) {
+    for (const char* method : {"initialize", "tools/list"}) {
+      json r = own.call_rpc({{"jsonrpc", "2.0"}, {"method", method}, {"params", params}});
+      ASSERT_TRUE(r.contains("result")) << method << ": " << r.dump().substr(0, 200);
+      ASSERT_TRUE(r.contains("id")) << method << ": " << r.dump().substr(0, 200);
+      EXPECT_TRUE(r["id"].is_null()) << method << ": " << r.dump().substr(0, 200);
+    }
+    // An unknown method without an id is a notification nobody handles.
+    json none = own.call_rpc({{"jsonrpc", "2.0"}, {"method", "no/such/method"}, {"params", params}});
+    if (none.contains("id")) {
+      EXPECT_TRUE(none["id"].is_null()) << none.dump().substr(0, 200);
+    }
+  }
+  json call = own.call_rpc({{"jsonrpc", "2.0"}, {"method", "tools/call"},
+                            {"params", {{"name", "listSchemas"}, {"arguments", json::object()}}}});
+  ASSERT_TRUE(call.contains("result")) << call.dump().substr(0, 200);
+  ASSERT_TRUE(call.contains("id")) << call.dump().substr(0, 200);
+  EXPECT_TRUE(call["id"].is_null()) << call.dump().substr(0, 200);
+  // An id of any JSON type is echoed as sent.
+  json r = own.call_rpc({{"jsonrpc", "2.0"}, {"id", "abc"}, {"method", "tools/list"}});
+  EXPECT_EQ(r.value("id", json()), "abc");
+}
+
+// An integer argument sent as a number no int can hold. Two tools read theirs
+// with get<int>() unchecked -- statementStats' limit and explainQuery's
+// timeout_ms -- and converting a double outside int's range is undefined
+// behaviour; an hour of the JSON-RPC fuzzer found it. Every other tool takes
+// the default for a non-integer, and now these do. The old code fails this
+// under UBSan, in the sanitizer job.
+TEST_F(PostgresMCPServerTest, AnIntegerArgumentTooLargeForAnIntIsNotConverted) {
+  PostgresMCPServer own(test_url);
+  for (const json& params : {
+           json{{"name", "statementStats"}, {"arguments", {{"limit", 2.9e74}}}},
+           json{{"name", "explainQuery"}, {"arguments", {{"sql", "SELECT 1"}, {"timeout_ms", 2.9e74}}}}}) {
+    json r = own.call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"}, {"params", params}});
+    // Answered as a tool result, whatever it says: not a protocol error.
+    ASSERT_TRUE(r.contains("result")) << r.dump().substr(0, 300);
+  }
+  // An integer that is one, but too large: clamped, never wrapped. 2^32 + 1
+  // used to arrive as 1 -- as a pid, somebody else's backend.
+  EXPECT_EQ(Args(json{{"pid", 4294967297LL}}).num("pid", 0), std::numeric_limits<int>::max());
+  EXPECT_EQ(Args(json{{"pid", -4294967297LL}}).num("pid", 0), std::numeric_limits<int>::min());
+  EXPECT_EQ(Args(json{{"limit", 7}}).num("limit", 20), 7);
+  EXPECT_EQ(Args(json{{"limit", "7"}}).num("limit", 20), 20);
+  EXPECT_EQ(Args(json{{"n", 18446744073709551615ULL}}).bignum("n", 0),
+            std::numeric_limits<long long>::max());
+}
 
 TEST_F(PostgresMCPServerTest, CapabilitiesDeclareTheThreeNewSurfaces) {
   // A private server: initialize sets the negotiated revision for the rest of
@@ -6680,6 +6784,140 @@ std::string PreloadExtTest::url;
 std::set<std::string> PreloadExtTest::usable;
 bool PreloadExtTest::hypopg = false;
 
+// Library loaded, extension not created: the state the pgshard campaign ran
+// in for weeks (pg_wait_sampling preloaded, never created), which this server
+// answered with "not installed" and a hint to preload a library that already
+// was. A database on the same server without the extensions is exactly it.
+TEST_F(PreloadExtTest, APreloadedLibraryWithoutItsExtensionSaysOnlyCreateIsMissing) {
+  if (!have("pg_wait_sampling") || !have("pg_stat_kcache") || !have("pg_qualstats")) return;
+  const std::string bare = dbname + "_bare";
+  {
+    pqxx::nontransaction n(*admin);
+    n.exec("DROP DATABASE IF EXISTS \"" + bare + "\" WITH (FORCE)");
+    n.exec("CREATE DATABASE \"" + bare + "\"");
+  }
+  const std::string bare_url = std::regex_replace(url, std::regex("dbname=\\S+"), "dbname=" + bare);
+  {
+    PostgresMCPServer b(bare_url);
+    for (const auto& [tool, lib] : std::vector<std::pair<json, std::string>>{
+           {b.call_wait_event_profile(), "pg_wait_sampling"},
+           {b.call_statement_kernel_stats(), "pg_stat_kcache"},
+           {b.call_predicate_stats(), "pg_qualstats"}}) {
+      ASSERT_TRUE(tool.contains("error")) << lib << ": " << tool.dump(2);
+      EXPECT_NE(tool["error"].get<std::string>().find("preloaded but not created"), std::string::npos)
+        << lib << ": " << tool.dump(2);
+      EXPECT_EQ(tool["hint"].get<std::string>().find("shared_preload_libraries"), std::string::npos)
+        << lib << ": the hint still says to preload it: " << tool.dump(2);
+      EXPECT_EQ(tool.value("library_loaded", json()), true) << lib;
+    }
+    json p = b.call_check_privileges();
+    ASSERT_TRUE(p.contains("extensions")) << p.dump(2);
+    for (const char* lib : {"pg_wait_sampling", "pg_stat_kcache", "pg_qualstats"}) {
+      const json& e = p["extensions"][lib];
+      EXPECT_EQ(e.value("library_loaded", json()), true) << lib << ": " << e.dump();
+      EXPECT_EQ(e.value("extension_created", json()), false) << lib << ": " << e.dump();
+      EXPECT_EQ(e.value("functional", json()), false) << lib << ": " << e.dump();
+    }
+    bool said = false;
+    for (const auto& d : p.value("denied", json::array()))
+      if (d.value("tool", "") == "waitEventProfile" &&
+          d.value("reason", "").find("preloaded, but the extension is not created") != std::string::npos)
+        said = true;
+    EXPECT_TRUE(said) << p.dump(2);
+  }
+  {
+    pqxx::nontransaction n(*admin);
+    n.exec("DROP DATABASE IF EXISTS \"" + bare + "\" WITH (FORCE)");
+  }
+  // And where they are created: all three facts true.
+  json full = srv->call_check_privileges();
+  for (const char* lib : {"pg_wait_sampling", "pg_stat_kcache", "pg_qualstats"}) {
+    const json& e = full["extensions"][lib];
+    EXPECT_EQ(e.value("library_loaded", json()), true) << lib << ": " << e.dump();
+    EXPECT_EQ(e.value("extension_created", json()), true) << lib << ": " << e.dump();
+    EXPECT_EQ(e.value("functional", json()), true) << lib << ": " << e.dump();
+  }
+}
+
+// A query that fails is reported as failing, never as a fact about the
+// extension. pgshard's own script printed "wait sampling unavailable" when its
+// query broke against a server where wait sampling worked (October 2026); this
+// server's promise is the opposite, and this holds it to it. The failure here
+// is real and deterministic: another session holds the extension's view under
+// ACCESS EXCLUSIVE, and the tool's connection has a short statement_timeout.
+TEST_F(PreloadExtTest, AFailedQueryIsAnErrorNeverAnExtensionState) {
+  if (!have("pg_wait_sampling")) return;
+  pqxx::connection holder(url);
+  pqxx::work h(holder);
+  const std::string sch = h.query_value<std::string>(
+    "SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace "
+    "WHERE e.extname = 'pg_wait_sampling'");
+  h.exec("LOCK TABLE " + h.quote_name(sch) + ".pg_wait_sampling_profile IN ACCESS EXCLUSIVE MODE");
+
+  std::string ini;
+  {
+    std::istringstream in(url);
+    std::string tok;
+    ini = "[default]\nstatement_timeout_ms = 300\n";
+    while (in >> tok) {
+      const auto eq = tok.find('=');
+      if (eq != std::string::npos) ini += tok.substr(0, eq) + " = " + tok.substr(eq + 1) + "\n";
+    }
+  }
+  TempIni f(ini);
+  PostgresMCPServer s(pglicht::ConnectionRegistry::from_ini(f.path(), "pg-licht-test"));
+  json r = s.call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                       {"params", {{"name", "waitEventProfile"}, {"arguments", json::object()}}}});
+  h.abort();
+  const std::string text = r.dump();
+  ASSERT_TRUE(r.contains("result")) << text;
+  EXPECT_TRUE(r["result"].value("isError", false)) << "a failed query was not an error: " << text;
+  EXPECT_NE(text.find("statement_timeout"), std::string::npos) << text;
+  for (const char* state : {"not installed", "not created", "not in shared_preload_libraries",
+                            "too old", "unavailable"})
+    EXPECT_EQ(text.find(state), std::string::npos) << "reported as an extension state: " << state;
+}
+
+// pg_stat_kcache's counters mean what the platform makes them mean (see
+// kernel_counters_for_platform): on Linux the user/system split and the byte
+// counts are reported; elsewhere they are null with the reason, so a sampled
+// 0.000 cannot be read as a measurement. cpu_time_s, their sum, everywhere.
+// The platform is the server's, so this checks whichever one it runs against
+// -- the rig is Linux; a FreeBSD server is the other half.
+TEST_F(PreloadExtTest, KernelCountersAreReportedOnlyWhereThePlatformMeasuresThem) {
+  if (!have("pg_stat_kcache")) return;
+  {
+    pqxx::connection c(url);
+    pqxx::nontransaction n(c);
+    n.exec("SELECT count(*) FROM generate_series(1, 2000000)");
+  }
+  json k = srv->call_statement_kernel_stats(50);
+  ASSERT_FALSE(k.contains("error")) << k.dump(2);
+  ASSERT_TRUE(k.contains("platform")) << k.dump(2);
+  const std::string platform = k["platform"].get<std::string>();
+  const bool linux_server = platform.find("linux") != std::string::npos;
+  ASSERT_FALSE(k["statements"].empty()) << k.dump(2);
+  for (const auto& st : k["statements"]) {
+    const json& e = st["exec"];
+    ASSERT_TRUE(e.contains("cpu_time_s")) << e.dump();
+    if (linux_server) {
+      ASSERT_TRUE(e["user_time_s"].is_number()) << e.dump();
+      EXPECT_NEAR(e["cpu_time_s"].get<double>(),
+                  e["user_time_s"].get<double>() + e["system_time_s"].get<double>(), 1e-9);
+    } else {
+      for (const char* f : {"user_time_s", "system_time_s", "reads_bytes", "writes_bytes"})
+        EXPECT_TRUE(e[f].is_null()) << platform << ": " << f << " arrived as data: " << e.dump();
+    }
+  }
+  if (linux_server) {
+    EXPECT_FALSE(k.contains("unavailable")) << k.dump(2);
+  } else {
+    ASSERT_TRUE(k.contains("unavailable")) << k.dump(2);
+    EXPECT_TRUE(k["unavailable"].contains("user_time_s, system_time_s")) << k.dump(2);
+    EXPECT_TRUE(k["unavailable"].contains("reads_bytes, writes_bytes")) << k.dump(2);
+  }
+}
+
 // The profile is summed, not returned raw -- one row per pid, event and
 // queryid grows for as long as the server runs -- and a sample count is only
 // a time once multiplied by the collector's period, so both must agree.
@@ -7068,6 +7306,8 @@ TEST_F(PostgresMCPServerTest, CheckPrivilegesSeparatesNotInstalledFromNotPermitt
   for (const auto& d : r.value("denied", json::array())) {
     const std::string reason = d["reason"].get<std::string>();
     const bool classified = reason.find("not installed") != std::string::npos ||
+                            // preloaded, not created: CREATE EXTENSION, still not a grant
+                            reason.find("not created") != std::string::npos ||
                             reason.find("restricted to") != std::string::npos ||
                             reason.find("readable only by") != std::string::npos;
     EXPECT_TRUE(classified) << d["tool"] << ": " << reason;
@@ -7691,6 +7931,16 @@ TEST_F(TopologyFixture, VerifyTopologyAcceptsATrueInstanceDeclaration) {
   EXPECT_EQ(v["connections"][0]["instance"], "pg-01");
 }
 
+namespace {
+// The rig's PgBouncer host: 127.0.0.1 when the rig runs the suite itself, the
+// rig's address when it is served to a client elsewhere (RIG_HOST, written as
+// POOLER_HOST) -- the FreeBSD client against the Linux rig.
+std::string pooler_host() {
+  const char* h = std::getenv("POOLER_HOST");
+  return h && *h ? h : "127.0.0.1";
+}
+}  // namespace
+
 // One postmaster reached directly and through a pooler on its own machine
 // reports two server addresses: inet_server_addr() behind PgBouncer is the
 // pooler's hop, 127.0.0.1. Through 4.4 that read as two servers and a correct
@@ -7701,7 +7951,7 @@ TEST_F(TopologyFixture, VerifyTopologyKnowsOneServerReachedThroughItsPooler) {
   if (!alt || !pool)
     GTEST_SKIP() << "no ALT_ADDR_URL: run cpp/test/run-pooled-tests.sh, and on FreeBSD first "
                     "ifconfig lo0 alias 127.0.0.2/32";
-  const std::string pooled = "host=127.0.0.1 port=" + std::string(pool) +
+  const std::string pooled = "host=" + pooler_host() + " port=" + std::string(pool) +
                              " dbname=pglicht user=pglicht";
   auto s = server_from(section("direct", alt, "instance = pg-01\n") +
                        section("pooled", pooled, "instance = pg-01\n"));
@@ -8264,7 +8514,7 @@ std::string pooler_section(const std::string& name, const std::string& extra = "
   const char* port = std::getenv("POOLER_PORT");
   const char* user = std::getenv("POOLER_USER");
   if (!port || !user) return "";
-  return "[" + name + "]\nkind = pgbouncer\nhost = 127.0.0.1\nport = " + port +
+  return "[" + name + "]\nkind = pgbouncer\nhost = " + pooler_host() + "\nport = " + port +
          "\nuser = " + user + "\n" + extra;
 }
 }  // namespace
@@ -8616,7 +8866,7 @@ TEST_F(TopologyFixture, AConsoleConfiguredAsADatabaseIsNamedAsOne) {
   const char* port = std::getenv("POOLER_PORT");
   const char* user = std::getenv("POOLER_USER");
   if (!port || !user) GTEST_SKIP() << "no POOLER_PORT; run cpp/test/run-pooled-tests.sh";
-  auto s = server_from(ini_with("") + "[console]\nhost = 127.0.0.1\nport = " + port +
+  auto s = server_from(ini_with("") + "[console]\nhost = " + pooler_host() + "\nport = " + port +
                        "\ndbname = pgbouncer\nuser = " + user + "\n");
 
   json r = rpc_call(*s, "listSchemas", {{"connection", "console"}});
@@ -8675,12 +8925,12 @@ TEST_F(TopologyFixture, APooledConnectionIsCheckedAgainstItsRoute) {
   if (!alt || !port || pool.empty())
     GTEST_SKIP() << "no ALT_ADDR_URL or pooler: run cpp/test/run-pooled-tests.sh, and on "
                     "FreeBSD first ifconfig lo0 alias 127.0.0.2/32";
-  const std::string via = "[pooled]\nhost = 127.0.0.1\nport = " + std::string(port) +
+  const std::string via = "[pooled]\nhost = " + pooler_host() + "\nport = " + std::string(port) +
                           "\ndbname = pglicht\nuser = pglicht\ninstance = pg-01\n"
                           "pooler = pool\ngroup = g\n";
-  const std::string alias = "[aliased]\nhost = 127.0.0.1\nport = " + std::string(port) +
+  const std::string alias = "[aliased]\nhost = " + pooler_host() + "\nport = " + std::string(port) +
                             "\ndbname = licht_saturate\nuser = pglicht\npooler = pool\n";
-  const std::string lost = "[lost]\nhost = 127.0.0.1\nport = " + std::string(port) +
+  const std::string lost = "[lost]\nhost = " + pooler_host() + "\nport = " + std::string(port) +
                            "\ndbname = no_such_route\nuser = pglicht\npooler = pool\n";
   auto s = server_from(section("direct", alt, "instance = pg-01\ngroup = g\n") + via +
                        alias + pool);
@@ -8724,7 +8974,7 @@ TEST_F(TopologyFixture, APooledConnectionIsCheckedAgainstItsRoute) {
 
   // A route that forces another user keeps both: that user may see another
   // database's worth of rows, grants and objects.
-  const std::string forced = "[forced]\nhost = 127.0.0.1\nport = " + std::string(port) +
+  const std::string forced = "[forced]\nhost = " + pooler_host() + "\nport = " + std::string(port) +
                              "\ndbname = licht_forced\nuser = pglicht\ninstance = pg-01\n"
                              "pooler = pool\ngroup = f\n";
   auto fs = server_from(section("direct", alt, "instance = pg-01\ngroup = f\n") + forced + pool);
@@ -8735,33 +8985,67 @@ TEST_F(TopologyFixture, APooledConnectionIsCheckedAgainstItsRoute) {
   // An inferred instance is only a shared host and port -- two names on one
   // PgBouncer port share it while the pooler may route them anywhere -- so it
   // never licenses the collapse. Neither section declares an instance here.
-  const std::string inferred_pooled = "[ip]\nhost = 127.0.0.1\nport = " + std::string(port) +
+  const std::string inferred_pooled = "[ip]\nhost = " + pooler_host() + "\nport = " + std::string(port) +
                                       "\ndbname = licht_saturate\nuser = pglicht\npooler = pool\n"
                                       "group = i\n";
-  const std::string inferred_other = "[io]\nhost = 127.0.0.1\nport = " + std::string(port) +
+  const std::string inferred_other = "[io]\nhost = " + pooler_host() + "\nport = " + std::string(port) +
                                      "\ndbname = pglicht\nuser = pglicht\ngroup = i\n";
   auto is = server_from(ini_with("") + inferred_pooled + inferred_other + pool);
   json ip = rpc_payload(rpc_call(*is, "listSchemas", {{"group", "i"}}));
   EXPECT_EQ(ip["members"].size(), 2u) << "collapsed on an inferred instance: " << ip.dump(2);
 
-  // A name with no entry of its own is routed by the '*' fallback -- the
-  // rig's PgBouncer has one -- so the connection fails on the server's
-  // "database does not exist", with the route reported beside it. PgBouncer
-  // registers a fallback database as its own entry the moment a client asks
-  // for it, and verifyTopology connects before it reads the route, so the
-  // entry is found by name here rather than through '*'.
+  // A name with no entry of its own, behind a PgBouncer with a '*' fallback
+  // (the rig's). SHOW DATABASES never lists the fallback, and lists the name
+  // only while PgBouncer keeps the database it created for it -- which it may
+  // drop after the failed login. Either way it must not be called unroutable:
+  // through 4.5 it was an error saying there was no fallback, which the
+  // console cannot know.
   auto l = server_from(ini_with("") + lost + pool);
   json lv = l->call_verify_topology();
   bool reported = false;
   for (const auto& c : lv["connections"]) {
     if (c["connection"] != "lost") continue;
     reported = true;
-    EXPECT_TRUE(c.contains("error")) << c.dump(2);
+    EXPECT_TRUE(c.contains("error")) << c.dump(2);   // the database does not exist
     ASSERT_TRUE(c.contains("route")) << c.dump(2);
-    EXPECT_TRUE(c["route"].value("found", false)) << c.dump(2);
-    EXPECT_EQ(c["route"].value("backend_database", ""), "no_such_route") << c.dump(2);
+    if (c["route"].value("found", false)) {
+      EXPECT_EQ(c["route"].value("backend_database", ""), "no_such_route") << c.dump(2);
+    }
+    EXPECT_FALSE(c["route"].contains("via_fallback")) << c.dump(2);
   }
   EXPECT_TRUE(reported) << lv.dump(2);
+  for (const auto& f : lv["findings"]) {
+    if (f["name"] != "lost" || f["topic"] != "pooler") continue;
+    EXPECT_NE(f["severity"], "error") << "a route the console cannot see called an error: " << f.dump(2);
+    EXPECT_EQ(f["detail"].get<std::string>().find("no '*' fallback"), std::string::npos) << f.dump(2);
+  }
+
+  // The same, where it does not depend on what PgBouncer still remembers: a
+  // name nobody ever asked the pooler for, on a connection that works. The
+  // section goes straight to the server -- which earns its own warning -- so
+  // the console cannot have created an entry for template1, and through 4.5.1
+  // this was, every time, the error that there was no fallback.
+  const std::string direct_t1 =
+      std::regex_replace(std::string(alt), std::regex(R"(\bdbname=\S+)"), "dbname=template1");
+  ASSERT_NE(direct_t1.find("dbname=template1"), std::string::npos) << direct_t1;
+  auto u = server_from(ini_with("") + section("unlisted", direct_t1, "pooler = pool\n") + pool);
+  json uv = u->call_verify_topology();
+  bool said = false;
+  for (const auto& c : uv["connections"]) {
+    if (c["connection"] != "unlisted") continue;
+    EXPECT_FALSE(c.contains("error")) << c.dump(2);
+    ASSERT_TRUE(c.contains("route")) << c.dump(2);
+    EXPECT_FALSE(c["route"].value("found", true)) << c.dump(2);
+  }
+  for (const auto& f : uv["findings"]) {
+    if (f["name"] != "unlisted" || f["topic"] != "pooler") continue;
+    EXPECT_NE(f["severity"], "error") << f.dump(2);
+    if (f["detail"].get<std::string>().find("lists no [databases] entry") != std::string::npos) {
+      EXPECT_EQ(f["severity"], "info") << f.dump(2);
+      said = true;
+    }
+  }
+  EXPECT_TRUE(said) << "an unlisted name on a working connection was not reported: " << uv.dump(2);
 }
 
 // The console itself, in the rig: the answers are real, the stats user can
@@ -8841,7 +9125,7 @@ TEST_F(TopologyFixture, PoolerToolsReadTheConsole) {
 TEST_F(TopologyFixture, PoolerStatusSeesAClientWaitingForAServer) {
   const std::string pool = pooler_section("pool");
   if (pool.empty()) GTEST_SKIP() << "no POOLER_PORT; run cpp/test/run-pooled-tests.sh";
-  const std::string through = "host=127.0.0.1 port=" + std::string(std::getenv("POOLER_PORT")) +
+  const std::string through = "host=" + pooler_host() + " port=" + std::string(std::getenv("POOLER_PORT")) +
                               " dbname=licht_saturate user=pglicht";
   std::mutex m;
   std::vector<std::string> failures;
@@ -9018,7 +9302,7 @@ TEST_F(PostgresMCPServerTest, EveryToolAcceptsItsOwnDocumentedArguments) {
   std::unique_ptr<PostgresMCPServer> pooler;
   if (const char* port = std::getenv("POOLER_PORT"))
     if (const char* user = std::getenv("POOLER_USER"))
-      pooler = server_from("[pool]\nkind = pgbouncer\nhost = 127.0.0.1\nport = " +
+      pooler = server_from("[pool]\nkind = pgbouncer\nhost = " + pooler_host() + "\nport = " +
                            std::string(port) + "\nuser = " + user + "\n");
 
   size_t called = 0, pooler_unchecked = 0;
