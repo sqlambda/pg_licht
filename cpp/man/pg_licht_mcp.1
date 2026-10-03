@@ -814,6 +814,27 @@ still hold
 .Ic SELECT
 on some tables and not others.
 .Pp
+.Va extensions
+reports the four extensions that need
+.Va shared_preload_libraries
+\(em
+.Li pg_stat_statements ,
+.Li pg_wait_sampling ,
+.Li pg_stat_kcache
+and
+.Li pg_qualstats
+\(em as three separate facts each:
+.Va library_loaded ,
+.Va extension_created
+in this database, and
+.Va functional ,
+whether its view answers a read, with the reason when it does not.
+The state that goes unnoticed is a mismatch between them: a library preloaded
+whose extension was never created needs only
+.Ic CREATE EXTENSION ,
+no restart, and the extension operations say so in that case rather than
+calling it not installed.
+.Pp
 An absent extension is distinguished from a missing privilege, because the two
 send an operator to different fixes.
 .Pp

@@ -1432,6 +1432,28 @@ private:
            w.find("wasn't initialized") != std::string::npos;
   }
 
+  // An extension that is not created, told apart from one whose library is
+  // not loaded either. The pgshard campaign (October 2026) ran for weeks with
+  // pg_wait_sampling preloaded but never created -- its FreeBSD configuration
+  // disabled the extension while preloading the library -- and this server
+  // answered "pg_wait_sampling is not installed" with a hint to add it to
+  // shared_preload_libraries, where it already was. The library's own
+  // setting is defined in every backend once it is loaded, created or not, so
+  // preload_state can tell the two apart from any database.
+  static json missing_extension(pqxx::work& txn, const std::string& lib,
+                                const std::string& probe_setting, bool after_pgss) {
+    const json loaded = preload_state(txn, lib, probe_setting);
+    if (loaded.is_boolean() && loaded.get<bool>())
+      return {{"error", lib + " is preloaded but not created in this database"},
+              {"hint", "The library is already loaded, so no restart is needed: run, "
+                       "in this database, CREATE EXTENSION " + lib + ";"},
+              {"library_loaded", true}, {"extension_created", false}};
+    json out = lib == "pg_stat_statements" ? pgss_missing() : preload_missing(lib, after_pgss);
+    out["library_loaded"] = loaded;
+    out["extension_created"] = false;
+    return out;
+  }
+
   static std::string preload_hint(const std::string& lib, bool after_pgss) {
     return "Add '" + lib + "' to shared_preload_libraries in postgresql.conf" +
            (after_pgss ? ", after 'pg_stat_statements'" : "") +
@@ -2686,7 +2708,7 @@ private:
       {"checkPrivileges",        schema_fixed("Which tools this role can use on this connection.",
                                    {{"connection", "string"}, {"role", "string"},
                                     {"tools", "integer"}, {"available", "integer"},
-                                    {"degraded", "array"}, {"denied", "array"}})},
+                                    {"degraded", "array"}, {"denied", "array"}, {"extensions", "object"}})},
       {"currentLocks",           schema_fixed("Lock rows, newest blocking chain first.",
                                    {{"locks", "array"}})},
       {"listConnections",        schema_fixed("The configured connection registry.",
@@ -3733,7 +3755,8 @@ private:
     // outcome the 42P01 catch below reports -- it is checked up front so the
     // caller gets that answer whatever their search_path looks like.
     const std::string pgss = extension_schema(txn, "pg_stat_statements");
-    if (pgss.empty()) return pgss_missing();
+    if (pgss.empty())
+      return missing_extension(txn, "pg_stat_statements", "pg_stat_statements.max", false);
 
     // pg_stat_statements_info.dealloc counts how many times the extension has
     // evicted its least-used entries because pg_stat_statements.max was
@@ -3873,7 +3896,8 @@ private:
     pqxx::work& txn = sess.txn();
 
     const std::string ext = extension_schema(txn, "pg_wait_sampling");
-    if (ext.empty()) return preload_missing("pg_wait_sampling", false);
+    if (ext.empty())
+      return missing_extension(txn, "pg_wait_sampling", "pg_wait_sampling.profile_period", false);
     // 1.0's profile has no queryid column.
     const std::string ver = extension_version(txn, "pg_wait_sampling");
     if (!extversion_at_least(ver, 1, 1)) return too_old("pg_wait_sampling", ver, "1.1");
@@ -3971,7 +3995,8 @@ private:
     pqxx::work& txn = sess.txn();
 
     const std::string ext = extension_schema(txn, "pg_stat_kcache");
-    if (ext.empty()) return preload_missing("pg_stat_kcache", true);
+    if (ext.empty())
+      return missing_extension(txn, "pg_stat_kcache", "pg_stat_kcache.track", true);
     // 2.1 had one set of counters with no plan/exec split and no `top`.
     const std::string ver = extension_version(txn, "pg_stat_kcache");
     if (!extversion_at_least(ver, 2, 2)) return too_old("pg_stat_kcache", ver, "2.2");
@@ -4085,7 +4110,8 @@ private:
     pqxx::work& txn = sess.txn();
 
     const std::string ext = extension_schema(txn, "pg_qualstats");
-    if (ext.empty()) return preload_missing("pg_qualstats", false);
+    if (ext.empty())
+      return missing_extension(txn, "pg_qualstats", "pg_qualstats.max", false);
     const std::string ver = extension_version(txn, "pg_qualstats");
     if (!extversion_at_least(ver, 2, 0)) return too_old("pg_qualstats", ver, "2.0");
     const json preloaded = preload_state(txn, "pg_qualstats", "pg_qualstats.max");
@@ -4214,7 +4240,8 @@ private:
     pqxx::work& txn = sess.txn();
 
     const std::string ext = extension_schema(txn, "pg_qualstats");
-    if (ext.empty()) return preload_missing("pg_qualstats", false);
+    if (ext.empty())
+      return missing_extension(txn, "pg_qualstats", "pg_qualstats.max", false);
     const std::string ver = extension_version(txn, "pg_qualstats");
     // Before 2.1 the advisor returned bare arrays of strings rather than
     // {ddl, queryids} objects, and ->> on a string is NULL without an error --
@@ -6079,7 +6106,8 @@ private:
       // Schema-qualified from pg_extension rather than left to search_path;
       // see extension_schema.
       const std::string pgss = extension_schema(txn, "pg_stat_statements");
-      if (pgss.empty()) return pgss_missing();
+      if (pgss.empty())
+        return missing_extension(txn, "pg_stat_statements", "pg_stat_statements.max", false);
 
       // Full, untruncated text: recovering it is the whole point of the
       // queryid path, so this deliberately omits statementStats' LEFT(query,500).
@@ -8886,9 +8914,12 @@ private:
     auto preload_deny = [&](const char* ext, const char* probe,
                             std::initializer_list<const char*> tools) {
       const bool installed = !extension_schema(txn, ext).empty();
-      const json loaded = installed ? preload_state(txn, ext, probe) : json(nullptr);
+      const json loaded = preload_state(txn, ext, probe);
       for (const char* t : tools) {
-        if (!installed)
+        if (!installed && loaded.is_boolean() && loaded.get<bool>())
+          deny(t, std::string("the ") + ext + " library is preloaded, but the extension "
+                  "is not created in this database: CREATE EXTENSION " + ext + ";");
+        else if (!installed)
           deny(t, std::string("the ") + ext + " extension is not installed");
         else if (loaded.is_boolean() && !loaded.get<bool>())
           deny(t, std::string("the ") + ext + " extension is installed but not in "
@@ -8911,8 +8942,13 @@ private:
                                       "pg_stat_statements hides their queryid; the kernel "
                                       "counters beside them are complete");
 
-    if (!has_pgss)
-      deny("statementStats", "the pg_stat_statements extension is not installed");
+    if (!has_pgss) {
+      const json loaded = preload_state(txn, "pg_stat_statements", "pg_stat_statements.max");
+      deny("statementStats", loaded.is_boolean() && loaded.get<bool>()
+        ? "the pg_stat_statements library is preloaded, but the extension is not "
+          "created in this database: CREATE EXTENSION pg_stat_statements;"
+        : "the pg_stat_statements extension is not installed");
+    }
     else if (!stats)
       degrade("statementStats", "the query text of statements run by other roles "
                                 "is replaced with <insufficient privilege>; the "
@@ -8984,6 +9020,46 @@ private:
     };
     if (!degraded.empty()) out["degraded"] = degraded;
     if (!denied.empty())   out["denied"]   = denied;
+
+    // The preload-backed extensions, as three facts each -- library loaded,
+    // extension created in this database, and functional (its view answers)
+    // -- because the interesting state is a mismatch between them, and that
+    // is the state that goes unnoticed: the pgshard campaign ran FreeBSD
+    // cells for weeks with pg_wait_sampling loaded and never created. Each
+    // probe runs in a savepoint, so one that fails costs only itself.
+    // pg_qualstats without its preload answers from this backend alone, which
+    // is not functional however the read goes.
+    struct Probe { const char* lib; const char* setting; const char* read; };
+    static const Probe kProbes[] = {
+      {"pg_stat_statements", "pg_stat_statements.max", "pg_stat_statements(false)"},
+      {"pg_wait_sampling", "pg_wait_sampling.profile_period", "pg_wait_sampling_profile"},
+      {"pg_stat_kcache", "pg_stat_kcache.track", "pg_stat_kcache()"},
+      {"pg_qualstats", "pg_qualstats.max", "pg_qualstats()"},
+    };
+    json exts = json::object();
+    for (const auto& pr : kProbes) {
+      const std::string sch = extension_schema(txn, pr.lib);
+      const json loaded = preload_state(txn, pr.lib, pr.setting);
+      json e = {{"library_loaded", loaded}, {"extension_created", !sch.empty()}};
+      if (sch.empty()) {
+        e["functional"] = false;
+      } else if (loaded.is_boolean() && !loaded.get<bool>()) {
+        e["functional"] = false;
+        e["reason"] = "not in shared_preload_libraries";
+      } else {
+        try {
+          pqxx::subtransaction sub{txn};
+          sub.exec("SELECT 1 FROM " + sch + "." + pr.read + " LIMIT 1");
+          sub.commit();
+          e["functional"] = true;
+        } catch (const std::exception& ex) {
+          e["functional"] = false;
+          e["reason"] = std::string(ex.what()).substr(0, 300);
+        }
+      }
+      exts[pr.lib] = e;
+    }
+    out["extensions"] = exts;
     return out;
   }
 

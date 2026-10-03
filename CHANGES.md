@@ -25,6 +25,24 @@
   has a `*` fallback, once a test happened to read the route after PgBouncer
   had dropped the name.
 
+### Extension state
+
+- **"Preloaded but not created" is told apart from "not installed".** The
+  extension operations answered a library that was preloaded but whose
+  extension was never created with "not installed" and a hint to add it to
+  `shared_preload_libraries` -- where it already was. The pgshard
+  measurement campaign (October 2026) ran FreeBSD cells for weeks in exactly
+  that state with pg_wait_sampling, giving up wait data for nothing. Now
+  `waitEventProfile`, `statementKernelStats`, `predicateStats`,
+  `suggestIndexes`, `statementStats` and `explainQuery` say "preloaded but not
+  created in this database", with `CREATE EXTENSION` as the whole fix, and
+  report `library_loaded` and `extension_created`; `checkPrivileges` gives the
+  same reason.
+- **`checkPrivileges` reports `extensions`**: for each of the four
+  preload-backed extensions, `library_loaded`, `extension_created` and
+  `functional` (its view answers a read, probed in a savepoint, with the
+  reason when not), so a mismatch between them is visible in one call.
+
 ### Testing
 
 - **FreeBSD 14.5 and 15.1 are tested in CI, against the full Linux rig.**

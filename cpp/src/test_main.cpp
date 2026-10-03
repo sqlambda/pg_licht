@@ -3034,10 +3034,20 @@ TEST_F(PostgresMCPServerTest, DatabaseStatsIncludesCurrentDatabase) {
 
 TEST_F(PostgresMCPServerTest, StatementStatsReturnsHintWhenNotInstalled) {
   json result = srv->call_statement_stats(20);
-  // pg_stat_statements is not in shared_preload_libraries in the test environment.
+  // The fixture's database never creates the extension. Whether the library
+  // is preloaded depends on the server -- the rig preloads it -- and the
+  // answer must say which, since the two have different fixes: CREATE
+  // EXTENSION alone, or a restart first.
   ASSERT_TRUE(result.contains("error"));
-  EXPECT_EQ(result["error"].get<std::string>(), "pg_stat_statements is not installed");
   EXPECT_TRUE(result.contains("hint"));
+  EXPECT_EQ(result.value("extension_created", json()), false) << result.dump(2);
+  if (result.value("library_loaded", json()) == json(true)) {
+    EXPECT_EQ(result["error"].get<std::string>(),
+              "pg_stat_statements is preloaded but not created in this database");
+    EXPECT_EQ(result["hint"].get<std::string>().find("shared_preload_libraries"), std::string::npos);
+  } else {
+    EXPECT_EQ(result["error"].get<std::string>(), "pg_stat_statements is not installed");
+  }
 }
 
 // --- tableBloat ---
@@ -4380,8 +4390,14 @@ TEST_F(PostgresMCPServerTest, ExplainQueryByQueryIdReportsMissingExtension) {
   // StatementStatsReturnsHintWhenNotInstalled passes.
   json r = srv->call_explain_query("123456789", "", json::array(), false, 0);
   ASSERT_TRUE(r.contains("error")) << r.dump(2);
-  EXPECT_EQ(r["error"].get<std::string>(), "pg_stat_statements is not installed");
   EXPECT_TRUE(r.contains("hint"));
+  // Preloaded or not depends on the server (the rig preloads it); either way
+  // the extension is not created here, and the message says which case it is.
+  EXPECT_EQ(r.value("extension_created", json()), false) << r.dump(2);
+  EXPECT_EQ(r["error"].get<std::string>(),
+            r.value("library_loaded", json()) == json(true)
+              ? "pg_stat_statements is preloaded but not created in this database"
+              : "pg_stat_statements is not installed");
 }
 
 // --- explainQuery against a real pg_stat_statements ---
@@ -6737,6 +6753,61 @@ std::string PreloadExtTest::url;
 std::set<std::string> PreloadExtTest::usable;
 bool PreloadExtTest::hypopg = false;
 
+// Library loaded, extension not created: the state the pgshard campaign ran
+// in for weeks (pg_wait_sampling preloaded, never created), which this server
+// answered with "not installed" and a hint to preload a library that already
+// was. A database on the same server without the extensions is exactly it.
+TEST_F(PreloadExtTest, APreloadedLibraryWithoutItsExtensionSaysOnlyCreateIsMissing) {
+  if (!have("pg_wait_sampling") || !have("pg_stat_kcache") || !have("pg_qualstats")) return;
+  const std::string bare = dbname + "_bare";
+  {
+    pqxx::nontransaction n(*admin);
+    n.exec("DROP DATABASE IF EXISTS \"" + bare + "\" WITH (FORCE)");
+    n.exec("CREATE DATABASE \"" + bare + "\"");
+  }
+  const std::string bare_url = std::regex_replace(url, std::regex("dbname=\\S+"), "dbname=" + bare);
+  {
+    PostgresMCPServer b(bare_url);
+    for (const auto& [tool, lib] : std::vector<std::pair<json, std::string>>{
+           {b.call_wait_event_profile(), "pg_wait_sampling"},
+           {b.call_statement_kernel_stats(), "pg_stat_kcache"},
+           {b.call_predicate_stats(), "pg_qualstats"}}) {
+      ASSERT_TRUE(tool.contains("error")) << lib << ": " << tool.dump(2);
+      EXPECT_NE(tool["error"].get<std::string>().find("preloaded but not created"), std::string::npos)
+        << lib << ": " << tool.dump(2);
+      EXPECT_EQ(tool["hint"].get<std::string>().find("shared_preload_libraries"), std::string::npos)
+        << lib << ": the hint still says to preload it: " << tool.dump(2);
+      EXPECT_EQ(tool.value("library_loaded", json()), true) << lib;
+    }
+    json p = b.call_check_privileges();
+    ASSERT_TRUE(p.contains("extensions")) << p.dump(2);
+    for (const char* lib : {"pg_wait_sampling", "pg_stat_kcache", "pg_qualstats"}) {
+      const json& e = p["extensions"][lib];
+      EXPECT_EQ(e.value("library_loaded", json()), true) << lib << ": " << e.dump();
+      EXPECT_EQ(e.value("extension_created", json()), false) << lib << ": " << e.dump();
+      EXPECT_EQ(e.value("functional", json()), false) << lib << ": " << e.dump();
+    }
+    bool said = false;
+    for (const auto& d : p.value("denied", json::array()))
+      if (d.value("tool", "") == "waitEventProfile" &&
+          d.value("reason", "").find("preloaded, but the extension is not created") != std::string::npos)
+        said = true;
+    EXPECT_TRUE(said) << p.dump(2);
+  }
+  {
+    pqxx::nontransaction n(*admin);
+    n.exec("DROP DATABASE IF EXISTS \"" + bare + "\" WITH (FORCE)");
+  }
+  // And where they are created: all three facts true.
+  json full = srv->call_check_privileges();
+  for (const char* lib : {"pg_wait_sampling", "pg_stat_kcache", "pg_qualstats"}) {
+    const json& e = full["extensions"][lib];
+    EXPECT_EQ(e.value("library_loaded", json()), true) << lib << ": " << e.dump();
+    EXPECT_EQ(e.value("extension_created", json()), true) << lib << ": " << e.dump();
+    EXPECT_EQ(e.value("functional", json()), true) << lib << ": " << e.dump();
+  }
+}
+
 // The profile is summed, not returned raw -- one row per pid, event and
 // queryid grows for as long as the server runs -- and a sample count is only
 // a time once multiplied by the collector's period, so both must agree.
@@ -7125,6 +7196,8 @@ TEST_F(PostgresMCPServerTest, CheckPrivilegesSeparatesNotInstalledFromNotPermitt
   for (const auto& d : r.value("denied", json::array())) {
     const std::string reason = d["reason"].get<std::string>();
     const bool classified = reason.find("not installed") != std::string::npos ||
+                            // preloaded, not created: CREATE EXTENSION, still not a grant
+                            reason.find("not created") != std::string::npos ||
                             reason.find("restricted to") != std::string::npos ||
                             reason.find("readable only by") != std::string::npos;
     EXPECT_TRUE(classified) << d["tool"] << ": " << reason;
