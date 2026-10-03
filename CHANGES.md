@@ -1,5 +1,28 @@
 # Changelog
 
+## 4.5.2 (2026-10-03)
+
+### Fixed
+
+- **A request without an id read invalid memory.** The server built every
+  response from `req["id"]` on a const JSON object, where a missing key is
+  undefined behaviour: nlohmann dereferences the map's end. A request with no
+  id -- a notification, in JSON-RPC terms, which a client may send for any
+  method -- therefore read freed memory (under ASan, a heap-use-after-free in
+  `send_response`). Present in every release before this one; found by a
+  JSON-RPC fuzzer within two seconds of its first run, on an `initialize`
+  carrying no id. Such a request is now answered with a null id.
+
+- **`verifyTopology` called a working route "unroutable".** A database
+  section declaring `pooler =` whose name the console did not list was
+  reported as an error: "no `[databases]` entry ... and no `*` fallback".
+  But PgBouncer's `SHOW DATABASES` never lists a `*` fallback -- only
+  explicit entries, and names a fallback has created, which it may drop again
+  after a failed login -- so the console cannot say there is none. It is now
+  information when the connection through the pooler works, and a warning
+  naming the connection's own error when it does not. The `via_fallback`
+  field, which could never be set, is gone.
+
 ## 4.5.1 (2026-09-28)
 
 ### Fixed

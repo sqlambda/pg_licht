@@ -8772,24 +8772,31 @@ TEST_F(TopologyFixture, APooledConnectionIsCheckedAgainstItsRoute) {
   json ip = rpc_payload(rpc_call(*is, "listSchemas", {{"group", "i"}}));
   EXPECT_EQ(ip["members"].size(), 2u) << "collapsed on an inferred instance: " << ip.dump(2);
 
-  // A name with no entry of its own is routed by the '*' fallback -- the
-  // rig's PgBouncer has one -- so the connection fails on the server's
-  // "database does not exist", with the route reported beside it. PgBouncer
-  // registers a fallback database as its own entry the moment a client asks
-  // for it, and verifyTopology connects before it reads the route, so the
-  // entry is found by name here rather than through '*'.
+  // A name with no entry of its own, behind a PgBouncer with a '*' fallback
+  // (the rig's). SHOW DATABASES never lists the fallback, and lists the name
+  // only while PgBouncer keeps the database it created for it -- which it may
+  // drop after the failed login. Either way it must not be called unroutable:
+  // through 4.5.1 it was an error saying there was no fallback, which the
+  // console cannot know.
   auto l = server_from(ini_with("") + lost + pool);
   json lv = l->call_verify_topology();
   bool reported = false;
   for (const auto& c : lv["connections"]) {
     if (c["connection"] != "lost") continue;
     reported = true;
-    EXPECT_TRUE(c.contains("error")) << c.dump(2);
+    EXPECT_TRUE(c.contains("error")) << c.dump(2);   // the database does not exist
     ASSERT_TRUE(c.contains("route")) << c.dump(2);
-    EXPECT_TRUE(c["route"].value("found", false)) << c.dump(2);
-    EXPECT_EQ(c["route"].value("backend_database", ""), "no_such_route") << c.dump(2);
+    if (c["route"].value("found", false)) {
+      EXPECT_EQ(c["route"].value("backend_database", ""), "no_such_route") << c.dump(2);
+    }
+    EXPECT_FALSE(c["route"].contains("via_fallback")) << c.dump(2);
   }
   EXPECT_TRUE(reported) << lv.dump(2);
+  for (const auto& f : lv["findings"]) {
+    if (f["name"] != "lost" || f["topic"] != "pooler") continue;
+    EXPECT_NE(f["severity"], "error") << "a route the console cannot see called an error: " << f.dump(2);
+    EXPECT_EQ(f["detail"].get<std::string>().find("no '*' fallback"), std::string::npos) << f.dump(2);
+  }
 }
 
 // The console itself, in the rig: the answers are real, the stats user can

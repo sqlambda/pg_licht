@@ -1,7 +1,7 @@
 .\" Copyright (c) 2026 Daniel Cristian.
 .\" Licensed under the Apache License, Version 2.0; see LICENSE.
 .\"
-.Dd September 28, 2026
+.Dd October 3, 2026
 .Dt PG_LICHT_MCP 1
 .Os pg-licht
 .Sh NAME
@@ -180,9 +180,9 @@ pooler = pooler_prod
 .Pp
 It buys three things.
 .Ic verifyTopology
-checks the route: a name the pooler cannot route, or routes to another database
-or port, is an error, an alias is noted, and the direct connection that is the
-same database \(em one postmaster, one database, one user \(em is named.
+checks the route: a name the pooler routes to another database or port is an
+error, an alias is noted, and the direct connection that is the same database
+\(em one postmaster, one database, one user \(em is named.
 The pooler operations accept the database's own name as
 .Va connection
 and answer from its console, about its pool, with
@@ -2580,15 +2580,17 @@ is also checked against that console's routing, and its
 .Va route
 is reported: the pooler database name, the backend host, port and database, any
 .Va force_user ,
-the pool mode and size, and
-.Va via_fallback
-when PgBouncer's
+and the pool mode and size.
+PgBouncer's
+.Ql SHOW DATABASES
+never lists a
 .Ql *
-entry routed it.
-PgBouncer registers a name routed by the fallback as an entry of its own once a
-client has asked for it, so
-.Va via_fallback
-is seen only before that.
+fallback, only explicit entries and the names a fallback has created \(em which
+it may drop again after a failed login \(em so a name it does not list may still
+be routed.
+When the connection through the pooler works, that is reported as information;
+when it fails, as a warning that names the connection's own error, which is what
+says whether the name is routed at all.
 Takes no
 .Va connection
 argument.
