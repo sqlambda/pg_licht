@@ -25,6 +25,24 @@
   has a `*` fallback, once a test happened to read the route after PgBouncer
   had dropped the name.
 
+### Testing
+
+- **FreeBSD 14.5 and 15.1 are tested in CI, against the full Linux rig.**
+  pg_licht is a client: what varies by platform is on its side, and the
+  server features under test -- every extension preloaded, a standby, a
+  cascade, a subscriber, split brain, a PgBouncer console -- are in the rig.
+  So the rig is served on the runner and the test binary is built and run in
+  a FreeBSD VM against it, with the require flags set: the extension tests
+  that 4.5.1 had to skip on FreeBSD (it packages neither hypopg nor
+  pg_wait_sampling for PostgreSQL 18) now run there. Rehearsed against the
+  libvirt bridge first: 485 direct, 480 through PgBouncer.
+- **The rig can be served.** `run-pooled-tests.sh` gains `RIG_HOST` (every
+  cluster and PgBouncer also listen there, and the URLs it hands out use it;
+  `0.0.0.0` for a client that substitutes its own route), `RIG_TRUST_NET`
+  (the subnets trusted from there, for a throwaway rig on a private network
+  only) and `RIG_SERVE` (write the tests' environment to a file and wait).
+  The tests take PgBouncer's host from `POOLER_HOST`.
+
 ### Fuzzing
 
 - **libFuzzer targets for the inputs from outside the process:**

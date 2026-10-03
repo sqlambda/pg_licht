@@ -361,3 +361,71 @@ jobs:
         run: |
           chmod +x cpp/build/pg_licht_mcp_test
           cpp/test/run-pooled-tests.sh
+
+  # The FreeBSD client against the Linux rig. pg_licht is a client: what varies
+  # by platform -- the build, the threads link, libpq and libpqxx as FreeBSD
+  # ships them -- is all on its side, while the server features under test are
+  # in the rig: every extension preloaded (FreeBSD packages neither hypopg nor
+  # pg_wait_sampling for PostgreSQL 18), a standby, a cascade, a subscriber,
+  # split brain and a PgBouncer console. So the rig runs here, on the runner,
+  # served (RIG_SERVE), and the test binary is built and run in a FreeBSD VM
+  # against it, with the require flags set: an extension test that skips
+  # fails the job, as it does on Linux.
+  freebsd-client:
+    name: freebsd-${{ matrix.release }}-client
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ["14.5", "15.1"]
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install the rig's server side
+        run: .github/scripts/apt-pgdg.sh libpq5 postgresql-18 postgresql-18-hypopg postgresql-18-pg-wait-sampling postgresql-18-pg-stat-kcache postgresql-18-pg-qualstats pgbouncer
+
+      # Every address, since the VM's route to the runner is only known inside
+      # it; trust the private ranges a VM network can use, on a runner that
+      # lives for this job alone.
+      - name: Serve the rig
+        run: |
+          RIG_HOST=0.0.0.0 RIG_TRUST_NET=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16 \
+            RIG_SERVE="$GITHUB_WORKSPACE/rig.env" PG_BINDIR=/usr/lib/postgresql/18/bin \
+            nohup cpp/test/run-pooled-tests.sh > rig.log 2>&1 &
+          for _ in $(seq 1 150); do [ -f rig.env ] && break; sleep 2; done
+          cat rig.log
+          test -f rig.env
+
+      - uses: vmactions/freebsd-vm@a2f9a41fa97f6848b8c3b791087dfcdaa5b473ff # v1.5.8
+        with:
+          release: ${{ matrix.release }}
+          usesh: true
+          sync: rsync
+          copyback: false
+          prepare: |
+            pkg install -y cmake pkgconf nlohmann-json postgresql-libpqxx googletest
+          run: |
+            set -e
+            # The URLs say 0.0.0.0; the rig is reached at the VM's gateway.
+            gw=$(netstat -rn -f inet | awk '$1 == "default" {print $2; exit}')
+            sed "s/0\.0\.0\.0/$gw/g" rig.env > rig.vm.env
+            . ./rig.vm.env
+            seen=$(psql -X -qtA "$DATABASE_URL_DIRECT" -c "SELECT host(inet_server_addr())")
+            echo "rig reached at $gw; the server sees the connection at $seen"
+            # The second-address tests need the server to see the client at an
+            # address other than PgBouncer's 127.0.0.1 hop. Through a NAT that
+            # forwards to the runner's loopback it sees 127.0.0.1 for both, so
+            # those two tests skip here rather than fail on their premise.
+            if [ "$seen" = 127.0.0.1 ]; then unset ALT_ADDR_URL; echo "second-address tests skip: NAT to loopback"; fi
+            cd cpp
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPGLICHT_WERROR=ON
+            cmake --build build --target pg_licht_mcp_test
+            export PGLICHT_REQUIRE_HYPOPG=1 PGLICHT_REQUIRE_PRELOAD_EXTENSIONS=1
+            DATABASE_URL="$DATABASE_URL_DIRECT" ./build/pg_licht_mcp_test
+            DATABASE_URL="$DATABASE_URL_POOLED" ./build/pg_licht_mcp_test
+
+      - name: Rig log
+        if: always()
+        run: tail -40 rig.log; rm -f rig.env

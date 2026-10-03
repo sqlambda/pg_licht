@@ -25,7 +25,12 @@
 #   CASCADE_PORT port for the cascading standby           (default: 59432)
 #   SPLIT_PORT  port for the second primary (split brain) (default: 54432)
 #   RIG_HOST    the address clients reach the rig at       (default: 127.0.0.1)
-#   RIG_TRUST_NET  the subnet trusted to connect from there, e.g. 192.168.121.0/24
+#   RIG_TRUST_NET  the subnets trusted to connect from there, comma-separated,
+#               e.g. 192.168.121.0/24
+#
+# RIG_HOST=0.0.0.0 listens on every address, for a client whose route to the
+# rig is only known on its side (a CI VM): the URLs written then say 0.0.0.0,
+# and the client substitutes the address it reaches the rig at.
 #   RIG_SERVE   a file: write the tests' environment to it and wait, instead of
 #               running the suite here -- until the file is removed
 #
@@ -96,13 +101,26 @@ RIG_HOST="${RIG_HOST:-127.0.0.1}"
 RIG_SERVE="${RIG_SERVE:-}"
 RIG_TRUST_NET="${RIG_TRUST_NET:-}"
 remote_listen=""
+primary_listen="127.0.0.1,127.0.0.2"
+sub_listen="127.0.0.1"
+bouncer_listen="127.0.0.1"
 if [ "$RIG_HOST" != 127.0.0.1 ]; then
   [ -n "$RIG_TRUST_NET" ] || { echo "ERROR: RIG_HOST=$RIG_HOST needs RIG_TRUST_NET" >&2; exit 1; }
   remote_listen=",$RIG_HOST"
+  if [ "$RIG_HOST" = 0.0.0.0 ]; then
+    # Every address, alone: 0.0.0.0 beside 127.0.0.1 on one port can fail
+    # to bind, and * covers the loopback addresses the rig itself uses.
+    primary_listen="*"; sub_listen="*"; bouncer_listen="*"
+  else
+    primary_listen="$primary_listen,$RIG_HOST"; sub_listen="$sub_listen,$RIG_HOST"
+    bouncer_listen="$bouncer_listen,$RIG_HOST"
+  fi
 fi
 
+# Serving the rig runs no tests here, so it needs no test binary.
+need_test_bin="$TEST_BIN"; [ -n "$RIG_SERVE" ] && need_test_bin=""
 for req in "$PG_BINDIR/initdb" "$PG_BINDIR/pg_ctl" "$PG_BINDIR/createdb" \
-           "$PG_BINDIR/pg_basebackup" "$PG_BINDIR/psql" "$PGBOUNCER" "$TEST_BIN"; do
+           "$PG_BINDIR/pg_basebackup" "$PG_BINDIR/psql" "$PGBOUNCER" ${need_test_bin:+"$need_test_bin"}; do
   [ -x "$req" ] || { echo "ERROR: missing or not executable: $req" >&2
                      [ "$req" = "$TEST_BIN" ] && echo "  build it: cmake --build $cpp_dir/build" >&2
                      exit 1; }
@@ -155,7 +173,7 @@ done
 
 cat >> "$PGDATA/postgresql.conf" <<CONF
 port = $PG_PORT
-listen_addresses = '127.0.0.1,127.0.0.2$remote_listen'
+listen_addresses = '$primary_listen'
 unix_socket_directories = '$work'
 shared_preload_libraries = '$PRELOAD'
 # pg_qualstats samples one statement in max_connections by default, which
@@ -174,8 +192,13 @@ echo "--- start postgres on $PG_PORT (preloaded: $PRELOAD)"
 # 127.0.0.1, so that sufficed there; FreeBSD sends it from 127.0.0.2 itself,
 # and the rule is needed for the second address to be reachable at all.
 echo "host all all 127.0.0.2/32 trust" >> "$PGDATA/pg_hba.conf"
-# The remote client's subnet, when the rig is served; see the header.
-[ -n "$remote_listen" ] && echo "host all all $RIG_TRUST_NET trust" >> "$PGDATA/pg_hba.conf"
+# The remote client's subnets, when the rig is served; see the header.
+trust_remote() {
+  [ -n "$remote_listen" ] || return 0
+  local IFS=,
+  for net in $RIG_TRUST_NET; do echo "host all all $net trust" >> "$1"; done
+}
+trust_remote "$PGDATA/pg_hba.conf"
 "$PG_BINDIR/pg_ctl" -D "$PGDATA" -l "$PGDATA/pg.log" -w start >/dev/null
 "$PG_BINDIR/createdb" -h 127.0.0.1 -p "$PG_PORT" -U pglicht pglicht
 
@@ -269,13 +292,13 @@ echo "--- initdb a logical subscriber on $SUBSCRIBER_PORT"
 
 cat >> "$SUBDATA/postgresql.conf" <<CONF
 port = $SUBSCRIBER_PORT
-listen_addresses = '127.0.0.1$remote_listen'
+listen_addresses = '$sub_listen'
 unix_socket_directories = '$work'
 fsync = off
 full_page_writes = off
 CONF
 
-[ -n "$remote_listen" ] && echo "host all all $RIG_TRUST_NET trust" >> "$SUBDATA/pg_hba.conf"
+trust_remote "$SUBDATA/pg_hba.conf"
 "$PG_BINDIR/pg_ctl" -D "$SUBDATA" -l "$SUBDATA/pg.log" -w start >/dev/null
 "$PG_BINDIR/createdb" -h 127.0.0.1 -p "$SUBSCRIBER_PORT" -U pglicht pglicht
 
@@ -321,7 +344,7 @@ licht_saturate = host=127.0.0.1 port=$PG_PORT dbname=pglicht user=pglicht pool_s
 licht_forced = host=127.0.0.1 port=$PG_PORT dbname=pglicht user=licht_somebody_else
 
 [pgbouncer]
-listen_addr = 127.0.0.1$remote_listen
+listen_addr = $bouncer_listen
 listen_port = $BOUNCER_PORT
 unix_socket_dir = $work
 auth_type = any
@@ -339,7 +362,7 @@ INI
 echo "--- start pgbouncer on $BOUNCER_PORT (pool_mode=transaction, DISCARD ALL)"
 "$PGBOUNCER" -d "$BDIR/pgbouncer.ini"
 for _ in $(seq 1 20); do
-  grep -q "listening on 127.0.0.1:$BOUNCER_PORT" "$BDIR/pgbouncer.log" 2>/dev/null && break
+  grep -qE "listening on .*:$BOUNCER_PORT" "$BDIR/pgbouncer.log" 2>/dev/null && break
   sleep 0.2
 done
 
