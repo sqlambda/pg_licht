@@ -1,7 +1,7 @@
 .\" Copyright (c) 2026 Daniel Cristian.
 .\" Licensed under the Apache License, Version 2.0; see LICENSE.
 .\"
-.Dd September 28, 2026
+.Dd October 3, 2026
 .Dt PG_LICHT_MCP 1
 .Os pg-licht
 .Sh NAME
@@ -180,9 +180,9 @@ pooler = pooler_prod
 .Pp
 It buys three things.
 .Ic verifyTopology
-checks the route: a name the pooler cannot route, or routes to another database
-or port, is an error, an alias is noted, and the direct connection that is the
-same database \(em one postmaster, one database, one user \(em is named.
+checks the route: a name the pooler routes to another database or port is an
+error, an alias is noted, and the direct connection that is the same database
+\(em one postmaster, one database, one user \(em is named.
 The pooler operations accept the database's own name as
 .Va connection
 and answer from its console, about its pool, with
@@ -813,6 +813,31 @@ because privilege there is per object: a role without blanket read access may
 still hold
 .Ic SELECT
 on some tables and not others.
+.Pp
+.Va extensions
+reports the four extensions that need
+.Va shared_preload_libraries
+\(em
+.Li pg_stat_statements ,
+.Li pg_wait_sampling ,
+.Li pg_stat_kcache
+and
+.Li pg_qualstats
+\(em as three separate facts each:
+.Va library_loaded ,
+.Va extension_created
+in this database, and
+.Va functional ,
+whether its view answers a read, with the reason when it does not.
+A probe that fails for a reason of its own, such as a timeout, leaves
+.Va functional
+null and says why under
+.Va probe_error .
+The state that goes unnoticed is a mismatch between them: a library preloaded
+whose extension was never created needs only
+.Ic CREATE EXTENSION ,
+no restart, and the extension operations say so in that case rather than
+calling it not installed.
 .Pp
 An absent extension is distinguished from a missing privilege, because the two
 send an operator to different fixes.
@@ -1691,6 +1716,24 @@ A high
 (involuntary context switches) is CPU contention;
 .Va majflts
 is memory pressure reaching the disk.
+.Pp
+What these counters mean depends on the platform the server runs on, which the
+answer names as
+.Va platform .
+.Va cpu_time_s ,
+user plus system, is the kernel's own total, checked on Linux and FreeBSD.
+On Linux the user and system split and the byte counts are given as measured.
+Elsewhere those four are null and
+.Va unavailable
+says why, because they are not what they look like.
+FreeBSD splits a thread's CPU time into user and system by statistical
+sampling, about every 7.9 ms, so a short statement is reported as all user
+time: 567,895 short updates measured 9.0 s of user time and 0.000 s of system
+time.
+It also charges a process only the storage I/O it performed synchronously, not
+the buffered writes flushed later: three sorts that spilled 1.08 GB of temporary
+files measured 0.47 MB written, where Linux charged 257 MB.
+Other platforms are not verified, and are treated the same way.
 .Pp
 Read from the
 .Fn pg_stat_kcache
@@ -2580,15 +2623,17 @@ is also checked against that console's routing, and its
 .Va route
 is reported: the pooler database name, the backend host, port and database, any
 .Va force_user ,
-the pool mode and size, and
-.Va via_fallback
-when PgBouncer's
+and the pool mode and size.
+PgBouncer's
+.Ql SHOW DATABASES
+never lists a
 .Ql *
-entry routed it.
-PgBouncer registers a name routed by the fallback as an entry of its own once a
-client has asked for it, so
-.Va via_fallback
-is seen only before that.
+fallback, only explicit entries and the names a fallback has created \(em which
+it drops again once their pool is empty \(em so a name it does not list may still
+be routed.
+When the connection through the pooler works, that is reported as information;
+when it fails, as a warning that names the connection's own error, which is what
+says whether the name is routed at all.
 Takes no
 .Va connection
 argument.
@@ -2789,6 +2834,21 @@ Errors remain a text block in both eras:
 .Va structuredContent
 is the format for a tool's answer, and an error is a message about why there is
 no answer.
+.Pp
+Two kinds of failure are kept apart, and never share a message.
+An answer carrying
+.Va error
+and
+.Va hint
+is a fact about the database: an extension that is absent, too old, preloaded
+but not created, or not preloaded; a grant that is missing.
+A statement that fails for any other reason \(em a timeout, a lock, a lost
+connection, a query this server got wrong \(em is reported as the failure it
+is, a call result with
+.Va isError
+set and the server's own message, and is never turned into a statement about
+what the database lacks.
+An empty result is an answer; a failed statement is not.
 .Pp
 Every operation declares an
 .Va outputSchema

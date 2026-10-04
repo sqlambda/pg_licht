@@ -262,7 +262,8 @@
         and real disk reads behind each statement, which predicates throw rows away, and the
         index that would serve them &mdash; all joined on the <code>query_id</code>
         <code>statementStats</code> reports, and each suggestion ready to test with
-        <code>evaluateIndex</code> without building it.</p></div>
+        <code>evaluateIndex</code> without building it. A counter the server's platform
+        does not measure is reported as unavailable, with the reason, never as zero.</p></div>
       <div class="feature"><h3>Answers you can cap</h3>
         <p>The listings and searches that grow with a database take a <code>pattern</code> or
         a narrower search, and the largest answers narrow themselves by default. Set a cap in
@@ -281,12 +282,25 @@
         <p>Every tool declares its output schema and is marked read-only, and clients on MCP
         2025-06-18 or later receive structured results.</p></div>
       <div class="feature"><h3>Tested where it matters</h3>
-        <p>PostgreSQL 14 through 18, under AddressSanitizer, ThreadSanitizer and valgrind,
-        through a pooler, with a standby, a cascading standby and a logical subscriber,
-        built with both g++ and clang.</p></div>
+        <p>PostgreSQL 14 through 18, under AddressSanitizer, UndefinedBehaviorSanitizer,
+        ThreadSanitizer and valgrind, through a pooler, with a standby, a cascading standby,
+        a logical subscriber and a split brain, built with both g++ and clang, and on
+        FreeBSD 14 and 15. The protocol and both configuration parsers are fuzzed on every
+        change, and clang-tidy fails the build on any finding.</p></div>
       <div class="feature"><h3>Packages that are installed before they ship</h3>
         <p>Every <code>.deb</code> and <code>.rpm</code> is installed on the distribution it
-        targets and run before a release is published.</p></div>
+        targets and run before a release is published, its version checked against the
+        binary inside it, and the Homebrew formula is built from source on every change.</p></div>
+      <div class="feature"><h3>Downloads you can verify</h3>
+        <p>Every release asset carries signed build provenance:
+        <code>gh attestation verify</code> proves a file was built by this repository's
+        release workflow from the tagged commit. A <code>SHA256SUMS</code> file is published
+        beside them for a check that needs no GitHub CLI.</p></div>
+      <div class="feature"><h3>Hardened binaries</h3>
+        <p>The Linux binaries are position-independent, with full RELRO, a non-executable
+        stack, stack protection and fortified libc calls &mdash; and each release binary is
+        inspected for them before it ships, rather than trusting the flags that were asked
+        for.</p></div>
       <div class="feature"><h3>Documentation generated from the binary</h3>
         <p>The <a href="reference/index.html">reference</a> and
         <a href="llms.txt">llms.txt</a> are built from the release itself, so they cannot

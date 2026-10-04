@@ -1,5 +1,250 @@
 # Changelog
 
+## 4.6.0 (2026-10-03)
+
+### Fixed
+
+- **A request without an id read invalid memory.** The server built every
+  response from `req["id"]` on a const JSON object, where a missing key is
+  undefined behaviour: nlohmann dereferences the map's end. A request with no
+  id -- a notification, in JSON-RPC terms, which a client may send for any
+  method -- therefore read freed memory (under ASan, a heap-use-after-free in
+  `send_response`). Present in every release before this one; found by the
+  new JSON-RPC fuzzer within two seconds of its first run, on an
+  `initialize` carrying no id. Such a request is now answered with a null id.
+
+- **`verifyTopology` called a working route "unroutable".** A database
+  section declaring `pooler =` whose name the console did not list was
+  reported as an error: "no `[databases]` entry ... and no `*` fallback".
+  But PgBouncer's `SHOW DATABASES` never lists a `*` fallback -- only
+  explicit entries, and names a fallback has created, which it drops again
+  once their pool is empty -- so the console cannot say there is none. It is now
+  information when the connection works, and a warning
+  naming the connection's own error when it does not. The `via_fallback`
+  field, which could never be set, is gone. Found by the rig, whose PgBouncer
+  has a `*` fallback, once a test happened to read the route after PgBouncer
+  had dropped the name.
+
+- **An integer argument too large for an `int` was converted anyway.**
+  `statementStats` read `limit` and `explainQuery` read `timeout_ms` without
+  checking the JSON type, and converting a number such as `1e80` to `int` is
+  undefined behaviour. Found by an hour of the JSON-RPC fuzzer. Both now
+  take their default for anything that is not an integer, as every other
+  tool already did. And an integer that is one but does not fit -- a `pid`
+  of 4294967297 arrived as pid 1 -- is clamped to the nearest `int`, never
+  wrapped. The sanitizer builds now add `-fsanitize=float-cast-overflow`,
+  which clang's `undefined` includes and GCC's does not, and
+  `-fno-sanitize-recover`: by default UBSan prints its finding and carries
+  on, so a test that provoked one passed.
+
+- **A request that was valid JSON but not a valid request was answered as a
+  parse error, without its id.** A `method` that is a number, a
+  `protocolVersion` or a tool `name` that is not a string: `-32700` with no
+  id, which a client waiting on that id never matched to its call. It is now
+  `-32600` carrying the request's id; `-32700` is kept for text that is not
+  JSON.
+
+### Extension state
+
+- **"Preloaded but not created" is told apart from "not installed".** The
+  extension operations answered a library that was preloaded but whose
+  extension was never created with "not installed" and a hint to add it to
+  `shared_preload_libraries` -- where it already was. The pgshard
+  measurement campaign ran FreeBSD cells for weeks in exactly
+  that state with pg_wait_sampling, giving up wait data for nothing. Now
+  `waitEventProfile`, `statementKernelStats`, `predicateStats`,
+  `suggestIndexes`, `statementStats` and `explainQuery` say "preloaded but not
+  created in this database", with `CREATE EXTENSION` as the whole fix, and
+  report `library_loaded` and `extension_created`; `checkPrivileges` gives the
+  same reason.
+- **`checkPrivileges` reports `extensions`**: for each of the four
+  preload-backed extensions, `library_loaded`, `extension_created` and
+  `functional` (its view answers a read, probed in a savepoint, with the
+  reason when not), so a mismatch between them is visible in one call. A
+  probe that fails for a reason of its own -- a timeout, a lock -- reports
+  `functional` as null with a `probe_error`, not as false.
+
+- **`statementKernelStats` no longer reports platform-shaped zeros.** The
+  pgshard campaign found pg_stat_kcache's `exec_system_time` at 0.000 on
+  FreeBSD and built two in-guest agents to work around it. Measured on
+  PostgreSQL 18.6 with pg_stat_kcache 2.3.2: FreeBSD splits a thread's CPU
+  time into user and system by sampling (~7.9 ms), so 567,895 short updates
+  reported 9.0 s of user time and 0.000 s of system time, though each wrote
+  WAL; and it charges a process only the I/O it did synchronously, so three
+  sorts that spilled 1.08 GB of temp files reported 0.47 MB written, where
+  Linux charged 257 MB. Each answer now names its `platform`, always gives
+  `cpu_time_s` (user + system, exact everywhere), and outside Linux sets the
+  split and the byte counts to null with the measured reason under
+  `unavailable`, so a caller cannot mistake them for data. Tested against
+  both a Linux and a FreeBSD server.
+- **A failed query is never reported as an extension state.** The manual
+  now states it, and a test holds the extension operations to it: with the
+  extension's view locked by another session and a short statement
+  timeout, `waitEventProfile` must answer with the timeout, as an error, and
+  not as "not installed" or "not preloaded". It already behaved this way;
+  the pgshard campaign's script did not, printing "wait sampling
+  unavailable" when its own query broke.
+
+### Testing
+
+- **FreeBSD 14.5 and 15.1 are tested in CI, against the full Linux rig.**
+  pg_licht is a client: what varies by platform is on its side, and the
+  server features under test -- every extension preloaded, a standby, a
+  cascade, a subscriber, split brain, a PgBouncer console -- are in the rig.
+  So the rig is served on the runner and the test binary is built and run in
+  a FreeBSD VM against it, with the require flags set: the extension tests
+  that 4.5.1 had to skip on FreeBSD (it packages neither hypopg nor
+  pg_wait_sampling for PostgreSQL 18) now run there. Rehearsed against the
+  libvirt bridge first: 485 direct, 480 through PgBouncer.
+- **And a FreeBSD server, for the one tool that depends on it.**
+  `statementKernelStats` is the only answer that varies with the server's
+  platform, and its FreeBSD side was tested by hand. The same CI job now
+  starts PostgreSQL 18 in the FreeBSD VM with `pg_stat_statements` and
+  `pg_stat_kcache` preloaded (`.github/scripts/freebsd-server.sh`) and runs
+  the kernel-counter tests against it, required rather than skipped, so
+  "null with a reason outside Linux" is checked against a real FreeBSD
+  kernel on 14.5 and 15.1.
+- **The Homebrew formula is built before the tag, not after.** The tap's
+  formula is rewritten only once a release exists, so nothing built through
+  it beforehand: the macOS release job installs the same dependencies but
+  runs cmake itself. A new job takes the tap's real formula, points it at a
+  tarball of the commit, and runs `brew install --build-from-source` and
+  `brew test`, then checks the installed binary's version and man page. It
+  runs on every pull request, and the release waits for it.
+- **The extension failure paths are tested.** A coverage build through the
+  rig showed 7 of the server's 320 functions never run by the suite, all of
+  them extension failure paths: not preloaded, too old for a tool,
+  pgstattuple missing, denied or moved while running. `ExtensionEdgeTest`
+  and `NotPreloadedTest` run them, the second against the rig's subscriber,
+  which preloads nothing.
+- **The rig can be served.** `run-pooled-tests.sh` gains `RIG_HOST` (every
+  cluster and PgBouncer also listen there, and the URLs it hands out use it;
+  `0.0.0.0` for a client that substitutes its own route), `RIG_TRUST_NET`
+  (the subnets the clusters trust from there; PgBouncer admits anyone who
+  reaches its port, so serve the rig only on a CI runner or a private
+  bridge, never a LAN address) and `RIG_SERVE` (write the tests' environment to a file and wait).
+  The tests take PgBouncer's host from `POOLER_HOST`.
+
+### Fuzzing
+
+- **libFuzzer targets for the inputs from outside the process:**
+  `fuzz_jsonrpc`, a client message through the real dispatch against a
+  server whose only connections cannot be reached (so it exercises parsing,
+  argument validation, sweep selection and the error paths, not a database);
+  and `fuzz_connections` and `fuzz_budgets`, the two INI parsers. Built with
+  `-DPGLICHT_FUZZ=ON` (clang), under ASan and UBSan, and seeded by
+  `tools/fuzz-seeds.py`: every protocol method, the list methods in both
+  eras, and one
+  `tools/call` per tool, plain and as a sweep, from the arguments the
+  reference shows. CI runs each for a minute on the clang job and uploads
+  any crashing input. The parsers gain `from_ini_text` and
+  `Budgets::parse_text`, so text is parsed without a file; the file paths
+  keep their permission rules, and a test holds the two to the same result.
+
+### Hardening
+
+- **The release binaries are hardened.** CMake never applied a
+  distribution's default flags, so the 4.5 binaries were PIE only because
+  Debian's GCC defaults to it, had RELRO without `BIND_NOW`, and had no
+  stack protector and no fortified calls -- in every deb, rpm and tarball.
+  Now, each behind a check that the toolchain accepts it: PIE always,
+  `-fstack-protector-strong`, `-fstack-clash-protection`, `-fcf-protection`
+  (x86-64), full RELRO (`-z relro -z now`), a non-executable stack, and
+  `_FORTIFY_SOURCE=3` in optimised builds without a sanitizer. The static
+  libpqxx the release links is now built position-independent, which Rocky's
+  gcc-toolset does not do by default.
+- **Uninitialised locals start as zero in Release builds**
+  (`-ftrivial-auto-var-init=zero`), so a read the code gets wrong is a
+  predictable zero rather than stale stack data from an earlier call.
+  Release and MinSizeRel only: never RelWithDebInfo, which CI's valgrind job
+  runs, nor Debug or a sanitizer build, where it would hide the very reads
+  those tools find. Measured cost: +2.6% on the server's own CPU work (3,000
+  requests with no database, median of seven interleaved runs), about 25 us
+  a request, against milliseconds a real call spends on the database; 12 kB
+  of binary.
+- **Hardening flags are checked with `-Werror`.** Apple clang accepts
+  `-fstack-clash-protection` on arm64 with only "argument unused during
+  compilation", so a plain check passed and the `-Werror` build failed on
+  macOS -- found by CI on this release's first push.
+- **`cpp/test/hardening-check.sh`** reads the binary with `readelf` and `nm`
+  and fails unless all of it is there. It is a ctest in optimised builds, and
+  the release workflow runs it on every Linux binary it ships, after `strip`.
+  Fortified calls are required where libc is glibc: FreeBSD's libc fortifies
+  C only, so a C++ binary there has none whatever the flags.
+
+### Supply chain
+
+- **Every GitHub Action is pinned to a commit SHA**, its version in a
+  comment, and `.github/dependabot.yml` keeps the pins current. The release
+  workflow publishes packages, the site and a Homebrew formula bump with
+  write permissions, and a moving tag such as `actions/checkout@v4` could be
+  re-pointed under it. The `actions_pinned` ctest fails on any unpinned
+  `uses:`, and CI runs it.
+- **Release assets carry build provenance.** Each tarball, `.deb` and `.rpm`
+  is attested (`actions/attest-build-provenance`) before the release is
+  created: a signed statement, kept by GitHub and logged publicly, that the
+  file was built by this repository's release workflow from the tagged
+  commit. `gh attestation verify <file> --repo sqlambda/pg_licht` checks a
+  download against it, which tells a release asset from a file of the same
+  name that came from somewhere else. INSTALL.md says how.
+- **A `SHA256SUMS` file is published with every release**, covering each
+  asset and the source tarball (under both names it downloads as), for a
+  check that needs no GitHub CLI:
+  `sha256sum -c --ignore-missing SHA256SUMS`.
+- **A package's version is asserted, not trusted.** The install check for
+  each `.deb` and `.rpm` compares the package's own version with what the
+  installed binary reports, and on a tag both with the tag; the Homebrew job
+  does the same for the formula build.
+- **`SECURITY.md`**: how to report a vulnerability (GitHub's private
+  reporting), and what pg_licht guarantees -- the READ ONLY transaction per
+  database call, the bounded `explainQuery` exception, the pooler tools'
+  fixed `SHOW` commands and the `stats_users` guard pg_licht cannot verify,
+  no table rows and no held passwords returned -- with what can still reach
+  the caller.
+
+### Static analysis
+
+- **clang-tidy runs in CI and fails on any finding**, from a checked-in
+  `cpp/.clang-tidy` (`bugprone-*`, `cert-*`, `clang-analyzer-*`,
+  `performance-*`, `cppcoreguidelines-pro-type-cstyle-cast`, each exclusion
+  commented). Its first run reported 899 findings: 664 were locals that
+  could be const (fixed, see below), 205 were three style checks, excluded
+  with their reasons, and none of the other 30 was a bug:
+  deliberate empty catches and one assignment-in-if now carry a `NOLINT`
+  that says why, two transaction accesses clang-tidy could not prove safe
+  are now guarded, `checkKey`'s type check lost a branch that duplicated its
+  default, and a copy became a reference. `misc-const-correctness` is on as
+  well: its 664 findings -- locals that could be `const` -- were fixed, so new
+  code is held to it.
+
+### Documented
+
+- **The landing page says what a release now guarantees**: downloads that
+  can be verified, hardened binaries, the wider test matrix (UBSan, split
+  brain, FreeBSD, fuzzing, clang-tidy), the formula built on every change,
+  and that a counter the platform does not measure is never a zero.
+- **BUILD.md** is brought up to date with the options, checks and CI jobs
+  this release adds.
+
+### Build
+
+- **`-Werror` is an option, `PGLICHT_WERROR`.** It was hard-coded, so a
+  warning from a compiler newer than CI's failed the build for anyone
+  building from source -- a Homebrew user on a new Xcode, since the formula
+  builds the release tarball on the user's machine, or a FreeBSD user. It now
+  defaults to on in a git checkout, where a warning can be fixed, and off in
+  a source tarball; CI passes `-DPGLICHT_WERROR=ON` in every job but the one that
+  builds through the Homebrew formula, which builds as a user does, so the
+  zero-warning policy is unchanged where it is enforced.
+
+- **More warnings, all clean:** `-Wnull-dereference`, `-Wformat=2`,
+  `-Wimplicit-fallthrough`, `-Wold-style-cast`, `-Wnon-virtual-dtor`,
+  `-Woverloaded-virtual`, `-Wcast-qual` and `-Wdouble-promotion`, plus
+  `-Wuseless-cast` on GCC and `-Wextra-semi` on clang. Measured first: GCC 14
+  found three casts to `std::string` of an expression that already was one,
+  clang 22 found nothing new, and both found two C-style casts in the tests;
+  all fixed in the same change.
+
 ## 4.5.1 (2026-09-28)
 
 ### Fixed

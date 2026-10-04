@@ -24,6 +24,26 @@
 #   SUBSCRIBER_PORT port for the logical subscriber       (default: 58432)
 #   CASCADE_PORT port for the cascading standby           (default: 59432)
 #   SPLIT_PORT  port for the second primary (split brain) (default: 54432)
+#   RIG_HOST    the address clients reach the rig at       (default: 127.0.0.1)
+#   RIG_TRUST_NET  the subnets trusted to connect from there, comma-separated,
+#               e.g. 192.168.121.0/24
+#
+# RIG_HOST=0.0.0.0 listens on every address, for a client whose route to the
+# rig is only known on its side (a CI VM): the URLs written then say 0.0.0.0,
+# and the client substitutes the address it reaches the rig at.
+#   RIG_SERVE   a file: write the tests' environment to it and wait, instead of
+#               running the suite here -- until the file is removed
+#
+# Serving the rig is how a test binary on another machine runs against it --
+# the FreeBSD client against this Linux rig (pg_licht is a client; the server
+# features under test are all here). With RIG_HOST other than 127.0.0.1, every
+# cluster and PgBouncer also listen there, every URL handed out uses it, and
+# pg_hba.conf trusts RIG_TRUST_NET. That limits the clusters' own ports only:
+# PgBouncer admits anyone who can reach its port (auth_type = any) and reaches
+# the primary over loopback, which is trusted -- so whoever can reach
+# BOUNCER_PORT on RIG_HOST is the cluster's superuser. Serve the rig only on
+# a network where that is acceptable: a CI runner with no inbound traffic, or
+# a private bridge to a VM. Never on a LAN address.
 #
 # A physical standby is streamed off the primary with pg_basebackup and its
 # conninfo is exported as STANDBY_URL. The role and topology tests use it to
@@ -81,9 +101,30 @@ STANDBY_PORT="${STANDBY_PORT:-57432}"
 SUBSCRIBER_PORT="${SUBSCRIBER_PORT:-58432}"
 CASCADE_PORT="${CASCADE_PORT:-59432}"
 SPLIT_PORT="${SPLIT_PORT:-54432}"
+RIG_HOST="${RIG_HOST:-127.0.0.1}"
+RIG_SERVE="${RIG_SERVE:-}"
+RIG_TRUST_NET="${RIG_TRUST_NET:-}"
+remote_listen=""
+primary_listen="127.0.0.1,127.0.0.2"
+sub_listen="127.0.0.1"
+bouncer_listen="127.0.0.1"
+if [ "$RIG_HOST" != 127.0.0.1 ]; then
+  [ -n "$RIG_TRUST_NET" ] || { echo "ERROR: RIG_HOST=$RIG_HOST needs RIG_TRUST_NET" >&2; exit 1; }
+  remote_listen=",$RIG_HOST"
+  if [ "$RIG_HOST" = 0.0.0.0 ]; then
+    # Every address, alone: 0.0.0.0 beside 127.0.0.1 on one port can fail
+    # to bind, and * covers the loopback addresses the rig itself uses.
+    primary_listen="*"; sub_listen="*"; bouncer_listen="*"
+  else
+    primary_listen="$primary_listen,$RIG_HOST"; sub_listen="$sub_listen,$RIG_HOST"
+    bouncer_listen="$bouncer_listen,$RIG_HOST"
+  fi
+fi
 
+# Serving the rig runs no tests here, so it needs no test binary.
+need_test_bin="$TEST_BIN"; [ -n "$RIG_SERVE" ] && need_test_bin=""
 for req in "$PG_BINDIR/initdb" "$PG_BINDIR/pg_ctl" "$PG_BINDIR/createdb" \
-           "$PG_BINDIR/pg_basebackup" "$PG_BINDIR/psql" "$PGBOUNCER" "$TEST_BIN"; do
+           "$PG_BINDIR/pg_basebackup" "$PG_BINDIR/psql" "$PGBOUNCER" ${need_test_bin:+"$need_test_bin"}; do
   [ -x "$req" ] || { echo "ERROR: missing or not executable: $req" >&2
                      [ "$req" = "$TEST_BIN" ] && echo "  build it: cmake --build $cpp_dir/build" >&2
                      exit 1; }
@@ -136,7 +177,7 @@ done
 
 cat >> "$PGDATA/postgresql.conf" <<CONF
 port = $PG_PORT
-listen_addresses = '127.0.0.1,127.0.0.2'
+listen_addresses = '$primary_listen'
 unix_socket_directories = '$work'
 shared_preload_libraries = '$PRELOAD'
 # pg_qualstats samples one statement in max_connections by default, which
@@ -155,6 +196,13 @@ echo "--- start postgres on $PG_PORT (preloaded: $PRELOAD)"
 # 127.0.0.1, so that sufficed there; FreeBSD sends it from 127.0.0.2 itself,
 # and the rule is needed for the second address to be reachable at all.
 echo "host all all 127.0.0.2/32 trust" >> "$PGDATA/pg_hba.conf"
+# The remote client's subnets, when the rig is served; see the header.
+trust_remote() {
+  [ -n "$remote_listen" ] || return 0
+  local IFS=,
+  for net in $RIG_TRUST_NET; do echo "host all all $net trust" >> "$1"; done
+}
+trust_remote "$PGDATA/pg_hba.conf"
 "$PG_BINDIR/pg_ctl" -D "$PGDATA" -l "$PGDATA/pg.log" -w start >/dev/null
 "$PG_BINDIR/createdb" -h 127.0.0.1 -p "$PG_PORT" -U pglicht pglicht
 
@@ -177,7 +225,7 @@ unix_socket_directories = '$work'
 CONF
 
 "$PG_BINDIR/pg_ctl" -D "$SBDATA" -l "$SBDATA/pg.log" -w start >/dev/null
-STANDBY_URL="host=127.0.0.1 port=$STANDBY_PORT dbname=pglicht user=pglicht"
+STANDBY_URL="host=$RIG_HOST port=$STANDBY_PORT dbname=pglicht user=pglicht"
 export STANDBY_URL
 
 # --- cascading standby -----------------------------------------------------
@@ -216,7 +264,7 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 [ "$streaming" = "1" ] || { echo "cascading standby never started streaming" >&2; exit 1; }
-CASCADE_URL="host=127.0.0.1 port=$CASCADE_PORT dbname=pglicht user=pglicht"
+CASCADE_URL="host=$RIG_HOST port=$CASCADE_PORT dbname=pglicht user=pglicht"
 export CASCADE_URL
 
 # --- a second primary of the same lineage: split brain ---------------------
@@ -228,7 +276,7 @@ port = $SPLIT_PORT
 unix_socket_directories = '$work'
 CONF
 "$PG_BINDIR/pg_ctl" -D "$SPDATA" -l "$SPDATA/pg.log" -w start >/dev/null
-SPLIT_URL="host=127.0.0.1 port=$SPLIT_PORT dbname=pglicht user=pglicht"
+SPLIT_URL="host=$RIG_HOST port=$SPLIT_PORT dbname=pglicht user=pglicht"
 export SPLIT_URL
 
 # --- logical subscriber ----------------------------------------------------
@@ -248,12 +296,13 @@ echo "--- initdb a logical subscriber on $SUBSCRIBER_PORT"
 
 cat >> "$SUBDATA/postgresql.conf" <<CONF
 port = $SUBSCRIBER_PORT
-listen_addresses = '127.0.0.1'
+listen_addresses = '$sub_listen'
 unix_socket_directories = '$work'
 fsync = off
 full_page_writes = off
 CONF
 
+trust_remote "$SUBDATA/pg_hba.conf"
 "$PG_BINDIR/pg_ctl" -D "$SUBDATA" -l "$SUBDATA/pg.log" -w start >/dev/null
 "$PG_BINDIR/createdb" -h 127.0.0.1 -p "$SUBSCRIBER_PORT" -U pglicht pglicht
 
@@ -283,7 +332,7 @@ for _ in $(seq 1 50); do
 done
 echo "--- logical subscriber ready ($ready of 2 tables synced)"
 
-SUBSCRIBER_URL="host=127.0.0.1 port=$SUBSCRIBER_PORT dbname=pglicht user=pglicht"
+SUBSCRIBER_URL="host=$RIG_HOST port=$SUBSCRIBER_PORT dbname=pglicht user=pglicht"
 export SUBSCRIBER_URL
 
 # --- companion pooler (transaction mode) -----------------------------------
@@ -299,7 +348,7 @@ licht_saturate = host=127.0.0.1 port=$PG_PORT dbname=pglicht user=pglicht pool_s
 licht_forced = host=127.0.0.1 port=$PG_PORT dbname=pglicht user=licht_somebody_else
 
 [pgbouncer]
-listen_addr = 127.0.0.1
+listen_addr = $bouncer_listen
 listen_port = $BOUNCER_PORT
 unix_socket_dir = $work
 auth_type = any
@@ -317,20 +366,28 @@ INI
 echo "--- start pgbouncer on $BOUNCER_PORT (pool_mode=transaction, DISCARD ALL)"
 "$PGBOUNCER" -d "$BDIR/pgbouncer.ini"
 for _ in $(seq 1 20); do
-  grep -q "listening on 127.0.0.1:$BOUNCER_PORT" "$BDIR/pgbouncer.log" 2>/dev/null && break
+  grep -qE "listening on .*:$BOUNCER_PORT" "$BDIR/pgbouncer.log" 2>/dev/null && break
   sleep 0.2
 done
 
 # The pooler tools read this PgBouncer's admin console; the tests find it here.
 POOLER_PORT=$BOUNCER_PORT
 POOLER_USER=pglicht_stats
-export POOLER_PORT POOLER_USER
+POOLER_HOST=$RIG_HOST
+export POOLER_PORT POOLER_USER POOLER_HOST
 
 # The primary under a second address; see the header. Linux routes all of
 # 127/8 to the loopback interface; FreeBSD needs it added first
 # (ifconfig lo0 alias 127.0.0.2/32). Without it the tests that need the
 # address skip, saying why, rather than fail on a connect error.
-if "$PG_BINDIR/psql" -X -qtA -h 127.0.0.2 -p "$PG_PORT" -U pglicht -d pglicht \
+#
+# Served to a remote client, the two addresses are the rig's own: the client
+# reaches the primary at RIG_HOST, and PgBouncer reaches it at 127.0.0.1 --
+# one server, two addresses, which is all these tests need.
+if [ -n "$remote_listen" ]; then
+  ALT_ADDR_URL="host=$RIG_HOST port=$PG_PORT dbname=pglicht user=pglicht"
+  export ALT_ADDR_URL
+elif "$PG_BINDIR/psql" -X -qtA -h 127.0.0.2 -p "$PG_PORT" -U pglicht -d pglicht \
      -c 'SELECT 1' >/dev/null 2>&1; then
   ALT_ADDR_URL="host=127.0.0.2 port=$PG_PORT dbname=pglicht user=pglicht"
   export ALT_ADDR_URL
@@ -344,13 +401,31 @@ else
        "(FreeBSD: ifconfig lo0 alias 127.0.0.2/32)"
 fi
 
+# --- or serve it -------------------------------------------------------------
+# The environment the suite reads, for a test binary elsewhere: run it once with
+# DATABASE_URL_DIRECT, once with DATABASE_URL_POOLED, as the two runs below do.
+if [ -n "$RIG_SERVE" ]; then
+  {
+    for v in STANDBY_URL CASCADE_URL SPLIT_URL SUBSCRIBER_URL ALT_ADDR_URL \
+             POOLER_HOST POOLER_PORT POOLER_USER; do
+      [ -n "${!v:-}" ] && printf "export %s='%s'\n" "$v" "${!v}"
+    done
+    printf "export DATABASE_URL_DIRECT='host=%s port=%s dbname=pglicht user=pglicht'\n" "$RIG_HOST" "$PG_PORT"
+    printf "export DATABASE_URL_POOLED='host=%s port=%s dbname=pglicht user=pglicht'\n" "$RIG_HOST" "$BOUNCER_PORT"
+  } > "$RIG_SERVE"
+  echo "--- serving the rig at $RIG_HOST; environment in $RIG_SERVE"
+  echo "    remove that file to tear the rig down"
+  while [ -f "$RIG_SERVE" ]; do sleep 2; done
+  exit 0
+fi
+
 # --- run the suite both ways -----------------------------------------------
 rc=0
-DATABASE_URL="host=127.0.0.1 port=$PG_PORT dbname=pglicht user=pglicht" "$TEST_BIN" >/tmp/pgl.direct.$$ 2>&1 || rc=$?
+DATABASE_URL="host=$RIG_HOST port=$PG_PORT dbname=pglicht user=pglicht" "$TEST_BIN" >/tmp/pgl.direct.$$ 2>&1 || rc=$?
 echo "================ DIRECT (port $PG_PORT) ================"; tail -4 /tmp/pgl.direct.$$; rm -f /tmp/pgl.direct.$$
 [ "$rc" -eq 0 ] || { echo "DIRECT run failed"; exit 1; }
 
-DATABASE_URL="host=127.0.0.1 port=$BOUNCER_PORT dbname=pglicht user=pglicht" "$TEST_BIN" >/tmp/pgl.pooled.$$ 2>&1 || rc=$?
+DATABASE_URL="host=$RIG_HOST port=$BOUNCER_PORT dbname=pglicht user=pglicht" "$TEST_BIN" >/tmp/pgl.pooled.$$ 2>&1 || rc=$?
 echo; echo "================ POOLED (port $BOUNCER_PORT) ================"; tail -4 /tmp/pgl.pooled.$$; rm -f /tmp/pgl.pooled.$$
 [ "$rc" -eq 0 ] || { echo "POOLED run failed"; exit 1; }
 

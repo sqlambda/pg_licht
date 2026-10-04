@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pg_licht_mcp VERSION 4.5.1 LANGUAGES CXX)
+project(pg_licht_mcp VERSION 4.6.0 LANGUAGES CXX)
 
 # Standard bin/ and share/man/ layout, so `cmake --install` produces a tree that
 # can be dropped onto a prefix as-is: the release tarballs are staged this way,
@@ -46,6 +46,7 @@ target_link_libraries(pg_licht_mcp
         Threads::Threads
 )
 pglicht_harden(pg_licht_mcp)
+pglicht_harden_binary(pg_licht_mcp)
 pglicht_apply_sanitizers(pg_licht_mcp)
 install(TARGETS pg_licht_mcp RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 # The man page is checked in rather than generated: the release containers
@@ -54,6 +55,33 @@ install(TARGETS pg_licht_mcp RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 # never run and CPack would then fail on a missing install file.
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/man/pg_licht_mcp.1
         DESTINATION ${CMAKE_INSTALL_MANDIR}/man1)
+
+# libFuzzer targets for the inputs that come from outside the process:
+# fuzz_jsonrpc (a client message, through the real dispatch),
+# fuzz_connections and fuzz_budgets (the two INI parsers). clang only, built
+# with ASan and UBSan; CI runs each for a minute on pull requests. Seeds:
+# tools/fuzz-seeds.py.
+option(PGLICHT_FUZZ "Build the libFuzzer targets (clang only)" OFF)
+if(PGLICHT_FUZZ)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "PGLICHT_FUZZ needs clang (libFuzzer); this is ${CMAKE_CXX_COMPILER_ID}")
+    endif()
+    foreach(_fuzz connections budgets jsonrpc)
+        set(_sources fuzz/fuzz_${_fuzz}.cpp)
+        if(_fuzz STREQUAL "jsonrpc")
+            list(APPEND _sources ${PGLICHT_REGISTRY_SOURCES})
+        endif()
+        add_executable(fuzz_${_fuzz} ${_sources})
+        target_compile_definitions(fuzz_${_fuzz} PRIVATE PGLICHT_VERSION="${PROJECT_VERSION}")
+        target_link_libraries(fuzz_${_fuzz} PRIVATE
+            nlohmann_json::nlohmann_json PkgConfig::PQXX PkgConfig::LIBPQ Threads::Threads)
+        pglicht_harden(fuzz_${_fuzz})
+        target_compile_options(fuzz_${_fuzz} PRIVATE
+            -g -fno-omit-frame-pointer -fsanitize=fuzzer,address,undefined
+            -fno-sanitize-recover=undefined)
+        target_link_options(fuzz_${_fuzz} PRIVATE -fsanitize=fuzzer,address,undefined)
+    endforeach()
+endif()
 
 option(BUILD_TESTING "Build the test suite" ON)
 if(BUILD_TESTING)
@@ -78,6 +106,7 @@ if(BUILD_TESTING)
             PkgConfig::LIBPQ
             Threads::Threads)
     pglicht_harden(pg_licht_mcp_test)
+    pglicht_harden_binary(pg_licht_mcp_test)
     pglicht_apply_sanitizers(pg_licht_mcp_test)
     add_test(NAME mcp_test COMMAND pg_licht_mcp_test)
     pglicht_add_valgrind_test(pg_licht_mcp_test)
@@ -102,6 +131,10 @@ if(BUILD_TESTING)
     add_test(NAME cli_version COMMAND $<TARGET_FILE:pg_licht_mcp> --version)
     set_tests_properties(cli_version PROPERTIES
         PASS_REGULAR_EXPRESSION "^pg_licht_mcp ${PROJECT_VERSION}\n$")
+    pglicht_add_hardening_test(pg_licht_mcp)
+    # Every GitHub Action pinned to a commit SHA (SECURITY.md, "The build").
+    add_test(NAME actions_pinned
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/actions-pinned.sh ${CMAKE_CURRENT_SOURCE_DIR}/..)
     add_test(NAME cli_unknown_option COMMAND $<TARGET_FILE:pg_licht_mcp> --no-such-option)
     set_tests_properties(cli_unknown_option PROPERTIES
         PASS_REGULAR_EXPRESSION "unknown option: --no-such-option")
