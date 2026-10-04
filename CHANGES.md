@@ -111,6 +111,12 @@
   tarball of the commit, and runs `brew install --build-from-source` and
   `brew test`, then checks the installed binary's version and man page. It
   runs on every pull request, and the release waits for it.
+- **The extension failure paths are tested.** A coverage build through the
+  rig showed 7 of the server's 320 functions never run by the suite, all of
+  them extension failure paths: not preloaded, too old for a tool,
+  pgstattuple missing, denied or moved while running. `ExtensionEdgeTest`
+  and `NotPreloadedTest` run them, the second against the rig's subscriber,
+  which preloads nothing.
 - **The rig can be served.** `run-pooled-tests.sh` gains `RIG_HOST` (every
   cluster and PgBouncer also listen there, and the URLs it hands out use it;
   `0.0.0.0` for a client that substitutes its own route), `RIG_TRUST_NET`
