@@ -1,12 +1,20 @@
 # pg-licht
 
-A PostgreSQL MCP (Model Context Protocol) server that exposes schema exploration tools over JSON-RPC 2.0.
+A read-only PostgreSQL MCP (Model Context Protocol) server: it lets an AI assistant read a
+database's schema, statistics, plans, locks, replication and PgBouncer pools from the
+catalog. It never writes, and never returns rows from your tables.
 
-Motivation to create another PostgreSQL MCP:
+Why another PostgreSQL MCP:
 
-- Only queries the catalog to inspect the structure (lower risk to leak data)
-- Allow to describe database model and routines based on what is in the database
-- Fast inspection of available indexes and relationships when analyzing a query plan
+- It reads the catalog and the statistics views, not your data, so there is far less to
+  leak: the model sees structure, sizes, plans and counters.
+- Read-only is enforced, not promised: every call runs in its own `READ ONLY` transaction
+  with a statement timeout, and no SQL is built from arguments.
+- One process serves the whole fleet. Any number of connections live in one file, and a
+  question can be put to every database of an instance, a replication group or a label at
+  once.
+- It answers what an operator asks — why is this slow, what is blocked, is the replica
+  keeping up, does the pool keep up — and returns the evidence as PostgreSQL reports it.
 
 ## Safety
 
