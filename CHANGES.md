@@ -16,12 +16,46 @@ FreeBSD, ZFS); this release is what they ran into.
   `n_tup_upd`, `n_tup_del` and `n_tup_hot_upd`, on every supported version,
   and the prompt names the two ratios.
 
+- **`indexBloat` reads a GiST index.** It refused one with "pgstattuple has
+  no statistics function for a gist index". There is no page-level function
+  for GiST, but `pgstattuple(regclass)` reads one, and returns what a bloat
+  review wants: length, live and dead tuples, free space. `WITHOUT OVERLAPS`
+  keys are GiST, so on a temporal model the largest indexes in the database
+  were the only ones the tool could say nothing about. The answer carries
+  `source`, the function that produced it, on every access method. SP-GiST
+  and BRIN are still refused, because `pgstattuple` refuses them itself --
+  a test now checks that against the server -- and the message says "cannot
+  read" instead of "no statistics function".
+
+- **A statement with a typed literal is not called truncated.**
+  pg_stat_statements records `DATE '2026-09-14'` as `DATE $6`: it replaces
+  the string and keeps the type name, and that is not SQL. `explainQuery` by
+  `queryid` answered the resulting syntax error with a hint to raise
+  `track_activity_query_size`, which was not the cause. It now says what the
+  statement had, shows the fragment, and says to pass the statement through
+  `sql`. Recognised from the statement text, not the error message, which is
+  in the server's `lc_messages`. The statement is still not rewritten.
+
+- **`diagnose-slow-query` no longer stops at a utility statement.** After a
+  bulk load or a migration the slowest statements on record are `ALTER
+  TABLE`, `CREATE INDEX`, `VACUUM` and `COPY`, which have no plan; step 2
+  called `explainQuery` on the first, was refused, and the prompt had nowhere
+  to go. It now says to report what the statement was and how long it took,
+  and to continue with the next one that can be planned.
+
 - **Sizes are no longer called "on disk".** Every size PostgreSQL reports is
   in logical bytes; on a filesystem that compresses or shares blocks with a
   snapshot the space occupied differs -- the database above occupied 68 GB on
   ZFS. `diskUsage`'s note says so, and `triage-disk-space` asks for the
   filesystem's own figure before promising what a cleanup returns, instead
   of reading WAL and temporary files as "actually on disk".
+
+### Build
+
+- **GitHub Actions updated**, to the versions Dependabot proposed:
+  `checkout` 7.0.1, `upload-artifact` 7.0.1, `download-artifact` 8.0.1,
+  `cache` 6.1.0, `upload-pages-artifact` 5.0.0 and `deploy-pages` 5.0.1, each
+  pinned to its commit.
 
 ## 4.6.0 (2026-10-03)
 

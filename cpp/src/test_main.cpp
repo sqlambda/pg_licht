@@ -334,9 +334,12 @@ protected:
       txn.exec("CREATE INDEX ams_gin   ON grocery.index_ams USING gin (tags)"
                " WITH (fastupdate = on, gin_pending_list_limit = 128)");
       txn.exec("CREATE INDEX ams_hash  ON grocery.index_ams USING hash (id)");
-      // gist has no pgstattuple function at all; the tool must say so by name
+      // gist has no pgstat*index function, and is read with pgstattuple();
+      // spgist and brin pgstattuple refuses, and the tool must say so by name
       // rather than fail with a bare error from the wrong function.
       txn.exec("CREATE INDEX ams_gist  ON grocery.index_ams USING gist (box_col)");
+      txn.exec("CREATE INDEX ams_spgist ON grocery.index_ams USING spgist (box_col)");
+      txn.exec("CREATE INDEX ams_brin  ON grocery.index_ams USING brin (id)");
       txn.exec("ANALYZE grocery.index_ams");
 
       // A partitioned index is a catalog entry with no storage of its own.
@@ -3135,13 +3138,48 @@ TEST_F(PostgresMCPServerTest, IndexBloatHashReturnsBucketAndOverflowPages) {
 // The point of resolving the access method from the catalog: a gist index
 // must produce a stated answer naming what is supported, not the bare
 // "relation is not a btree index" that pgstatindex would raise.
-TEST_F(PostgresMCPServerTest, IndexBloatUnsupportedAccessMethodIsNamed) {
+// A GiST index has no pgstat*index function, and through 4.6 it was refused
+// as unsupported. pgstattuple(regclass) reads one. WITHOUT OVERLAPS keys are
+// GiST, so on a temporal model these are the largest indexes there are.
+TEST_F(PostgresMCPServerTest, IndexBloatGistReturnsTupleLevelFigures) {
   json r = srv->call_index_bloat("grocery", "ams_gist");
-  ASSERT_TRUE(r.contains("error")) << r.dump(2);
-  EXPECT_NE(r["error"].get<std::string>().find("gist"), std::string::npos);
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
   EXPECT_EQ(r["access_method"].get<std::string>(), "gist");
-  ASSERT_TRUE(r.contains("hint"));
-  EXPECT_NE(r["hint"].get<std::string>().find("pageinspect"), std::string::npos);
+  EXPECT_EQ(r["source"].get<std::string>(), "pgstattuple");
+  for (const char* f : {"table_len", "tuple_count", "dead_tuple_count", "free_space"}) {
+    ASSERT_TRUE(r.contains(f)) << f << r.dump(2);
+    EXPECT_TRUE(r[f].is_number_integer()) << f;
+  }
+  for (const char* f : {"tuple_percent", "dead_tuple_percent", "free_percent"})
+    EXPECT_TRUE(r[f].is_number()) << f << r.dump(2);
+  EXPECT_GT(r["table_len"].get<long long>(), 0);
+  // The page-level fields of another access method must not appear as zeros.
+  EXPECT_FALSE(r.contains("leaf_fragmentation")) << r.dump(2);
+  EXPECT_NE(r["note"].get<std::string>().find("tuple-level"), std::string::npos);
+  // The other access methods say which function answered too.
+  EXPECT_EQ(srv->call_index_bloat("grocery", "ams_btree")["source"], "pgstatindex");
+}
+
+// spgist and brin are refused by pgstattuple itself, which is the premise of
+// not falling back for them -- checked here against the server, not assumed.
+TEST_F(PostgresMCPServerTest, IndexBloatUnsupportedAccessMethodIsNamed) {
+  for (const char* am : {"spgist", "brin"}) {
+    const std::string idx = std::string("ams_") + am;
+    json r = srv->call_index_bloat("grocery", idx);
+    ASSERT_TRUE(r.contains("error")) << r.dump(2);
+    EXPECT_NE(r["error"].get<std::string>().find(am), std::string::npos) << r.dump(2);
+    EXPECT_EQ(r["access_method"].get<std::string>(), am);
+    ASSERT_TRUE(r.contains("hint"));
+    EXPECT_NE(r["hint"].get<std::string>().find("pageinspect"), std::string::npos);
+
+    pqxx::connection c(test_url);
+    pqxx::work t(c);
+    const std::string sch = t.exec("SELECT n.nspname FROM pg_extension e JOIN pg_namespace n "
+                                   "ON n.oid = e.extnamespace WHERE e.extname = 'pgstattuple'")
+                              .at(0).at(0).as<std::string>();
+    EXPECT_THROW(t.exec("SELECT * FROM " + sch + ".pgstattuple('grocery." + idx + "'::regclass)"),
+                 pqxx::sql_error) << am << " is readable after all";
+  }
 }
 
 TEST_F(PostgresMCPServerTest, IndexBloatPartitionedIndexHasNoStorageOfItsOwn) {
@@ -4729,6 +4767,58 @@ TEST_F(PgssMCPServerTest, QueryIdFromADroppedDatabaseIsReportedNotCrashed) {
   ASSERT_TRUE(r.contains("error")) << r.dump(2);
   EXPECT_NE(r["error"].get<std::string>().find("no longer exists"), std::string::npos);
   EXPECT_TRUE(r.contains("hint"));
+}
+
+// A typed literal is the one constant pg_stat_statements normalises into
+// text that is not SQL: DATE '2026-09-14' is recorded as DATE $1. Through 4.6
+// the answer blamed track_activity_query_size, on a statement that had not
+// been truncated.
+TEST_F(PgssMCPServerTest, AStatementWithATypedLiteralIsNotCalledTruncated) {
+  {
+    pqxx::connection c(url);
+    pqxx::work t(c);
+    t.exec("SELECT count(*) AS zzz_typed_literal_marker FROM pg_class "
+           "WHERE DATE '2026-09-14' > DATE '2026-01-01'");
+    t.commit();
+  }
+  std::string qid, recorded;
+  {
+    pqxx::connection c(url);
+    pqxx::work t(c);
+    pqxx::result r = t.exec(
+      "SELECT queryid::text, query FROM extensions.pg_stat_statements "
+      "WHERE query ILIKE '%zzz_typed_literal_marker%' AND query NOT ILIKE '%pg_stat_statements%' "
+      "ORDER BY total_exec_time DESC LIMIT 1");
+    if (!r.empty()) { qid = r[0][0].as<std::string>(); recorded = r[0][1].as<std::string>(); }
+  }
+  if (qid.empty()) GTEST_SKIP() << "could not seed the statement";
+  // The premise, checked: the constant went and the type name stayed.
+  ASSERT_NE(recorded.find("DATE $1"), std::string::npos) << recorded;
+
+  json r = srv->call_explain_query(qid, "", json::array(), false, 0);
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  EXPECT_NE(r["error"].get<std::string>().find("typed literal"), std::string::npos) << r.dump(2);
+  EXPECT_NE(r["error"].get<std::string>().find("DATE $1"), std::string::npos) << r.dump(2);
+  const std::string hint = r.value("hint", "");
+  EXPECT_NE(hint.find("type name"), std::string::npos) << hint;
+  EXPECT_NE(hint.find("'sql' argument"), std::string::npos) << hint;
+  EXPECT_EQ(hint.find("track_activity_query_size"), std::string::npos) << hint;
+
+  // A statement that really is cut short still gets the truncation hint,
+  // and so does one whose parameter merely follows a keyword: AT TIME ZONE $1
+  // is an ordinary parameter, and LIMIT $1 is not a type.
+  for (const char* q : {"SELECT count(*) FROM pg_class WHERE",
+                        "SELECT now() AT TIME ZONE $1 FROM pg_class WHERE",
+                        "SELECT relname FROM pg_class LIMIT $1 WHERE"}) {
+    json cut = srv->call_explain_query("", q, json::array(), false, 0);
+    ASSERT_TRUE(cut.contains("error")) << q << cut.dump(2);
+    EXPECT_EQ(cut["error"].get<std::string>().find("typed literal"), std::string::npos)
+        << q << cut.dump(2);
+  }
+  // The two-word forms are recognised by their first word too.
+  json tz = srv->call_explain_query("", "SELECT TIMESTAMP WITH TIME ZONE $1", json::array(), false, 0);
+  ASSERT_TRUE(tz.contains("error")) << tz.dump(2);
+  EXPECT_NE(tz["error"].get<std::string>().find("typed literal"), std::string::npos) << tz.dump(2);
 }
 
 // --- connection config ---

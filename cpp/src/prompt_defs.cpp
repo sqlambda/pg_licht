@@ -31,6 +31,20 @@ auto PostgresMCPServer::prompt_defs() -> const std::vector<PromptDef>& {
                                 : " whose mean duration is at least " + mind + "s")
                 + " and call explainQuery with its query_id.\n";
          s +=
+           "   That statement may not be a query. pg_stat_statements also "
+           "tracks utility statements -- ALTER TABLE, CREATE INDEX, VACUUM, "
+           "COPY -- and after a bulk load, a migration or a maintenance window "
+           "they are the slowest things on record. They have no plan, and "
+           "explainQuery refuses them by their first word. Do not stop there: "
+           "report what the statement was, how many times it ran and how long "
+           "it took in total, because a review after a migration wants to "
+           "know that building one key took two hours. Then take the next "
+           "statement in the ranking that starts with SELECT, INSERT, UPDATE, "
+           "DELETE, MERGE, WITH, TABLE or VALUES and continue with it. If "
+           "explainQuery says instead that the statement could not be parsed, "
+           "read its hint: it says whether the text was cut short or holds a "
+           "construct that cannot be prepared, and in both cases the full "
+           "statement has to come from the caller through the sql argument.\n"
            "   Before reading the plan, ask what the time went on, where "
            "checkPrivileges says the extensions allow it. statementKernelStats "
            "with the same query_id splits it the way the kernel saw it: "

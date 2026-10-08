@@ -2377,7 +2377,21 @@ Reads only the metapage, so it is cheap on any size of index.
 and
 .Va free_percent .
 Reads the whole index.
+.It Li gist
+.Li pgstattuple :
+there is no page-level function for GiST, so these are the tuple-level figures
+.Va table_len , tuple_count , tuple_len , tuple_percent , dead_tuple_count ,
+.Va dead_tuple_len , dead_tuple_percent , free_space
+and
+.Va free_percent .
+A
+.Li WITHOUT OVERLAPS
+key is a GiST index.
+Reads the whole index.
 .El
+.Pp
+.Va source
+names the function that answered.
 .Pp
 The metrics are deliberately not normalized across access methods, unlike
 .Ic tableBloat Ns 's
@@ -2397,12 +2411,12 @@ a fragmented index that nothing has scanned since the last statistics reset is
 a candidate for dropping rather than for
 .Ql REINDEX .
 .Pp
-.Li gist , spgist
+.Li spgist
 and
 .Li brin
-have no
+are read by no
 .Li pgstattuple
-function at all and are reported as unsupported by name; their page-level
+function and are reported as unsupported by name; their page-level
 detail is in the
 .Li pageinspect
 extension instead.
@@ -2444,6 +2458,19 @@ queryid, as a decimal string.
 It is a 64-bit value and does not survive JSON number precision.
 Mutually exclusive with
 .Va sql .
+Two kinds of recorded statement cannot be planned from their text, and the
+answer says which: one cut short at
+.Va track_activity_query_size ,
+and one that had a typed literal.
+.Li pg_stat_statements
+records
+.Ql DATE '2026-09-14'
+as
+.Ql DATE $6 ,
+keeping the type name without its string, which is not SQL at any length.
+Both have to be passed through
+.Va sql
+instead.
 .It Va sql
 A single
 .Ic SELECT , INSERT , UPDATE , DELETE , MERGE , WITH , TABLE ,

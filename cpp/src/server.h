@@ -6122,6 +6122,57 @@ private:
     return {};
   }
 
+  // "DATE $6" when a parameter follows a type name in a statement the server
+  // has already refused to parse, and "" otherwise. Read from the statement
+  // and not from the error message: the message is in the server's
+  // lc_messages, and "at or near" is English only. It can only ever change
+  // what is said about a statement that failed with a syntax error.
+  static std::string typed_literal_parameter(const std::string& sql) {
+    // The type names that are written this way in practice.
+    static const std::set<std::string> kTypes = {
+      "date", "time", "timetz", "timestamp", "timestamptz", "interval",
+      "numeric", "decimal", "integer", "int", "int2", "int4", "int8", "bigint",
+      "smallint", "real", "float4", "float8", "money", "boolean", "bool",
+      "text", "varchar", "char", "bpchar", "name", "bytea", "uuid", "json", "jsonb",
+      "xml", "inet", "cidr", "macaddr", "point", "box", "bit", "varbit", "oid",
+      "regclass", "tsquery", "tsvector", "daterange", "tsrange", "tstzrange",
+      "int4range", "int8range", "numrange"};
+    auto word_before = [&sql](size_t& end) {   // the word ending at `end`, lowercased
+      while (end > 0 && std::isspace(static_cast<unsigned char>(sql[end - 1]))) end--;
+      const size_t stop = end;
+      while (end > 0 && (std::isalnum(static_cast<unsigned char>(sql[end - 1])) || sql[end - 1] == '_')) end--;
+      std::string w = sql.substr(end, stop - end);
+      for (auto& ch : w) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+      return w;
+    };
+    for (size_t p = sql.find('$'); p != std::string::npos; p = sql.find('$', p + 1)) {
+      size_t e = p + 1;
+      while (e < sql.size() && std::isdigit(static_cast<unsigned char>(sql[e]))) e++;
+      if (e == p + 1) continue;                                  // not $n
+      if (p == 0 || !std::isspace(static_cast<unsigned char>(sql[p - 1]))) continue;
+      size_t at = p;
+      const std::string w = word_before(at);
+      if (w.empty()) continue;
+      std::string shown = sql.substr(at, p - at);
+      while (!shown.empty() && std::isspace(static_cast<unsigned char>(shown.back()))) shown.pop_back();
+      bool typed = kTypes.count(w) > 0;
+      // TIMESTAMP WITH TIME ZONE $n is a typed literal; AT TIME ZONE $n is an
+      // ordinary parameter. DOUBLE PRECISION $n likewise needs its first word.
+      if (w == "zone") {
+        size_t q = at;
+        if (word_before(q) == "time") {
+          const std::string with = word_before(q);
+          typed = with == "with" || with == "without";
+        }
+      } else if (w == "precision") {
+        size_t q = at;
+        typed = word_before(q) == "double";
+      }
+      if (typed) return shown + " " + sql.substr(p, e - p);
+    }
+    return "";
+  }
+
   const json explain_query(const std::string& queryid, const std::string& sql_in,
                            const json& params, bool analyze, int timeout_ms,
                            const json& settings, const std::string& plan_as_role) {
@@ -6449,6 +6500,26 @@ private:
       // std::string_view (explicit conversion to std::string), while 7.x
       // returns std::string. Parens accept both.
       std::string ss(e.sqlstate());
+      // A typed literal -- DATE '2026-09-14', INTERVAL '1 day' -- is the one
+      // thing pg_stat_statements normalises into text that is not SQL: it
+      // replaces the string and keeps the type name, leaving DATE $6, and a
+      // type name must be followed by a string literal. Through 4.6 this was
+      // answered with the truncation hint below, which sent the reader to a
+      // setting that was not the cause.
+      if (ss == "42601") {
+        const std::string typed = typed_literal_parameter(std::string(e.query()));
+        if (!typed.empty())
+          return {{"error", "the statement could not be parsed: it had a typed literal, "
+                            "which pg_stat_statements recorded as " + typed},
+                  {"hint", "the original statement wrote a constant as a type name and "
+                           "a string, such as DATE '2026-09-14'. pg_stat_statements "
+                           "replaces the string with a parameter and keeps the type "
+                           "name, and the result is not valid SQL whatever its length, "
+                           "so this statement cannot be explained by queryid. "
+                           "Pass the statement via the 'sql' argument with the "
+                           "constant written out, or as a cast: $1::date"},
+                  {"detail", e.what()}};
+      }
       if (ss == "42601")
         return {{"error", "the statement could not be parsed"},
                 {"hint", "pg_stat_statements truncates query text at "
@@ -6712,22 +6783,28 @@ private:
       };
     }
 
-    // gist, spgist and brin have no pgstattuple support at all. Saying so,
-    // and naming what is supported, is the whole difference between a dead
-    // end and a caller who knows to reach for pageinspect.
+    // There is no pgstat*index function for gist, and through 4.6 a GiST
+    // index was refused as unsupported. But the general pgstattuple(regclass)
+    // reads one -- length, live and dead tuples, free space -- which is what a
+    // bloat review wants, and WITHOUT OVERLAPS keys are GiST: on a temporal
+    // model they are the largest indexes in the database and were the only
+    // ones this tool could say nothing about. spgist and brin it refuses
+    // itself ("is not supported"), so those stay a stated dead end, with
+    // pageinspect named.
     static const std::map<std::string, std::string> FUNCS = {
       {"btree", "pgstatindex"},
       {"gin",   "pgstatginindex"},
       {"hash",  "pgstathashindex"},
+      {"gist",  "pgstattuple"},
     };
     auto fn = FUNCS.find(am);
     if (fn == FUNCS.end()) {
       return {
-        {"error", "pgstattuple has no statistics function for a " +
+        {"error", "pgstattuple cannot read a " +
                   (am.empty() ? std::string("(unknown)") : am) + " index"},
-        {"hint", "supported access methods are btree, gin and hash; for gist, "
-                 "spgist and brin the page-level detail is in the pageinspect "
-                 "extension instead"},
+        {"hint", "page-level statistics exist for btree, gin and hash, and "
+                 "tuple-level ones for gist; for spgist and brin the detail is "
+                 "in the pageinspect extension instead"},
         {"access_method", am}
       };
     }
@@ -6765,6 +6842,12 @@ private:
        " 'overflow_pages', s.overflow_pages, 'bitmap_pages', s.bitmap_pages,"
        " 'unused_pages', s.unused_pages, 'live_items', s.live_items,"
        " 'dead_items', s.dead_items, 'free_percent', s.free_percent"},
+      {"gist",
+       "'table_len', s.table_len, 'tuple_count', s.tuple_count,"
+       " 'tuple_len', s.tuple_len, 'tuple_percent', s.tuple_percent,"
+       " 'dead_tuple_count', s.dead_tuple_count, 'dead_tuple_len', s.dead_tuple_len,"
+       " 'dead_tuple_percent', s.dead_tuple_percent,"
+       " 'free_space', s.free_space, 'free_percent', s.free_percent"},
     };
 
     // The oid is resolved above and passed back as text, so the function
@@ -6792,6 +6875,16 @@ private:
           ? json("on") : meta["fastupdate"];
         out["pending_list_limit_kb"] = meta["pending_list_limit_kb"];
       }
+      // Which function answered, because for gist it is not a page-level one:
+      // there is no tree level or fragmentation here, only how full the pages
+      // are and how much of that is dead.
+      out["source"] = fn->second;
+      if (am == "gist")
+        out["note"] = "pgstattuple has no page-level function for a gist index, so "
+                      "these are the tuple-level figures of pgstattuple(regclass): "
+                      "table_len is the index's length in bytes, and free_percent "
+                      "and dead_tuple_percent are shares of it. It reads the whole "
+                      "index under a share lock on each page.";
       return out;
     } catch (const pqxx::insufficient_privilege& e) {
       return pgstattuple_denied(fn->second, e.what());
