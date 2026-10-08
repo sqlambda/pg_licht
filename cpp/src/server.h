@@ -18,6 +18,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <unistd.h>
 #include <nlohmann/json.hpp>
@@ -9397,7 +9398,12 @@ private:
         on_server.insert(row[0].as<std::string>());
       sub.commit();
       know_on_server = true;
-    } catch (const std::exception&) {}
+    } catch (const std::exception&) {
+      // Unknown, not "nothing is available": the reasons below then say only
+      // that the extension is not installed, as they did before.
+      on_server.clear();
+      know_on_server = false;
+    }
     auto absent = [&](const std::string& ext, bool preloaded_too = false) {
       std::string why = "the " + ext + " extension is not installed";
       if (!know_on_server) return why;
@@ -9580,7 +9586,7 @@ private:
           // Only "the object is not there" or "not loaded" is a state of the
           // extension. A timeout, a lock or a lost connection is this probe
           // failing, and says nothing about it: functional is then unknown.
-          const std::string state{ex.sqlstate()};   // a string_view in libpqxx 8
+          const std::string_view state{ex.sqlstate()};   // a string in libpqxx 7, a view in 8
           const bool about_ext = state.rfind("42", 0) == 0 || state == "3F000" ||
                                  state == "55000" || state == "0A000";
           e["functional"] = about_ext ? json(false) : json();
