@@ -2924,6 +2924,61 @@ TEST_F(PostgresMCPServerTest, ListSequencesUnknownSchemaReturnsEmpty) {
 
 // --- listExtensions ---
 
+// What could be installed, on request. Without the argument the answer is
+// what it always was -- every key an installed extension, no new field -- so
+// nothing that reads it changes.
+TEST_F(PostgresMCPServerTest, ListExtensionsCanAlsoListWhatIsAvailable) {
+  json plain = srv->call_extensions();
+  ASSERT_TRUE(plain.contains("plpgsql")) << plain.dump(2).substr(0, 300);
+  for (const auto& [name, e] : plain.items())
+    EXPECT_FALSE(e.contains("installed")) << name << " gained a field by default";
+
+  json all = srv->call_extensions(true);
+  size_t installed = 0, available = 0;
+  for (const auto& [name, e] : all.items()) {
+    ASSERT_TRUE(e.contains("installed")) << name;
+    ASSERT_TRUE(e.contains("default_version")) << name;
+    if (e["installed"] == true) {
+      installed++;
+      EXPECT_TRUE(plain.contains(name)) << name;
+      EXPECT_TRUE(e.contains("version")) << name;
+    } else {
+      available++;
+      EXPECT_FALSE(plain.contains(name)) << name;
+      EXPECT_FALSE(e.contains("schema")) << name << ": not created, so it has no schema";
+      EXPECT_TRUE(e["default_version"].is_string()) << name;
+    }
+  }
+  EXPECT_EQ(installed, plain.size());
+  // Against the catalog itself, whatever this server happens to package.
+  pqxx::connection c(test_url);
+  pqxx::work t(c);
+  EXPECT_EQ(available, t.exec("SELECT count(*) FROM pg_available_extensions "
+                              "WHERE installed_version IS NULL").at(0).at(0).as<size_t>());
+  // Any role may read the view, which is what lets checkPrivileges use it.
+  EXPECT_TRUE(t.exec("SELECT has_table_privilege('public', 'pg_catalog.pg_available_extensions', "
+                     "'SELECT')").at(0).at(0).as<bool>());
+
+  // And through the dispatch, where the argument is read.
+  json viaRpc = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+      {"params", {{"name", "listExtensions"}, {"arguments", {{"available", true}}}}}});
+  ASSERT_TRUE(viaRpc.contains("result")) << viaRpc.dump().substr(0, 300);
+  EXPECT_NE(viaRpc.dump().find("default_version"), std::string::npos);
+}
+
+// A tool denied for a missing extension says how far away the extension is.
+TEST_F(PostgresMCPServerTest, CheckPrivilegesSaysWhetherAMissingExtensionIsAvailable) {
+  json p = srv->call_check_privileges();
+  ASSERT_TRUE(p.contains("denied")) << p.dump(2).substr(0, 400);
+  for (const auto& d : p["denied"]) {
+    const std::string why = d.value("reason", "");
+    if (why.find("extension is not installed") == std::string::npos) continue;
+    const bool here = why.find("available on this server: CREATE EXTENSION") != std::string::npos;
+    const bool absent = why.find("files are not on this server") != std::string::npos;
+    EXPECT_TRUE(here != absent) << why;
+  }
+}
+
 TEST_F(PostgresMCPServerTest, ListExtensionsReturnsKnownExtension) {
   json result = srv->call_extensions();
   EXPECT_TRUE(result.is_object());
@@ -4239,6 +4294,30 @@ TEST_F(PostgresMCPServerTest, HostCapacityComputesRatiosFromInjectedHardware) {
   EXPECT_FALSE(d["committed_worst_case_percent_of_ram"].is_null());
 }
 
+// Memory the operating system holds outside the page cache -- a ZFS ARC of a
+// fixed size. Through 4.6 the worst case had no place for it, and on a 32 GB
+// server with an 8 GB ARC read 82% where the truth was over 100%.
+TEST_F(PostgresMCPServerTest, HostCapacityCountsReservedMemoryInTheWorstCase) {
+  json without = srv->call_host_capacity(32768, 16, "");
+  json with = srv->call_host_capacity(32768, 16, "", 8192);
+  const json& a = without["derived"];
+  const json& b = with["derived"];
+  // Not declared is null, never a zero that reads as "nothing is reserved".
+  ASSERT_TRUE(a.contains("host_reserved_bytes")) << a.dump(2);
+  EXPECT_TRUE(a["host_reserved_bytes"].is_null()) << a.dump(2);
+  EXPECT_FALSE(without["host"].contains("reserved_mb"));
+
+  const long long reserved = 8192LL * 1048576LL;
+  EXPECT_EQ(b["host_reserved_bytes"].get<long long>(), reserved);
+  EXPECT_NEAR(b["host_reserved_percent_of_ram"].get<double>(), 25.0, 0.05);
+  EXPECT_EQ(with["host"]["reserved_mb"], 8192);
+  EXPECT_EQ(b["committed_worst_case_bytes"].get<long long>(),
+            a["committed_worst_case_bytes"].get<long long>() + reserved);
+  EXPECT_NEAR(b["committed_worst_case_percent_of_ram"].get<double>(),
+              a["committed_worst_case_percent_of_ram"].get<double>() + 25.0, 0.11);
+
+}
+
 TEST_F(PostgresMCPServerTest, HostCapacityResolvesByteUnitsPerSetting) {
   json r = srv->call_host_capacity(0, 0, "");
   auto& s = r["settings"];
@@ -4769,6 +4848,40 @@ TEST_F(PgssMCPServerTest, QueryIdFromADroppedDatabaseIsReportedNotCrashed) {
   EXPECT_TRUE(r.contains("hint"));
 }
 
+// pg_stat_statements tracks utility statements, and after a load they head
+// the ranking; diagnose-slow-query stopped at the first. Each entry now says
+// whether explainQuery will take it, by the rule explainQuery itself applies.
+TEST_F(PgssMCPServerTest, StatementStatsSaysWhichStatementsHaveAPlan) {
+  {
+    pqxx::connection c(url);
+    pqxx::nontransaction n(c);
+    n.exec("CREATE TABLE IF NOT EXISTS public.zzz_explainable_marker (id int)");
+    n.exec("ALTER TABLE public.zzz_explainable_marker ADD COLUMN IF NOT EXISTS note text");
+    n.exec("SELECT count(*) AS zzz_explainable_marker FROM public.zzz_explainable_marker");
+  }
+  json r = srv->call_statement_stats(5000);
+  ASSERT_FALSE(r.contains("error")) << r.dump(2).substr(0, 400);
+  bool utility = false, planned = false;
+  for (const auto& st : r["statements"]) {
+    ASSERT_TRUE(st.contains("explainable")) << st.dump();
+    if (!st["query"].is_string()) { EXPECT_TRUE(st["explainable"].is_null()); continue; }
+    const std::string q = st["query"].get<std::string>();
+    if (q.find("zzz_explainable_marker") == std::string::npos) continue;
+    if (q.rfind("ALTER TABLE", 0) == 0) { utility = true; EXPECT_EQ(st["explainable"], false) << q; }
+    if (q.rfind("SELECT count(*) AS zzz_explainable_marker", 0) == 0) {
+      planned = true; EXPECT_EQ(st["explainable"], true) << q;
+    }
+    // And the two tools agree: what is marked false, explainQuery refuses.
+    if (st["explainable"] == false) {
+      EXPECT_THROW(srv->call_explain_query(st["query_id"].get<std::string>(), "", json::array(), false, 0),
+                   std::runtime_error) << q;
+    }
+  }
+  EXPECT_TRUE(planned) << "the seeded SELECT was not found";
+  // track_utility is on by default; where it is off there is nothing to mark.
+  if (!utility) GTEST_SKIP() << "no utility statement was tracked (track_utility off?)";
+}
+
 // A typed literal is the one constant pg_stat_statements normalises into
 // text that is not SQL: DATE '2026-09-14' is recorded as DATE $1. Through 4.6
 // the answer blamed track_activity_query_size, on a statement that had not
@@ -4861,6 +4974,19 @@ TEST(ConnectionConfigTest, ParsesNamedSections) {
   EXPECT_EQ(reg.get("other").dbname, "two");
   EXPECT_EQ(reg.get("other").user, "bob");
   EXPECT_NE(reg.get("default").conninfo.find("dbname=one"), std::string::npos);
+}
+
+// host_reserved_mb: per connection, inherited from an instance section like
+// the RAM it is counted against, never passed to libpq, and a positive
+// integer of megabytes or nothing.
+TEST(ConnectionConfigTest, ReservedMemoryIsReadAndInherited) {
+  auto reg = load("[own]\ndbname = x\nhost_ram_mb = 32768\nhost_reserved_mb = 8192\n"
+                  "[member]\ndbname = y\ninstance = pg-01\n"
+                  "[instance:pg-01]\nhost_ram_mb = 65536\nhost_reserved_mb = 4096\n");
+  EXPECT_EQ(reg.get("own").capacity.reserved_mb, 8192);
+  EXPECT_EQ(reg.get("own").conninfo.find("host_reserved_mb"), std::string::npos);
+  EXPECT_EQ(reg.get("member").capacity.reserved_mb, 4096);
+  EXPECT_THROW(load("[own]\ndbname = x\nhost_reserved_mb = 8GB\n"), std::runtime_error);
 }
 
 TEST(ConnectionConfigTest, AppendsApplicationName) {
@@ -6924,6 +7050,16 @@ TEST_F(PreloadExtTest, APreloadedLibraryWithoutItsExtensionSaysOnlyCreateIsMissi
           d.value("reason", "").find("preloaded, but the extension is not created") != std::string::npos)
         said = true;
     EXPECT_TRUE(said) << p.dump(2);
+    // pgstattuple is packaged here and not created in this database: one
+    // CREATE EXTENSION away, and the reason says so. Through 4.6 it said only
+    // "not installed", the same as for an extension whose package is absent.
+    bool one_command = false;
+    for (const auto& d : p.value("denied", json::array()))
+      if (d.value("tool", "") == "tableBloat" &&
+          d.value("reason", "").find("available on this server: CREATE EXTENSION pgstattuple;")
+            != std::string::npos)
+        one_command = true;
+    EXPECT_TRUE(one_command) << p.dump(2);
   }
   {
     pqxx::nontransaction n(*admin);

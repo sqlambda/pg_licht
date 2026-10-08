@@ -368,8 +368,8 @@
       "arguments": {"limit": 2},
       "result": {
         "statements": [
-          {"query_id": "-6203381990422871044", "query": "UPDATE shop.orders SET status = $1 WHERE id = $2", "calls": 18244102, "total_exec_ms": 9120441.2, "mean_exec_ms": 0.5, "rows": 18244102, "shared_blks_hit": 91220103, "shared_blks_read": 12033, "user": "app_rw", "database": "shop"},
-          {"query_id": "3301928477102934411", "query": "SELECT id, status FROM shop.orders WHERE customer_id = $1 ORDER BY created_at DESC LIMIT $2", "calls": 4410233, "total_exec_ms": 3120982.7, "mean_exec_ms": 0.71, "rows": 88204660, "shared_blks_hit": 402211093, "shared_blks_read": 440112, "user": "app_rw", "database": "shop"}
+          {"query_id": "-6203381990422871044", "query": "UPDATE shop.orders SET status = $1 WHERE id = $2", "explainable": true, "calls": 18244102, "total_exec_ms": 9120441.2, "mean_exec_ms": 0.5, "rows": 18244102, "shared_blks_hit": 91220103, "shared_blks_read": 12033, "user": "app_rw", "database": "shop"},
+          {"query_id": "3301928477102934411", "query": "SELECT id, status FROM shop.orders WHERE customer_id = $1 ORDER BY created_at DESC LIMIT $2", "explainable": true, "calls": 4410233, "total_exec_ms": 3120982.7, "mean_exec_ms": 0.71, "rows": 88204660, "shared_blks_hit": 402211093, "shared_blks_read": 440112, "user": "app_rw", "database": "shop"}
         ],
         "info": {"dealloc": 0, "stats_reset": "2026-08-01T00:00:00Z"}
       }

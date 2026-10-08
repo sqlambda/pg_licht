@@ -57,13 +57,18 @@ inline constexpr int kDefaultStatementTimeoutMs = 120000;
 // from it.
 struct HostCapacity {
   long long ram_mb = 0;
+  // Memory the operating system holds outside the page cache and does not
+  // give back on request: a ZFS ARC of a fixed size, huge pages reserved for
+  // something else, another service on the machine. Counted in hostCapacity's
+  // worst case, which without it left 8 GB of 32 out on a ZFS server.
+  long long reserved_mb = 0;
   int vcpus = 0;
   std::string storage;   // free text, e.g. "nvme", "gp3", "spinning rust"
   std::string note;      // free text, e.g. "shared with the app server"
   std::string source;    // where the values came from, for the caller to judge
 
   bool configured() const {
-    return ram_mb > 0 || vcpus > 0 || !storage.empty() || !note.empty();
+    return ram_mb > 0 || reserved_mb > 0 || vcpus > 0 || !storage.empty() || !note.empty();
   }
 };
 
@@ -528,6 +533,9 @@ public:
     std::string const ram = env("PG_LICHT_HOST_RAM_MB");
     std::string const cpu = env("PG_LICHT_HOST_VCPUS");
     if (!ram.empty()) cap.ram_mb = detail::positive_int(ram, "PG_LICHT_HOST_RAM_MB");
+    std::string const reserved = env("PG_LICHT_HOST_RESERVED_MB");
+    if (!reserved.empty())
+      cap.reserved_mb = detail::positive_int(reserved, "PG_LICHT_HOST_RESERVED_MB");
     if (!cpu.empty()) cap.vcpus = static_cast<int>(
                         detail::positive_int(cpu, "PG_LICHT_HOST_VCPUS"));
     cap.storage = env("PG_LICHT_HOST_STORAGE");
@@ -568,6 +576,8 @@ private:
     const std::string where = path + ": [instance:" + iname + "]";
     for (const auto& [key, val] : kvs) {
       if (key == "host_ram_mb")      cap.ram_mb = detail::positive_int(val, where + " host_ram_mb");
+      else if (key == "host_reserved_mb")
+        cap.reserved_mb = detail::positive_int(val, where + " host_reserved_mb");
       else if (key == "host_vcpus")  cap.vcpus = static_cast<int>(
                                        detail::positive_int(val, where + " host_vcpus"));
       else if (key == "host_storage") cap.storage = val;
@@ -575,7 +585,7 @@ private:
       else
         throw std::runtime_error(
           where + ": unexpected key '" + key + "'. An instance section carries "
-          "host capacity only (host_ram_mb, host_vcpus, host_storage, "
+          "host capacity only (host_ram_mb, host_reserved_mb, host_vcpus, host_storage, "
           "host_note); connection keys belong in a connection section");
     }
     if (cap.configured()) cap.source = "instance section";
@@ -603,6 +613,7 @@ private:
       const bool declared_own = c.capacity.configured();
       bool inherited = false;
       if (c.capacity.ram_mb == 0 && from.ram_mb > 0) { c.capacity.ram_mb = from.ram_mb; inherited = true; }
+      if (c.capacity.reserved_mb == 0 && from.reserved_mb > 0) { c.capacity.reserved_mb = from.reserved_mb; inherited = true; }
       if (c.capacity.vcpus == 0 && from.vcpus > 0)   { c.capacity.vcpus = from.vcpus;   inherited = true; }
       if (c.capacity.storage.empty() && !from.storage.empty()) { c.capacity.storage = from.storage; inherited = true; }
       if (c.capacity.note.empty() && !from.note.empty())       { c.capacity.note = from.note;       inherited = true; }
@@ -756,6 +767,11 @@ private:
       // whole string as an invalid option otherwise.
       if (key == "host_ram_mb") {
         cfg.capacity.ram_mb = detail::positive_int(val, path + ": [" + name + "] host_ram_mb");
+        continue;
+      }
+      if (key == "host_reserved_mb") {
+        cfg.capacity.reserved_mb =
+          detail::positive_int(val, path + ": [" + name + "] host_reserved_mb");
         continue;
       }
       if (key == "host_vcpus") {

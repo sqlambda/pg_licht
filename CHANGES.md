@@ -41,7 +41,32 @@ FreeBSD, ZFS); this release is what they ran into.
   TABLE`, `CREATE INDEX`, `VACUUM` and `COPY`, which have no plan; step 2
   called `explainQuery` on the first, was refused, and the prompt had nowhere
   to go. It now says to report what the statement was and how long it took,
-  and to continue with the next one that can be planned.
+  and to continue with the next one that can be planned. `statementStats`
+  marks each statement `explainable`: false for a utility statement, true
+  for one `explainQuery` will take -- one rule for both tools -- and null
+  where the text is hidden. Nothing is left out of the ranking.
+
+- **What could be installed is listed.** `listExtensions` returned the
+  extensions installed and nothing else, so a plan that needed `bloom` could
+  say only that it was not there. With `available: true` it also returns the
+  extensions whose files are on the server and which are not created in this
+  database, every entry then marked `installed` and carrying
+  `default_version`. Without the argument the answer is unchanged.
+  `checkPrivileges` draws the same line for the extensions pg_licht uses: a
+  tool denied for a missing extension says whether it is one
+  `CREATE EXTENSION` away or needs its package first.
+
+- **`hostCapacity` can count memory the operating system has reserved.**
+  Its worst case was `shared_buffers`, `work_mem` times `max_connections`
+  and `maintenance_work_mem` times the autovacuum workers, against
+  `host_ram_mb`. On a 32 GB server with a ZFS ARC capped at 8 GB it reported
+  82% where the truth was over 100%, and nothing in the answer suggested
+  looking. `host_reserved_mb` (per connection or instance, as
+  `PG_LICHT_HOST_RESERVED_MB`, or the `reserved_mb` argument) declares
+  memory held outside the page cache; it is added to
+  `committed_worst_case` and reported as `host_reserved_bytes`, which is
+  null, not zero, when nothing was declared -- and a note says what that
+  leaves out.
 
 - **Sizes are no longer called "on disk".** Every size PostgreSQL reports is
   in logical bytes; on a filesystem that compresses or shares blocks with a

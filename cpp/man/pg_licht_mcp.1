@@ -418,15 +418,30 @@ They are therefore injected, and
 correlates them with
 .Va shared_buffers , Va work_mem ,
 and the rest.
-Four optional keys per section carry them:
+Five optional keys per section carry them:
 .Bd -literal -offset indent
 [prod]
-service      = db01_ro
-host_ram_mb  = 65536
-host_vcpus   = 16
+service          = db01_ro
+host_ram_mb      = 65536
+host_vcpus       = 16
+host_reserved_mb = 8192            ; e.g. a ZFS ARC capped at 8 GB
 host_storage = local nvme          ; free text, never interpreted
 host_note    = shared with the app ; free text, never interpreted
 .Ed
+.Pp
+.Va host_reserved_mb
+is memory the operating system holds outside the page cache and does not give
+back on request: a ZFS ARC of a fixed size, huge pages reserved for something
+else, another service on the machine.
+PostgreSQL cannot see it, and
+.Ic hostCapacity
+adds it to the committed worst case, as its own line.
+Where it is not declared the answer says so rather than counting zero: on a
+32 GB server with an 8 GB ARC, a worst case reported as 82% of RAM was in fact
+more than all of it.
+The page cache itself must not be put here; it shrinks under pressure, and
+.Va effective_cache_size
+already describes it.
 .Pp
 These keys are consumed by
 .Nm
@@ -1329,8 +1344,26 @@ and so on) with type and handler function.
 .It Ic listCasts
 Type casts involving at least one user-defined type, excluding
 built-in-to-built-in casts, with source and target types, context, and method.
-.It Ic listExtensions
+.It Ic listExtensions Op Va available
 Installed extensions with version, schema, relocatable flag, and description.
+With
+.Va available
+set, also the extensions whose files are on the server and which are not
+created in this database, from
+.Li pg_available_extensions ;
+every entry then carries
+.Va installed
+and
+.Va default_version ,
+the version
+.Ic CREATE EXTENSION
+would install.
+Whether an extension a plan needs is one command away, or needs a package and
+perhaps a restart first, changes the plan.
+.Ic checkPrivileges
+draws the same line for the extensions this server itself uses: an operation
+denied because its extension is missing says whether that extension is
+available on the server.
 .El
 .Ss Extensibility and text search
 .Bl -tag -width Ds
@@ -1590,6 +1623,21 @@ alongside an
 block from
 .Li pg_stat_statements_info .
 Returns a clear error with setup instructions if the extension is not installed.
+.Pp
+Each statement carries
+.Va explainable .
+.Li pg_stat_statements
+tracks utility statements too, and after a bulk load, a migration or a
+maintenance window they head the ranking:
+.Ic ALTER TABLE , CREATE INDEX , VACUUM , COPY .
+They have no plan, so
+.Va explainable
+is false for them and true for a statement
+.Ic explainQuery
+will take, by the same first-word rule that operation applies; it is null
+where the query text is hidden from the connecting role.
+Nothing is left out: a review after a migration wants to see that building
+one key took two hours.
 .Pp
 .Va info.dealloc
 counts how often the extension has evicted its least-used entries because
@@ -3347,6 +3395,12 @@ Honoured only with the single-connection
 form; with a connections file, use
 .Va host_ram_mb
 in the section instead.
+See
+.Sx Host capacity .
+.It Ev PG_LICHT_HOST_RESERVED_MB
+Memory the operating system holds outside the page cache, in megabytes; the
+environment form of
+.Va host_reserved_mb .
 See
 .Sx Host capacity .
 .It Ev PG_LICHT_HOST_VCPUS

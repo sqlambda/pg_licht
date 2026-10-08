@@ -514,13 +514,15 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args& a) -> json {
          return s.sequences(a.str("schema", "public"), a.str("pattern")); }},
       {"listExtensions",
-       "return installed PostgreSQL extensions with version, schema, relocatable flag, and description",
+       "return installed PostgreSQL extensions with version, schema, relocatable flag, and description. With available: true, also the extensions whose files are on the server but which are not created in this database (from pg_available_extensions), each entry then carrying installed: true or false and default_version, the version CREATE EXTENSION would install -- which says whether an extension a plan needs is one command away or needs a package first",
        []() -> json { return {
    		{"type", "object"},
-   		{"properties", json::object()}
+   		{"properties", {
+   		    {"available", {{"type", "boolean"}, {"description", "also list extensions that are available on the server and not installed in this database, and mark every entry installed: true or false. Defaults to false, which returns installed extensions only"}}}
+   		  }}
    	      }; },
-       [](PostgresMCPServer& s, const Args&) -> json {
-         return s.extensions(); }},
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         return s.extensions(a.flag("available", false)); }},
       {"databaseSize",
        "return the current database name and its total disk size",
        []() -> json { return {
@@ -603,7 +605,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
        [](PostgresMCPServer& s, const Args&) -> json {
          return s.database_stats(); }},
       {"statementStats",
-       "return tracked queries from pg_stat_statements under 'statements', with calls, timing, row counts, buffer usage, temporary block I/O and WAL volume, alongside an 'info' block from pg_stat_statements_info whose dealloc counter says whether entries are being evicted -- if it is climbing, this is not the slowest queries in the cluster but the slowest of those that survived eviction. query_id is a decimal string, ready to pass to explainQuery. Returns a clear error with setup instructions if the extension is not installed",
+       "return tracked queries from pg_stat_statements under 'statements', with calls, timing, row counts, buffer usage, temporary block I/O and WAL volume, alongside an 'info' block from pg_stat_statements_info whose dealloc counter says whether entries are being evicted -- if it is climbing, this is not the slowest queries in the cluster but the slowest of those that survived eviction. query_id is a decimal string, ready to pass to explainQuery. Each statement carries 'explainable': false for a utility statement (ALTER TABLE, CREATE INDEX, VACUUM, COPY...), which pg_stat_statements also tracks, which has no plan, and which heads this ranking after a bulk load or a migration; true for one explainQuery will take; null where the query text is hidden from this role. Returns a clear error with setup instructions if the extension is not installed",
        []() -> json { return {
    		{"type", "object"},
    		{"properties", {
@@ -770,6 +772,10 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    			{"type", "integer"},
    			{"description", "total host memory in megabytes, overriding any configured value"}
    		      }},
+   		    {"reserved_mb", {
+   			{"type", "integer"},
+   			{"description", "megabytes the operating system holds outside the page cache and does not give back on request -- a ZFS ARC of a fixed size, huge pages reserved for something else -- overriding any configured host_reserved_mb. Added to the committed worst case"}
+   		      }},
    		    {"vcpus", {
    			{"type", "integer"},
    			{"description", "number of vCPUs or cores available to the host, overriding any configured value"}
@@ -785,7 +791,7 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
          int const vcpus = a.num("vcpus", 0);
          std::string const storage = a.contains("storage") && a["storage"].is_string()
            ? a["storage"].get<std::string>() : "";
-         return s.host_capacity(ram_mb, vcpus, storage); }},
+         return s.host_capacity(ram_mb, vcpus, storage, a.bignum("reserved_mb", 0)); }},
       {"duplicateIndexes",
        "return indexes that duplicate or are covered by another index on the same table. 'identical' groups indexes whose key columns, operator classes, collations, sort order, INCLUDE columns and partial predicate all match; 'redundant' reports an index whose key columns are a leading prefix of a wider index that also covers its INCLUDE columns. Comparison is by column expression rather than attribute number, so expression indexes and differing sort orders are handled correctly, and a unique index is never called redundant for being a prefix. Each entry carries size, idx_scan, the backing constraint name, and the replica identity and validity flags, since those decide whether it can be dropped at all. READ counters_since BEFORE idx_scan: it is when this database's statistics were last reset, and idx_scan counts only since then. A zero on a recently reset database says nothing about a monthly or quarterly index. It is a lower bound -- pg_stat_reset_single_table_counters() zeroes one relation without moving it",
        []() -> json { return {

@@ -830,7 +830,7 @@ public:
   const json call_sequences(const std::string& schema, const std::string& pattern) {
     return sequences(schema, pattern);
   }
-  const json call_extensions() { return extensions(); }
+  const json call_extensions(bool available = false) { return extensions(available); }
   const json call_database_size() { return database_size(); }
   const json call_server_settings() { return server_settings("", false); }
   const json call_server_settings(const std::string& p, bool all) { return server_settings(p, all); }
@@ -924,8 +924,9 @@ public:
   const json call_table_io_stats(const std::string& schema, const std::string& table_name, int limit) {
     return table_io_stats(schema, table_name, limit);
   }
-  const json call_host_capacity(long long ram_mb, int vcpus, const std::string& storage) {
-    return host_capacity(ram_mb, vcpus, storage);
+  const json call_host_capacity(long long ram_mb, int vcpus, const std::string& storage,
+                                long long reserved_mb = 0) {
+    return host_capacity(ram_mb, vcpus, storage, reserved_mb);
   }
 
   // Drive one JSON-RPC request and return the response, for tests that need the
@@ -1617,6 +1618,7 @@ private:
       // Host capacity, so a caller can see at a glance which connections still
       // need it injected before hostCapacity can compute anything.
       if (c.capacity.ram_mb > 0)        entry["host_ram_mb"]  = c.capacity.ram_mb;
+      if (c.capacity.reserved_mb > 0)   entry["host_reserved_mb"] = c.capacity.reserved_mb;
       if (c.capacity.vcpus > 0)         entry["host_vcpus"]   = c.capacity.vcpus;
       if (!c.capacity.storage.empty())  entry["host_storage"] = c.capacity.storage;
       if (!c.capacity.note.empty())     entry["host_note"]    = c.capacity.note;
@@ -1669,6 +1671,7 @@ private:
       entry["source"] = registry_.get(members.front()).instance_source;
       const auto cap = registry_.instance_capacity(name);
       if (cap.ram_mb > 0)       entry["host_ram_mb"]  = cap.ram_mb;
+      if (cap.reserved_mb > 0)  entry["host_reserved_mb"] = cap.reserved_mb;
       if (cap.vcpus > 0)        entry["host_vcpus"]   = cap.vcpus;
       if (!cap.storage.empty()) entry["host_storage"] = cap.storage;
       if (!cap.note.empty())    entry["host_note"]    = cap.note;
@@ -3411,11 +3414,18 @@ private:
     }
   }
 
-  const json extensions() {
+  // With `available`, also what could be installed: the extensions whose
+  // files are on the server and which are not created in this database, from
+  // pg_available_extensions. A plan that needs bloom or btree_gin reads very
+  // differently when the extension is one CREATE EXTENSION away than when it
+  // needs a package and perhaps a restart, and through 4.6 this could only
+  // say "not installed". Opt-in, so the default answer is what it always
+  // was: every key an installed extension. With it, every entry says which.
+  const json extensions(bool available = false) {
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string const query = R"(
+    std::string const query = !available ? R"(
       SELECT JSONB_OBJECT_AGG(
                e.extname,
                JSONB_BUILD_OBJECT(
@@ -3427,6 +3437,31 @@ private:
              )
       FROM pg_extension AS e
       JOIN pg_namespace AS n ON n.oid = e.extnamespace;
+    )" : R"(
+      SELECT JSONB_OBJECT_AGG(x.name, x.entry)
+      FROM (
+        SELECT e.extname AS name,
+               JSONB_BUILD_OBJECT(
+                 'installed',   true,
+                 'version',     e.extversion,
+                 'default_version', a.default_version,
+                 'schema',      n.nspname,
+                 'relocatable', e.extrelocatable,
+                 'description', COALESCE(obj_description(e.oid, 'pg_extension'), '')
+               ) AS entry
+          FROM pg_extension AS e
+          JOIN pg_namespace AS n ON n.oid = e.extnamespace
+          LEFT JOIN pg_available_extensions AS a ON a.name = e.extname
+        UNION ALL
+        SELECT a.name,
+               JSONB_BUILD_OBJECT(
+                 'installed',   false,
+                 'default_version', a.default_version,
+                 'description', COALESCE(a.comment, '')
+               )
+          FROM pg_available_extensions AS a
+         WHERE a.installed_version IS NULL
+      ) AS x;
     )";
 
     pqxx::result const res = txn.exec(query);
@@ -3869,6 +3904,18 @@ private:
       if (!res.empty() && !res[0][0].is_null()) {
         json out = json::parse(res[0][0].as<std::string>());
         out["order_by"] = key;
+        // pg_stat_statements tracks utility statements too, and after a bulk
+        // load or a migration they head this ranking: ALTER TABLE, CREATE
+        // INDEX, VACUUM, COPY. They have no plan, and diagnose-slow-query
+        // used to stop at the first one. Nothing is hidden -- a review after
+        // a migration wants to see the DDL -- but each entry says whether
+        // explainQuery will take it. Null where the text is hidden from this
+        // role, since there is nothing to read the first word of.
+        if (out.contains("statements") && out["statements"].is_array())
+          for (auto& st : out["statements"])
+            st["explainable"] = st.contains("query") && st["query"].is_string()
+                                  ? json(has_a_plan(st["query"].get<std::string>()))
+                                  : json();
         return out;
       } else {
         return {{"statements", json::array()}, {"order_by", key}};
@@ -5511,14 +5558,15 @@ private:
   // the connections file, or the environment. Whichever is used is named in
   // 'source', because every derived ratio is only as good as that figure.
   const json host_capacity(long long ram_mb_arg, int vcpus_arg,
-                           const std::string& storage_arg) {
+                           const std::string& storage_arg, long long reserved_mb_arg = 0) {
     pglicht::HostCapacity cap = active_cfg().capacity;
-    if (ram_mb_arg > 0 || vcpus_arg > 0 || !storage_arg.empty()) {
+    if (ram_mb_arg > 0 || vcpus_arg > 0 || !storage_arg.empty() || reserved_mb_arg > 0) {
       // Arguments win over configuration, and are reported as a distinct
       // source: a value passed per call is a claim about right now, while the
       // file may have been written for a machine that has since been resized.
       pglicht::HostCapacity from_args;
       from_args.ram_mb  = ram_mb_arg > 0 ? ram_mb_arg : cap.ram_mb;
+      from_args.reserved_mb = reserved_mb_arg > 0 ? reserved_mb_arg : cap.reserved_mb;
       from_args.vcpus   = vcpus_arg  > 0 ? vcpus_arg  : cap.vcpus;
       from_args.storage = !storage_arg.empty() ? storage_arg : cap.storage;
       from_args.note    = cap.note;
@@ -5537,7 +5585,8 @@ private:
     std::string const query = R"(
       WITH host AS (
         SELECT NULLIF($1, '')::bigint AS ram_bytes,
-               NULLIF($2, '')::int    AS vcpus
+               NULLIF($2, '')::int    AS vcpus,
+               NULLIF($3, '')::bigint AS reserved_bytes
       ),
       g AS (
         SELECT name, setting, unit,
@@ -5668,13 +5717,19 @@ private:
           'work_mem_effective_max_bytes', GREATEST(v.work_mem, wm.max_bytes),
           'work_mem_is_overridden', wm.max_bytes IS NOT NULL
                                     AND wm.max_bytes > v.work_mem,
+          -- Null when host_reserved_mb is not declared, never zero: "none
+          -- was declared" is not "the host reserves nothing".
+          'host_reserved_bytes', host.reserved_bytes,
+          'host_reserved_percent_of_ram',
+            round(100.0 * host.reserved_bytes / NULLIF(host.ram_bytes, 0), 1),
           'committed_worst_case_bytes',
             v.shared_buffers + GREATEST(v.work_mem, wm.max_bytes) * v.max_connections
-              + v.maint_work_mem * v.av_workers,
+              + v.maint_work_mem * v.av_workers + COALESCE(host.reserved_bytes, 0),
           'committed_worst_case_percent_of_ram',
             round(100.0 * (v.shared_buffers
                            + GREATEST(v.work_mem, wm.max_bytes) * v.max_connections
-                           + v.maint_work_mem * v.av_workers)
+                           + v.maint_work_mem * v.av_workers
+                           + COALESCE(host.reserved_bytes, 0))
                   / NULLIF(host.ram_bytes, 0), 1),
           'max_parallel_workers_per_vcpu',
             round((SELECT setting::numeric FROM g WHERE name = 'max_parallel_workers')
@@ -5690,6 +5745,12 @@ private:
           'floor on the worst case, not a ceiling.',
           'shared_buffers is counted once here; the operating system page cache is '
           'not, which is what effective_cache_size is meant to describe.',
+          'committed_worst_case includes host_reserved_mb when it is declared: memory '
+          'the operating system holds outside the page cache and does not give back '
+          'on request, such as a ZFS ARC of a fixed size or huge pages reserved for '
+          'something else. PostgreSQL cannot see it. Where host_reserved_bytes is '
+          'null none was declared, and on such a host the worst case is higher than '
+          'the figure here by that amount.',
           'settings shows this session''s values. overrides carries what '
           'pg_db_role_setting holds for other roles and databases, which pg_settings '
           'cannot show and which is the usual answer to "slow only from the '
@@ -5701,7 +5762,9 @@ private:
     pqxx::result const res = pqxx_exec(
       txn, query,
       pqxx::params{cap.ram_mb > 0 ? std::to_string(cap.ram_mb * 1048576LL) : std::string{},
-                   cap.vcpus  > 0 ? std::to_string(cap.vcpus)              : std::string{}});
+                   cap.vcpus  > 0 ? std::to_string(cap.vcpus)              : std::string{},
+                   cap.reserved_mb > 0 ? std::to_string(cap.reserved_mb * 1048576LL)
+                                       : std::string{}});
 
     json out = (!res.empty() && !res[0][0].is_null())
       ? json::parse(res[0][0].as<std::string>()) : json::object();
@@ -5711,6 +5774,7 @@ private:
       host["ram_mb"]    = cap.ram_mb;
       host["ram_bytes"] = cap.ram_mb * 1048576LL;
     }
+    if (cap.reserved_mb > 0)  host["reserved_mb"] = cap.reserved_mb;
     if (cap.vcpus > 0)        host["vcpus"]   = cap.vcpus;
     if (!cap.storage.empty()) host["storage"] = cap.storage;
     if (!cap.note.empty())    host["note"]    = cap.note;
@@ -5749,6 +5813,17 @@ private:
   // comments. pg_stat_statements also tracks utility statements (CREATE
   // DATABASE, SET, VACUUM, ...), and EXPLAIN cannot take those at all --
   // "EXPLAIN SET work_mem='4MB'" is a syntax error, not a graceful failure.
+  // Whether EXPLAIN accepts a statement, by its first word. One rule for
+  // explainQuery's refusal and statementStats' `explainable`, so the ranking
+  // cannot call plannable what the other tool then refuses as a utility
+  // statement.
+  static bool has_a_plan(const std::string& sql) {
+    static const std::set<std::string> EXPLAINABLE = {
+      "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "WITH", "TABLE", "VALUES"
+    };
+    return EXPLAINABLE.count(leading_keyword(sql)) > 0;
+  }
+
   static std::string leading_keyword(const std::string& sql) {
     size_t i = 0;
     for (;;) {
@@ -6341,11 +6416,8 @@ private:
     if (sql.empty())
       throw std::runtime_error("the statement is empty");
 
-    static const std::set<std::string> EXPLAINABLE = {
-      "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "WITH", "TABLE", "VALUES"
-    };
     std::string const kw = leading_keyword(sql);
-    if (!EXPLAINABLE.count(kw))
+    if (!has_a_plan(sql))
       throw std::runtime_error(
         "statement cannot be EXPLAINed: it starts with \"" +
         (kw.empty() ? std::string("(nothing)") : kw) +
@@ -9077,20 +9149,46 @@ private:
       degraded.push_back({{"tool", tool}, {"what", what}});
     };
 
+    // "Not installed" is two different amounts of work: an extension whose
+    // files are on the server is one CREATE EXTENSION away, and one whose
+    // files are not needs a package first. pg_available_extensions tells
+    // them apart and any role may read it. Unknown if the read fails, and
+    // then nothing is added to the reason.
+    std::set<std::string> on_server;
+    bool know_on_server = false;
+    try {
+      pqxx::subtransaction sub{txn};
+      for (const auto& row : sub.exec("SELECT name FROM pg_available_extensions"))
+        on_server.insert(row[0].as<std::string>());
+      sub.commit();
+      know_on_server = true;
+    } catch (const std::exception&) {}
+    auto absent = [&](const std::string& ext, bool preloaded_too = false) {
+      std::string why = "the " + ext + " extension is not installed";
+      if (!know_on_server) return why;
+      if (!on_server.count(ext))
+        return why + ", and its files are not on this server: the package has to be "
+                     "installed first";
+      return why + "; it is available on this server: CREATE EXTENSION " + ext +
+             (ext == "pg_stat_kcache" ? " CASCADE;" : ";") +
+             (preloaded_too ? " It also has to be in shared_preload_libraries, which "
+                              "takes a restart" : "");
+    };
+
     // Denied means the tool cannot produce an answer for this role at all.
     for (const char* t : {"tableBloat", "indexBloat"}) {
-      if (!has_pgstattuple) deny(t, "the pgstattuple extension is not installed");
+      if (!has_pgstattuple) deny(t, absent("pgstattuple"));
       else if (!scan)       deny(t, "the pgstattuple functions are restricted to "
                                     "roles permitted to run table-scanning "
                                     "monitoring functions");
     }
     for (const char* t : {"bufferCacheSummary", "bufferCacheContents"}) {
-      if (!has_buffercache) deny(t, "the pg_buffercache extension is not installed");
+      if (!has_buffercache) deny(t, absent("pg_buffercache"));
       else if (!monitor)    deny(t, "pg_buffercache is readable only by roles "
                                     "granted the monitoring role");
     }
     if (!has_hypopg)
-      deny("evaluateIndex", "the hypopg extension is not installed");
+      deny("evaluateIndex", absent("hypopg"));
     else if (!data)
       degrade("evaluateIndex", "planning a statement needs SELECT on the tables "
                                "it references, so this fails on any statement "
@@ -9110,7 +9208,7 @@ private:
                   "is not created in this database: CREATE EXTENSION " + ext +
                   (std::string(ext) == "pg_stat_kcache" ? " CASCADE;" : ";"));
         else if (!installed)
-          deny(t, std::string("the ") + ext + " extension is not installed");
+          deny(t, absent(ext, true));
         else if (loaded.is_boolean() && !loaded.get<bool>())
           deny(t, std::string("the ") + ext + " extension is installed but not in "
                   "shared_preload_libraries, so it has nothing to report");
@@ -9137,7 +9235,7 @@ private:
       deny("statementStats", loaded.is_boolean() && loaded.get<bool>()
         ? "the pg_stat_statements library is preloaded, but the extension is not "
           "created in this database: CREATE EXTENSION pg_stat_statements;"
-        : "the pg_stat_statements extension is not installed");
+        : absent("pg_stat_statements", true));
     }
     else if (!stats)
       degrade("statementStats", "the query text of statements run by other roles "

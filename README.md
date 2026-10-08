@@ -444,6 +444,11 @@ Inheritance follows `instance` only, never `replication_group`: replicas routine
 smaller machines, and inheriting the primary's RAM would give every replica a confidently
 wrong `shared_buffers` ratio.
 
+Where the operating system holds memory outside the page cache and does not give it back
+on request -- a ZFS ARC of a fixed size, huge pages reserved for something else -- declare
+it too, as `host_reserved_mb`, and `hostCapacity` counts it in the worst case. PostgreSQL
+cannot see it.
+
 Or, with a single `DATABASE_URL`, via `PG_LICHT_HOST_RAM_MB` and `PG_LICHT_HOST_VCPUS`. An
 agent that inspects the host at run time can instead pass `ram_mb` and `vcpus` straight to
 the tool, which takes precedence over both.
