@@ -467,7 +467,8 @@ TEST_F(PostgresMCPServerTest, TablesCarriesNoStatistics) {
   for (const char* f : {"rows", "size", "size_estimate", "seq_scan", "idx_scan",
                         "n_live_tup", "n_dead_tup", "n_mod_since_analyze",
                         "n_ins_since_vacuum", "last_vacuum", "last_analyze",
-                        "n_tup_newpage_upd", "last_seq_scan"})
+                        "n_tup_newpage_upd", "last_seq_scan", "n_tup_upd",
+                        "n_tup_hot_upd"})
     EXPECT_FALSE(result["users"].contains(f)) << f << " is still on listTables";
 }
 
@@ -605,7 +606,7 @@ TEST_F(PostgresMCPServerTest, TableDetailsCarriesNoStatistics) {
                         "seq_scan", "idx_scan", "n_live_tup", "n_dead_tup",
                         "n_mod_since_analyze", "n_ins_since_vacuum",
                         "last_vacuum", "last_analyze", "n_tup_newpage_upd",
-                        "last_seq_scan"})
+                        "last_seq_scan", "n_tup_upd", "n_tup_hot_upd"})
     EXPECT_FALSE(result.contains(f)) << f << " is still on tableDetails";
 
   // Reason 3 of the split: most_common_vals is literal column values, and this
@@ -3398,6 +3399,15 @@ TEST_F(PostgresMCPServerTest, TableStatsIncludeFailedHotUpdatesOnPg16AndLater) {
   json one = srv->call_table_stats("grocery", "users");
   EXPECT_EQ(one.contains("n_tup_newpage_upd"), pg16);
   EXPECT_EQ(one.contains("last_seq_scan"), pg16);
+
+  // What n_tup_newpage_upd is a share of. On every version: it was returned
+  // alone through 4.6, and the prompt that reads it asks for the ratio.
+  for (const char* f : {"n_tup_ins", "n_tup_upd", "n_tup_del", "n_tup_hot_upd"}) {
+    ASSERT_TRUE(one.contains(f)) << f << ": " << one.dump(2).substr(0, 600);
+    EXPECT_TRUE(one[f].is_number_integer()) << f;
+    ASSERT_TRUE(listed["users"].contains(f)) << f;
+    EXPECT_TRUE(listed["users"][f].is_number_integer()) << f;
+  }
 
   // pg_stat_user_indexes.last_idx_scan is gated on the same release, and it is
   // built by concatenation now rather than erased out of a finished query --

@@ -1,5 +1,28 @@
 # Changelog
 
+## 4.7.0 (unreleased)
+
+What the prompts could not answer. Seven of the twelve prompts were followed
+step by step against a freshly loaded 106 GB database (PostgreSQL 18 on
+FreeBSD, ZFS); this release is what they ran into.
+
+### Fixed
+
+- **`tableStats` and `listTableStats` return the write counters.**
+  `n_tup_newpage_upd` was returned alone, and `bloat-and-vacuum-review` told
+  the reader to compare it "against the update count", which was not there:
+  two reviews said so in their reports, on a table where 0.6% of 7.9 million
+  updates had stayed on their page. Both tools now return `n_tup_ins`,
+  `n_tup_upd`, `n_tup_del` and `n_tup_hot_upd`, on every supported version,
+  and the prompt names the two ratios.
+
+- **Sizes are no longer called "on disk".** Every size PostgreSQL reports is
+  in logical bytes; on a filesystem that compresses or shares blocks with a
+  snapshot the space occupied differs -- the database above occupied 68 GB on
+  ZFS. `diskUsage`'s note says so, and `triage-disk-space` asks for the
+  filesystem's own figure before promising what a cleanup returns, instead
+  of reading WAL and temporary files as "actually on disk".
+
 ## 4.6.0 (2026-10-03)
 
 ### Fixed

@@ -8202,7 +8202,10 @@ private:
       "Sizes are what PostgreSQL accounts for, not the volume. Total and free "
       "space are not exposed to SQL by any PostgreSQL function, so this cannot "
       "say how much room is left -- only what is consuming it and how that is "
-      "divided. The pg_ls_* sections need pg_monitor; a section that reports an "
+      "divided. They are logical bytes: on a filesystem that compresses, "
+      "deduplicates or shares blocks with a snapshot (ZFS, btrfs) the space "
+      "occupied differs, usually downwards, by a ratio PostgreSQL cannot see, "
+      "so freeing 10 GB here may return less than 10 GB to the volume. The pg_ls_* sections need pg_monitor; a section that reports an "
       "error rather than a size is usually that.";
     return out;
   }
@@ -9207,6 +9210,13 @@ private:
   // The pg_stat_user_tables columns both tools return, in one place so the
   // single-table and schema-wide forms cannot drift apart.
   //
+  // The four write counters -- n_tup_ins, n_tup_upd, n_tup_del, n_tup_hot_upd
+  // -- arrived in 4.7. Until then n_tup_newpage_upd was returned alone, and
+  // bloat-and-vacuum-review told the reader to compare it "against the update
+  // count", which was not there: two reviews of a freshly loaded registry
+  // said so in their reports, on a table where 0.6% of 7.9 million updates
+  // had stayed on their page. They are cumulative since counters_since.
+  //
   // The four timestamps are returned separately, under the catalog's own names.
   // Through 4.1.1 they were two, each a GREATEST() of the manual and automatic
   // column, which was wrong in the one direction that does not look wrong: a
@@ -9244,6 +9254,8 @@ private:
                                           s.last_analyze, s.last_autoanalyze),
                'seq_scan', s.seq_scan, 'idx_scan', s.idx_scan,
                'n_live_tup', s.n_live_tup, 'n_dead_tup', s.n_dead_tup,
+               'n_tup_ins', s.n_tup_ins, 'n_tup_upd', s.n_tup_upd,
+               'n_tup_del', s.n_tup_del, 'n_tup_hot_upd', s.n_tup_hot_upd,
                'n_mod_since_analyze', s.n_mod_since_analyze,
                'n_ins_since_vacuum', s.n_ins_since_vacuum,
                'last_vacuum', s.last_vacuum,

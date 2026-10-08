@@ -151,7 +151,7 @@ privilege-gated opens by calling `checkPrivileges`.
 
 `triage-disk-space` is the one that arrives at night, and `diskUsage` is what
 makes it answerable without a shell on the server: WAL size, the archive
-backlog, temp files on disk now, the log directory, and sizes per tablespace and
+backlog, the temp files present now, the log directory, and sizes per tablespace and
 per database. Only the headroom is unreachable — PostgreSQL exposes no function
 for free space. The prompt leads with what makes the obvious response wrong:
 `VACUUM FULL` needs free space equal to the table and its indexes *before* it

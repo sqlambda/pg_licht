@@ -1016,7 +1016,9 @@ is the server's compile-time
 .Va seq_scan
 and
 .Va idx_scan ,
-live and dead tuples, mods-since-analyze, inserts-since-vacuum, the four
+live and dead tuples, the cumulative write counters
+.Pq Va n_tup_ins , Va n_tup_upd , Va n_tup_del , Va n_tup_hot_upd ,
+mods-since-analyze, inserts-since-vacuum, the four
 .Li pg_stat_user_tables
 timestamps
 .Pq Va last_vacuum , Va last_autovacuum , Va last_analyze , Va last_autoanalyze ,
@@ -1927,6 +1929,13 @@ PostgreSQL exposes no function for total or free space, so this reports what is
 consuming space and how it divides, never the headroom.
 A tablespace also carries its location, which matters because the database that
 is growing and the volume that is full need not be the same device.
+.Pp
+Every size is in logical bytes, as PostgreSQL counts them.
+On a filesystem that compresses, deduplicates or shares blocks with a snapshot
+\(em ZFS, btrfs \(em the space occupied differs, usually downwards, by a ratio
+PostgreSQL cannot see: a 106 GB database was measured occupying 68 GB on ZFS at
+its default compression.
+Freeing 10 GB as counted here may return less than that to the volume.
 .Pp
 A climbing
 .Pa .ready
