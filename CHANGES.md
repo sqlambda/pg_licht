@@ -6,6 +6,38 @@ What the prompts could not answer. Seven of the twelve prompts were followed
 step by step against a freshly loaded 106 GB database (PostgreSQL 18 on
 FreeBSD, ZFS); this release is what they ran into.
 
+### Added
+
+- **`rowScatter`: what being out of physical order costs.** `tableStats`
+  returns `physical_order_correlation`, which says a column is out of order
+  and not what that costs. The reading that does was taken by hand: one
+  city's 157,058 rows were on 140,257 pages where about 3,300 would hold
+  them, and that ratio is what `CLUSTER` would gain a query reading them.
+  `rowScatter` takes a table and a column. With a `value` it is exact: the
+  rows that match, the distinct pages they sit on, `pages_if_packed` and
+  `scatter_ratio`, reading at most `max_rows` rows and saying when that cap
+  was reached. Without one it samples whole pages (`TABLESAMPLE SYSTEM`,
+  about ten thousand unless `sample_percent` says otherwise) for the values
+  pg_stats lists as most common, which answers which column is worth
+  clustering on. At 100 percent the two forms agree to the row and the page,
+  and a test holds them to it. It reads the table through `ctid` and needs
+  `SELECT` on it; the exact form returns counts only, the sampled form only
+  values `tableStats` already returns. A third tool that reads a table, with
+  `checkKey` and `explainQuery`, and like them it returns no rows: the
+  manual, `SECURITY.md` and the landing page say three where they said two.
+  76 tools; a bare login role runs 59 of the 73 database tools and the
+  monitoring role 67, measured again.
+
+- **`review-clustering`, a thirteenth prompt.** Whether a table is worth
+  clustering, on which columns and with what fill factor, as a sequence of
+  readings: `physical_order_correlation` for which columns are out of
+  order, `predicateStats` or `statementStats` for which of them queries
+  filter on, `rowScatter` for what the scatter costs, the write counters for
+  how fast the order decays, and `tableSize` for the space and the lock a
+  `CLUSTER` takes. It asks for the fill factor to be justified by what it
+  buys, since an update to an indexed column cannot stay on its page however
+  much room is left. Its steps were worked out on one table.
+
 ### Fixed
 
 - **`tableStats` and `listTableStats` return the write counters.**

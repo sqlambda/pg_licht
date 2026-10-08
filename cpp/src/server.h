@@ -9,6 +9,7 @@
 #include <limits>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <iostream>
 #include <map>
@@ -900,6 +901,11 @@ public:
     for (const auto& v : supported_protocols())
       if (v == requested) return v;
     return "2024-11-05";
+  }
+  const json call_row_scatter(const std::string& schema, const std::string& table_name,
+                              const std::string& column, const json& value, bool has_value,
+                              long long max_rows = 0, double sample_percent = 0) {
+    return row_scatter(schema, table_name, column, value, has_value, max_rows, sample_percent);
   }
   const json call_check_key(const std::string& schema, const std::string& table_name, const json& values) {
     return check_key(schema, table_name, values);
@@ -2167,6 +2173,9 @@ private:
 
       // Per-database catalogs, identical on a physical replica.
       {"checkKey",              {true,  false, false, false}},
+      // Heap pages are replicated byte for byte, so the physical order of a
+      // table is the same on a physical replica as on its primary.
+      {"rowScatter",            {true,  false, false, false}},
       {"databaseSize",          {true,  false, false, false}},
       {"enumDetails",           {true,  false, false, false}},
       {"explainQuery",          {true,  false, false, false}},
@@ -2736,6 +2745,12 @@ private:
                                    {{"database", "string"}, {"size", "integer"}})},
       {"checkKey",               schema_fixed("Whether a row with the given key exists.",
                                    {{"exists", "boolean"}})},
+      {"rowScatter",             schema_fixed("How scattered the rows of a value are across a "
+                                              "table's pages, exact for one value or sampled "
+                                              "for the most common ones.",
+                                   {{"schema", "string"}, {"table", "string"}, {"column", "string"},
+                                    {"mode", "string"}, {"table_pages", "integer"},
+                                    {"note", "string"}})},
       {"evaluateIndex",          schema_fixed("How a statement would plan with different indexes.",
                                    {{"statement", "string"}, {"hypopg_version", "string"},
                                     {"baseline", "object"}, {"hypothetical", "object"},
@@ -7275,6 +7290,226 @@ private:
     return {{"exists", exists}};
   }
 
+  // How scattered the rows of one value are across the table's pages.
+  //
+  // physical_order_correlation, which tableStats returns, says a column is
+  // out of physical order. It does not say what that costs. This does: the
+  // rows that match, the distinct pages they sit on, and the pages they would
+  // need if packed. One city's 157,058 rows were found on 140,257 pages where
+  // 3,300 would hold them, and that ratio is what CLUSTER would gain any query
+  // reading those rows from the table.
+  //
+  // Two forms. With a value: exact, over the matching rows, at most max_rows
+  // of them. Without: sampled by page (TABLESAMPLE SYSTEM), for the values
+  // pg_stats already lists as most common -- so no value reaches the caller
+  // that tableStats would not return, and none at all in the exact form,
+  // which echoes nothing back. SYSTEM takes whole pages, so the rows and
+  // pages of a value within the sample are an unbiased reading of its
+  // density; at 100 percent the two forms agree exactly, which a test holds
+  // them to.
+  //
+  // It reads the table, through ctid, and needs SELECT on it and nothing else.
+  const json row_scatter(const std::string& schema, const std::string& table_name,
+                         const std::string& column, const json& value, bool has_value,
+                         long long max_rows, double sample_percent) {
+    if (max_rows <= 0) max_rows = 200000;
+    max_rows = std::min<long long>(max_rows, 5000000);
+    if (sample_percent < 0 || sample_percent > 100)
+      throw std::runtime_error("sample_percent must be above 0 and at most 100");
+    if (has_value && (value.is_array() || value.is_object()))
+      throw std::runtime_error("value must be a string, a number, a boolean or null");
+
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+
+    pqxx::result const meta = pqxx_exec(txn, R"(
+      SELECT c.relkind::text, c.relpages::bigint, c.reltuples::float8,
+             a.atttypid::regtype::text
+        FROM pg_class AS c
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        LEFT JOIN pg_attribute AS a
+               ON a.attrelid = c.oid AND a.attname = $3
+              AND a.attnum > 0 AND NOT a.attisdropped
+       WHERE n.nspname = $1 AND c.relname = $2;
+    )", pqxx::params{schema, table_name, column});
+    if (meta.empty())
+      return {{"error", "no relation named \"" + schema + "\".\"" + table_name + "\""},
+              {"hint", "tables are listed by listTables"}};
+    const std::string relkind = meta[0][0].as<std::string>();
+    if (relkind == "p")
+      return {{"error", "\"" + schema + "\".\"" + table_name + "\" is a partitioned table "
+                        "and has no pages of its own"},
+              {"hint", "rows are stored in its partitions, each with its own physical "
+                       "order; name one partition (listPartitions, partitionDetails)"}};
+    if (relkind != "r" && relkind != "m")
+      return {{"error", "\"" + schema + "\".\"" + table_name + "\" is not a table or a "
+                        "materialized view"},
+              {"hint", "only a relation with pages of its own has a physical order"}};
+    if (meta[0][3].is_null())
+      return {{"error", "\"" + schema + "\".\"" + table_name + "\" has no column \"" + column + "\""},
+              {"hint", "columns are listed by tableDetails"}};
+
+    const long long relpages = meta[0][1].as<long long>();
+    const double reltuples = meta[0][2].as<double>();
+    const std::string coltype = meta[0][3].as<std::string>();   // from the catalog, quoted by regtype
+    auto qi = [](const std::string& s) {
+      std::string r = "\"";
+      for (char const c : s) { if (c == '"') r += "\"\""; else r += c; }
+      return r + "\"";
+    };
+    const std::string rel = qi(schema) + "." + qi(table_name);
+    const char* const blk = "(ctid::text::point)[0]::bigint";
+
+    json out = {{"schema", schema}, {"table", table_name}, {"column", column},
+                {"table_pages", relpages}};
+
+    try {
+      if (has_value) {
+        // --- exact: the rows of one value ---
+        pqxx::result res;
+        if (value.is_null()) {
+          res = pqxx_exec(txn,
+            "SELECT count(*), count(DISTINCT blk) FROM (SELECT " + std::string(blk) + " AS blk"
+            " FROM " + rel + " WHERE " + qi(column) + " IS NULL LIMIT $1::bigint) AS m",
+            pqxx::params{std::to_string(max_rows)});
+        } else {
+          const std::string text = value.is_string()  ? value.get<std::string>()
+                                 : value.is_boolean() ? (value.get<bool>() ? "true" : "false")
+                                                      : value.dump();
+          res = pqxx_exec(txn,
+            "SELECT count(*), count(DISTINCT blk) FROM (SELECT " + std::string(blk) + " AS blk"
+            " FROM " + rel + " WHERE " + qi(column) + " = $1::" + coltype +
+            " LIMIT $2::bigint) AS m",
+            pqxx::params{text, std::to_string(max_rows)});
+        }
+        const long long rows = res[0][0].as<long long>();
+        const long long pages = res[0][1].as<long long>();
+        out["mode"] = "exact";
+        out["rows"] = rows;
+        out["pages"] = pages;
+        out["max_rows"] = max_rows;
+        out["capped"] = rows >= max_rows;
+        // What a page holds on average, from the last VACUUM or ANALYZE. Null
+        // where the table has never had either, rather than a guess.
+        if (relpages > 0 && reltuples > 0) {
+          const double rpp = reltuples / static_cast<double>(relpages);
+          const long long packed = std::max<long long>(
+            1, static_cast<long long>(std::ceil(static_cast<double>(rows) / rpp)));
+          out["rows_per_page"] = std::round(rpp * 10.0) / 10.0;
+          out["pages_if_packed"] = rows > 0 ? json(packed) : json(0);
+          out["scatter_ratio"] = rows > 0
+            ? json(std::round(static_cast<double>(pages) / static_cast<double>(packed) * 10.0) / 10.0)
+            : json();
+        } else {
+          out["rows_per_page"] = nullptr;
+          out["pages_if_packed"] = nullptr;
+          out["scatter_ratio"] = nullptr;
+        }
+        out["note"] = std::string(
+          "rows of this value were read and the distinct pages they sit on counted; "
+          "pages_if_packed is what the same rows would need at the table's average "
+          "rows_per_page, and scatter_ratio is pages over that -- 1 is already packed, "
+          "and the ratio is roughly what clustering on this column would save a query "
+          "that reads these rows from the table.") +
+          (rows >= max_rows ? " The cap was reached: only the first max_rows matching "
+                              "rows were read, so rows and pages are lower bounds and "
+                              "the ratio describes that part." : "") +
+          (relpages > 0 && reltuples > 0 ? "" : " The table has never been vacuumed or "
+                              "analyzed, so there is no rows_per_page to pack by.");
+        return out;
+      }
+
+      // --- sampled: the most common values, by page ---
+      // About ten thousand pages by default, which bounds the read at roughly
+      // 80 MB on any size of table.
+      double pct = sample_percent;
+      if (pct <= 0)
+        pct = relpages <= 10000 ? 100.0
+                                : std::max(0.001, 100.0 * 10000.0 / static_cast<double>(relpages));
+      pqxx::result const res = pqxx_exec(txn, R"(
+        WITH mcv AS (
+          SELECT v.val, f.freq, v.ord
+            FROM pg_stats AS s,
+                 LATERAL unnest(s.most_common_vals::text::text[]) WITH ORDINALITY AS v(val, ord)
+                 JOIN LATERAL unnest(s.most_common_freqs) WITH ORDINALITY AS f(freq, ord)
+                   ON f.ord = v.ord
+           WHERE s.schemaname = $1 AND s.tablename = $2 AND s.attname = $3
+             AND NOT s.inherited
+           ORDER BY v.ord LIMIT 10
+        ),
+        smp AS MATERIALIZED (
+          SELECT )" + std::string(blk) + R"( AS blk,
+                 (SELECT m.ord FROM mcv AS m WHERE m.val = t.)" + qi(column) + R"(::text) AS ord
+            FROM )" + rel + R"( AS t TABLESAMPLE SYSTEM ($4::real)
+        )
+        SELECT JSONB_BUILD_OBJECT(
+                 'sampled_pages', (SELECT count(DISTINCT blk) FROM smp),
+                 'sampled_rows',  (SELECT count(*) FROM smp),
+                 'values', COALESCE((
+                   SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                            'value', m.val, 'frequency', m.freq,
+                            'sampled_rows', x.n, 'sampled_pages_with_value', x.p)
+                          ORDER BY m.ord)
+                     FROM mcv AS m
+                     LEFT JOIN LATERAL (SELECT count(*) AS n, count(DISTINCT blk) AS p
+                                          FROM smp WHERE smp.ord = m.ord) AS x ON true
+                 ), '[]'::jsonb));
+      )", pqxx::params{schema, table_name, column, std::to_string(pct)});
+
+      json got = json::parse(res[0][0].as<std::string>());
+      const long long spages = got["sampled_pages"].get<long long>();
+      const long long srows = got["sampled_rows"].get<long long>();
+      out["mode"] = "sampled";
+      out["sample_percent"] = std::round(pct * 1000.0) / 1000.0;
+      out["sampled_pages"] = spages;
+      out["sampled_rows"] = srows;
+      // From the sample itself, so it needs no ANALYZE and counts live rows.
+      const double rpp = spages > 0 ? static_cast<double>(srows) / static_cast<double>(spages) : 0.0;
+      out["rows_per_page"] = spages > 0 ? json(std::round(rpp * 10.0) / 10.0) : json();
+      json values = json::array();
+      for (auto& v : got["values"]) {
+        const long long n = v["sampled_rows"].get<long long>();
+        const long long p = v["sampled_pages_with_value"].get<long long>();
+        if (spages > 0) {
+          const double share = static_cast<double>(p) / static_cast<double>(spages);
+          v["share_of_pages_percent"] = std::round(share * 1000.0) / 10.0;
+          v["estimated_pages"] = std::llround(share * static_cast<double>(relpages));
+          v["estimated_rows"] = std::llround(
+            static_cast<double>(n) * static_cast<double>(relpages) / static_cast<double>(spages));
+        }
+        if (n > 0 && rpp > 0) {
+          const double packed = std::max(1.0, std::ceil(static_cast<double>(n) / rpp));
+          v["scatter_ratio"] = std::round(static_cast<double>(p) / packed * 10.0) / 10.0;
+        } else {
+          v["scatter_ratio"] = nullptr;
+        }
+        values.push_back(v);
+      }
+      out["values"] = values;
+      out["note"] = std::string(
+        "a sample of whole pages (TABLESAMPLE SYSTEM), read for the values pg_stats "
+        "lists as most common in this column. share_of_pages_percent is how much of "
+        "the table a query for that value touches; scatter_ratio is the pages its "
+        "sampled rows sit on over the pages they would fill, so 1 is already packed. "
+        "A column whose common values each sit on most pages at a high ratio is "
+        "worth clustering on; pass one value for the exact count.") +
+        (values.empty() ? " pg_stats lists no common values for this column -- it is "
+                          "unique, was never analyzed, or this role may not read it -- "
+                          "so there is nothing to measure without a value." : "");
+      return out;
+    } catch (const pqxx::insufficient_privilege& e) {
+      return {{"error", "this role may not read \"" + schema + "\".\"" + table_name + "\""},
+              {"hint", "rowScatter reads the table's rows to find the pages they are on, "
+                       "so it needs SELECT on the table"},
+              {"detail", e.what()}};
+    } catch (const pqxx::data_exception& e) {
+      return {{"error", "the value is not a valid " + coltype},
+              {"hint", "pass the value as it would be written in SQL for a column of "
+                       "that type, as a string"},
+              {"detail", e.what()}};
+    }
+  }
+
   const json enums(const std::string& schema) {
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
@@ -9282,6 +9517,7 @@ private:
                             "appear with null values -- indistinguishable from "
                             "a table that was never analyzed");
       degrade("checkKey", "fails on any table this role cannot SELECT");
+      degrade("rowScatter", "fails on any table this role cannot SELECT");
       degrade("explainQuery", "fails on any statement referencing a table this "
                               "role cannot SELECT");
     }

@@ -846,6 +846,26 @@ auto PostgresMCPServer::tool_defs() -> const std::vector<ToolDef>& {
    	      }; },
        [](PostgresMCPServer& s, const Args& a) -> json {
          return s.check_key(a.str("schema", "public"), a.str("table", ""), a.arr("values")); }},
+      {"rowScatter",
+       "measure how scattered the rows of a value are across a table's pages, which is what clustering the table on that column would gain. tableStats' physical_order_correlation says a column is out of physical order; this says what that costs. With 'value': exact -- the rows that match, the distinct pages they sit on, pages_if_packed (the pages those rows would need at the table's average rows per page) and scatter_ratio, pages over that, where 1 is already packed and 40 means a query for that value reads forty times the pages it needs to. At most max_rows matching rows are read, and 'capped' says whether that limit was reached. Without 'value': sampled by whole pages (TABLESAMPLE SYSTEM, about ten thousand pages unless sample_percent says otherwise), for the values pg_stats lists as most common in the column, each with the share of pages it appears on and its scatter_ratio -- which answers which column is worth clustering on without naming a value. Reads the table's rows through ctid, so it needs SELECT on the table; returns counts only in the exact form, and in the sampled form only values tableStats already returns. Not for a partitioned table: name one partition",
+       []() -> json { return {
+   		{"type", "object"},
+   		{"properties", {
+   		    {"schema", {{"type", "string"}}},
+   		    {"table",  {{"type", "string"}}},
+   		    {"column", {{"type", "string"}}},
+   		    {"value",  {{"description", "the value whose rows to measure, as a string, number or boolean in the column's own text form; null measures the rows where the column is null. Omit it for the sampled form over the column's most common values"}}},
+   		    {"max_rows", {{"type", "integer"}, {"description", "with value: read at most this many matching rows. Defaults to 200000, at most 5000000"}}},
+   		    {"sample_percent", {{"type", "number"}, {"description", "without value: the share of the table's pages to sample, above 0 and at most 100. Defaults to whatever reads about ten thousand pages, and to 100 on a table smaller than that"}}}
+   		  }},
+   		{"required", {"schema", "table", "column"}}
+   	      }; },
+       [](PostgresMCPServer& s, const Args& a) -> json {
+         double const pct = a.contains("sample_percent") && a["sample_percent"].is_number()
+           ? a["sample_percent"].get<double>() : 0.0;
+         return s.row_scatter(a.str("schema", "public"), a.str("table", ""), a.str("column", ""),
+                              a.contains("value") ? a["value"] : json(), a.contains("value"),
+                              a.bignum("max_rows", 0), pct); }},
       {"explainQuery",
        "return the raw EXPLAIN (FORMAT JSON) plan for a statement, either recovered from pg_stat_statements by queryid (full untruncated text) or supplied directly as sql. Runs in a read-only transaction bounded by statement_timeout. Statements with $n placeholders are planned with GENERIC_PLAN unless concrete params are supplied, in which case the statement is PREPAREd and planned with real values. analyze:true runs EXPLAIN (ANALYZE, BUFFERS), which really executes the statement, and is honoured only after the plan is proven free of any ModifyTable node -- so data-modifying statements, including data-modifying CTEs, are never executed; it also requires an explicit timeout_ms. Returns the plan verbatim plus generic/analyzed/read_only flags and the pg_stat_statements row; no heuristics and no generated DDL, the plan is yours to interpret. Every plan carries a Settings block (EXPLAIN SETTINGS) naming the settings that differ from the built-in default, because the plan is built in THIS server's session and not in the one the statement really runs in -- work_mem alone can change the algorithm rather than the cost, turning a HashAggregate into a Sort plus GroupAggregate. Compare it against hostCapacity.overrides, which reports the per-role and per-database settings pg_settings cannot show: where they differ, this plan is not the plan production gets -- and plan_as_role then plans it under what that role actually carries, so the difference between the two plans becomes the finding rather than a caveat. planning_environment reports what was applied and, for plan_as_role, what was skipped",
        []() -> json { return {

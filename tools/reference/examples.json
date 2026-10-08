@@ -464,6 +464,10 @@
       "arguments": {"schema": "shop", "index": "orders_pkey"},
       "result": {"schema": "shop", "index": "orders_pkey", "table": "orders", "access_method": "btree", "index_size": 27025408, "idx_scan": 9120004, "tree_level": 2, "leaf_pages": 3280, "internal_pages": 18, "empty_pages": 0, "deleted_pages": 12, "avg_leaf_density": 88.4, "leaf_fragmentation": 3.2}
     },
+    "rowScatter": {
+      "arguments": {"schema": "shop", "table": "orders", "column": "customer_id", "value": 48213},
+      "result": {"schema": "shop", "table": "orders", "column": "customer_id", "table_pages": 22870, "mode": "exact", "rows": 1840, "pages": 1795, "max_rows": 200000, "capped": false, "rows_per_page": 52.7, "pages_if_packed": 35, "scatter_ratio": 51.3, "note": "rows of this value were read and the distinct pages they sit on counted; pages_if_packed is what the same rows would need at the table's average rows_per_page, and scatter_ratio is pages over that -- 1 is already packed."}
+    },
     "checkKey": {
       "arguments": {"schema": "shop", "table": "orders", "values": [482211]},
       "result": {"exists": true}
@@ -569,6 +573,7 @@
     "capacity-check": {"arguments": {"connection": "shop_prod"}},
     "replication-slot-review": {"arguments": {"connection": "shop_prod"}},
     "plan-schema-change": {"arguments": {"change": "ALTER TABLE shop.orders ADD COLUMN invoice_no bigint", "schema": "shop", "table": "orders"}},
+    "review-clustering": {"arguments": {"schema": "shop", "table": "orders"}},
     "check-role-access": {"arguments": {"role": "reporting", "object": "shop.orders", "privilege": "SELECT"}},
     "explain-and-fix": {"arguments": {"sql": "SELECT id, status FROM shop.orders WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 20", "params": "[88213]", "schema": "shop"}}
   }

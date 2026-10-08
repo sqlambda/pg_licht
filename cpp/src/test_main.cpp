@@ -2990,6 +2990,142 @@ TEST_F(PostgresMCPServerTest, ListExtensionsReturnsKnownExtension) {
   EXPECT_TRUE(ext.contains("description"));
 }
 
+// --- rowScatter ---
+
+namespace {
+// 200,000 rows in id order. `scattered` cycles through 50 values, so each one
+// is on every page; `clustered` changes every 4,000 rows, so each one is on a
+// handful of adjacent pages. The same 4,000 rows per value either way, which
+// is the whole point: correlation aside, only the pages differ.
+void seed_scatter(const std::string& url) {
+  pqxx::connection c(url);
+  pqxx::work t(c);
+  t.exec("DROP TABLE IF EXISTS grocery.scatter");
+  t.exec("CREATE TABLE grocery.scatter (id int, scattered int, clustered int, label text)");
+  t.exec("INSERT INTO grocery.scatter SELECT g, g % 50, g / 4000, 'it''s ' || (g % 5) "
+         "FROM generate_series(0, 199999) AS g");
+  t.exec("ANALYZE grocery.scatter");
+  t.commit();
+}
+}  // namespace
+
+// What physical_order_correlation cannot say: what being out of order costs.
+TEST_F(PostgresMCPServerTest, RowScatterMeasuresPagesTouchedAgainstPagesNeeded) {
+  seed_scatter(test_url);
+  json far = srv->call_row_scatter("grocery", "scatter", "scattered", 7, true);
+  json near = srv->call_row_scatter("grocery", "scatter", "clustered", 7, true);
+  ASSERT_FALSE(far.contains("error")) << far.dump(2);
+  ASSERT_FALSE(near.contains("error")) << near.dump(2);
+  EXPECT_EQ(far["mode"], "exact");
+  EXPECT_EQ(far["rows"], 4000);
+  EXPECT_EQ(near["rows"], 4000);
+  EXPECT_EQ(far["capped"], false);
+  const long long table_pages = far["table_pages"].get<long long>();
+  ASSERT_GT(table_pages, 500);
+  // One row in fifty, on (nearly) every page of the table...
+  EXPECT_GE(far["pages"].get<long long>(), table_pages * 9 / 10) << far.dump(2);
+  EXPECT_GT(far["scatter_ratio"].get<double>(), 20.0) << far.dump(2);
+  // ...and the same number of rows, adjacent, on about as many pages as they fill.
+  EXPECT_LE(near["pages"].get<long long>(), near["pages_if_packed"].get<long long>() + 2) << near.dump(2);
+  EXPECT_LT(near["scatter_ratio"].get<double>(), 1.5) << near.dump(2);
+  EXPECT_EQ(far["pages_if_packed"], near["pages_if_packed"]);
+  // Counts only: nothing of the value or the rows comes back.
+  EXPECT_FALSE(far.contains("value"));
+  EXPECT_FALSE(far.contains("values"));
+
+  // The cap is a stated lower bound, not a silent one.
+  json capped = srv->call_row_scatter("grocery", "scatter", "scattered", 7, true, 100);
+  EXPECT_EQ(capped["rows"], 100);
+  EXPECT_EQ(capped["capped"], true);
+  EXPECT_NE(capped["note"].get<std::string>().find("lower bounds"), std::string::npos);
+
+  // Other types go through the column's own input function, quotes and all.
+  json label = srv->call_row_scatter("grocery", "scatter", "label", "it's 3", true);
+  EXPECT_EQ(label["rows"], 40000) << label.dump(2);
+  json none = srv->call_row_scatter("grocery", "scatter", "label", nullptr, true);
+  EXPECT_EQ(none["rows"], 0) << none.dump(2);
+  EXPECT_TRUE(none["scatter_ratio"].is_null());
+  json bad = srv->call_row_scatter("grocery", "scatter", "scattered", "seven", true);
+  ASSERT_TRUE(bad.contains("error")) << bad.dump(2);
+  EXPECT_NE(bad["error"].get<std::string>().find("not a valid integer"), std::string::npos) << bad.dump(2);
+
+  // Through the dispatch, where a JSON number is the value.
+  json rpc = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+      {"params", {{"name", "rowScatter"},
+                  {"arguments", {{"schema", "grocery"}, {"table", "scatter"},
+                                 {"column", "scattered"}, {"value", 7}}}}}});
+  ASSERT_TRUE(rpc.contains("result")) << rpc.dump().substr(0, 300);
+  EXPECT_NE(rpc.dump().find("scatter_ratio"), std::string::npos);
+}
+
+// The sampled form is an estimate, so it is held to the exact one: at 100
+// percent they must agree to the row and the page, and at 10 percent the
+// ratio must still tell a scattered column from a clustered one.
+TEST_F(PostgresMCPServerTest, RowScatterSampledAgreesWithTheExactCount) {
+  seed_scatter(test_url);
+  json exact = srv->call_row_scatter("grocery", "scatter", "scattered", 7, true);
+  json whole = srv->call_row_scatter("grocery", "scatter", "scattered", json(), false, 0, 100.0);
+  ASSERT_FALSE(whole.contains("error")) << whole.dump(2);
+  EXPECT_EQ(whole["mode"], "sampled");
+  EXPECT_EQ(whole["sampled_rows"], 200000);
+  EXPECT_EQ(whole["sampled_pages"], exact["table_pages"]);
+  ASSERT_FALSE(whole["values"].empty()) << whole.dump(2);
+  EXPECT_LE(whole["values"].size(), 10u);
+  bool found = false;
+  for (const auto& v : whole["values"]) {
+    // Every value here is one pg_stats already lists for the column.
+    EXPECT_TRUE(v["frequency"].is_number()) << v.dump();
+    EXPECT_EQ(v["sampled_rows"], 4000) << v.dump();
+    if (v["value"] != "7") continue;
+    found = true;
+    EXPECT_EQ(v["sampled_pages_with_value"], exact["pages"]) << v.dump();
+    EXPECT_EQ(v["estimated_pages"], exact["pages"]) << v.dump();
+    EXPECT_EQ(v["estimated_rows"], 4000) << v.dump();
+  }
+  // 7 is one of fifty equally common values and need not be among the ten
+  // listed; the agreement is checked on whichever is.
+  if (!found) {
+    const json& v = whole["values"][0];
+    json one = srv->call_row_scatter("grocery", "scatter", "scattered",
+                                     std::stoi(v["value"].get<std::string>()), true);
+    EXPECT_EQ(v["sampled_pages_with_value"], one["pages"]) << v.dump() << one.dump();
+  }
+
+  json tenth = srv->call_row_scatter("grocery", "scatter", "scattered", json(), false, 0, 10.0);
+  ASSERT_FALSE(tenth["values"].empty()) << tenth.dump(2);
+  ASSERT_GT(tenth["sampled_pages"].get<long long>(), 20) << tenth.dump(2);
+  const double want = exact["scatter_ratio"].get<double>();
+  for (const auto& v : tenth["values"]) {
+    EXPECT_GT(v["share_of_pages_percent"].get<double>(), 90.0) << v.dump();
+    EXPECT_NEAR(v["scatter_ratio"].get<double>(), want, want * 0.35) << v.dump();
+  }
+  json packed = srv->call_row_scatter("grocery", "scatter", "clustered", json(), false, 0, 10.0);
+  for (const auto& v : packed["values"]) {
+    if (v["sampled_rows"].get<long long>() < 200) continue;   // too few to judge
+    EXPECT_LT(v["scatter_ratio"].get<double>(), 2.0) << v.dump();
+    EXPECT_LT(v["share_of_pages_percent"].get<double>(), 15.0) << v.dump();
+  }
+  // A unique column has no common values, and the answer says there is
+  // nothing to measure rather than returning an empty list in silence.
+  json unique = srv->call_row_scatter("grocery", "scatter", "id", json(), false);
+  EXPECT_TRUE(unique["values"].empty()) << unique.dump(2);
+  EXPECT_NE(unique["note"].get<std::string>().find("nothing to measure"), std::string::npos);
+}
+
+TEST_F(PostgresMCPServerTest, RowScatterRefusalsSayWhatToDoInstead) {
+  json r = srv->call_row_scatter("grocery", "no_such_table", "x", 1, true);
+  EXPECT_NE(r["error"].get<std::string>().find("no relation named"), std::string::npos) << r.dump(2);
+  r = srv->call_row_scatter("grocery", "users", "no_such_column", 1, true);
+  EXPECT_NE(r["error"].get<std::string>().find("has no column"), std::string::npos) << r.dump(2);
+  r = srv->call_row_scatter("grocery", "index_parted", "id", 1, true);
+  EXPECT_NE(r["error"].get<std::string>().find("partitioned table"), std::string::npos) << r.dump(2);
+  EXPECT_NE(r["hint"].get<std::string>().find("partition"), std::string::npos);
+  r = srv->call_row_scatter("grocery", "ams_btree", "id", 1, true);
+  EXPECT_NE(r["error"].get<std::string>().find("is not a table"), std::string::npos) << r.dump(2);
+  EXPECT_THROW(srv->call_row_scatter("grocery", "users", "id", json::array({1}), true), std::runtime_error);
+  EXPECT_THROW(srv->call_row_scatter("grocery", "users", "id", json(), false, 0, 250.0), std::runtime_error);
+}
+
 // --- databaseSize ---
 
 TEST_F(PostgresMCPServerTest, DatabaseSizeReturnsDatabaseNameAndSize) {
@@ -6111,7 +6247,7 @@ TEST_F(PostgresMCPServerTest, PromptsAreListedWithTheirArguments) {
   for (const char* n : {"diagnose-slow-query", "triage-lock-contention",
                         "bloat-and-vacuum-review", "buffer-cache-review",
                         "capacity-check", "replication-slot-review",
-                        "plan-schema-change", "explain-and-fix"})
+                        "plan-schema-change", "review-clustering", "explain-and-fix"})
     EXPECT_TRUE(names.count(n)) << n << " is missing";
 }
 
@@ -6129,6 +6265,32 @@ TEST_F(PostgresMCPServerTest, PromptsSendTheModelToCheckPrivilegesFirst) {
     const std::string text = r["result"]["messages"][0]["content"]["text"].get<std::string>();
     EXPECT_NE(text.find("checkPrivileges"), std::string::npos) << n;
   }
+}
+
+// The clustering review rests on readings, and each one has to be named: a
+// prompt that recommends CLUSTER without the cost of the scatter, the rate of
+// decay or the lock is the recipe this server's prompts exist to avoid.
+TEST_F(PostgresMCPServerTest, TheClusteringPromptMeasuresBeforeItRecommends) {
+  json r = rpc1(*srv, "prompts/get", {{"name", "review-clustering"},
+                                      {"arguments", {{"schema", "shop"}, {"table", "orders"}}}});
+  const std::string t = r["result"]["messages"][0]["content"]["text"].get<std::string>();
+  EXPECT_NE(t.find("shop.orders"), std::string::npos);
+  for (const char* reading : {"checkPrivileges", "tableStats", "physical_order_correlation",
+                              "predicateStats", "rowScatter", "scatter_ratio", "n_tup_hot_upd",
+                              "tableDetails", "tableSize", "ACCESS EXCLUSIVE",
+                              "plan-schema-change"})
+    EXPECT_NE(t.find(reading), std::string::npos) << reading << " missing from the clustering review";
+  // And every tool it names exists, with the field it tells the reader to read.
+  json tools = rpc1(*srv, "tools/list", json::object());
+  std::set<std::string> names;
+  for (const auto& tl : tools["result"]["tools"]) names.insert(tl["name"].get<std::string>());
+  for (const char* tool : {"tableStats", "predicateStats", "statementStats", "rowScatter",
+                           "tableDetails", "tableSize", "checkPrivileges", "diskUsage"})
+    EXPECT_TRUE(names.count(tool)) << tool;
+  // Both arguments are required: there is no table to review without them.
+  json missing = rpc1(*srv, "prompts/get", {{"name", "review-clustering"},
+                                            {"arguments", {{"schema", "shop"}}}});
+  EXPECT_TRUE(missing.contains("error")) << missing.dump().substr(0, 300);
 }
 
 TEST_F(PostgresMCPServerTest, TheSlowQueryPromptBranchesIntoBloatAndVacuum) {

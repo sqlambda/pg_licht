@@ -22,9 +22,12 @@ It is meant to be launched by the client, not run interactively.
 .Nm
 queries the catalog only: schemas, tables, columns, functions, types, roles, and
 the statistics views.
-It does not read user table data, with the single narrow exception of
+It does not read user table data, with two narrow exceptions that return
+counts and never rows:
 .Ic checkKey ,
-which tests a primary key for existence.
+which tests a primary key for existence, and
+.Ic rowScatter ,
+which counts the pages the rows of a value sit on.
 Every call to a database runs inside its own
 .Ql READ ONLY
 transaction, and the pooler tools send PgBouncer's admin console nothing but
@@ -784,12 +787,13 @@ Most of this server works for any role that can connect, because the catalog is
 world-readable.
 Measured on PostgreSQL 18: a bare
 .Ic LOGIN
-role with no grants runs 59 of the 72 database operations at full fidelity when every
+role with no grants runs 59 of the 73 database operations at full fidelity when every
 extension is present, and the monitoring role takes that to 67.
-What remains for the monitoring role is the three that read row data \(em the
+What remains for the monitoring role is the four that read row data \(em the
 .Ic tableStats
 column histograms,
-.Ic checkKey
+.Ic checkKey ,
+.Ic rowScatter
 and
 .Ic explainQuery
 \(em plus
@@ -2469,6 +2473,71 @@ detail is in the
 .Li pageinspect
 extension instead.
 A partitioned index has no storage of its own and is reported as such.
+.It Ic rowScatter Ar schema Ar table Ar column Op Va value , Va max_rows , Va sample_percent
+How scattered the rows of a value are across a table's pages, which is what
+clustering the table on that column would gain.
+.Ic tableStats
+returns
+.Va physical_order_correlation ,
+which says a column is out of physical order; this says what that costs.
+On a 73-million-row table whose city column had a correlation of 0.09, one
+city's 157,058 rows were on 140,257 pages where about 3,300 would hold them.
+.Pp
+With
+.Va value ,
+the count is exact:
+.Va rows
+that match,
+the distinct
+.Va pages
+they sit on,
+.Va pages_if_packed
+\(em what those rows would need at the table's average
+.Va rows_per_page
+\(em and
+.Va scatter_ratio ,
+pages over that.
+A ratio of 1 is already packed; 40 means a query for that value reads forty
+times the pages it needs to.
+At most
+.Va max_rows
+matching rows are read, 200,000 unless given and never more than 5,000,000, and
+.Va capped
+says whether that limit was reached, in which case the counts are lower bounds.
+A
+.Va value
+of null measures the rows where the column is null.
+.Pp
+Without
+.Va value ,
+the reading is sampled by whole pages
+.Pq Li TABLESAMPLE SYSTEM
+for the values
+.Li pg_stats
+lists as most common in the column, up to ten: for each,
+.Va share_of_pages_percent ,
+the share of the table a query for it touches,
+.Va estimated_rows , estimated_pages
+and its
+.Va scatter_ratio .
+That answers which column is worth clustering on without naming a value.
+About ten thousand pages are read unless
+.Va sample_percent
+says otherwise, and the whole table when it is smaller than that; at 100
+percent the sampled figures equal the exact ones.
+.Pp
+It reads the table's rows, through
+.Li ctid ,
+so it needs
+.Ic SELECT
+on the table and holds an
+.Li AccessShareLock
+for the read.
+The exact form returns counts and echoes nothing back; the sampled form returns
+only values
+.Ic tableStats
+already returns.
+A partitioned table has no pages of its own: name one partition.
 .It Ic checkKey Ar schema Ar table Ar values
 Check whether a row exists by primary key, single or composite.
 Value types are validated against the primary key column types before querying.
@@ -2970,7 +3039,7 @@ capability is declared, so there is no mechanism by which it could.
 Anything read from a live catalog is hinted at one minute.
 This matters most for
 .Ic tools/list ,
-which is roughly 160 kB once 75 operations carry descriptions, annotations,
+which is roughly 170 kB once 76 operations carry descriptions, annotations,
 titles and output schemas, and which a client would otherwise re-fetch whenever
 it needed the list.
 .Pp
@@ -3269,6 +3338,33 @@ full rewrite, and for the size at which the answer would flip.
 Lock level alone settles nothing: a strong lock held for a millisecond is safe
 and a weak one held for an hour may not be, and duration comes from the
 measurements.
+.It Ic review-clustering Ar schema Ar table
+Decides whether a table is worth clustering, on which columns, and with what
+fill factor.
+Clustering pays when queries fetch many rows of one value from the table and
+those rows are spread over many pages, and pays nothing when they are already
+together or the queries are answered from an index alone; the order is not
+maintained afterwards, so the gain decays at the rate the table changes.
+The prompt has each of those measured:
+.Va physical_order_correlation
+from
+.Ic tableStats
+for which columns are out of order,
+.Ic predicateStats
+or
+.Ic statementStats
+for which of them queries filter on,
+.Ic rowScatter
+for what the scatter costs a query, the write counters for how fast the order
+drifts, and
+.Ic tableSize
+for the space and the exclusive lock a
+.Ic CLUSTER
+needs.
+It asks for the fill factor to be justified by what it buys: an update that
+changes an indexed column cannot stay on its page whatever room is left, so
+there a fill factor buys locality and not cheaper updates.
+"Do not cluster" is a result, and the more common one.
 .It Ic check-role-access Ar role Ar object Op Va privilege , connection
 Whether a role can use a table, view, function or procedure, and which rows it
 then sees.
@@ -3931,10 +4027,13 @@ The second guard is the operator's to set up:
 does not verify it, and a user from
 .Va admin_users
 would work and would not be refused.
-Two operations read a user table, and neither returns its rows:
+Three operations read a user table, and none returns its rows:
 .Ic checkKey
 answers only whether a row with the given primary key exists, though that answer
-is itself a fact about the table; and
+is itself a fact about the table;
+.Ic rowScatter
+answers how many rows hold a value the caller names and how many pages they
+are on, which is a fact about the table in the same way; and
 .Ic explainQuery
 with
 .Va analyze
@@ -3969,6 +4068,15 @@ the most common values with their frequencies, and histogram bounds, which are
 sample values from the column.
 PostgreSQL returns them only for columns the connecting role may
 .Ic SELECT .
+.It Ic rowScatter
+Without a
+.Va value ,
+the column's most common values as
+.Li pg_stats
+lists them, the same ones
+.Ic tableStats
+returns, each beside its page counts.
+With a value it returns counts alone.
 .It Ic explainQuery , evaluateIndex
 Plans, which repeat the literals of the statement the caller wrote.
 .It Ic functionDetails , tableDetails
