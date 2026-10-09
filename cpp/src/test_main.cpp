@@ -3028,6 +3028,67 @@ void seed_scatter(const std::string& url) {
 }
 }  // namespace
 
+// A character(4) column is "character" to regtype, and '8105'::character is
+// character(1): the value was cut to '8' and the answer was zero rows on zero
+// pages, with no error, for exactly the columns a table is clustered on.
+TEST_F(PostgresMCPServerTest, RowScatterComparesAFixedWidthValueWhole) {
+  {
+    pqxx::connection c(test_url);
+    pqxx::work t(c);
+    t.exec("DROP TABLE IF EXISTS grocery.scatter_fixed");
+    t.exec("CREATE TABLE grocery.scatter_fixed (id int, city character(4), "
+           "padded character(6), flags bit(4), vflags bit varying(8), codes character(2)[])");
+    t.exec("INSERT INTO grocery.scatter_fixed SELECT g, lpad((8100 + g % 10)::text, 4, '0'), "
+           "'ab', (g % 16)::bit(4), (g % 16)::bit(4), ARRAY['SP', 'RJ'] "
+           "FROM generate_series(0, 19999) AS g");
+    t.exec("ANALYZE grocery.scatter_fixed");
+    t.commit();
+  }
+  json city = srv->call_row_scatter("grocery", "scatter_fixed", "city", "8105", true);
+  ASSERT_FALSE(city.contains("error")) << city.dump(2);
+  EXPECT_EQ(city["rows"], 2000) << city.dump(2);
+  EXPECT_GT(city["pages"].get<long long>(), 0) << city.dump(2);
+
+  // Not cut to its first four characters either: nothing is stored as this.
+  json longer = srv->call_row_scatter("grocery", "scatter_fixed", "city", "81057", true);
+  ASSERT_FALSE(longer.contains("error")) << longer.dump(2);
+  EXPECT_EQ(longer["rows"], 0) << longer.dump(2);
+  // A value shorter than the column compares the way character does, the
+  // padding ignored.
+  json padded = srv->call_row_scatter("grocery", "scatter_fixed", "padded", "ab", true);
+  EXPECT_EQ(padded["rows"], 20000) << padded.dump(2);
+
+  json bits = srv->call_row_scatter("grocery", "scatter_fixed", "flags", "1010", true);
+  ASSERT_FALSE(bits.contains("error")) << bits.dump(2);
+  EXPECT_EQ(bits["rows"], 1250) << bits.dump(2);
+  json vbits = srv->call_row_scatter("grocery", "scatter_fixed", "vflags", "1010", true);
+  EXPECT_EQ(vbits["rows"], 1250) << vbits.dump(2);
+  json codes = srv->call_row_scatter("grocery", "scatter_fixed", "codes", "{SP,RJ}", true);
+  ASSERT_FALSE(codes.contains("error")) << codes.dump(2);
+  EXPECT_EQ(codes["rows"], 20000) << codes.dump(2);
+
+  // The sampled form reads the same column and agrees with the exact one.
+  json sampled = srv->call_row_scatter("grocery", "scatter_fixed", "city", json(), false, 0, 100);
+  ASSERT_FALSE(sampled.contains("error")) << sampled.dump(2);
+  bool found = false;
+  for (const auto& v : sampled["values"])
+    if (v["value"] == "8105") {
+      found = true;
+      EXPECT_EQ(v["sampled_rows"], 2000) << v.dump(2);
+      EXPECT_EQ(v["sampled_pages_with_value"], city["pages"]) << v.dump(2);
+    }
+  EXPECT_TRUE(found) << sampled.dump(2);
+  // A value shorter than its column is stored padded, and is still found.
+  json wide = srv->call_row_scatter("grocery", "scatter_fixed", "padded", json(), false, 0, 100);
+  ASSERT_FALSE(wide.contains("error")) << wide.dump(2);
+  ASSERT_EQ(wide["values"].size(), 1u) << wide.dump(2);
+  EXPECT_EQ(wide["values"][0]["sampled_rows"], 20000) << wide.dump(2);
+
+  pqxx::connection c(test_url);
+  pqxx::nontransaction n(c);
+  n.exec("DROP TABLE grocery.scatter_fixed");
+}
+
 // What physical_order_correlation cannot say: what being out of order costs.
 TEST_F(PostgresMCPServerTest, RowScatterMeasuresPagesTouchedAgainstPagesNeeded) {
   seed_scatter(test_url);

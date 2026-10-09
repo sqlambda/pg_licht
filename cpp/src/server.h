@@ -7357,7 +7357,11 @@ private:
 
     pqxx::result const meta = pqxx_exec(txn, R"(
       SELECT c.relkind::text, c.relpages::bigint, c.reltuples::float8,
-             a.atttypid::regtype::text
+             a.atttypid::regtype::text,
+             (SELECT quote_ident(tn.nspname) || '.' || quote_ident(t.typname)
+                FROM pg_type AS t
+                JOIN pg_namespace AS tn ON tn.oid = t.typnamespace
+               WHERE t.oid = a.atttypid)
         FROM pg_class AS c
         JOIN pg_namespace AS n ON n.oid = c.relnamespace
         LEFT JOIN pg_attribute AS a
@@ -7385,6 +7389,14 @@ private:
     const long long relpages = meta[0][1].as<long long>();
     const double reltuples = meta[0][2].as<double>();
     const std::string coltype = meta[0][3].as<std::string>();   // from the catalog, quoted by regtype
+    // What the value is cast to is the type's own catalog name, never the name
+    // regtype prints. regtype calls a character(4) column "character", and
+    // '8105'::character is character(1): '8', which matches nothing, so one
+    // city's rows came back as zero rows on zero pages and no error. bit is
+    // the same. pg_catalog.bpchar carries no length, and neither truncates the
+    // value nor pads it; character(4) would cut '81057' down to a value nobody
+    // asked for.
+    const std::string casttype = meta[0][4].as<std::string>();
     auto qi = [](const std::string& s) {
       std::string r = "\"";
       for (char const c : s) { if (c == '"') r += "\"\""; else r += c; }
@@ -7411,7 +7423,7 @@ private:
                                                       : value.dump();
           res = pqxx_exec(txn,
             "SELECT count(*), count(DISTINCT blk) FROM (SELECT " + std::string(blk) + " AS blk"
-            " FROM " + rel + " WHERE " + qi(column) + " = $1::" + coltype +
+            " FROM " + rel + " WHERE " + qi(column) + " = $1::" + casttype +
             " LIMIT $2::bigint) AS m",
             pqxx::params{text, std::to_string(max_rows)});
         }
@@ -7472,7 +7484,11 @@ private:
         ),
         smp AS MATERIALIZED (
           SELECT )" + std::string(blk) + R"( AS blk,
-                 (SELECT m.ord FROM mcv AS m WHERE m.val = t.)" + qi(column) + R"(::text) AS ord
+                 -- Compared in the column's own type, not as text: pg_stats
+                 -- prints a character(6) value padded and the column cast to
+                 -- text drops the padding, so the two never met.
+                 (SELECT m.ord FROM mcv AS m
+                   WHERE m.val::)" + casttype + R"( = t.)" + qi(column) + R"() AS ord
             FROM )" + rel + R"( AS t TABLESAMPLE SYSTEM ($4::real)
         )
         SELECT JSONB_BUILD_OBJECT(
