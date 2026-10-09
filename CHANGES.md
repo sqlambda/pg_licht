@@ -100,6 +100,20 @@ FreeBSD, ZFS); this release is what they ran into.
   null, not zero, when nothing was declared -- and a note says what that
   leaves out.
 
+- **`hostCapacity` reports what a hash may take.** Its arithmetic counted
+  one `work_mem` per connection and its note said a query may use a multiple
+  of that, without `hash_mem_multiplier`: the factor by which a hash table
+  may exceed `work_mem`, 2 by default since PostgreSQL 15. One statement with
+  seven hash nodes, eight workers and both settings raised by hand took a
+  server down the day after a review had put its worst case at 82%. The
+  setting is now among those reported, with two derived figures:
+  `work_mem_times_hash_mem_multiplier_bytes`, the allowance of one hash
+  table in one process, and `one_hash_node_all_processes_bytes`, that times
+  `max_parallel_workers_per_gather` plus one -- about 1.2 GB for each hash in
+  a plan at 64 MB, 2 and 8. `committed_worst_case` is unchanged; the two are
+  beside it, and `capacity-check` reads them. Neither can see what a session
+  sets for itself.
+
 - **Sizes are no longer called "on disk".** Every size PostgreSQL reports is
   in logical bytes; on a filesystem that compresses or shares blocks with a
   snapshot the space occupied differs -- the database above occupied 68 GB on

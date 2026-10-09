@@ -5633,7 +5633,12 @@ private:
                (SELECT bytes   FROM g WHERE name = 'maintenance_work_mem') AS maint_work_mem,
                (SELECT bytes   FROM g WHERE name = 'effective_cache_size') AS effective_cache_size,
                (SELECT setting::bigint FROM g WHERE name = 'max_connections')        AS max_connections,
-               (SELECT setting::bigint FROM g WHERE name = 'autovacuum_max_workers') AS av_workers
+               (SELECT setting::bigint FROM g WHERE name = 'autovacuum_max_workers') AS av_workers,
+               (SELECT setting::bigint FROM g
+                 WHERE name = 'max_parallel_workers_per_gather')                     AS per_gather,
+               -- A real, not an integer, so g above does not carry it.
+               (SELECT setting::numeric FROM pg_settings
+                 WHERE name = 'hash_mem_multiplier')                                 AS hash_mult
       ),
       -- pg_db_role_setting is a whole configuration layer pg_settings cannot
       -- show: pg_settings reports the value for THIS session, so an
@@ -5713,7 +5718,10 @@ private:
                 FROM ovr
                GROUP BY 1, 2, 3) AS g), '[]'::jsonb),
         'settings', (SELECT JSONB_OBJECT_AGG(name, JSONB_BUILD_OBJECT(
-                        'setting', setting, 'unit', unit, 'bytes', bytes)) FROM g),
+                        'setting', setting, 'unit', unit, 'bytes', bytes)) FROM g)
+                    || (SELECT JSONB_BUILD_OBJECT(name, JSONB_BUILD_OBJECT(
+                          'setting', setting, 'unit', unit, 'bytes', NULL))
+                          FROM pg_settings WHERE name = 'hash_mem_multiplier'),
         'derived', (SELECT JSONB_BUILD_OBJECT(
           'shared_buffers_percent_of_ram',
             round(100.0 * v.shared_buffers / NULLIF(host.ram_bytes, 0), 1),
@@ -5733,6 +5741,19 @@ private:
           'work_mem_effective_max_bytes', GREATEST(v.work_mem, wm.max_bytes),
           'work_mem_is_overridden', wm.max_bytes IS NOT NULL
                                     AND wm.max_bytes > v.work_mem,
+          -- What one hash table may take, and what one hash node may take
+          -- across a parallel query's processes. Neither is in the worst case
+          -- below, which counts one work_mem per connection: a plan has as
+          -- many of these as it has hash nodes, and how many that is belongs
+          -- to the statement, not to the server.
+          'work_mem_times_hash_mem_multiplier_bytes',
+            round(GREATEST(v.work_mem, wm.max_bytes) * v.hash_mult)::bigint,
+          'one_hash_node_all_processes_bytes',
+            round(GREATEST(v.work_mem, wm.max_bytes) * v.hash_mult
+                  * (v.per_gather + 1))::bigint,
+          'one_hash_node_all_processes_percent_of_ram',
+            round(100.0 * GREATEST(v.work_mem, wm.max_bytes) * v.hash_mult
+                  * (v.per_gather + 1) / NULLIF(host.ram_bytes, 0), 1),
           -- Null when host_reserved_mb is not declared, never zero: "none
           -- was declared" is not "the host reserves nothing".
           'host_reserved_bytes', host.reserved_bytes,
@@ -5759,6 +5780,15 @@ private:
           'with several sorts or hash joins can use a multiple of it, and parallel '
           'workers each get their own. work_mem_times_max_connections is therefore a '
           'floor on the worst case, not a ceiling.',
+          'A hash table is allowed work_mem times hash_mem_multiplier, which is 2 by '
+          'default since PostgreSQL 15, so a hash join or a hashed aggregate may take '
+          'twice what work_mem says. work_mem_times_hash_mem_multiplier is that '
+          'allowance for one hash table in one process, and one_hash_node_all_processes '
+          'multiplies it by max_parallel_workers_per_gather + 1, which is what one hash '
+          'node of a parallel query may take. A statement with several hash nodes may '
+          'take that for each, and neither figure is part of committed_worst_case. '
+          'Both use this session''s hash_mem_multiplier; a session may raise it, and '
+          'work_mem with it, beyond anything reported here.',
           'shared_buffers is counted once here; the operating system page cache is '
           'not, which is what effective_cache_size is meant to describe.',
           'committed_worst_case includes host_reserved_mb when it is declared: memory '

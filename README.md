@@ -450,6 +450,11 @@ on request -- a ZFS ARC of a fixed size, huge pages reserved for something else 
 it too, as `host_reserved_mb`, and `hostCapacity` counts it in the worst case. PostgreSQL
 cannot see it.
 
+The worst case counts one `work_mem` per connection. A hash table is allowed `work_mem`
+times `hash_mem_multiplier`, so `hostCapacity` also reports what one hash node of a
+parallel query may take (`one_hash_node_all_processes_bytes`); a statement with several
+may take it for each.
+
 Or, with a single `DATABASE_URL`, via `PG_LICHT_HOST_RAM_MB` and `PG_LICHT_HOST_VCPUS`. An
 agent that inspects the host at run time can instead pass `ram_mb` and `vcpus` straight to
 the tool, which takes precedence over both.

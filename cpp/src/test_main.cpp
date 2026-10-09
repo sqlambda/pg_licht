@@ -4454,6 +4454,44 @@ TEST_F(PostgresMCPServerTest, HostCapacityCountsReservedMemoryInTheWorstCase) {
 
 }
 
+// A hash table is allowed work_mem x hash_mem_multiplier, and the worst case
+// counts one work_mem per connection. The allowance is reported beside it and
+// not folded in, so the worst case means what it meant.
+TEST_F(PostgresMCPServerTest, HostCapacityReportsWhatAHashMayTake) {
+  json r = srv->call_host_capacity(32768, 16, "");
+  const json& s = r["settings"];
+  const json& d = r["derived"];
+  ASSERT_TRUE(s.contains("hash_mem_multiplier")) << s.dump(2);
+  // A multiplier has no unit, so no byte count: null, not zero.
+  EXPECT_TRUE(s["hash_mem_multiplier"]["bytes"].is_null());
+  const double mult = std::stod(s["hash_mem_multiplier"]["setting"].get<std::string>());
+  const long long work_mem = d["work_mem_effective_max_bytes"].get<long long>();
+  const long long processes =
+    std::stoll(s["max_parallel_workers_per_gather"]["setting"].get<std::string>()) + 1;
+
+  const long long one = d["work_mem_times_hash_mem_multiplier_bytes"].get<long long>();
+  EXPECT_EQ(one, std::llround(static_cast<double>(work_mem) * mult)) << d.dump(2);
+  EXPECT_EQ(d["one_hash_node_all_processes_bytes"].get<long long>(),
+            std::llround(static_cast<double>(work_mem) * mult
+                         * static_cast<double>(processes))) << d.dump(2);
+  EXPECT_NEAR(d["one_hash_node_all_processes_percent_of_ram"].get<double>(),
+              100.0 * static_cast<double>(work_mem) * mult * static_cast<double>(processes)
+                / (32768.0 * 1048576.0), 0.06);
+  // Beside the worst case, not inside it.
+  const long long worst =
+    s["shared_buffers"]["bytes"].get<long long>()
+    + work_mem * std::stoll(s["max_connections"]["setting"].get<std::string>())
+    + s["maintenance_work_mem"]["bytes"].get<long long>()
+      * std::stoll(s["autovacuum_max_workers"]["setting"].get<std::string>());
+  EXPECT_EQ(d["committed_worst_case_bytes"].get<long long>(), worst) << d.dump(2);
+
+  // Without host RAM the bytes are still there and the percentage is null.
+  json bare = srv->call_host_capacity(0, 0, "");
+  EXPECT_EQ(bare["derived"]["one_hash_node_all_processes_bytes"].get<long long>(),
+            d["one_hash_node_all_processes_bytes"].get<long long>());
+  EXPECT_TRUE(bare["derived"]["one_hash_node_all_processes_percent_of_ram"].is_null());
+}
+
 TEST_F(PostgresMCPServerTest, HostCapacityResolvesByteUnitsPerSetting) {
   json r = srv->call_host_capacity(0, 0, "");
   auto& s = r["settings"];

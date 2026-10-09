@@ -445,8 +445,8 @@
       "result": {
         "host": {"ram_mb": 65536, "ram_bytes": 68719476736, "vcpus": 16, "source": "config file"},
         "server": {"version": "18.6", "database": "shop"},
-        "settings": {"shared_buffers": {"setting": "2097152", "unit": "8kB", "bytes": 17179869184}, "work_mem": {"setting": "32768", "unit": "kB", "bytes": 33554432}, "max_connections": {"setting": "300"}},
-        "derived": {"shared_buffers_percent_of_ram": 25.0, "work_mem_times_max_connections_percent_of_ram": 14.6, "max_parallel_workers_per_vcpu": 0.5}
+        "settings": {"shared_buffers": {"setting": "2097152", "unit": "8kB", "bytes": 17179869184}, "work_mem": {"setting": "32768", "unit": "kB", "bytes": 33554432}, "hash_mem_multiplier": {"setting": "2"}, "max_parallel_workers_per_gather": {"setting": "2"}, "max_connections": {"setting": "300"}},
+        "derived": {"shared_buffers_percent_of_ram": 25.0, "work_mem_times_max_connections_percent_of_ram": 14.6, "work_mem_times_hash_mem_multiplier_bytes": 67108864, "one_hash_node_all_processes_bytes": 201326592, "max_parallel_workers_per_vcpu": 0.5}
       }
     },
     "duplicateIndexes": {

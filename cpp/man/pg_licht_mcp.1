@@ -2143,6 +2143,28 @@ times
 .Va autovacuum_max_workers ,
 their combined total, and parallel workers per vCPU.
 .Pp
+A hash table is allowed
+.Va work_mem
+times
+.Va hash_mem_multiplier ,
+which is 2 by default since PostgreSQL 15, so
+.Va hash_mem_multiplier
+is reported with the settings and two figures are derived from it:
+.Va work_mem_times_hash_mem_multiplier_bytes ,
+the allowance of one hash table in one process, and
+.Va one_hash_node_all_processes_bytes ,
+that allowance times
+.Va max_parallel_workers_per_gather
+plus one, which is what one hash node of a parallel query may take.
+A statement with several hash nodes may take it for each.
+Neither is part of the worst case, which counts one
+.Va work_mem
+per connection, and both are computed from this session's
+.Va hash_mem_multiplier :
+a session that raises it, or
+.Va work_mem ,
+is beyond what any figure here describes.
+.Pp
 Total RAM and vCPU count are properties of the host, not of the cluster: no
 catalog holds them, so they have to be injected.
 See
