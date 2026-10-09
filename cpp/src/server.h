@@ -5276,7 +5276,7 @@ private:
         WHERE n.nspname = $1
           AND ($2 = '' OR tc.relname = $2)
       )
-      SELECT JSONB_BUILD_OBJECT()" + kCountersSince + R"(,
+      SELECT JSONB_BUILD_OBJECT()" + counters_since_sql() + R"(,
         'identical', COALESCE((
           SELECT JSONB_AGG(g ORDER BY g->>'table')
           FROM (
@@ -9722,7 +9722,7 @@ private:
   // while pg_stat_reset_shared() moves one, and the latest would then date
   // the table counters by a reset that never touched them. All three exist on
   // every supported major and are readable by any role.
-  static inline const std::string kCountersSinceFrom = R"(
+  static constexpr const char* kCountersSinceFrom = R"(
              FROM pg_stat_database AS d
              LEFT JOIN LATERAL (
                SELECT x.stats_reset, x.source
@@ -9733,10 +9733,15 @@ private:
                 WHERE x.stats_reset IS NOT NULL
                 ORDER BY x.stats_reset, x.source LIMIT 1) AS w ON true
             WHERE d.datname = current_database()))";
-  static inline const std::string kCountersSince =
-    "'counters_since', (SELECT COALESCE(d.stats_reset, w.stats_reset)" + kCountersSinceFrom +
-    ", 'counters_since_source', (SELECT CASE WHEN d.stats_reset IS NOT NULL"
-    " THEN 'pg_stat_database' ELSE w.source END" + kCountersSinceFrom;
+  // A function, not a static string: building one at start-up can throw where
+  // nothing can catch it.
+  static std::string counters_since_sql() {
+    return std::string("'counters_since', (SELECT COALESCE(d.stats_reset, w.stats_reset)")
+      + kCountersSinceFrom
+      + ", 'counters_since_source', (SELECT CASE WHEN d.stats_reset IS NOT NULL"
+        " THEN 'pg_stat_database' ELSE w.source END"
+      + kCountersSinceFrom;
+  }
 
   static constexpr const char* kTableStatsCommon = R"(
                'rows', c.reltuples,
@@ -9787,7 +9792,7 @@ private:
 
     std::string const query = std::string(R"(
       SELECT JSONB_BUILD_OBJECT(
-               'table', c.relname,)") + kCountersSince + "," + kTableStatsCommon + pg16 + R"(,
+               'table', c.relname,)") + counters_since_sql() + "," + kTableStatsCommon + pg16 + R"(,
                'columns', COALESCE(columns, '{}'::jsonb),
                -- pg_stats returns NO ROW for a table whose RLS is active for
                -- this role, so every per-column statistic below comes back null
@@ -10414,7 +10419,7 @@ private:
              JOIN pg_class pc ON pc.oid = pi.inhparent
              JOIN pg_namespace pn ON pn.oid = pc.relnamespace
             WHERE pi.inhrelid = c.oid),
-        )") + kCountersSince + R"(,
+        )") + counters_since_sql() + R"(,
         'partition_count', (SELECT count(*) FROM pg_inherits WHERE inhparent = c.oid),
         'partitions_truncated', (SELECT count(*) FROM pg_inherits WHERE inhparent = c.oid) > $3::int,
         'partitions', COALESCE((
