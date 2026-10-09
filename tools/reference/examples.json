@@ -95,7 +95,7 @@
         "table": "shop.orders", "rows": 1204388, "size_estimate": 187351040,
         "seq_scan": 41, "idx_scan": 9832117, "n_live_tup": 1204102, "n_dead_tup": 18344,
         "n_tup_ins": 1310224, "n_tup_upd": 2840117, "n_tup_del": 105836, "n_tup_hot_upd": 2511904,
-        "n_mod_since_analyze": 22410, "n_ins_since_vacuum": 9120,
+        "n_mod_since_analyze": 22410, "n_ins_since_vacuum": 9120, "cumulative_statistics_missing": false,
         "columns": {"status": {"null_frac": 0.0, "n_distinct": 3, "most_common_vals": ["shipped", "paid", "pending"], "most_common_freqs": [0.71, 0.24, 0.05]}},
         "indexes": {"orders_pkey": {"idx_scan": 9120004}, "orders_customer_id_idx": {"idx_scan": 712113}}
       }
@@ -146,7 +146,7 @@
     "partitionDetails": {
       "arguments": {"schema": "shop", "table": "events"},
       "result": {
-        "table": "events", "strategy": "range", "key": "RANGE (created_at)", "is_partition_of": null, "counters_since": "2026-08-01T00:00:00Z",
+        "table": "events", "strategy": "range", "key": "RANGE (created_at)", "is_partition_of": null, "counters_since": "2026-08-01T00:00:00Z", "counters_since_source": "pg_stat_database",
         "partition_count": 2, "partitions_truncated": false, "order_by": "name",
         "partitions": [
           {"name": "events_2026_08", "schema": "shop", "bound": "FOR VALUES FROM ('2026-08-01 00:00:00+00') TO ('2026-09-01 00:00:00+00')", "is_default": false, "is_partitioned": false, "rows": 7340112, "size_estimate": 1182990336, "n_dead_tup": 20431, "last_autovacuum": "2026-09-02T03:11:40Z"},
@@ -157,8 +157,8 @@
     "listTableStats": {
       "arguments": {"schema": "shop"},
       "result": {
-        "orders": {"rows": 1204388, "size_estimate": 187351040, "seq_scan": 41, "idx_scan": 9832117, "n_dead_tup": 18344, "last_autovacuum": "2026-09-14T22:05:12Z"},
-        "customers": {"rows": 88213, "size_estimate": 13705216, "seq_scan": 12, "idx_scan": 1200443, "n_dead_tup": 211, "last_autovacuum": "2026-09-13T08:40:01Z"}
+        "orders": {"rows": 1204388, "size_estimate": 187351040, "seq_scan": 41, "idx_scan": 9832117, "n_dead_tup": 18344, "last_autovacuum": "2026-09-14T22:05:12Z", "cumulative_statistics_missing": false},
+        "customers": {"rows": 88213, "size_estimate": 13705216, "seq_scan": 12, "idx_scan": 1200443, "n_dead_tup": 211, "last_autovacuum": "2026-09-13T08:40:01Z", "cumulative_statistics_missing": false}
       }
     },
     "tableSize": {

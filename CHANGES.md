@@ -114,6 +114,28 @@ FreeBSD, ZFS); this release is what they ran into.
   beside it, and `capacity-check` reads them. Neither can see what a session
   sets for itself.
 
+- **Statistics lost in a crash no longer read as a table nobody maintains.**
+  Crash recovery discards every cumulative counter. A 73-million-row table
+  vacuumed and analyzed that morning then came back from `tableStats` with
+  `n_live_tup` 0 and no vacuum or analyze on record, and `counters_since`
+  null: since PostgreSQL 15 a database has no reset time until somebody
+  resets it, and recovery leaves none (14 stamps it with the recovery time;
+  both reproduced with a `kill -9`). `counters_since` now falls back to the
+  earliest reset among `pg_stat_archiver`, `pg_stat_bgwriter` and
+  `pg_stat_wal`, which the same recovery resets, and
+  `counters_since_source` says which view the time came from -- the
+  earliest, since `pg_stat_reset_shared()` moves one of them and recovery
+  all three. On `tableStats`, `duplicateIndexes` and `partitionDetails`.
+
+  `tableStats` and `listTableStats` also say it per table:
+  `cumulative_statistics_missing` is true where the catalog counts rows and
+  the counters have none, with no vacuum or analyze on record. A restore and
+  an upgrade leave the same picture, and so does every table on a standby,
+  always, since vacuum and analyze are recorded on the primary -- measured
+  on 18, and the flag is true there too. `tableStats` adds a note saying
+  which of those the server is. `bloat-and-vacuum-review` reads the flag
+  before calling a table neglected.
+
 - **Sizes are no longer called "on disk".** Every size PostgreSQL reports is
   in logical bytes; on a filesystem that compresses or shares blocks with a
   snapshot the space occupied differs -- the database above occupied 68 GB on

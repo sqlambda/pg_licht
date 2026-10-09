@@ -2722,6 +2722,7 @@ private:
       {"partitionDetails",       schema_fixed("One partitioned table and its partitions, at most `limit` of them.",
                                    {{"table", "string"}, {"strategy", "string"}, {"key", "string"},
                                     {"is_partition_of", "string"}, {"counters_since", "string"},
+                                    {"counters_since_source", "string"},
                                     {"partition_count", "integer"},
                                     {"partitions_truncated", "boolean"}, {"order_by", "string"},
                                     {"partitions", "array"}})},
@@ -2737,6 +2738,7 @@ private:
                                     {"seq_scan", "integer"}, {"idx_scan", "integer"},
                                     {"n_live_tup", "integer"}, {"n_dead_tup", "integer"},
                                     {"n_mod_since_analyze", "integer"}, {"n_ins_since_vacuum", "integer"},
+                                    {"cumulative_statistics_missing", "boolean"}, {"note", "string"},
                                     {"columns", "object"}, {"indexes", "object"}})},
       {"tableSize",              schema_fixed("One table's measured size.",
                                    {{"table", "string"}, {"kind", "string"}, {"main_size", "integer"},
@@ -5274,7 +5276,7 @@ private:
         WHERE n.nspname = $1
           AND ($2 = '' OR tc.relname = $2)
       )
-      SELECT JSONB_BUILD_OBJECT()" + std::string(kCountersSince) + R"(,
+      SELECT JSONB_BUILD_OBJECT()" + kCountersSince + R"(,
         'identical', COALESCE((
           SELECT JSONB_AGG(g ORDER BY g->>'table')
           FROM (
@@ -9706,9 +9708,35 @@ private:
   // pg_stat_reset_single_table_counters() zeroes one relation without touching
   // pg_stat_database.stats_reset, so a null or old value here does not prove
   // the counters beside it are that old. It does prove they are no older.
-  static constexpr const char* kCountersSince =
-    "'counters_since', (SELECT stats_reset FROM pg_stat_database"
-    "                    WHERE datname = current_database())";
+  //
+  // pg_stat_database.stats_reset is null on a database nobody has reset, and
+  // since PostgreSQL 15 it is null again after crash recovery, which discards
+  // every cumulative counter. A table vacuumed that morning then reads
+  // n_live_tup 0 and no vacuum on record, with nothing to say the counters are
+  // an hour old: reproduced with a kill -9 on 18, where 14 stamps the database
+  // with the recovery time by itself. The server-wide views are reset in the
+  // same recovery and do carry a time, so they stand in when the database has
+  // none, and counters_since_source says which reading this is.
+  //
+  // The EARLIEST of them, not the latest: recovery moves all three together,
+  // while pg_stat_reset_shared() moves one, and the latest would then date
+  // the table counters by a reset that never touched them. All three exist on
+  // every supported major and are readable by any role.
+  static inline const std::string kCountersSinceFrom = R"(
+             FROM pg_stat_database AS d
+             LEFT JOIN LATERAL (
+               SELECT x.stats_reset, x.source
+                 FROM (VALUES ('pg_stat_archiver', (SELECT stats_reset FROM pg_stat_archiver)),
+                              ('pg_stat_bgwriter', (SELECT stats_reset FROM pg_stat_bgwriter)),
+                              ('pg_stat_wal',      (SELECT stats_reset FROM pg_stat_wal)))
+                        AS x(source, stats_reset)
+                WHERE x.stats_reset IS NOT NULL
+                ORDER BY x.stats_reset, x.source LIMIT 1) AS w ON true
+            WHERE d.datname = current_database()))";
+  static inline const std::string kCountersSince =
+    "'counters_since', (SELECT COALESCE(d.stats_reset, w.stats_reset)" + kCountersSinceFrom +
+    ", 'counters_since_source', (SELECT CASE WHEN d.stats_reset IS NOT NULL"
+    " THEN 'pg_stat_database' ELSE w.source END" + kCountersSinceFrom;
 
   static constexpr const char* kTableStatsCommon = R"(
                'rows', c.reltuples,
@@ -9724,7 +9752,25 @@ private:
                'last_vacuum', s.last_vacuum,
                'last_autovacuum', s.last_autovacuum,
                'last_analyze', s.last_analyze,
-               'last_autoanalyze', s.last_autoanalyze)";
+               'last_autoanalyze', s.last_autoanalyze,
+               -- The catalog counts rows that the cumulative statistics have
+               -- never seen inserted, vacuumed or analyzed. On a server with
+               -- its statistics intact that does not last: loading a table
+               -- counts its rows as live. It is what crash recovery and an
+               -- immediate shutdown leave, what a restore or an upgrade starts
+               -- with, and what every table on a standby looks like always,
+               -- since vacuum and analyze are recorded where they ran. Read
+               -- without this, each of those is a table nobody maintains.
+               --
+               -- Null for a partitioned parent or a view, whose n_live_tup is
+               -- zero by construction and proves nothing.
+               'cumulative_statistics_missing',
+                 CASE WHEN c.relkind IN ('r', 'm')
+                      THEN c.reltuples > 0
+                           AND COALESCE(s.n_live_tup, 0) = 0
+                           AND s.last_vacuum IS NULL AND s.last_autovacuum IS NULL
+                           AND s.last_analyze IS NULL AND s.last_autoanalyze IS NULL
+                 END)";
 
   const json table_stats(const std::string& schema, const std::string& table) {
     Session sess = open_session();
@@ -9816,9 +9862,27 @@ private:
 
     pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema, table});
 
-    if (!res.empty() && !res[0][0].is_null())
-      return json::parse(res[0][0].as<std::string>());
-    return {};
+    if (res.empty() || res[0][0].is_null()) return {};
+    json out = json::parse(res[0][0].as<std::string>());
+    // Said in words where one table is read. listTableStats carries the flag
+    // alone: on a standby it is true of every table, and a sentence on each
+    // would be the payload.
+    if (out.value("cumulative_statistics_missing", json()) == true) {
+      out["note"] = sess.in_recovery()
+        ? "cumulative_statistics_missing: this server is a standby. Vacuum, analyze "
+          "and the tuple counters are recorded on the primary, where they happen, and "
+          "are never replicated, so n_live_tup of zero and null vacuum and analyze "
+          "times here say nothing about maintenance. Read them on the primary. The "
+          "scan counters are this server's own."
+        : "cumulative_statistics_missing: the catalog counts rows in this table and "
+          "the cumulative statistics have none, with no vacuum or analyze on record. "
+          "That is statistics which are not there, not a table nobody maintains: crash "
+          "recovery and an immediate shutdown discard them, and a restore or an "
+          "upgrade does not carry them over. counters_since says how far back they "
+          "reach. The planner's own statistics, in columns, are separate and are "
+          "still there.";
+    }
+    return out;
   }
 
   // Partitioning, which nothing here read until 4.3.0. relkind 'p' was used in

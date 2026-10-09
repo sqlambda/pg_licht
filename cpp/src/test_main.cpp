@@ -1714,19 +1714,38 @@ TEST_F(PostgresMCPServerTest, ScanCountersCarryTheWindowTheyCover) {
   ASSERT_TRUE(ts.contains("counters_since")) << ts.dump(2);
 
   // Wired to pg_stat_database rather than to something that merely looks like
-  // a timestamp: the two must be the same reading.
+  // a timestamp: the two must be the same reading. Where the database carries
+  // no reset time -- any database nobody has reset, and since PostgreSQL 15
+  // any database after crash recovery -- the earliest reset among the
+  // server-wide views stands in, and the source says so.
+  std::string want = expected, source = "pg_stat_database";
   if (expected.empty()) {
-    EXPECT_TRUE(dup["counters_since"].is_null());
-    EXPECT_TRUE(ts["counters_since"].is_null());
-  } else {
-    ASSERT_TRUE(dup["counters_since"].is_string()) << dup["counters_since"].dump();
-    EXPECT_EQ(dup["counters_since"], ts["counters_since"]);
-    // Same instant, whatever the two renderings look like textually.
-    const std::string got = dup["counters_since"].get<std::string>();
-    EXPECT_TRUE(n.query_value<bool>(
-        "SELECT " + n.quote(got) + "::timestamptz = " + n.quote(expected) + "::timestamptz"))
-        << "tool: " << got << "  catalog: " << expected;
+    const pqxx::result earliest = n.exec(
+        "SELECT source, stats_reset::text FROM ("
+        "  SELECT 'pg_stat_archiver' AS source, stats_reset FROM pg_stat_archiver"
+        "  UNION ALL SELECT 'pg_stat_bgwriter', stats_reset FROM pg_stat_bgwriter"
+        "  UNION ALL SELECT 'pg_stat_wal', stats_reset FROM pg_stat_wal) AS x "
+        "WHERE stats_reset IS NOT NULL ORDER BY stats_reset, source LIMIT 1");
+    ASSERT_EQ(earliest.size(), 1u);
+    source = earliest[0][0].as<std::string>();
+    want = earliest[0][1].as<std::string>();
   }
+  for (const json* r : {&dup, &ts}) {
+    ASSERT_TRUE((*r)["counters_since"].is_string()) << (*r)["counters_since"].dump();
+    // Same instant, whatever the two renderings look like textually.
+    const std::string got = (*r)["counters_since"].get<std::string>();
+    EXPECT_TRUE(n.query_value<bool>(
+        "SELECT " + n.quote(got) + "::timestamptz = " + n.quote(want) + "::timestamptz"))
+        << "tool: " << got << "  catalog: " << want;
+    EXPECT_EQ((*r)["counters_since_source"], source) << r->dump(2);
+  }
+  // The earliest, so a reset of one server-wide view cannot date the table
+  // counters by itself: never later than any of the three.
+  EXPECT_TRUE(n.query_value<bool>(
+      "SELECT " + n.quote(dup["counters_since"].get<std::string>()) + "::timestamptz <= ALL ("
+      "  SELECT stats_reset FROM pg_stat_archiver UNION ALL"
+      "  SELECT stats_reset FROM pg_stat_bgwriter UNION ALL"
+      "  SELECT stats_reset FROM pg_stat_wal)") || !expected.empty());
 }
 
 // listSchemas dumped every relation name in every schema. On a database where
@@ -3613,6 +3632,84 @@ TEST_F(PostgresMCPServerTest, DatabaseStatsIncludesSessionCounters) {
 }
 
 // --- listTableStats / tableStats version-gated columns ---
+
+// Crash recovery discards the cumulative statistics and keeps the catalog, so
+// a table vacuumed that morning comes back with rows in the millions, no live
+// tuples and no vacuum on record: a neglected table, to anyone reading the
+// fields the bloat review reads. Resetting one table's counters leaves exactly
+// that picture without taking the server down.
+TEST_F(PostgresMCPServerTest, TableStatsSayWhenTheCumulativeStatisticsAreNotThere) {
+  // Each step from a connection of its own, which reports what it did when
+  // it closes. A session that stays open holds its counts back for a while,
+  // and the load's would then arrive after the reset and undo it. Behind a
+  // pooler the backend stays open whatever the client does, so the reset also
+  // waits until the load's inserts have been counted.
+  auto run = [&](const std::string& sql) {
+    pqxx::connection w(test_url);
+    pqxx::nontransaction wn(w);
+    wn.exec(sql);
+  };
+  run("DROP TABLE IF EXISTS grocery.lost_stats");
+  run("CREATE TABLE grocery.lost_stats AS SELECT g AS id FROM generate_series(1, 5000) AS g");
+  run("VACUUM ANALYZE grocery.lost_stats");
+
+  // The statistics reach the view a moment after the command returns.
+  auto settled = [&](bool want) {
+    json r;
+    for (int i = 0; i < 50; i++) {
+      r = srv->call_table_stats("grocery", "lost_stats");
+      if (r.value("cumulative_statistics_missing", json()) == want &&
+          r["last_vacuum"].is_null() == want &&
+          r["n_tup_ins"] == (want ? 0 : 5000))
+        break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return r;
+  };
+
+  json before = settled(false);
+  EXPECT_EQ(before["cumulative_statistics_missing"], false) << before.dump(2);
+  EXPECT_FALSE(before.contains("note")) << before.dump(2);
+  // Not a figure to hold it to: the vacuum sets it and the load's own count
+  // is added whenever it arrives.
+  EXPECT_GT(before["n_live_tup"].get<long long>(), 0) << before.dump(2);
+
+  run("SELECT pg_stat_reset_single_table_counters('grocery.lost_stats'::regclass)");
+  json after = settled(true);
+  EXPECT_EQ(after["cumulative_statistics_missing"], true) << after.dump(2);
+  // The catalog still counts the rows; only the counters are gone.
+  EXPECT_EQ(after["rows"].get<double>(), 5000) << after.dump(2);
+  EXPECT_EQ(after["n_live_tup"].get<long long>(), 0) << after.dump(2);
+  ASSERT_TRUE(after.contains("note")) << after.dump(2);
+  const std::string note = after["note"].get<std::string>();
+  EXPECT_NE(note.find("not a table nobody maintains"), std::string::npos) << note;
+  EXPECT_NE(note.find("counters_since"), std::string::npos) << note;
+  EXPECT_EQ(note.find("standby"), std::string::npos) << note;
+
+  // The schema-wide form carries the flag and not the sentence.
+  json all = srv->call_list_table_stats("grocery", "lost_stats");
+  ASSERT_TRUE(all.contains("lost_stats")) << all.dump(2);
+  EXPECT_EQ(all["lost_stats"]["cumulative_statistics_missing"], true);
+  EXPECT_FALSE(all["lost_stats"].contains("note"));
+
+  // One more insert is enough to end it: the counters have seen the table.
+  run("INSERT INTO grocery.lost_stats VALUES (5001)");
+  json again;
+  for (int i = 0; i < 50; i++) {
+    again = srv->call_table_stats("grocery", "lost_stats");
+    if (again["cumulative_statistics_missing"] == false) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  EXPECT_EQ(again["cumulative_statistics_missing"], false) << again.dump(2);
+
+  // A partitioned parent has no live tuples by construction; that proves
+  // nothing, so it is not asked.
+  json parent = srv->call_table_stats("grocery", "events");
+  ASSERT_TRUE(parent.contains("cumulative_statistics_missing")) << parent.dump(2);
+  EXPECT_TRUE(parent["cumulative_statistics_missing"].is_null()) << parent.dump(2);
+
+  run("DROP TABLE grocery.lost_stats");
+}
 
 TEST_F(PostgresMCPServerTest, TableStatsIncludeFailedHotUpdatesOnPg16AndLater) {
   const bool pg16 = pg_server_version_num(test_url) >= 160000;
@@ -6453,6 +6550,21 @@ TEST_F(PostgresMCPServerTest, APromptSubstitutesItsArguments) {
       << "the bloat prompt must send the model to check the slot first";
 }
 
+// After crash recovery every table reads as never vacuumed. The review that
+// tells a neglected table from a busy one by those fields has to be told there
+// is a third way to get that picture, and where the server says so.
+TEST_F(PostgresMCPServerTest, TheBloatPromptKnowsLostStatisticsFromNeglect) {
+  json r = rpc1(*srv, "prompts/get", {{"name", "bloat-and-vacuum-review"}});
+  const std::string text = r["result"]["messages"][0]["content"]["text"].get<std::string>();
+  EXPECT_NE(text.find("cumulative_statistics_missing"), std::string::npos);
+  const size_t lost = text.find("counters_since_source");
+  ASSERT_NE(lost, std::string::npos);
+  EXPECT_NE(text.find("Crash recovery"), std::string::npos);
+  EXPECT_NE(text.find("replica"), std::string::npos);
+  // In the step that ranks tables, before the slots and the measuring.
+  EXPECT_LT(lost, text.find("2. Call replicationSlots"));
+}
+
 TEST_F(PostgresMCPServerTest, APromptFallsBackWhenAnOptionalArgumentIsOmitted) {
   json r = rpc1(*srv, "prompts/get", {{"name", "bloat-and-vacuum-review"}});
   ASSERT_TRUE(r["result"].contains("messages")) << r.dump(2);
@@ -8270,6 +8382,50 @@ std::string standby_url() {
   return u ? std::string(u) : std::string();
 }
 }  // namespace
+
+// Vacuum and analyze are recorded where they run, so on a standby every table
+// that has rows reads as never vacuumed and holding no live tuples. Measured
+// on PostgreSQL 18. The flag is true of all of them, and the sentence beside
+// one table names the standby as the reason, not a crash.
+//
+// The fixture's database, which the standby has by replay: STANDBY_URL names
+// the rig's own, where there is nothing to read.
+TEST_F(PostgresMCPServerTest, OnAStandbyEveryTableWithRowsLacksItsCumulativeStatistics) {
+  if (standby_url().empty())
+    GTEST_SKIP() << "no STANDBY_URL; run cpp/test/run-pooled-tests.sh";
+  const std::string url = std::regex_replace(
+      standby_url(), std::regex(R"(\bdbname\s*=\s*\S+)"), "dbname=" + test_dbname);
+  PostgresMCPServer standby{url};
+
+  json all;
+  for (int i = 0; i < 50; i++) {
+    all = standby.call_list_table_stats("grocery");
+    if (all.contains("users") && all["users"]["rows"].is_number() &&
+        all["users"]["rows"].get<double>() > 0)
+      break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  ASSERT_TRUE(all.contains("users")) << all.dump(2);
+
+  int flagged = 0;
+  for (const auto& [name, t] : all.items()) {
+    if (!t["rows"].is_number() || t["rows"].get<double>() <= 0) continue;
+    if (t["cumulative_statistics_missing"].is_null()) continue;   // a parent or a view
+    EXPECT_EQ(t["cumulative_statistics_missing"], true) << name << ": " << t.dump(2);
+    flagged++;
+  }
+  EXPECT_GT(flagged, 1) << all.dump(2);
+
+  json r = standby.call_table_stats("grocery", "users");
+  ASSERT_TRUE(r.contains("note")) << r.dump(2);
+  const std::string note = r["note"].get<std::string>();
+  EXPECT_NE(note.find("standby"), std::string::npos) << note;
+  EXPECT_NE(note.find("primary"), std::string::npos) << note;
+  EXPECT_EQ(note.find("rash recovery"), std::string::npos) << note;
+  // The same table on the primary, a moment earlier, is in order.
+  json here = srv->call_table_stats("grocery", "users");
+  EXPECT_EQ(here["cumulative_statistics_missing"], false) << here.dump(2);
+}
 
 // A standby can be a sender too, and replay_behind_bytes has its own branch
 // for it: pg_current_wal_lsn() raises in recovery, so the minuend there is the

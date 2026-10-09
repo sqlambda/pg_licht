@@ -1072,6 +1072,52 @@ remains the latest of all four, since any of them refreshes
 .Li relpages
 and
 .Li reltuples .
+.Pp
+.Va counters_since
+is when the counters were last reset, and every count and timestamp above
+covers only the time since.
+It is
+.Li pg_stat_database.stats_reset
+where the database has one.
+Where it has none \(em a database nobody has reset, and since PostgreSQL 15 any
+database after crash recovery, which discards every cumulative counter \(em it
+is the earliest reset among
+.Li pg_stat_archiver ,
+.Li pg_stat_bgwriter
+and
+.Li pg_stat_wal ,
+which the same recovery resets, and
+.Va counters_since_source
+names the view.
+The earliest, because
+.Fn pg_stat_reset_shared
+moves one of them and recovery moves all three.
+A table vacuumed in the morning reads as never vacuumed after a crash at noon;
+.Va counters_since
+is what says the record is an hour old.
+.Ic duplicateIndexes
+and
+.Ic partitionDetails
+carry the same two fields.
+It remains a lower bound:
+.Fn pg_stat_reset_single_table_counters
+zeroes one relation and moves nothing.
+.Pp
+.Va cumulative_statistics_missing
+is true where the catalog counts rows in the table and the cumulative
+statistics have none: no live tuples and no vacuum or analyze on record.
+On a server whose statistics are intact that does not last, since loading a
+table counts its rows as live.
+It is what crash recovery and an immediate shutdown leave behind, what a
+restore or an upgrade starts with, and what every table on a standby looks
+like always, because vacuum and analyze are recorded on the primary and never
+replicated.
+A
+.Va note
+says which of those the server is.
+Read without it, each is a table nobody maintains.
+It is null for a partitioned parent or a view, whose live tuple count is zero
+by construction, and it ends with the first insert the counters see.
 .It Ic columnHistogram Ar schema Ar table Ar column
 The whole value distribution of one column: the most common values with their
 frequencies, and the full histogram of everything else.
@@ -1105,7 +1151,9 @@ on the column gets nulls rather than data.
 .It Ic listTableStats Ar schema Op Va pattern
 The same statistics for every table in
 .Ar schema ,
-without the per-column histograms.
+without the per-column histograms, and with
+.Va cumulative_statistics_missing
+on each table but not the sentence that explains it.
 .Va pattern ,
 when given, keeps only the tables whose name contains it, case-insensitively.
 Name one table to

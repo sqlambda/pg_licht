@@ -111,7 +111,7 @@ describe but never reject: payloads here are version-conditional, and any tool
 may answer `{error, hint}` when an extension is absent.
 
 Results that the protocol marks cacheable carry `ttlMs` and `cacheScope`.
-`tools/list` is about 170 kB (136 kB before MCP 2025-06-18, which carries no output
+`tools/list` is about 171 kB (138 kB before MCP 2025-06-18, which carries no output
 schemas) and changes only when the connections file is reloaded, so it is hinted at one
 minute and scoped `private` — it varies by negotiated revision and names the
 configured default connection, so it must not be served to another caller from
