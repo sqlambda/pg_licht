@@ -1,5 +1,155 @@
 # Changelog
 
+## 4.7.0 (unreleased)
+
+What the prompts could not answer. Seven of the twelve prompts were followed
+step by step against a freshly loaded 106 GB database (PostgreSQL 18 on
+FreeBSD, ZFS); this release is what they ran into.
+
+### Added
+
+- **`rowScatter`: what being out of physical order costs.** `tableStats`
+  returns `physical_order_correlation`, which says a column is out of order
+  and not what that costs. The reading that does was taken by hand: one
+  city's 157,058 rows were on 140,257 pages where about 3,300 would hold
+  them, and that ratio is what `CLUSTER` would gain a query reading them.
+  `rowScatter` takes a table and a column. With a `value` it is exact: the
+  rows that match, the distinct pages they sit on, `pages_if_packed` and
+  `scatter_ratio`, reading at most `max_rows` rows and saying when that cap
+  was reached. Without one it samples whole pages (`TABLESAMPLE SYSTEM`,
+  about ten thousand unless `sample_percent` says otherwise) for the values
+  pg_stats lists as most common, which answers which column is worth
+  clustering on. At 100 percent the two forms agree to the row and the page,
+  and a test holds them to it. It reads the table through `ctid` and needs
+  `SELECT` on it; the exact form returns counts only, the sampled form only
+  values `tableStats` already returns. A third tool that reads a table, with
+  `checkKey` and `explainQuery`, and like them it returns no rows: the
+  manual, `SECURITY.md` and the landing page say three where they said two.
+  76 tools; a bare login role runs 59 of the 73 database tools and the
+  monitoring role 67, measured again.
+
+- **`review-clustering`, a thirteenth prompt.** Whether a table is worth
+  clustering, on which columns and with what fill factor, as a sequence of
+  readings: `physical_order_correlation` for which columns are out of
+  order, `predicateStats` or `statementStats` for which of them queries
+  filter on, `rowScatter` for what the scatter costs, the write counters for
+  how fast the order decays, and `tableSize` for the space and the lock a
+  `CLUSTER` takes. It asks for the fill factor to be justified by what it
+  buys, since an update to an indexed column cannot stay on its page however
+  much room is left. Its steps were worked out on one table.
+
+### Fixed
+
+- **`tableStats` and `listTableStats` return the write counters.**
+  `n_tup_newpage_upd` was returned alone, and `bloat-and-vacuum-review` told
+  the reader to compare it "against the update count", which was not there:
+  two reviews said so in their reports, on a table where 0.6% of 7.9 million
+  updates had stayed on their page. Both tools now return `n_tup_ins`,
+  `n_tup_upd`, `n_tup_del` and `n_tup_hot_upd`, on every supported version,
+  and the prompt names the two ratios.
+
+- **`indexBloat` reads a GiST index.** It refused one with "pgstattuple has
+  no statistics function for a gist index". There is no page-level function
+  for GiST, but `pgstattuple(regclass)` reads one, and returns what a bloat
+  review wants: length, live and dead tuples, free space. `WITHOUT OVERLAPS`
+  keys are GiST, so on a temporal model the largest indexes in the database
+  were the only ones the tool could say nothing about. The answer carries
+  `source`, the function that produced it, on every access method. SP-GiST
+  and BRIN are still refused, because `pgstattuple` refuses them itself --
+  a test now checks that against the server -- and the message says "cannot
+  read" instead of "no statistics function".
+
+- **A statement with a typed literal is not called truncated.**
+  pg_stat_statements records `DATE '2026-09-14'` as `DATE $6`: it replaces
+  the string and keeps the type name, and that is not SQL. `explainQuery` by
+  `queryid` answered the resulting syntax error with a hint to raise
+  `track_activity_query_size`, which was not the cause. It now says what the
+  statement had, shows the fragment, and says to pass the statement through
+  `sql`. Recognised from the statement text, not the error message, which is
+  in the server's `lc_messages`. The statement is still not rewritten.
+
+- **`diagnose-slow-query` no longer stops at a utility statement.** After a
+  bulk load or a migration the slowest statements on record are `ALTER
+  TABLE`, `CREATE INDEX`, `VACUUM` and `COPY`, which have no plan; step 2
+  called `explainQuery` on the first, was refused, and the prompt had nowhere
+  to go. It now says to report what the statement was and how long it took,
+  and to continue with the next one that can be planned. `statementStats`
+  marks each statement `explainable`: false for a utility statement, true
+  for one `explainQuery` will take -- one rule for both tools -- and null
+  where the text is hidden. Nothing is left out of the ranking.
+
+- **What could be installed is listed.** `listExtensions` returned the
+  extensions installed and nothing else, so a plan that needed `bloom` could
+  say only that it was not there. With `available: true` it also returns the
+  extensions whose files are on the server and which are not created in this
+  database, every entry then marked `installed` and carrying
+  `default_version`. Without the argument the answer is unchanged.
+  `checkPrivileges` draws the same line for the extensions pg_licht uses: a
+  tool denied for a missing extension says whether it is one
+  `CREATE EXTENSION` away or needs its package first.
+
+- **`hostCapacity` can count memory the operating system has reserved.**
+  Its worst case was `shared_buffers`, `work_mem` times `max_connections`
+  and `maintenance_work_mem` times the autovacuum workers, against
+  `host_ram_mb`. On a 32 GB server with a ZFS ARC capped at 8 GB it reported
+  82% where the truth was over 100%, and nothing in the answer suggested
+  looking. `host_reserved_mb` (per connection or instance, as
+  `PG_LICHT_HOST_RESERVED_MB`, or the `reserved_mb` argument) declares
+  memory held outside the page cache; it is added to
+  `committed_worst_case` and reported as `host_reserved_bytes`, which is
+  null, not zero, when nothing was declared -- and a note says what that
+  leaves out.
+
+- **`hostCapacity` reports what a hash may take.** Its arithmetic counted
+  one `work_mem` per connection and its note said a query may use a multiple
+  of that, without `hash_mem_multiplier`: the factor by which a hash table
+  may exceed `work_mem`, 2 by default since PostgreSQL 15. One statement with
+  seven hash nodes, eight workers and both settings raised by hand took a
+  server down the day after a review had put its worst case at 82%. The
+  setting is now among those reported, with two derived figures:
+  `work_mem_times_hash_mem_multiplier_bytes`, the allowance of one hash
+  table in one process, and `one_hash_node_all_processes_bytes`, that times
+  `max_parallel_workers_per_gather` plus one -- about 1.2 GB for each hash in
+  a plan at 64 MB, 2 and 8. `committed_worst_case` is unchanged; the two are
+  beside it, and `capacity-check` reads them. Neither can see what a session
+  sets for itself.
+
+- **Statistics lost in a crash no longer read as a table nobody maintains.**
+  Crash recovery discards every cumulative counter. A 73-million-row table
+  vacuumed and analyzed that morning then came back from `tableStats` with
+  `n_live_tup` 0 and no vacuum or analyze on record, and `counters_since`
+  null: since PostgreSQL 15 a database has no reset time until somebody
+  resets it, and recovery leaves none (14 stamps it with the recovery time;
+  both reproduced with a `kill -9`). `counters_since` now falls back to the
+  earliest reset among `pg_stat_archiver`, `pg_stat_bgwriter` and
+  `pg_stat_wal`, which the same recovery resets, and
+  `counters_since_source` says which view the time came from -- the
+  earliest, since `pg_stat_reset_shared()` moves one of them and recovery
+  all three. On `tableStats`, `duplicateIndexes` and `partitionDetails`.
+
+  `tableStats` and `listTableStats` also say it per table:
+  `cumulative_statistics_missing` is true where the catalog counts rows and
+  the counters have none, with no vacuum or analyze on record. A restore and
+  an upgrade leave the same picture, and so does every table on a standby,
+  always, since vacuum and analyze are recorded on the primary -- measured
+  on 18, and the flag is true there too. `tableStats` adds a note saying
+  which of those the server is. `bloat-and-vacuum-review` reads the flag
+  before calling a table neglected.
+
+- **Sizes are no longer called "on disk".** Every size PostgreSQL reports is
+  in logical bytes; on a filesystem that compresses or shares blocks with a
+  snapshot the space occupied differs -- the database above occupied 68 GB on
+  ZFS. `diskUsage`'s note says so, and `triage-disk-space` asks for the
+  filesystem's own figure before promising what a cleanup returns, instead
+  of reading WAL and temporary files as "actually on disk".
+
+### Build
+
+- **GitHub Actions updated**, to the versions Dependabot proposed:
+  `checkout` 7.0.1, `upload-artifact` 7.0.1, `download-artifact` 8.0.1,
+  `cache` 6.1.0, `upload-pages-artifact` 5.0.0 and `deploy-pages` 5.0.1, each
+  pinned to its commit.
+
 ## 4.6.0 (2026-10-03)
 
 ### Fixed

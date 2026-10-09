@@ -111,10 +111,11 @@ describe but never reject: payloads here are version-conditional, and any tool
 may answer `{error, hint}` when an extension is absent.
 
 Results that the protocol marks cacheable carry `ttlMs` and `cacheScope`.
-`tools/list` is about 93 kB and entirely static, so it is hinted at one hour
-and scoped `private` — it varies by negotiated revision and names the
+`tools/list` is about 171 kB (138 kB before MCP 2025-06-18, which carries no output
+schemas) and changes only when the connections file is reloaded, so it is hinted at one
+minute and scoped `private` — it varies by negotiated revision and names the
 configured default connection, so it must not be served to another caller from
-a shared cache. Catalog-derived results are hinted at one minute.
+a shared cache. Catalog-derived results are hinted at one minute too.
 
 List operations accept an opaque `cursor` and return `nextCursor`. The page
 size is larger than anything this server lists today, so a client that ignores
@@ -139,11 +140,11 @@ Readings stay tools, because the model has to decide *when* to take them.
 a template, so a 10 000-table database does not produce a 10 000-entry
 response.
 
-Twelve **prompts** encode an order of investigation that is easy to get wrong:
+Thirteen **prompts** encode an order of investigation that is easy to get wrong:
 `diagnose-slow-query`, `triage-lock-contention`, `diagnose-deadlock`,
 `triage-active-sessions`, `triage-disk-space`, `bloat-and-vacuum-review`,
 `buffer-cache-review`, `capacity-check`, `replication-slot-review`,
-`plan-schema-change`, `check-role-access` and `explain-and-fix`. The `triage-`
+`plan-schema-change`, `review-clustering`, `check-role-access` and `explain-and-fix`. The `triage-`
 ones are written for a page rather than an investigation: they establish how
 long there is before they propose anything. They are static text and touch no
 database until the model acts on them, and each one whose tools are
@@ -151,13 +152,13 @@ privilege-gated opens by calling `checkPrivileges`.
 
 `triage-disk-space` is the one that arrives at night, and `diskUsage` is what
 makes it answerable without a shell on the server: WAL size, the archive
-backlog, temp files on disk now, the log directory, and sizes per tablespace and
+backlog, the temp files present now, the log directory, and sizes per tablespace and
 per database. Only the headroom is unreachable — PostgreSQL exposes no function
 for free space. The prompt leads with what makes the obvious response wrong:
 `VACUUM FULL` needs free space equal to the table and its indexes *before* it
 releases any, so it is not a disk-full action.
 
-Counts: 59 of 72 database operations for a bare login role, 67 with `pg_monitor` — the
+Counts: 59 of 73 database operations for a bare login role, 67 with `pg_monitor` — the
 `pg_ls_*` directory reads `diskUsage` uses are part of what that role grants.
 
 `triage-active-sessions` is for a server running more sessions at once than it
@@ -186,7 +187,7 @@ indexes and current lock waits can tell the two apart. **Completions** are offer
 
 ## Tools
 
-75 read-only operations, grouped as schema exploration, catalog search, cluster-wide
+76 read-only operations, grouped as schema exploration, catalog search, cluster-wide
 objects, extensibility and text search, foreign data and replication, monitoring and
 statistics, diagnostics and query planning, topology, connections, and connection poolers. Highlights include
 `tableDetails` (columns, indexes, constraints, foreign keys in both directions, triggers,
@@ -206,7 +207,7 @@ or source, use a search.
 
 `checkPrivileges` reports which of them the current role can actually use on a given
 connection. Most work for any role that can connect, since the catalog is world-readable:
-measured on PostgreSQL 18 with every extension present, a bare login role runs 59 of the 72
+measured on PostgreSQL 18 with every extension present, a bare login role runs 59 of the 73
 database operations at full fidelity, the monitoring role 67. What remains for the monitoring role reads row data or
 plans against it, apart from replication origin progress, which only the superuser can read. Worth calling first
 against an unfamiliar connection — a privilege-filtered answer is easy to mistake for an
@@ -444,6 +445,16 @@ Inheritance follows `instance` only, never `replication_group`: replicas routine
 smaller machines, and inheriting the primary's RAM would give every replica a confidently
 wrong `shared_buffers` ratio.
 
+Where the operating system holds memory outside the page cache and does not give it back
+on request -- a ZFS ARC of a fixed size, huge pages reserved for something else -- declare
+it too, as `host_reserved_mb`, and `hostCapacity` counts it in the worst case. PostgreSQL
+cannot see it.
+
+The worst case counts one `work_mem` per connection. A hash table is allowed `work_mem`
+times `hash_mem_multiplier`, so `hostCapacity` also reports what one hash node of a
+parallel query may take (`one_hash_node_all_processes_bytes`); a statement with several
+may take it for each.
+
 Or, with a single `DATABASE_URL`, via `PG_LICHT_HOST_RAM_MB` and `PG_LICHT_HOST_VCPUS`. An
 agent that inspects the host at run time can instead pass `ram_mb` and `vcpus` straight to
 the tool, which takes precedence over both.
@@ -490,7 +501,7 @@ function body, a very large plan: with a cap set, that is refused with a hint po
 
 | | |
 |---|---|
-| `man pg_licht_mcp` | configuration, connection strings, all 75 operations, MCP client setup |
+| `man pg_licht_mcp` | configuration, connection strings, all 76 operations, MCP client setup |
 | [INSTALL.md](INSTALL.md) | Homebrew, deb, rpm, tarball, verifying, uninstalling |
 | [BUILD.md](BUILD.md) | building from source, tests, sanitizers, CI, release process |
 | [CHANGES.md](CHANGES.md) | changelog |

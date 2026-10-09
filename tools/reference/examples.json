@@ -94,7 +94,8 @@
       "result": {
         "table": "shop.orders", "rows": 1204388, "size_estimate": 187351040,
         "seq_scan": 41, "idx_scan": 9832117, "n_live_tup": 1204102, "n_dead_tup": 18344,
-        "n_mod_since_analyze": 22410, "n_ins_since_vacuum": 9120,
+        "n_tup_ins": 1310224, "n_tup_upd": 2840117, "n_tup_del": 105836, "n_tup_hot_upd": 2511904,
+        "n_mod_since_analyze": 22410, "n_ins_since_vacuum": 9120, "cumulative_statistics_missing": false,
         "columns": {"status": {"null_frac": 0.0, "n_distinct": 3, "most_common_vals": ["shipped", "paid", "pending"], "most_common_freqs": [0.71, 0.24, 0.05]}},
         "indexes": {"orders_pkey": {"idx_scan": 9120004}, "orders_customer_id_idx": {"idx_scan": 712113}}
       }
@@ -145,7 +146,7 @@
     "partitionDetails": {
       "arguments": {"schema": "shop", "table": "events"},
       "result": {
-        "table": "events", "strategy": "range", "key": "RANGE (created_at)", "is_partition_of": null, "counters_since": "2026-08-01T00:00:00Z",
+        "table": "events", "strategy": "range", "key": "RANGE (created_at)", "is_partition_of": null, "counters_since": "2026-08-01T00:00:00Z", "counters_since_source": "pg_stat_database",
         "partition_count": 2, "partitions_truncated": false, "order_by": "name",
         "partitions": [
           {"name": "events_2026_08", "schema": "shop", "bound": "FOR VALUES FROM ('2026-08-01 00:00:00+00') TO ('2026-09-01 00:00:00+00')", "is_default": false, "is_partitioned": false, "rows": 7340112, "size_estimate": 1182990336, "n_dead_tup": 20431, "last_autovacuum": "2026-09-02T03:11:40Z"},
@@ -156,8 +157,8 @@
     "listTableStats": {
       "arguments": {"schema": "shop"},
       "result": {
-        "orders": {"rows": 1204388, "size_estimate": 187351040, "seq_scan": 41, "idx_scan": 9832117, "n_dead_tup": 18344, "last_autovacuum": "2026-09-14T22:05:12Z"},
-        "customers": {"rows": 88213, "size_estimate": 13705216, "seq_scan": 12, "idx_scan": 1200443, "n_dead_tup": 211, "last_autovacuum": "2026-09-13T08:40:01Z"}
+        "orders": {"rows": 1204388, "size_estimate": 187351040, "seq_scan": 41, "idx_scan": 9832117, "n_dead_tup": 18344, "last_autovacuum": "2026-09-14T22:05:12Z", "cumulative_statistics_missing": false},
+        "customers": {"rows": 88213, "size_estimate": 13705216, "seq_scan": 12, "idx_scan": 1200443, "n_dead_tup": 211, "last_autovacuum": "2026-09-13T08:40:01Z", "cumulative_statistics_missing": false}
       }
     },
     "tableSize": {
@@ -367,8 +368,8 @@
       "arguments": {"limit": 2},
       "result": {
         "statements": [
-          {"query_id": "-6203381990422871044", "query": "UPDATE shop.orders SET status = $1 WHERE id = $2", "calls": 18244102, "total_exec_ms": 9120441.2, "mean_exec_ms": 0.5, "rows": 18244102, "shared_blks_hit": 91220103, "shared_blks_read": 12033, "user": "app_rw", "database": "shop"},
-          {"query_id": "3301928477102934411", "query": "SELECT id, status FROM shop.orders WHERE customer_id = $1 ORDER BY created_at DESC LIMIT $2", "calls": 4410233, "total_exec_ms": 3120982.7, "mean_exec_ms": 0.71, "rows": 88204660, "shared_blks_hit": 402211093, "shared_blks_read": 440112, "user": "app_rw", "database": "shop"}
+          {"query_id": "-6203381990422871044", "query": "UPDATE shop.orders SET status = $1 WHERE id = $2", "explainable": true, "calls": 18244102, "total_exec_ms": 9120441.2, "mean_exec_ms": 0.5, "rows": 18244102, "shared_blks_hit": 91220103, "shared_blks_read": 12033, "user": "app_rw", "database": "shop"},
+          {"query_id": "3301928477102934411", "query": "SELECT id, status FROM shop.orders WHERE customer_id = $1 ORDER BY created_at DESC LIMIT $2", "explainable": true, "calls": 4410233, "total_exec_ms": 3120982.7, "mean_exec_ms": 0.71, "rows": 88204660, "shared_blks_hit": 402211093, "shared_blks_read": 440112, "user": "app_rw", "database": "shop"}
         ],
         "info": {"dealloc": 0, "stats_reset": "2026-08-01T00:00:00Z"}
       }
@@ -444,8 +445,8 @@
       "result": {
         "host": {"ram_mb": 65536, "ram_bytes": 68719476736, "vcpus": 16, "source": "config file"},
         "server": {"version": "18.6", "database": "shop"},
-        "settings": {"shared_buffers": {"setting": "2097152", "unit": "8kB", "bytes": 17179869184}, "work_mem": {"setting": "32768", "unit": "kB", "bytes": 33554432}, "max_connections": {"setting": "300"}},
-        "derived": {"shared_buffers_percent_of_ram": 25.0, "work_mem_times_max_connections_percent_of_ram": 14.6, "max_parallel_workers_per_vcpu": 0.5}
+        "settings": {"shared_buffers": {"setting": "2097152", "unit": "8kB", "bytes": 17179869184}, "work_mem": {"setting": "32768", "unit": "kB", "bytes": 33554432}, "hash_mem_multiplier": {"setting": "2"}, "max_parallel_workers_per_gather": {"setting": "2"}, "max_connections": {"setting": "300"}},
+        "derived": {"shared_buffers_percent_of_ram": 25.0, "work_mem_times_max_connections_percent_of_ram": 14.6, "work_mem_times_hash_mem_multiplier_bytes": 67108864, "one_hash_node_all_processes_bytes": 201326592, "max_parallel_workers_per_vcpu": 0.5}
       }
     },
     "duplicateIndexes": {
@@ -462,6 +463,10 @@
     "indexBloat": {
       "arguments": {"schema": "shop", "index": "orders_pkey"},
       "result": {"schema": "shop", "index": "orders_pkey", "table": "orders", "access_method": "btree", "index_size": 27025408, "idx_scan": 9120004, "tree_level": 2, "leaf_pages": 3280, "internal_pages": 18, "empty_pages": 0, "deleted_pages": 12, "avg_leaf_density": 88.4, "leaf_fragmentation": 3.2}
+    },
+    "rowScatter": {
+      "arguments": {"schema": "shop", "table": "orders", "column": "customer_id", "value": 48213},
+      "result": {"schema": "shop", "table": "orders", "column": "customer_id", "table_pages": 22870, "mode": "exact", "rows": 1840, "pages": 1795, "max_rows": 200000, "capped": false, "rows_per_page": 52.7, "pages_if_packed": 35, "scatter_ratio": 51.3, "note": "rows of this value were read and the distinct pages they sit on counted; pages_if_packed is what the same rows would need at the table's average rows_per_page, and scatter_ratio is pages over that -- 1 is already packed."}
     },
     "checkKey": {
       "arguments": {"schema": "shop", "table": "orders", "values": [482211]},
@@ -568,6 +573,7 @@
     "capacity-check": {"arguments": {"connection": "shop_prod"}},
     "replication-slot-review": {"arguments": {"connection": "shop_prod"}},
     "plan-schema-change": {"arguments": {"change": "ALTER TABLE shop.orders ADD COLUMN invoice_no bigint", "schema": "shop", "table": "orders"}},
+    "review-clustering": {"arguments": {"schema": "shop", "table": "orders"}},
     "check-role-access": {"arguments": {"role": "reporting", "object": "shop.orders", "privilege": "SELECT"}},
     "explain-and-fix": {"arguments": {"sql": "SELECT id, status FROM shop.orders WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 20", "params": "[88213]", "schema": "shop"}}
   }

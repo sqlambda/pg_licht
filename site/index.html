@@ -12,11 +12,13 @@
   assumed; where a number is written by hand, the source of it is noted beside
   it in this comment block:
     - tool listing size vs connection count: 152,519 bytes with 1, 150 and
-      1,000 configured connections, 72 tools, on MCP 2025-06-18; startup
+      1,000 configured connections, 72 tools, on MCP 2025-06-18 (171,451
+      bytes at 76 tools, 2026-10-09); startup
       26-36 ms, debug build (2026-09-22; was 135 KB and 51-62 ms at 68 tools,
       2026-09-15)
-    - 59 and 67 of 72: checkPrivileges as a bare and a pg_monitor role on
-      PostgreSQL 18 with every extension present (2026-09-22)
+    - 59 and 67 of 73: checkPrivileges as a bare and a pg_monitor role on
+      PostgreSQL 18 with every extension present (2026-10-08; 59 and 67 of 72
+      on 2026-09-22, before rowScatter, which needs SELECT like checkKey)
     - sweeps: at most 32 members per call (kMaxSweepMembers), 16 at a time
       (kSweepConcurrency); at most 32 idle connections kept warm (kMaxIdle),
       all in cpp/src/server.h
@@ -208,7 +210,7 @@
         whole suite runs through a real PgBouncer on every change.</p></div>
       <div class="feature"><h3>Honest about privileges</h3>
         <p><code>checkPrivileges</code> says which tools the connecting role can really use:
-        59 of 72 database tools for a bare login role, 67 with <code>pg_monitor</code>.</p></div>
+        59 of 73 database tools for a bare login role, 67 with <code>pg_monitor</code>.</p></div>
     </div>
   </section>
 
@@ -222,8 +224,9 @@
         <h3>Never</h3>
         <ul>
           <li>Writes, alters or deletes anything.</li>
-          <li>Returns rows from a table. The two tools that read one return only a yes or no
-          (<code>checkKey</code>) or a plan with row counts (<code>explainQuery</code>).</li>
+          <li>Returns rows from a table. The three tools that read one return only a yes or no
+          (<code>checkKey</code>), counts of rows and pages (<code>rowScatter</code>) or a
+          plan with row counts (<code>explainQuery</code>).</li>
           <li>Returns a password it holds, a user mapping's options, or a subscription's
           connection string.</li>
           <li>Returns a constant <code>pg_qualstats</code> recorded. It keeps the literal of

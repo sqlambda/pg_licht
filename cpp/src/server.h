@@ -9,6 +9,7 @@
 #include <limits>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <iostream>
 #include <map>
@@ -17,6 +18,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <unistd.h>
 #include <nlohmann/json.hpp>
@@ -830,7 +832,7 @@ public:
   const json call_sequences(const std::string& schema, const std::string& pattern) {
     return sequences(schema, pattern);
   }
-  const json call_extensions() { return extensions(); }
+  const json call_extensions(bool available = false) { return extensions(available); }
   const json call_database_size() { return database_size(); }
   const json call_server_settings() { return server_settings("", false); }
   const json call_server_settings(const std::string& p, bool all) { return server_settings(p, all); }
@@ -901,6 +903,11 @@ public:
       if (v == requested) return v;
     return "2024-11-05";
   }
+  const json call_row_scatter(const std::string& schema, const std::string& table_name,
+                              const std::string& column, const json& value, bool has_value,
+                              long long max_rows = 0, double sample_percent = 0) {
+    return row_scatter(schema, table_name, column, value, has_value, max_rows, sample_percent);
+  }
   const json call_check_key(const std::string& schema, const std::string& table_name, const json& values) {
     return check_key(schema, table_name, values);
   }
@@ -924,8 +931,9 @@ public:
   const json call_table_io_stats(const std::string& schema, const std::string& table_name, int limit) {
     return table_io_stats(schema, table_name, limit);
   }
-  const json call_host_capacity(long long ram_mb, int vcpus, const std::string& storage) {
-    return host_capacity(ram_mb, vcpus, storage);
+  const json call_host_capacity(long long ram_mb, int vcpus, const std::string& storage,
+                                long long reserved_mb = 0) {
+    return host_capacity(ram_mb, vcpus, storage, reserved_mb);
   }
 
   // Drive one JSON-RPC request and return the response, for tests that need the
@@ -1617,6 +1625,7 @@ private:
       // Host capacity, so a caller can see at a glance which connections still
       // need it injected before hostCapacity can compute anything.
       if (c.capacity.ram_mb > 0)        entry["host_ram_mb"]  = c.capacity.ram_mb;
+      if (c.capacity.reserved_mb > 0)   entry["host_reserved_mb"] = c.capacity.reserved_mb;
       if (c.capacity.vcpus > 0)         entry["host_vcpus"]   = c.capacity.vcpus;
       if (!c.capacity.storage.empty())  entry["host_storage"] = c.capacity.storage;
       if (!c.capacity.note.empty())     entry["host_note"]    = c.capacity.note;
@@ -1669,6 +1678,7 @@ private:
       entry["source"] = registry_.get(members.front()).instance_source;
       const auto cap = registry_.instance_capacity(name);
       if (cap.ram_mb > 0)       entry["host_ram_mb"]  = cap.ram_mb;
+      if (cap.reserved_mb > 0)  entry["host_reserved_mb"] = cap.reserved_mb;
       if (cap.vcpus > 0)        entry["host_vcpus"]   = cap.vcpus;
       if (!cap.storage.empty()) entry["host_storage"] = cap.storage;
       if (!cap.note.empty())    entry["host_note"]    = cap.note;
@@ -2164,6 +2174,9 @@ private:
 
       // Per-database catalogs, identical on a physical replica.
       {"checkKey",              {true,  false, false, false}},
+      // Heap pages are replicated byte for byte, so the physical order of a
+      // table is the same on a physical replica as on its primary.
+      {"rowScatter",            {true,  false, false, false}},
       {"databaseSize",          {true,  false, false, false}},
       {"enumDetails",           {true,  false, false, false}},
       {"explainQuery",          {true,  false, false, false}},
@@ -2709,6 +2722,7 @@ private:
       {"partitionDetails",       schema_fixed("One partitioned table and its partitions, at most `limit` of them.",
                                    {{"table", "string"}, {"strategy", "string"}, {"key", "string"},
                                     {"is_partition_of", "string"}, {"counters_since", "string"},
+                                    {"counters_since_source", "string"},
                                     {"partition_count", "integer"},
                                     {"partitions_truncated", "boolean"}, {"order_by", "string"},
                                     {"partitions", "array"}})},
@@ -2724,6 +2738,7 @@ private:
                                     {"seq_scan", "integer"}, {"idx_scan", "integer"},
                                     {"n_live_tup", "integer"}, {"n_dead_tup", "integer"},
                                     {"n_mod_since_analyze", "integer"}, {"n_ins_since_vacuum", "integer"},
+                                    {"cumulative_statistics_missing", "boolean"}, {"note", "string"},
                                     {"columns", "object"}, {"indexes", "object"}})},
       {"tableSize",              schema_fixed("One table's measured size.",
                                    {{"table", "string"}, {"kind", "string"}, {"main_size", "integer"},
@@ -2733,6 +2748,12 @@ private:
                                    {{"database", "string"}, {"size", "integer"}})},
       {"checkKey",               schema_fixed("Whether a row with the given key exists.",
                                    {{"exists", "boolean"}})},
+      {"rowScatter",             schema_fixed("How scattered the rows of a value are across a "
+                                              "table's pages, exact for one value or sampled "
+                                              "for the most common ones.",
+                                   {{"schema", "string"}, {"table", "string"}, {"column", "string"},
+                                    {"mode", "string"}, {"table_pages", "integer"},
+                                    {"note", "string"}})},
       {"evaluateIndex",          schema_fixed("How a statement would plan with different indexes.",
                                    {{"statement", "string"}, {"hypopg_version", "string"},
                                     {"baseline", "object"}, {"hypothetical", "object"},
@@ -3411,11 +3432,18 @@ private:
     }
   }
 
-  const json extensions() {
+  // With `available`, also what could be installed: the extensions whose
+  // files are on the server and which are not created in this database, from
+  // pg_available_extensions. A plan that needs bloom or btree_gin reads very
+  // differently when the extension is one CREATE EXTENSION away than when it
+  // needs a package and perhaps a restart, and through 4.6 this could only
+  // say "not installed". Opt-in, so the default answer is what it always
+  // was: every key an installed extension. With it, every entry says which.
+  const json extensions(bool available = false) {
     Session sess = open_session();
     pqxx::work& txn = sess.txn();
 
-    std::string const query = R"(
+    std::string const query = !available ? R"(
       SELECT JSONB_OBJECT_AGG(
                e.extname,
                JSONB_BUILD_OBJECT(
@@ -3427,6 +3455,31 @@ private:
              )
       FROM pg_extension AS e
       JOIN pg_namespace AS n ON n.oid = e.extnamespace;
+    )" : R"(
+      SELECT JSONB_OBJECT_AGG(x.name, x.entry)
+      FROM (
+        SELECT e.extname AS name,
+               JSONB_BUILD_OBJECT(
+                 'installed',   true,
+                 'version',     e.extversion,
+                 'default_version', a.default_version,
+                 'schema',      n.nspname,
+                 'relocatable', e.extrelocatable,
+                 'description', COALESCE(obj_description(e.oid, 'pg_extension'), '')
+               ) AS entry
+          FROM pg_extension AS e
+          JOIN pg_namespace AS n ON n.oid = e.extnamespace
+          LEFT JOIN pg_available_extensions AS a ON a.name = e.extname
+        UNION ALL
+        SELECT a.name,
+               JSONB_BUILD_OBJECT(
+                 'installed',   false,
+                 'default_version', a.default_version,
+                 'description', COALESCE(a.comment, '')
+               )
+          FROM pg_available_extensions AS a
+         WHERE a.installed_version IS NULL
+      ) AS x;
     )";
 
     pqxx::result const res = txn.exec(query);
@@ -3869,6 +3922,18 @@ private:
       if (!res.empty() && !res[0][0].is_null()) {
         json out = json::parse(res[0][0].as<std::string>());
         out["order_by"] = key;
+        // pg_stat_statements tracks utility statements too, and after a bulk
+        // load or a migration they head this ranking: ALTER TABLE, CREATE
+        // INDEX, VACUUM, COPY. They have no plan, and diagnose-slow-query
+        // used to stop at the first one. Nothing is hidden -- a review after
+        // a migration wants to see the DDL -- but each entry says whether
+        // explainQuery will take it. Null where the text is hidden from this
+        // role, since there is nothing to read the first word of.
+        if (out.contains("statements") && out["statements"].is_array())
+          for (auto& st : out["statements"])
+            st["explainable"] = st.contains("query") && st["query"].is_string()
+                                  ? json(has_a_plan(st["query"].get<std::string>()))
+                                  : json();
         return out;
       } else {
         return {{"statements", json::array()}, {"order_by", key}};
@@ -5211,7 +5276,7 @@ private:
         WHERE n.nspname = $1
           AND ($2 = '' OR tc.relname = $2)
       )
-      SELECT JSONB_BUILD_OBJECT()" + std::string(kCountersSince) + R"(,
+      SELECT JSONB_BUILD_OBJECT()" + counters_since_sql() + R"(,
         'identical', COALESCE((
           SELECT JSONB_AGG(g ORDER BY g->>'table')
           FROM (
@@ -5511,14 +5576,15 @@ private:
   // the connections file, or the environment. Whichever is used is named in
   // 'source', because every derived ratio is only as good as that figure.
   const json host_capacity(long long ram_mb_arg, int vcpus_arg,
-                           const std::string& storage_arg) {
+                           const std::string& storage_arg, long long reserved_mb_arg = 0) {
     pglicht::HostCapacity cap = active_cfg().capacity;
-    if (ram_mb_arg > 0 || vcpus_arg > 0 || !storage_arg.empty()) {
+    if (ram_mb_arg > 0 || vcpus_arg > 0 || !storage_arg.empty() || reserved_mb_arg > 0) {
       // Arguments win over configuration, and are reported as a distinct
       // source: a value passed per call is a claim about right now, while the
       // file may have been written for a machine that has since been resized.
       pglicht::HostCapacity from_args;
       from_args.ram_mb  = ram_mb_arg > 0 ? ram_mb_arg : cap.ram_mb;
+      from_args.reserved_mb = reserved_mb_arg > 0 ? reserved_mb_arg : cap.reserved_mb;
       from_args.vcpus   = vcpus_arg  > 0 ? vcpus_arg  : cap.vcpus;
       from_args.storage = !storage_arg.empty() ? storage_arg : cap.storage;
       from_args.note    = cap.note;
@@ -5537,7 +5603,8 @@ private:
     std::string const query = R"(
       WITH host AS (
         SELECT NULLIF($1, '')::bigint AS ram_bytes,
-               NULLIF($2, '')::int    AS vcpus
+               NULLIF($2, '')::int    AS vcpus,
+               NULLIF($3, '')::bigint AS reserved_bytes
       ),
       g AS (
         SELECT name, setting, unit,
@@ -5568,7 +5635,12 @@ private:
                (SELECT bytes   FROM g WHERE name = 'maintenance_work_mem') AS maint_work_mem,
                (SELECT bytes   FROM g WHERE name = 'effective_cache_size') AS effective_cache_size,
                (SELECT setting::bigint FROM g WHERE name = 'max_connections')        AS max_connections,
-               (SELECT setting::bigint FROM g WHERE name = 'autovacuum_max_workers') AS av_workers
+               (SELECT setting::bigint FROM g WHERE name = 'autovacuum_max_workers') AS av_workers,
+               (SELECT setting::bigint FROM g
+                 WHERE name = 'max_parallel_workers_per_gather')                     AS per_gather,
+               -- A real, not an integer, so g above does not carry it.
+               (SELECT setting::numeric FROM pg_settings
+                 WHERE name = 'hash_mem_multiplier')                                 AS hash_mult
       ),
       -- pg_db_role_setting is a whole configuration layer pg_settings cannot
       -- show: pg_settings reports the value for THIS session, so an
@@ -5648,7 +5720,10 @@ private:
                 FROM ovr
                GROUP BY 1, 2, 3) AS g), '[]'::jsonb),
         'settings', (SELECT JSONB_OBJECT_AGG(name, JSONB_BUILD_OBJECT(
-                        'setting', setting, 'unit', unit, 'bytes', bytes)) FROM g),
+                        'setting', setting, 'unit', unit, 'bytes', bytes)) FROM g)
+                    || (SELECT JSONB_BUILD_OBJECT(name, JSONB_BUILD_OBJECT(
+                          'setting', setting, 'unit', unit, 'bytes', NULL))
+                          FROM pg_settings WHERE name = 'hash_mem_multiplier'),
         'derived', (SELECT JSONB_BUILD_OBJECT(
           'shared_buffers_percent_of_ram',
             round(100.0 * v.shared_buffers / NULLIF(host.ram_bytes, 0), 1),
@@ -5668,13 +5743,32 @@ private:
           'work_mem_effective_max_bytes', GREATEST(v.work_mem, wm.max_bytes),
           'work_mem_is_overridden', wm.max_bytes IS NOT NULL
                                     AND wm.max_bytes > v.work_mem,
+          -- What one hash table may take, and what one hash node may take
+          -- across a parallel query's processes. Neither is in the worst case
+          -- below, which counts one work_mem per connection: a plan has as
+          -- many of these as it has hash nodes, and how many that is belongs
+          -- to the statement, not to the server.
+          'work_mem_times_hash_mem_multiplier_bytes',
+            round(GREATEST(v.work_mem, wm.max_bytes) * v.hash_mult)::bigint,
+          'one_hash_node_all_processes_bytes',
+            round(GREATEST(v.work_mem, wm.max_bytes) * v.hash_mult
+                  * (v.per_gather + 1))::bigint,
+          'one_hash_node_all_processes_percent_of_ram',
+            round(100.0 * GREATEST(v.work_mem, wm.max_bytes) * v.hash_mult
+                  * (v.per_gather + 1) / NULLIF(host.ram_bytes, 0), 1),
+          -- Null when host_reserved_mb is not declared, never zero: "none
+          -- was declared" is not "the host reserves nothing".
+          'host_reserved_bytes', host.reserved_bytes,
+          'host_reserved_percent_of_ram',
+            round(100.0 * host.reserved_bytes / NULLIF(host.ram_bytes, 0), 1),
           'committed_worst_case_bytes',
             v.shared_buffers + GREATEST(v.work_mem, wm.max_bytes) * v.max_connections
-              + v.maint_work_mem * v.av_workers,
+              + v.maint_work_mem * v.av_workers + COALESCE(host.reserved_bytes, 0),
           'committed_worst_case_percent_of_ram',
             round(100.0 * (v.shared_buffers
                            + GREATEST(v.work_mem, wm.max_bytes) * v.max_connections
-                           + v.maint_work_mem * v.av_workers)
+                           + v.maint_work_mem * v.av_workers
+                           + COALESCE(host.reserved_bytes, 0))
                   / NULLIF(host.ram_bytes, 0), 1),
           'max_parallel_workers_per_vcpu',
             round((SELECT setting::numeric FROM g WHERE name = 'max_parallel_workers')
@@ -5688,8 +5782,23 @@ private:
           'with several sorts or hash joins can use a multiple of it, and parallel '
           'workers each get their own. work_mem_times_max_connections is therefore a '
           'floor on the worst case, not a ceiling.',
+          'A hash table is allowed work_mem times hash_mem_multiplier, which is 2 by '
+          'default since PostgreSQL 15, so a hash join or a hashed aggregate may take '
+          'twice what work_mem says. work_mem_times_hash_mem_multiplier is that '
+          'allowance for one hash table in one process, and one_hash_node_all_processes '
+          'multiplies it by max_parallel_workers_per_gather + 1, which is what one hash '
+          'node of a parallel query may take. A statement with several hash nodes may '
+          'take that for each, and neither figure is part of committed_worst_case. '
+          'Both use this session''s hash_mem_multiplier; a session may raise it, and '
+          'work_mem with it, beyond anything reported here.',
           'shared_buffers is counted once here; the operating system page cache is '
           'not, which is what effective_cache_size is meant to describe.',
+          'committed_worst_case includes host_reserved_mb when it is declared: memory '
+          'the operating system holds outside the page cache and does not give back '
+          'on request, such as a ZFS ARC of a fixed size or huge pages reserved for '
+          'something else. PostgreSQL cannot see it. Where host_reserved_bytes is '
+          'null none was declared, and on such a host the worst case is higher than '
+          'the figure here by that amount.',
           'settings shows this session''s values. overrides carries what '
           'pg_db_role_setting holds for other roles and databases, which pg_settings '
           'cannot show and which is the usual answer to "slow only from the '
@@ -5701,7 +5810,9 @@ private:
     pqxx::result const res = pqxx_exec(
       txn, query,
       pqxx::params{cap.ram_mb > 0 ? std::to_string(cap.ram_mb * 1048576LL) : std::string{},
-                   cap.vcpus  > 0 ? std::to_string(cap.vcpus)              : std::string{}});
+                   cap.vcpus  > 0 ? std::to_string(cap.vcpus)              : std::string{},
+                   cap.reserved_mb > 0 ? std::to_string(cap.reserved_mb * 1048576LL)
+                                       : std::string{}});
 
     json out = (!res.empty() && !res[0][0].is_null())
       ? json::parse(res[0][0].as<std::string>()) : json::object();
@@ -5711,6 +5822,7 @@ private:
       host["ram_mb"]    = cap.ram_mb;
       host["ram_bytes"] = cap.ram_mb * 1048576LL;
     }
+    if (cap.reserved_mb > 0)  host["reserved_mb"] = cap.reserved_mb;
     if (cap.vcpus > 0)        host["vcpus"]   = cap.vcpus;
     if (!cap.storage.empty()) host["storage"] = cap.storage;
     if (!cap.note.empty())    host["note"]    = cap.note;
@@ -5749,6 +5861,17 @@ private:
   // comments. pg_stat_statements also tracks utility statements (CREATE
   // DATABASE, SET, VACUUM, ...), and EXPLAIN cannot take those at all --
   // "EXPLAIN SET work_mem='4MB'" is a syntax error, not a graceful failure.
+  // Whether EXPLAIN accepts a statement, by its first word. One rule for
+  // explainQuery's refusal and statementStats' `explainable`, so the ranking
+  // cannot call plannable what the other tool then refuses as a utility
+  // statement.
+  static bool has_a_plan(const std::string& sql) {
+    static const std::set<std::string> EXPLAINABLE = {
+      "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "WITH", "TABLE", "VALUES"
+    };
+    return EXPLAINABLE.count(leading_keyword(sql)) > 0;
+  }
+
   static std::string leading_keyword(const std::string& sql) {
     size_t i = 0;
     for (;;) {
@@ -6122,6 +6245,57 @@ private:
     return {};
   }
 
+  // "DATE $6" when a parameter follows a type name in a statement the server
+  // has already refused to parse, and "" otherwise. Read from the statement
+  // and not from the error message: the message is in the server's
+  // lc_messages, and "at or near" is English only. It can only ever change
+  // what is said about a statement that failed with a syntax error.
+  static std::string typed_literal_parameter(const std::string& sql) {
+    // The type names that are written this way in practice.
+    static const std::set<std::string> kTypes = {
+      "date", "time", "timetz", "timestamp", "timestamptz", "interval",
+      "numeric", "decimal", "integer", "int", "int2", "int4", "int8", "bigint",
+      "smallint", "real", "float4", "float8", "money", "boolean", "bool",
+      "text", "varchar", "char", "bpchar", "name", "bytea", "uuid", "json", "jsonb",
+      "xml", "inet", "cidr", "macaddr", "point", "box", "bit", "varbit", "oid",
+      "regclass", "tsquery", "tsvector", "daterange", "tsrange", "tstzrange",
+      "int4range", "int8range", "numrange"};
+    auto word_before = [&sql](size_t& end) {   // the word ending at `end`, lowercased
+      while (end > 0 && std::isspace(static_cast<unsigned char>(sql[end - 1]))) end--;
+      const size_t stop = end;
+      while (end > 0 && (std::isalnum(static_cast<unsigned char>(sql[end - 1])) || sql[end - 1] == '_')) end--;
+      std::string w = sql.substr(end, stop - end);
+      for (auto& ch : w) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+      return w;
+    };
+    for (size_t p = sql.find('$'); p != std::string::npos; p = sql.find('$', p + 1)) {
+      size_t e = p + 1;
+      while (e < sql.size() && std::isdigit(static_cast<unsigned char>(sql[e]))) e++;
+      if (e == p + 1) continue;                                  // not $n
+      if (p == 0 || !std::isspace(static_cast<unsigned char>(sql[p - 1]))) continue;
+      size_t at = p;
+      const std::string w = word_before(at);
+      if (w.empty()) continue;
+      std::string shown = sql.substr(at, p - at);
+      while (!shown.empty() && std::isspace(static_cast<unsigned char>(shown.back()))) shown.pop_back();
+      bool typed = kTypes.count(w) > 0;
+      // TIMESTAMP WITH TIME ZONE $n is a typed literal; AT TIME ZONE $n is an
+      // ordinary parameter. DOUBLE PRECISION $n likewise needs its first word.
+      if (w == "zone") {
+        size_t q = at;
+        if (word_before(q) == "time") {
+          const std::string with = word_before(q);
+          typed = with == "with" || with == "without";
+        }
+      } else if (w == "precision") {
+        size_t q = at;
+        typed = word_before(q) == "double";
+      }
+      if (typed) return shown + " " + sql.substr(p, e - p);
+    }
+    return "";
+  }
+
   const json explain_query(const std::string& queryid, const std::string& sql_in,
                            const json& params, bool analyze, int timeout_ms,
                            const json& settings, const std::string& plan_as_role) {
@@ -6290,11 +6464,8 @@ private:
     if (sql.empty())
       throw std::runtime_error("the statement is empty");
 
-    static const std::set<std::string> EXPLAINABLE = {
-      "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "WITH", "TABLE", "VALUES"
-    };
     std::string const kw = leading_keyword(sql);
-    if (!EXPLAINABLE.count(kw))
+    if (!has_a_plan(sql))
       throw std::runtime_error(
         "statement cannot be EXPLAINed: it starts with \"" +
         (kw.empty() ? std::string("(nothing)") : kw) +
@@ -6449,6 +6620,26 @@ private:
       // std::string_view (explicit conversion to std::string), while 7.x
       // returns std::string. Parens accept both.
       std::string ss(e.sqlstate());
+      // A typed literal -- DATE '2026-09-14', INTERVAL '1 day' -- is the one
+      // thing pg_stat_statements normalises into text that is not SQL: it
+      // replaces the string and keeps the type name, leaving DATE $6, and a
+      // type name must be followed by a string literal. Through 4.6 this was
+      // answered with the truncation hint below, which sent the reader to a
+      // setting that was not the cause.
+      if (ss == "42601") {
+        const std::string typed = typed_literal_parameter(std::string(e.query()));
+        if (!typed.empty())
+          return {{"error", "the statement could not be parsed: it had a typed literal, "
+                            "which pg_stat_statements recorded as " + typed},
+                  {"hint", "the original statement wrote a constant as a type name and "
+                           "a string, such as DATE '2026-09-14'. pg_stat_statements "
+                           "replaces the string with a parameter and keeps the type "
+                           "name, and the result is not valid SQL whatever its length, "
+                           "so this statement cannot be explained by queryid. "
+                           "Pass the statement via the 'sql' argument with the "
+                           "constant written out, or as a cast: $1::date"},
+                  {"detail", e.what()}};
+      }
       if (ss == "42601")
         return {{"error", "the statement could not be parsed"},
                 {"hint", "pg_stat_statements truncates query text at "
@@ -6712,22 +6903,28 @@ private:
       };
     }
 
-    // gist, spgist and brin have no pgstattuple support at all. Saying so,
-    // and naming what is supported, is the whole difference between a dead
-    // end and a caller who knows to reach for pageinspect.
+    // There is no pgstat*index function for gist, and through 4.6 a GiST
+    // index was refused as unsupported. But the general pgstattuple(regclass)
+    // reads one -- length, live and dead tuples, free space -- which is what a
+    // bloat review wants, and WITHOUT OVERLAPS keys are GiST: on a temporal
+    // model they are the largest indexes in the database and were the only
+    // ones this tool could say nothing about. spgist and brin it refuses
+    // itself ("is not supported"), so those stay a stated dead end, with
+    // pageinspect named.
     static const std::map<std::string, std::string> FUNCS = {
       {"btree", "pgstatindex"},
       {"gin",   "pgstatginindex"},
       {"hash",  "pgstathashindex"},
+      {"gist",  "pgstattuple"},
     };
     auto fn = FUNCS.find(am);
     if (fn == FUNCS.end()) {
       return {
-        {"error", "pgstattuple has no statistics function for a " +
+        {"error", "pgstattuple cannot read a " +
                   (am.empty() ? std::string("(unknown)") : am) + " index"},
-        {"hint", "supported access methods are btree, gin and hash; for gist, "
-                 "spgist and brin the page-level detail is in the pageinspect "
-                 "extension instead"},
+        {"hint", "page-level statistics exist for btree, gin and hash, and "
+                 "tuple-level ones for gist; for spgist and brin the detail is "
+                 "in the pageinspect extension instead"},
         {"access_method", am}
       };
     }
@@ -6765,6 +6962,12 @@ private:
        " 'overflow_pages', s.overflow_pages, 'bitmap_pages', s.bitmap_pages,"
        " 'unused_pages', s.unused_pages, 'live_items', s.live_items,"
        " 'dead_items', s.dead_items, 'free_percent', s.free_percent"},
+      {"gist",
+       "'table_len', s.table_len, 'tuple_count', s.tuple_count,"
+       " 'tuple_len', s.tuple_len, 'tuple_percent', s.tuple_percent,"
+       " 'dead_tuple_count', s.dead_tuple_count, 'dead_tuple_len', s.dead_tuple_len,"
+       " 'dead_tuple_percent', s.dead_tuple_percent,"
+       " 'free_space', s.free_space, 'free_percent', s.free_percent"},
     };
 
     // The oid is resolved above and passed back as text, so the function
@@ -6792,6 +6995,16 @@ private:
           ? json("on") : meta["fastupdate"];
         out["pending_list_limit_kb"] = meta["pending_list_limit_kb"];
       }
+      // Which function answered, because for gist it is not a page-level one:
+      // there is no tree level or fragmentation here, only how full the pages
+      // are and how much of that is dead.
+      out["source"] = fn->second;
+      if (am == "gist")
+        out["note"] = "pgstattuple has no page-level function for a gist index, so "
+                      "these are the tuple-level figures of pgstattuple(regclass): "
+                      "table_len is the index's length in bytes, and free_percent "
+                      "and dead_tuple_percent are shares of it. It reads the whole "
+                      "index under a share lock on each page.";
       return out;
     } catch (const pqxx::insufficient_privilege& e) {
       return pgstattuple_denied(fn->second, e.what());
@@ -7108,6 +7321,242 @@ private:
     pqxx::result const res = pqxx_exec(txn, sql, params);
     bool exists = res[0][0].as<bool>();
     return {{"exists", exists}};
+  }
+
+  // How scattered the rows of one value are across the table's pages.
+  //
+  // physical_order_correlation, which tableStats returns, says a column is
+  // out of physical order. It does not say what that costs. This does: the
+  // rows that match, the distinct pages they sit on, and the pages they would
+  // need if packed. One city's 157,058 rows were found on 140,257 pages where
+  // 3,300 would hold them, and that ratio is what CLUSTER would gain any query
+  // reading those rows from the table.
+  //
+  // Two forms. With a value: exact, over the matching rows, at most max_rows
+  // of them. Without: sampled by page (TABLESAMPLE SYSTEM), for the values
+  // pg_stats already lists as most common -- so no value reaches the caller
+  // that tableStats would not return, and none at all in the exact form,
+  // which echoes nothing back. SYSTEM takes whole pages, so the rows and
+  // pages of a value within the sample are an unbiased reading of its
+  // density; at 100 percent the two forms agree exactly, which a test holds
+  // them to.
+  //
+  // It reads the table, through ctid, and needs SELECT on it and nothing else.
+  const json row_scatter(const std::string& schema, const std::string& table_name,
+                         const std::string& column, const json& value, bool has_value,
+                         long long max_rows, double sample_percent) {
+    if (max_rows <= 0) max_rows = 200000;
+    max_rows = std::min<long long>(max_rows, 5000000);
+    if (sample_percent < 0 || sample_percent > 100)
+      throw std::runtime_error("sample_percent must be above 0 and at most 100");
+    if (has_value && (value.is_array() || value.is_object()))
+      throw std::runtime_error("value must be a string, a number, a boolean or null");
+
+    Session sess = open_session();
+    pqxx::work& txn = sess.txn();
+
+    pqxx::result const meta = pqxx_exec(txn, R"(
+      SELECT c.relkind::text, c.relpages::bigint, c.reltuples::float8,
+             a.atttypid::regtype::text,
+             (SELECT quote_ident(tn.nspname) || '.' || quote_ident(t.typname)
+                FROM pg_type AS t
+                JOIN pg_namespace AS tn ON tn.oid = t.typnamespace
+               WHERE t.oid = a.atttypid)
+        FROM pg_class AS c
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        LEFT JOIN pg_attribute AS a
+               ON a.attrelid = c.oid AND a.attname = $3
+              AND a.attnum > 0 AND NOT a.attisdropped
+       WHERE n.nspname = $1 AND c.relname = $2;
+    )", pqxx::params{schema, table_name, column});
+    if (meta.empty())
+      return {{"error", "no relation named \"" + schema + "\".\"" + table_name + "\""},
+              {"hint", "tables are listed by listTables"}};
+    const std::string relkind = meta[0][0].as<std::string>();
+    if (relkind == "p")
+      return {{"error", "\"" + schema + "\".\"" + table_name + "\" is a partitioned table "
+                        "and has no pages of its own"},
+              {"hint", "rows are stored in its partitions, each with its own physical "
+                       "order; name one partition (listPartitions, partitionDetails)"}};
+    if (relkind != "r" && relkind != "m")
+      return {{"error", "\"" + schema + "\".\"" + table_name + "\" is not a table or a "
+                        "materialized view"},
+              {"hint", "only a relation with pages of its own has a physical order"}};
+    if (meta[0][3].is_null())
+      return {{"error", "\"" + schema + "\".\"" + table_name + "\" has no column \"" + column + "\""},
+              {"hint", "columns are listed by tableDetails"}};
+
+    const long long relpages = meta[0][1].as<long long>();
+    const double reltuples = meta[0][2].as<double>();
+    const std::string coltype = meta[0][3].as<std::string>();   // from the catalog, quoted by regtype
+    // What the value is cast to is the type's own catalog name, never the name
+    // regtype prints. regtype calls a character(4) column "character", and
+    // '8105'::character is character(1): '8', which matches nothing, so one
+    // city's rows came back as zero rows on zero pages and no error. bit is
+    // the same. pg_catalog.bpchar carries no length, and neither truncates the
+    // value nor pads it; character(4) would cut '81057' down to a value nobody
+    // asked for.
+    const std::string casttype = meta[0][4].as<std::string>();
+    auto qi = [](const std::string& s) {
+      std::string r = "\"";
+      for (char const c : s) { if (c == '"') r += "\"\""; else r += c; }
+      return r + "\"";
+    };
+    const std::string rel = qi(schema) + "." + qi(table_name);
+    const char* const blk = "(ctid::text::point)[0]::bigint";
+
+    json out = {{"schema", schema}, {"table", table_name}, {"column", column},
+                {"table_pages", relpages}};
+
+    try {
+      if (has_value) {
+        // --- exact: the rows of one value ---
+        pqxx::result res;
+        if (value.is_null()) {
+          res = pqxx_exec(txn,
+            "SELECT count(*), count(DISTINCT blk) FROM (SELECT " + std::string(blk) + " AS blk"
+            " FROM " + rel + " WHERE " + qi(column) + " IS NULL LIMIT $1::bigint) AS m",
+            pqxx::params{std::to_string(max_rows)});
+        } else {
+          const std::string text = value.is_string()  ? value.get<std::string>()
+                                 : value.is_boolean() ? (value.get<bool>() ? "true" : "false")
+                                                      : value.dump();
+          res = pqxx_exec(txn,
+            "SELECT count(*), count(DISTINCT blk) FROM (SELECT " + std::string(blk) + " AS blk"
+            " FROM " + rel + " WHERE " + qi(column) + " = $1::" + casttype +
+            " LIMIT $2::bigint) AS m",
+            pqxx::params{text, std::to_string(max_rows)});
+        }
+        const long long rows = res[0][0].as<long long>();
+        const long long pages = res[0][1].as<long long>();
+        out["mode"] = "exact";
+        out["rows"] = rows;
+        out["pages"] = pages;
+        out["max_rows"] = max_rows;
+        out["capped"] = rows >= max_rows;
+        // What a page holds on average, from the last VACUUM or ANALYZE. Null
+        // where the table has never had either, rather than a guess.
+        if (relpages > 0 && reltuples > 0) {
+          const double rpp = reltuples / static_cast<double>(relpages);
+          const long long packed = std::max<long long>(
+            1, static_cast<long long>(std::ceil(static_cast<double>(rows) / rpp)));
+          out["rows_per_page"] = std::round(rpp * 10.0) / 10.0;
+          out["pages_if_packed"] = rows > 0 ? json(packed) : json(0);
+          out["scatter_ratio"] = rows > 0
+            ? json(std::round(static_cast<double>(pages) / static_cast<double>(packed) * 10.0) / 10.0)
+            : json();
+        } else {
+          out["rows_per_page"] = nullptr;
+          out["pages_if_packed"] = nullptr;
+          out["scatter_ratio"] = nullptr;
+        }
+        out["note"] = std::string(
+          "rows of this value were read and the distinct pages they sit on counted; "
+          "pages_if_packed is what the same rows would need at the table's average "
+          "rows_per_page, and scatter_ratio is pages over that -- 1 is already packed, "
+          "and the ratio is roughly what clustering on this column would save a query "
+          "that reads these rows from the table.") +
+          (rows >= max_rows ? " The cap was reached: only the first max_rows matching "
+                              "rows were read, so rows and pages are lower bounds and "
+                              "the ratio describes that part." : "") +
+          (relpages > 0 && reltuples > 0 ? "" : " The table has never been vacuumed or "
+                              "analyzed, so there is no rows_per_page to pack by.");
+        return out;
+      }
+
+      // --- sampled: the most common values, by page ---
+      // About ten thousand pages by default, which bounds the read at roughly
+      // 80 MB on any size of table.
+      double pct = sample_percent;
+      if (pct <= 0)
+        pct = relpages <= 10000 ? 100.0
+                                : std::max(0.001, 100.0 * 10000.0 / static_cast<double>(relpages));
+      pqxx::result const res = pqxx_exec(txn, R"(
+        WITH mcv AS (
+          SELECT v.val, f.freq, v.ord
+            FROM pg_stats AS s,
+                 LATERAL unnest(s.most_common_vals::text::text[]) WITH ORDINALITY AS v(val, ord)
+                 JOIN LATERAL unnest(s.most_common_freqs) WITH ORDINALITY AS f(freq, ord)
+                   ON f.ord = v.ord
+           WHERE s.schemaname = $1 AND s.tablename = $2 AND s.attname = $3
+             AND NOT s.inherited
+           ORDER BY v.ord LIMIT 10
+        ),
+        smp AS MATERIALIZED (
+          SELECT )" + std::string(blk) + R"( AS blk,
+                 -- Compared in the column's own type, not as text: pg_stats
+                 -- prints a character(6) value padded and the column cast to
+                 -- text drops the padding, so the two never met.
+                 (SELECT m.ord FROM mcv AS m
+                   WHERE m.val::)" + casttype + R"( = t.)" + qi(column) + R"() AS ord
+            FROM )" + rel + R"( AS t TABLESAMPLE SYSTEM ($4::real)
+        )
+        SELECT JSONB_BUILD_OBJECT(
+                 'sampled_pages', (SELECT count(DISTINCT blk) FROM smp),
+                 'sampled_rows',  (SELECT count(*) FROM smp),
+                 'values', COALESCE((
+                   SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                            'value', m.val, 'frequency', m.freq,
+                            'sampled_rows', x.n, 'sampled_pages_with_value', x.p)
+                          ORDER BY m.ord)
+                     FROM mcv AS m
+                     LEFT JOIN LATERAL (SELECT count(*) AS n, count(DISTINCT blk) AS p
+                                          FROM smp WHERE smp.ord = m.ord) AS x ON true
+                 ), '[]'::jsonb));
+      )", pqxx::params{schema, table_name, column, std::to_string(pct)});
+
+      json got = json::parse(res[0][0].as<std::string>());
+      const long long spages = got["sampled_pages"].get<long long>();
+      const long long srows = got["sampled_rows"].get<long long>();
+      out["mode"] = "sampled";
+      out["sample_percent"] = std::round(pct * 1000.0) / 1000.0;
+      out["sampled_pages"] = spages;
+      out["sampled_rows"] = srows;
+      // From the sample itself, so it needs no ANALYZE and counts live rows.
+      const double rpp = spages > 0 ? static_cast<double>(srows) / static_cast<double>(spages) : 0.0;
+      out["rows_per_page"] = spages > 0 ? json(std::round(rpp * 10.0) / 10.0) : json();
+      json values = json::array();
+      for (auto& v : got["values"]) {
+        const long long n = v["sampled_rows"].get<long long>();
+        const long long p = v["sampled_pages_with_value"].get<long long>();
+        if (spages > 0) {
+          const double share = static_cast<double>(p) / static_cast<double>(spages);
+          v["share_of_pages_percent"] = std::round(share * 1000.0) / 10.0;
+          v["estimated_pages"] = std::llround(share * static_cast<double>(relpages));
+          v["estimated_rows"] = std::llround(
+            static_cast<double>(n) * static_cast<double>(relpages) / static_cast<double>(spages));
+        }
+        if (n > 0 && rpp > 0) {
+          const double packed = std::max(1.0, std::ceil(static_cast<double>(n) / rpp));
+          v["scatter_ratio"] = std::round(static_cast<double>(p) / packed * 10.0) / 10.0;
+        } else {
+          v["scatter_ratio"] = nullptr;
+        }
+        values.push_back(v);
+      }
+      out["values"] = values;
+      out["note"] = std::string(
+        "a sample of whole pages (TABLESAMPLE SYSTEM), read for the values pg_stats "
+        "lists as most common in this column. share_of_pages_percent is how much of "
+        "the table a query for that value touches; scatter_ratio is the pages its "
+        "sampled rows sit on over the pages they would fill, so 1 is already packed. "
+        "A column whose common values each sit on most pages at a high ratio is "
+        "worth clustering on; pass one value for the exact count.") +
+        (values.empty() ? " pg_stats lists no common values for this column -- it is "
+                          "unique, was never analyzed, or this role may not read it -- "
+                          "so there is nothing to measure without a value." : "");
+      return out;
+    } catch (const pqxx::insufficient_privilege& e) {
+      return {{"error", "this role may not read \"" + schema + "\".\"" + table_name + "\""},
+              {"hint", "rowScatter reads the table's rows to find the pages they are on, "
+                       "so it needs SELECT on the table"},
+              {"detail", e.what()}};
+    } catch (const pqxx::data_exception& e) {
+      return {{"error", "the value is not a valid " + coltype},
+              {"hint", "pass the value as it would be written in SQL for a column of "
+                       "that type, as a string"},
+              {"detail", e.what()}};
+    }
   }
 
   const json enums(const std::string& schema) {
@@ -8202,7 +8651,10 @@ private:
       "Sizes are what PostgreSQL accounts for, not the volume. Total and free "
       "space are not exposed to SQL by any PostgreSQL function, so this cannot "
       "say how much room is left -- only what is consuming it and how that is "
-      "divided. The pg_ls_* sections need pg_monitor; a section that reports an "
+      "divided. They are logical bytes: on a filesystem that compresses, "
+      "deduplicates or shares blocks with a snapshot (ZFS, btrfs) the space "
+      "occupied differs, usually downwards, by a ratio PostgreSQL cannot see, "
+      "so freeing 10 GB here may return less than 10 GB to the volume. The pg_ls_* sections need pg_monitor; a section that reports an "
       "error rather than a size is usually that.";
     return out;
   }
@@ -8981,20 +9433,51 @@ private:
       degraded.push_back({{"tool", tool}, {"what", what}});
     };
 
+    // "Not installed" is two different amounts of work: an extension whose
+    // files are on the server is one CREATE EXTENSION away, and one whose
+    // files are not needs a package first. pg_available_extensions tells
+    // them apart and any role may read it. Unknown if the read fails, and
+    // then nothing is added to the reason.
+    std::set<std::string> on_server;
+    bool know_on_server = false;
+    try {
+      pqxx::subtransaction sub{txn};
+      for (const auto& row : sub.exec("SELECT name FROM pg_available_extensions"))
+        on_server.insert(row[0].as<std::string>());
+      sub.commit();
+      know_on_server = true;
+    } catch (const std::exception&) {
+      // Unknown, not "nothing is available": the reasons below then say only
+      // that the extension is not installed, as they did before.
+      on_server.clear();
+      know_on_server = false;
+    }
+    auto absent = [&](const std::string& ext, bool preloaded_too = false) {
+      std::string why = "the " + ext + " extension is not installed";
+      if (!know_on_server) return why;
+      if (!on_server.count(ext))
+        return why + ", and its files are not on this server: the package has to be "
+                     "installed first";
+      return why + "; it is available on this server: CREATE EXTENSION " + ext +
+             (ext == "pg_stat_kcache" ? " CASCADE;" : ";") +
+             (preloaded_too ? " It also has to be in shared_preload_libraries, which "
+                              "takes a restart" : "");
+    };
+
     // Denied means the tool cannot produce an answer for this role at all.
     for (const char* t : {"tableBloat", "indexBloat"}) {
-      if (!has_pgstattuple) deny(t, "the pgstattuple extension is not installed");
+      if (!has_pgstattuple) deny(t, absent("pgstattuple"));
       else if (!scan)       deny(t, "the pgstattuple functions are restricted to "
                                     "roles permitted to run table-scanning "
                                     "monitoring functions");
     }
     for (const char* t : {"bufferCacheSummary", "bufferCacheContents"}) {
-      if (!has_buffercache) deny(t, "the pg_buffercache extension is not installed");
+      if (!has_buffercache) deny(t, absent("pg_buffercache"));
       else if (!monitor)    deny(t, "pg_buffercache is readable only by roles "
                                     "granted the monitoring role");
     }
     if (!has_hypopg)
-      deny("evaluateIndex", "the hypopg extension is not installed");
+      deny("evaluateIndex", absent("hypopg"));
     else if (!data)
       degrade("evaluateIndex", "planning a statement needs SELECT on the tables "
                                "it references, so this fails on any statement "
@@ -9014,7 +9497,7 @@ private:
                   "is not created in this database: CREATE EXTENSION " + ext +
                   (std::string(ext) == "pg_stat_kcache" ? " CASCADE;" : ";"));
         else if (!installed)
-          deny(t, std::string("the ") + ext + " extension is not installed");
+          deny(t, absent(ext, true));
         else if (loaded.is_boolean() && !loaded.get<bool>())
           deny(t, std::string("the ") + ext + " extension is installed but not in "
                   "shared_preload_libraries, so it has nothing to report");
@@ -9041,7 +9524,7 @@ private:
       deny("statementStats", loaded.is_boolean() && loaded.get<bool>()
         ? "the pg_stat_statements library is preloaded, but the extension is not "
           "created in this database: CREATE EXTENSION pg_stat_statements;"
-        : "the pg_stat_statements extension is not installed");
+        : absent("pg_stat_statements", true));
     }
     else if (!stats)
       degrade("statementStats", "the query text of statements run by other roles "
@@ -9088,6 +9571,7 @@ private:
                             "appear with null values -- indistinguishable from "
                             "a table that was never analyzed");
       degrade("checkKey", "fails on any table this role cannot SELECT");
+      degrade("rowScatter", "fails on any table this role cannot SELECT");
       degrade("explainQuery", "fails on any statement referencing a table this "
                               "role cannot SELECT");
     }
@@ -9150,7 +9634,7 @@ private:
           // Only "the object is not there" or "not loaded" is a state of the
           // extension. A timeout, a lock or a lost connection is this probe
           // failing, and says nothing about it: functional is then unknown.
-          const std::string state{ex.sqlstate()};   // a string_view in libpqxx 8
+          const std::string_view state{ex.sqlstate()};   // a string in libpqxx 7, a view in 8
           const bool about_ext = state.rfind("42", 0) == 0 || state == "3F000" ||
                                  state == "55000" || state == "0A000";
           e["functional"] = about_ext ? json(false) : json();
@@ -9207,6 +9691,13 @@ private:
   // The pg_stat_user_tables columns both tools return, in one place so the
   // single-table and schema-wide forms cannot drift apart.
   //
+  // The four write counters -- n_tup_ins, n_tup_upd, n_tup_del, n_tup_hot_upd
+  // -- arrived in 4.7. Until then n_tup_newpage_upd was returned alone, and
+  // bloat-and-vacuum-review told the reader to compare it "against the update
+  // count", which was not there: two reviews of a freshly loaded registry
+  // said so in their reports, on a table where 0.6% of 7.9 million updates
+  // had stayed on their page. They are cumulative since counters_since.
+  //
   // The four timestamps are returned separately, under the catalog's own names.
   // Through 4.1.1 they were two, each a GREATEST() of the manual and automatic
   // column, which was wrong in the one direction that does not look wrong: a
@@ -9233,9 +9724,40 @@ private:
   // pg_stat_reset_single_table_counters() zeroes one relation without touching
   // pg_stat_database.stats_reset, so a null or old value here does not prove
   // the counters beside it are that old. It does prove they are no older.
-  static constexpr const char* kCountersSince =
-    "'counters_since', (SELECT stats_reset FROM pg_stat_database"
-    "                    WHERE datname = current_database())";
+  //
+  // pg_stat_database.stats_reset is null on a database nobody has reset, and
+  // since PostgreSQL 15 it is null again after crash recovery, which discards
+  // every cumulative counter. A table vacuumed that morning then reads
+  // n_live_tup 0 and no vacuum on record, with nothing to say the counters are
+  // an hour old: reproduced with a kill -9 on 18, where 14 stamps the database
+  // with the recovery time by itself. The server-wide views are reset in the
+  // same recovery and do carry a time, so they stand in when the database has
+  // none, and counters_since_source says which reading this is.
+  //
+  // The EARLIEST of them, not the latest: recovery moves all three together,
+  // while pg_stat_reset_shared() moves one, and the latest would then date
+  // the table counters by a reset that never touched them. All three exist on
+  // every supported major and are readable by any role.
+  static constexpr const char* kCountersSinceFrom = R"(
+             FROM pg_stat_database AS d
+             LEFT JOIN LATERAL (
+               SELECT x.stats_reset, x.source
+                 FROM (VALUES ('pg_stat_archiver', (SELECT stats_reset FROM pg_stat_archiver)),
+                              ('pg_stat_bgwriter', (SELECT stats_reset FROM pg_stat_bgwriter)),
+                              ('pg_stat_wal',      (SELECT stats_reset FROM pg_stat_wal)))
+                        AS x(source, stats_reset)
+                WHERE x.stats_reset IS NOT NULL
+                ORDER BY x.stats_reset, x.source LIMIT 1) AS w ON true
+            WHERE d.datname = current_database()))";
+  // A function, not a static string: building one at start-up can throw where
+  // nothing can catch it.
+  static std::string counters_since_sql() {
+    return std::string("'counters_since', (SELECT COALESCE(d.stats_reset, w.stats_reset)")
+      + kCountersSinceFrom
+      + ", 'counters_since_source', (SELECT CASE WHEN d.stats_reset IS NOT NULL"
+        " THEN 'pg_stat_database' ELSE w.source END"
+      + kCountersSinceFrom;
+  }
 
   static constexpr const char* kTableStatsCommon = R"(
                'rows', c.reltuples,
@@ -9244,12 +9766,32 @@ private:
                                           s.last_analyze, s.last_autoanalyze),
                'seq_scan', s.seq_scan, 'idx_scan', s.idx_scan,
                'n_live_tup', s.n_live_tup, 'n_dead_tup', s.n_dead_tup,
+               'n_tup_ins', s.n_tup_ins, 'n_tup_upd', s.n_tup_upd,
+               'n_tup_del', s.n_tup_del, 'n_tup_hot_upd', s.n_tup_hot_upd,
                'n_mod_since_analyze', s.n_mod_since_analyze,
                'n_ins_since_vacuum', s.n_ins_since_vacuum,
                'last_vacuum', s.last_vacuum,
                'last_autovacuum', s.last_autovacuum,
                'last_analyze', s.last_analyze,
-               'last_autoanalyze', s.last_autoanalyze)";
+               'last_autoanalyze', s.last_autoanalyze,
+               -- The catalog counts rows that the cumulative statistics have
+               -- never seen inserted, vacuumed or analyzed. On a server with
+               -- its statistics intact that does not last: loading a table
+               -- counts its rows as live. It is what crash recovery and an
+               -- immediate shutdown leave, what a restore or an upgrade starts
+               -- with, and what every table on a standby looks like always,
+               -- since vacuum and analyze are recorded where they ran. Read
+               -- without this, each of those is a table nobody maintains.
+               --
+               -- Null for a partitioned parent or a view, whose n_live_tup is
+               -- zero by construction and proves nothing.
+               'cumulative_statistics_missing',
+                 CASE WHEN c.relkind IN ('r', 'm')
+                      THEN c.reltuples > 0
+                           AND COALESCE(s.n_live_tup, 0) = 0
+                           AND s.last_vacuum IS NULL AND s.last_autovacuum IS NULL
+                           AND s.last_analyze IS NULL AND s.last_autoanalyze IS NULL
+                 END)";
 
   const json table_stats(const std::string& schema, const std::string& table) {
     Session sess = open_session();
@@ -9266,7 +9808,7 @@ private:
 
     std::string const query = std::string(R"(
       SELECT JSONB_BUILD_OBJECT(
-               'table', c.relname,)") + kCountersSince + "," + kTableStatsCommon + pg16 + R"(,
+               'table', c.relname,)") + counters_since_sql() + "," + kTableStatsCommon + pg16 + R"(,
                'columns', COALESCE(columns, '{}'::jsonb),
                -- pg_stats returns NO ROW for a table whose RLS is active for
                -- this role, so every per-column statistic below comes back null
@@ -9341,9 +9883,27 @@ private:
 
     pqxx::result const res = pqxx_exec(txn, query, pqxx::params{schema, table});
 
-    if (!res.empty() && !res[0][0].is_null())
-      return json::parse(res[0][0].as<std::string>());
-    return {};
+    if (res.empty() || res[0][0].is_null()) return {};
+    json out = json::parse(res[0][0].as<std::string>());
+    // Said in words where one table is read. listTableStats carries the flag
+    // alone: on a standby it is true of every table, and a sentence on each
+    // would be the payload.
+    if (out.value("cumulative_statistics_missing", json()) == true) {
+      out["note"] = sess.in_recovery()
+        ? "cumulative_statistics_missing: this server is a standby. Vacuum, analyze "
+          "and the tuple counters are recorded on the primary, where they happen, and "
+          "are never replicated, so n_live_tup of zero and null vacuum and analyze "
+          "times here say nothing about maintenance. Read them on the primary. The "
+          "scan counters are this server's own."
+        : "cumulative_statistics_missing: the catalog counts rows in this table and "
+          "the cumulative statistics have none, with no vacuum or analyze on record. "
+          "That is statistics which are not there, not a table nobody maintains: crash "
+          "recovery and an immediate shutdown discard them, and a restore or an "
+          "upgrade does not carry them over. counters_since says how far back they "
+          "reach. The planner's own statistics, in columns, are separate and are "
+          "still there.";
+    }
+    return out;
   }
 
   // Partitioning, which nothing here read until 4.3.0. relkind 'p' was used in
@@ -9875,7 +10435,7 @@ private:
              JOIN pg_class pc ON pc.oid = pi.inhparent
              JOIN pg_namespace pn ON pn.oid = pc.relnamespace
             WHERE pi.inhrelid = c.oid),
-        )") + kCountersSince + R"(,
+        )") + counters_since_sql() + R"(,
         'partition_count', (SELECT count(*) FROM pg_inherits WHERE inhparent = c.oid),
         'partitions_truncated', (SELECT count(*) FROM pg_inherits WHERE inhparent = c.oid) > $3::int,
         'partitions', COALESCE((

@@ -334,9 +334,12 @@ protected:
       txn.exec("CREATE INDEX ams_gin   ON grocery.index_ams USING gin (tags)"
                " WITH (fastupdate = on, gin_pending_list_limit = 128)");
       txn.exec("CREATE INDEX ams_hash  ON grocery.index_ams USING hash (id)");
-      // gist has no pgstattuple function at all; the tool must say so by name
+      // gist has no pgstat*index function, and is read with pgstattuple();
+      // spgist and brin pgstattuple refuses, and the tool must say so by name
       // rather than fail with a bare error from the wrong function.
       txn.exec("CREATE INDEX ams_gist  ON grocery.index_ams USING gist (box_col)");
+      txn.exec("CREATE INDEX ams_spgist ON grocery.index_ams USING spgist (box_col)");
+      txn.exec("CREATE INDEX ams_brin  ON grocery.index_ams USING brin (id)");
       txn.exec("ANALYZE grocery.index_ams");
 
       // A partitioned index is a catalog entry with no storage of its own.
@@ -467,7 +470,8 @@ TEST_F(PostgresMCPServerTest, TablesCarriesNoStatistics) {
   for (const char* f : {"rows", "size", "size_estimate", "seq_scan", "idx_scan",
                         "n_live_tup", "n_dead_tup", "n_mod_since_analyze",
                         "n_ins_since_vacuum", "last_vacuum", "last_analyze",
-                        "n_tup_newpage_upd", "last_seq_scan"})
+                        "n_tup_newpage_upd", "last_seq_scan", "n_tup_upd",
+                        "n_tup_hot_upd"})
     EXPECT_FALSE(result["users"].contains(f)) << f << " is still on listTables";
 }
 
@@ -605,7 +609,7 @@ TEST_F(PostgresMCPServerTest, TableDetailsCarriesNoStatistics) {
                         "seq_scan", "idx_scan", "n_live_tup", "n_dead_tup",
                         "n_mod_since_analyze", "n_ins_since_vacuum",
                         "last_vacuum", "last_analyze", "n_tup_newpage_upd",
-                        "last_seq_scan"})
+                        "last_seq_scan", "n_tup_upd", "n_tup_hot_upd"})
     EXPECT_FALSE(result.contains(f)) << f << " is still on tableDetails";
 
   // Reason 3 of the split: most_common_vals is literal column values, and this
@@ -1710,19 +1714,38 @@ TEST_F(PostgresMCPServerTest, ScanCountersCarryTheWindowTheyCover) {
   ASSERT_TRUE(ts.contains("counters_since")) << ts.dump(2);
 
   // Wired to pg_stat_database rather than to something that merely looks like
-  // a timestamp: the two must be the same reading.
+  // a timestamp: the two must be the same reading. Where the database carries
+  // no reset time -- any database nobody has reset, and since PostgreSQL 15
+  // any database after crash recovery -- the earliest reset among the
+  // server-wide views stands in, and the source says so.
+  std::string want = expected, source = "pg_stat_database";
   if (expected.empty()) {
-    EXPECT_TRUE(dup["counters_since"].is_null());
-    EXPECT_TRUE(ts["counters_since"].is_null());
-  } else {
-    ASSERT_TRUE(dup["counters_since"].is_string()) << dup["counters_since"].dump();
-    EXPECT_EQ(dup["counters_since"], ts["counters_since"]);
-    // Same instant, whatever the two renderings look like textually.
-    const std::string got = dup["counters_since"].get<std::string>();
-    EXPECT_TRUE(n.query_value<bool>(
-        "SELECT " + n.quote(got) + "::timestamptz = " + n.quote(expected) + "::timestamptz"))
-        << "tool: " << got << "  catalog: " << expected;
+    const pqxx::result earliest = n.exec(
+        "SELECT source, stats_reset::text FROM ("
+        "  SELECT 'pg_stat_archiver' AS source, stats_reset FROM pg_stat_archiver"
+        "  UNION ALL SELECT 'pg_stat_bgwriter', stats_reset FROM pg_stat_bgwriter"
+        "  UNION ALL SELECT 'pg_stat_wal', stats_reset FROM pg_stat_wal) AS x "
+        "WHERE stats_reset IS NOT NULL ORDER BY stats_reset, source LIMIT 1");
+    ASSERT_EQ(earliest.size(), 1u);
+    source = earliest[0][0].as<std::string>();
+    want = earliest[0][1].as<std::string>();
   }
+  for (const json* r : {&dup, &ts}) {
+    ASSERT_TRUE((*r)["counters_since"].is_string()) << (*r)["counters_since"].dump();
+    // Same instant, whatever the two renderings look like textually.
+    const std::string got = (*r)["counters_since"].get<std::string>();
+    EXPECT_TRUE(n.query_value<bool>(
+        "SELECT " + n.quote(got) + "::timestamptz = " + n.quote(want) + "::timestamptz"))
+        << "tool: " << got << "  catalog: " << want;
+    EXPECT_EQ((*r)["counters_since_source"], source) << r->dump(2);
+  }
+  // The earliest, so a reset of one server-wide view cannot date the table
+  // counters by itself: never later than any of the three.
+  EXPECT_TRUE(n.query_value<bool>(
+      "SELECT " + n.quote(dup["counters_since"].get<std::string>()) + "::timestamptz <= ALL ("
+      "  SELECT stats_reset FROM pg_stat_archiver UNION ALL"
+      "  SELECT stats_reset FROM pg_stat_bgwriter UNION ALL"
+      "  SELECT stats_reset FROM pg_stat_wal)") || !expected.empty());
 }
 
 // listSchemas dumped every relation name in every schema. On a database where
@@ -2920,6 +2943,61 @@ TEST_F(PostgresMCPServerTest, ListSequencesUnknownSchemaReturnsEmpty) {
 
 // --- listExtensions ---
 
+// What could be installed, on request. Without the argument the answer is
+// what it always was -- every key an installed extension, no new field -- so
+// nothing that reads it changes.
+TEST_F(PostgresMCPServerTest, ListExtensionsCanAlsoListWhatIsAvailable) {
+  json plain = srv->call_extensions();
+  ASSERT_TRUE(plain.contains("plpgsql")) << plain.dump(2).substr(0, 300);
+  for (const auto& [name, e] : plain.items())
+    EXPECT_FALSE(e.contains("installed")) << name << " gained a field by default";
+
+  json all = srv->call_extensions(true);
+  size_t installed = 0, available = 0;
+  for (const auto& [name, e] : all.items()) {
+    ASSERT_TRUE(e.contains("installed")) << name;
+    ASSERT_TRUE(e.contains("default_version")) << name;
+    if (e["installed"] == true) {
+      installed++;
+      EXPECT_TRUE(plain.contains(name)) << name;
+      EXPECT_TRUE(e.contains("version")) << name;
+    } else {
+      available++;
+      EXPECT_FALSE(plain.contains(name)) << name;
+      EXPECT_FALSE(e.contains("schema")) << name << ": not created, so it has no schema";
+      EXPECT_TRUE(e["default_version"].is_string()) << name;
+    }
+  }
+  EXPECT_EQ(installed, plain.size());
+  // Against the catalog itself, whatever this server happens to package.
+  pqxx::connection c(test_url);
+  pqxx::work t(c);
+  EXPECT_EQ(available, t.exec("SELECT count(*) FROM pg_available_extensions "
+                              "WHERE installed_version IS NULL").at(0).at(0).as<size_t>());
+  // Any role may read the view, which is what lets checkPrivileges use it.
+  EXPECT_TRUE(t.exec("SELECT has_table_privilege('public', 'pg_catalog.pg_available_extensions', "
+                     "'SELECT')").at(0).at(0).as<bool>());
+
+  // And through the dispatch, where the argument is read.
+  json viaRpc = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+      {"params", {{"name", "listExtensions"}, {"arguments", {{"available", true}}}}}});
+  ASSERT_TRUE(viaRpc.contains("result")) << viaRpc.dump().substr(0, 300);
+  EXPECT_NE(viaRpc.dump().find("default_version"), std::string::npos);
+}
+
+// A tool denied for a missing extension says how far away the extension is.
+TEST_F(PostgresMCPServerTest, CheckPrivilegesSaysWhetherAMissingExtensionIsAvailable) {
+  json p = srv->call_check_privileges();
+  ASSERT_TRUE(p.contains("denied")) << p.dump(2).substr(0, 400);
+  for (const auto& d : p["denied"]) {
+    const std::string why = d.value("reason", "");
+    if (why.find("extension is not installed") == std::string::npos) continue;
+    const bool here = why.find("available on this server: CREATE EXTENSION") != std::string::npos;
+    const bool absent = why.find("files are not on this server") != std::string::npos;
+    EXPECT_TRUE(here != absent) << why;
+  }
+}
+
 TEST_F(PostgresMCPServerTest, ListExtensionsReturnsKnownExtension) {
   json result = srv->call_extensions();
   EXPECT_TRUE(result.is_object());
@@ -2929,6 +3007,203 @@ TEST_F(PostgresMCPServerTest, ListExtensionsReturnsKnownExtension) {
   EXPECT_TRUE(ext.contains("schema"));
   EXPECT_TRUE(ext.contains("relocatable"));
   EXPECT_TRUE(ext.contains("description"));
+}
+
+// --- rowScatter ---
+
+namespace {
+// 200,000 rows in id order. `scattered` cycles through 50 values, so each one
+// is on every page; `clustered` changes every 4,000 rows, so each one is on a
+// handful of adjacent pages. The same 4,000 rows per value either way, which
+// is the whole point: correlation aside, only the pages differ.
+void seed_scatter(const std::string& url) {
+  pqxx::connection c(url);
+  pqxx::work t(c);
+  t.exec("DROP TABLE IF EXISTS grocery.scatter");
+  t.exec("CREATE TABLE grocery.scatter (id int, scattered int, clustered int, label text)");
+  t.exec("INSERT INTO grocery.scatter SELECT g, g % 50, g / 4000, 'it''s ' || (g % 5) "
+         "FROM generate_series(0, 199999) AS g");
+  t.exec("ANALYZE grocery.scatter");
+  t.commit();
+}
+}  // namespace
+
+// A character(4) column is "character" to regtype, and '8105'::character is
+// character(1): the value was cut to '8' and the answer was zero rows on zero
+// pages, with no error, for exactly the columns a table is clustered on.
+TEST_F(PostgresMCPServerTest, RowScatterComparesAFixedWidthValueWhole) {
+  {
+    pqxx::connection c(test_url);
+    pqxx::work t(c);
+    t.exec("DROP TABLE IF EXISTS grocery.scatter_fixed");
+    t.exec("CREATE TABLE grocery.scatter_fixed (id int, city character(4), "
+           "padded character(6), flags bit(4), vflags bit varying(8), codes character(2)[])");
+    t.exec("INSERT INTO grocery.scatter_fixed SELECT g, lpad((8100 + g % 10)::text, 4, '0'), "
+           "'ab', (g % 16)::bit(4), (g % 16)::bit(4), ARRAY['SP', 'RJ'] "
+           "FROM generate_series(0, 19999) AS g");
+    t.exec("ANALYZE grocery.scatter_fixed");
+    t.commit();
+  }
+  json city = srv->call_row_scatter("grocery", "scatter_fixed", "city", "8105", true);
+  ASSERT_FALSE(city.contains("error")) << city.dump(2);
+  EXPECT_EQ(city["rows"], 2000) << city.dump(2);
+  EXPECT_GT(city["pages"].get<long long>(), 0) << city.dump(2);
+
+  // Not cut to its first four characters either: nothing is stored as this.
+  json longer = srv->call_row_scatter("grocery", "scatter_fixed", "city", "81057", true);
+  ASSERT_FALSE(longer.contains("error")) << longer.dump(2);
+  EXPECT_EQ(longer["rows"], 0) << longer.dump(2);
+  // A value shorter than the column compares the way character does, the
+  // padding ignored.
+  json padded = srv->call_row_scatter("grocery", "scatter_fixed", "padded", "ab", true);
+  EXPECT_EQ(padded["rows"], 20000) << padded.dump(2);
+
+  json bits = srv->call_row_scatter("grocery", "scatter_fixed", "flags", "1010", true);
+  ASSERT_FALSE(bits.contains("error")) << bits.dump(2);
+  EXPECT_EQ(bits["rows"], 1250) << bits.dump(2);
+  json vbits = srv->call_row_scatter("grocery", "scatter_fixed", "vflags", "1010", true);
+  EXPECT_EQ(vbits["rows"], 1250) << vbits.dump(2);
+  json codes = srv->call_row_scatter("grocery", "scatter_fixed", "codes", "{SP,RJ}", true);
+  ASSERT_FALSE(codes.contains("error")) << codes.dump(2);
+  EXPECT_EQ(codes["rows"], 20000) << codes.dump(2);
+
+  // The sampled form reads the same column and agrees with the exact one.
+  json sampled = srv->call_row_scatter("grocery", "scatter_fixed", "city", json(), false, 0, 100);
+  ASSERT_FALSE(sampled.contains("error")) << sampled.dump(2);
+  bool found = false;
+  for (const auto& v : sampled["values"])
+    if (v["value"] == "8105") {
+      found = true;
+      EXPECT_EQ(v["sampled_rows"], 2000) << v.dump(2);
+      EXPECT_EQ(v["sampled_pages_with_value"], city["pages"]) << v.dump(2);
+    }
+  EXPECT_TRUE(found) << sampled.dump(2);
+  // A value shorter than its column is stored padded, and is still found.
+  json wide = srv->call_row_scatter("grocery", "scatter_fixed", "padded", json(), false, 0, 100);
+  ASSERT_FALSE(wide.contains("error")) << wide.dump(2);
+  ASSERT_EQ(wide["values"].size(), 1u) << wide.dump(2);
+  EXPECT_EQ(wide["values"][0]["sampled_rows"], 20000) << wide.dump(2);
+
+  pqxx::connection c(test_url);
+  pqxx::nontransaction n(c);
+  n.exec("DROP TABLE grocery.scatter_fixed");
+}
+
+// What physical_order_correlation cannot say: what being out of order costs.
+TEST_F(PostgresMCPServerTest, RowScatterMeasuresPagesTouchedAgainstPagesNeeded) {
+  seed_scatter(test_url);
+  json far = srv->call_row_scatter("grocery", "scatter", "scattered", 7, true);
+  json near = srv->call_row_scatter("grocery", "scatter", "clustered", 7, true);
+  ASSERT_FALSE(far.contains("error")) << far.dump(2);
+  ASSERT_FALSE(near.contains("error")) << near.dump(2);
+  EXPECT_EQ(far["mode"], "exact");
+  EXPECT_EQ(far["rows"], 4000);
+  EXPECT_EQ(near["rows"], 4000);
+  EXPECT_EQ(far["capped"], false);
+  const long long table_pages = far["table_pages"].get<long long>();
+  ASSERT_GT(table_pages, 500);
+  // One row in fifty, on (nearly) every page of the table...
+  EXPECT_GE(far["pages"].get<long long>(), table_pages * 9 / 10) << far.dump(2);
+  EXPECT_GT(far["scatter_ratio"].get<double>(), 20.0) << far.dump(2);
+  // ...and the same number of rows, adjacent, on about as many pages as they fill.
+  EXPECT_LE(near["pages"].get<long long>(), near["pages_if_packed"].get<long long>() + 2) << near.dump(2);
+  EXPECT_LT(near["scatter_ratio"].get<double>(), 1.5) << near.dump(2);
+  EXPECT_EQ(far["pages_if_packed"], near["pages_if_packed"]);
+  // Counts only: nothing of the value or the rows comes back.
+  EXPECT_FALSE(far.contains("value"));
+  EXPECT_FALSE(far.contains("values"));
+
+  // The cap is a stated lower bound, not a silent one.
+  json capped = srv->call_row_scatter("grocery", "scatter", "scattered", 7, true, 100);
+  EXPECT_EQ(capped["rows"], 100);
+  EXPECT_EQ(capped["capped"], true);
+  EXPECT_NE(capped["note"].get<std::string>().find("lower bounds"), std::string::npos);
+
+  // Other types go through the column's own input function, quotes and all.
+  json label = srv->call_row_scatter("grocery", "scatter", "label", "it's 3", true);
+  EXPECT_EQ(label["rows"], 40000) << label.dump(2);
+  json none = srv->call_row_scatter("grocery", "scatter", "label", nullptr, true);
+  EXPECT_EQ(none["rows"], 0) << none.dump(2);
+  EXPECT_TRUE(none["scatter_ratio"].is_null());
+  json bad = srv->call_row_scatter("grocery", "scatter", "scattered", "seven", true);
+  ASSERT_TRUE(bad.contains("error")) << bad.dump(2);
+  EXPECT_NE(bad["error"].get<std::string>().find("not a valid integer"), std::string::npos) << bad.dump(2);
+
+  // Through the dispatch, where a JSON number is the value.
+  json rpc = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+      {"params", {{"name", "rowScatter"},
+                  {"arguments", {{"schema", "grocery"}, {"table", "scatter"},
+                                 {"column", "scattered"}, {"value", 7}}}}}});
+  ASSERT_TRUE(rpc.contains("result")) << rpc.dump().substr(0, 300);
+  EXPECT_NE(rpc.dump().find("scatter_ratio"), std::string::npos);
+}
+
+// The sampled form is an estimate, so it is held to the exact one: at 100
+// percent they must agree to the row and the page, and at 10 percent the
+// ratio must still tell a scattered column from a clustered one.
+TEST_F(PostgresMCPServerTest, RowScatterSampledAgreesWithTheExactCount) {
+  seed_scatter(test_url);
+  json exact = srv->call_row_scatter("grocery", "scatter", "scattered", 7, true);
+  json whole = srv->call_row_scatter("grocery", "scatter", "scattered", json(), false, 0, 100.0);
+  ASSERT_FALSE(whole.contains("error")) << whole.dump(2);
+  EXPECT_EQ(whole["mode"], "sampled");
+  EXPECT_EQ(whole["sampled_rows"], 200000);
+  EXPECT_EQ(whole["sampled_pages"], exact["table_pages"]);
+  ASSERT_FALSE(whole["values"].empty()) << whole.dump(2);
+  EXPECT_LE(whole["values"].size(), 10u);
+  bool found = false;
+  for (const auto& v : whole["values"]) {
+    // Every value here is one pg_stats already lists for the column.
+    EXPECT_TRUE(v["frequency"].is_number()) << v.dump();
+    EXPECT_EQ(v["sampled_rows"], 4000) << v.dump();
+    if (v["value"] != "7") continue;
+    found = true;
+    EXPECT_EQ(v["sampled_pages_with_value"], exact["pages"]) << v.dump();
+    EXPECT_EQ(v["estimated_pages"], exact["pages"]) << v.dump();
+    EXPECT_EQ(v["estimated_rows"], 4000) << v.dump();
+  }
+  // 7 is one of fifty equally common values and need not be among the ten
+  // listed; the agreement is checked on whichever is.
+  if (!found) {
+    const json& v = whole["values"][0];
+    json one = srv->call_row_scatter("grocery", "scatter", "scattered",
+                                     std::stoi(v["value"].get<std::string>()), true);
+    EXPECT_EQ(v["sampled_pages_with_value"], one["pages"]) << v.dump() << one.dump();
+  }
+
+  json tenth = srv->call_row_scatter("grocery", "scatter", "scattered", json(), false, 0, 10.0);
+  ASSERT_FALSE(tenth["values"].empty()) << tenth.dump(2);
+  ASSERT_GT(tenth["sampled_pages"].get<long long>(), 20) << tenth.dump(2);
+  const double want = exact["scatter_ratio"].get<double>();
+  for (const auto& v : tenth["values"]) {
+    EXPECT_GT(v["share_of_pages_percent"].get<double>(), 90.0) << v.dump();
+    EXPECT_NEAR(v["scatter_ratio"].get<double>(), want, want * 0.35) << v.dump();
+  }
+  json packed = srv->call_row_scatter("grocery", "scatter", "clustered", json(), false, 0, 10.0);
+  for (const auto& v : packed["values"]) {
+    if (v["sampled_rows"].get<long long>() < 200) continue;   // too few to judge
+    EXPECT_LT(v["scatter_ratio"].get<double>(), 2.0) << v.dump();
+    EXPECT_LT(v["share_of_pages_percent"].get<double>(), 15.0) << v.dump();
+  }
+  // A unique column has no common values, and the answer says there is
+  // nothing to measure rather than returning an empty list in silence.
+  json unique = srv->call_row_scatter("grocery", "scatter", "id", json(), false);
+  EXPECT_TRUE(unique["values"].empty()) << unique.dump(2);
+  EXPECT_NE(unique["note"].get<std::string>().find("nothing to measure"), std::string::npos);
+}
+
+TEST_F(PostgresMCPServerTest, RowScatterRefusalsSayWhatToDoInstead) {
+  json r = srv->call_row_scatter("grocery", "no_such_table", "x", 1, true);
+  EXPECT_NE(r["error"].get<std::string>().find("no relation named"), std::string::npos) << r.dump(2);
+  r = srv->call_row_scatter("grocery", "users", "no_such_column", 1, true);
+  EXPECT_NE(r["error"].get<std::string>().find("has no column"), std::string::npos) << r.dump(2);
+  r = srv->call_row_scatter("grocery", "index_parted", "id", 1, true);
+  EXPECT_NE(r["error"].get<std::string>().find("partitioned table"), std::string::npos) << r.dump(2);
+  EXPECT_NE(r["hint"].get<std::string>().find("partition"), std::string::npos);
+  r = srv->call_row_scatter("grocery", "ams_btree", "id", 1, true);
+  EXPECT_NE(r["error"].get<std::string>().find("is not a table"), std::string::npos) << r.dump(2);
+  EXPECT_THROW(srv->call_row_scatter("grocery", "users", "id", json::array({1}), true), std::runtime_error);
+  EXPECT_THROW(srv->call_row_scatter("grocery", "users", "id", json(), false, 0, 250.0), std::runtime_error);
 }
 
 // --- databaseSize ---
@@ -3134,13 +3409,48 @@ TEST_F(PostgresMCPServerTest, IndexBloatHashReturnsBucketAndOverflowPages) {
 // The point of resolving the access method from the catalog: a gist index
 // must produce a stated answer naming what is supported, not the bare
 // "relation is not a btree index" that pgstatindex would raise.
-TEST_F(PostgresMCPServerTest, IndexBloatUnsupportedAccessMethodIsNamed) {
+// A GiST index has no pgstat*index function, and through 4.6 it was refused
+// as unsupported. pgstattuple(regclass) reads one. WITHOUT OVERLAPS keys are
+// GiST, so on a temporal model these are the largest indexes there are.
+TEST_F(PostgresMCPServerTest, IndexBloatGistReturnsTupleLevelFigures) {
   json r = srv->call_index_bloat("grocery", "ams_gist");
-  ASSERT_TRUE(r.contains("error")) << r.dump(2);
-  EXPECT_NE(r["error"].get<std::string>().find("gist"), std::string::npos);
+  ASSERT_FALSE(r.contains("error")) << r.dump(2);
   EXPECT_EQ(r["access_method"].get<std::string>(), "gist");
-  ASSERT_TRUE(r.contains("hint"));
-  EXPECT_NE(r["hint"].get<std::string>().find("pageinspect"), std::string::npos);
+  EXPECT_EQ(r["source"].get<std::string>(), "pgstattuple");
+  for (const char* f : {"table_len", "tuple_count", "dead_tuple_count", "free_space"}) {
+    ASSERT_TRUE(r.contains(f)) << f << r.dump(2);
+    EXPECT_TRUE(r[f].is_number_integer()) << f;
+  }
+  for (const char* f : {"tuple_percent", "dead_tuple_percent", "free_percent"})
+    EXPECT_TRUE(r[f].is_number()) << f << r.dump(2);
+  EXPECT_GT(r["table_len"].get<long long>(), 0);
+  // The page-level fields of another access method must not appear as zeros.
+  EXPECT_FALSE(r.contains("leaf_fragmentation")) << r.dump(2);
+  EXPECT_NE(r["note"].get<std::string>().find("tuple-level"), std::string::npos);
+  // The other access methods say which function answered too.
+  EXPECT_EQ(srv->call_index_bloat("grocery", "ams_btree")["source"], "pgstatindex");
+}
+
+// spgist and brin are refused by pgstattuple itself, which is the premise of
+// not falling back for them -- checked here against the server, not assumed.
+TEST_F(PostgresMCPServerTest, IndexBloatUnsupportedAccessMethodIsNamed) {
+  for (const char* am : {"spgist", "brin"}) {
+    const std::string idx = std::string("ams_") + am;
+    json r = srv->call_index_bloat("grocery", idx);
+    ASSERT_TRUE(r.contains("error")) << r.dump(2);
+    EXPECT_NE(r["error"].get<std::string>().find(am), std::string::npos) << r.dump(2);
+    EXPECT_EQ(r["access_method"].get<std::string>(), am);
+    ASSERT_TRUE(r.contains("hint"));
+    EXPECT_NE(r["hint"].get<std::string>().find("pageinspect"), std::string::npos);
+
+    pqxx::connection c(test_url);
+    pqxx::work t(c);
+    const std::string sch = t.exec("SELECT n.nspname FROM pg_extension e JOIN pg_namespace n "
+                                   "ON n.oid = e.extnamespace WHERE e.extname = 'pgstattuple'")
+                              .at(0).at(0).as<std::string>();
+    EXPECT_THROW(t.exec("SELECT * FROM " + sch + ".pgstattuple('grocery." + idx + "'::regclass)"),
+                 pqxx::sql_error) << am << " is readable after all";
+  }
 }
 
 TEST_F(PostgresMCPServerTest, IndexBloatPartitionedIndexHasNoStorageOfItsOwn) {
@@ -3384,6 +3694,84 @@ TEST_F(PostgresMCPServerTest, DatabaseStatsIncludesSessionCounters) {
 
 // --- listTableStats / tableStats version-gated columns ---
 
+// Crash recovery discards the cumulative statistics and keeps the catalog, so
+// a table vacuumed that morning comes back with rows in the millions, no live
+// tuples and no vacuum on record: a neglected table, to anyone reading the
+// fields the bloat review reads. Resetting one table's counters leaves exactly
+// that picture without taking the server down.
+TEST_F(PostgresMCPServerTest, TableStatsSayWhenTheCumulativeStatisticsAreNotThere) {
+  // Each step from a connection of its own, which reports what it did when
+  // it closes. A session that stays open holds its counts back for a while,
+  // and the load's would then arrive after the reset and undo it. Behind a
+  // pooler the backend stays open whatever the client does, so the reset also
+  // waits until the load's inserts have been counted.
+  auto run = [&](const std::string& sql) {
+    pqxx::connection w(test_url);
+    pqxx::nontransaction wn(w);
+    wn.exec(sql);
+  };
+  run("DROP TABLE IF EXISTS grocery.lost_stats");
+  run("CREATE TABLE grocery.lost_stats AS SELECT g AS id FROM generate_series(1, 5000) AS g");
+  run("VACUUM ANALYZE grocery.lost_stats");
+
+  // The statistics reach the view a moment after the command returns.
+  auto settled = [&](bool want) {
+    json r;
+    for (int i = 0; i < 50; i++) {
+      r = srv->call_table_stats("grocery", "lost_stats");
+      if (r.value("cumulative_statistics_missing", json()) == want &&
+          r["last_vacuum"].is_null() == want &&
+          r["n_tup_ins"] == (want ? 0 : 5000))
+        break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return r;
+  };
+
+  json before = settled(false);
+  EXPECT_EQ(before["cumulative_statistics_missing"], false) << before.dump(2);
+  EXPECT_FALSE(before.contains("note")) << before.dump(2);
+  // Not a figure to hold it to: the vacuum sets it and the load's own count
+  // is added whenever it arrives.
+  EXPECT_GT(before["n_live_tup"].get<long long>(), 0) << before.dump(2);
+
+  run("SELECT pg_stat_reset_single_table_counters('grocery.lost_stats'::regclass)");
+  json after = settled(true);
+  EXPECT_EQ(after["cumulative_statistics_missing"], true) << after.dump(2);
+  // The catalog still counts the rows; only the counters are gone.
+  EXPECT_EQ(after["rows"].get<double>(), 5000) << after.dump(2);
+  EXPECT_EQ(after["n_live_tup"].get<long long>(), 0) << after.dump(2);
+  ASSERT_TRUE(after.contains("note")) << after.dump(2);
+  const std::string note = after["note"].get<std::string>();
+  EXPECT_NE(note.find("not a table nobody maintains"), std::string::npos) << note;
+  EXPECT_NE(note.find("counters_since"), std::string::npos) << note;
+  EXPECT_EQ(note.find("standby"), std::string::npos) << note;
+
+  // The schema-wide form carries the flag and not the sentence.
+  json all = srv->call_list_table_stats("grocery", "lost_stats");
+  ASSERT_TRUE(all.contains("lost_stats")) << all.dump(2);
+  EXPECT_EQ(all["lost_stats"]["cumulative_statistics_missing"], true);
+  EXPECT_FALSE(all["lost_stats"].contains("note"));
+
+  // One more insert is enough to end it: the counters have seen the table.
+  run("INSERT INTO grocery.lost_stats VALUES (5001)");
+  json again;
+  for (int i = 0; i < 50; i++) {
+    again = srv->call_table_stats("grocery", "lost_stats");
+    if (again["cumulative_statistics_missing"] == false) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  EXPECT_EQ(again["cumulative_statistics_missing"], false) << again.dump(2);
+
+  // A partitioned parent has no live tuples by construction; that proves
+  // nothing, so it is not asked.
+  json parent = srv->call_table_stats("grocery", "events");
+  ASSERT_TRUE(parent.contains("cumulative_statistics_missing")) << parent.dump(2);
+  EXPECT_TRUE(parent["cumulative_statistics_missing"].is_null()) << parent.dump(2);
+
+  run("DROP TABLE grocery.lost_stats");
+}
+
 TEST_F(PostgresMCPServerTest, TableStatsIncludeFailedHotUpdatesOnPg16AndLater) {
   const bool pg16 = pg_server_version_num(test_url) >= 160000;
 
@@ -3398,6 +3786,15 @@ TEST_F(PostgresMCPServerTest, TableStatsIncludeFailedHotUpdatesOnPg16AndLater) {
   json one = srv->call_table_stats("grocery", "users");
   EXPECT_EQ(one.contains("n_tup_newpage_upd"), pg16);
   EXPECT_EQ(one.contains("last_seq_scan"), pg16);
+
+  // What n_tup_newpage_upd is a share of. On every version: it was returned
+  // alone through 4.6, and the prompt that reads it asks for the ratio.
+  for (const char* f : {"n_tup_ins", "n_tup_upd", "n_tup_del", "n_tup_hot_upd"}) {
+    ASSERT_TRUE(one.contains(f)) << f << ": " << one.dump(2).substr(0, 600);
+    EXPECT_TRUE(one[f].is_number_integer()) << f;
+    ASSERT_TRUE(listed["users"].contains(f)) << f;
+    EXPECT_TRUE(listed["users"][f].is_number_integer()) << f;
+  }
 
   // pg_stat_user_indexes.last_idx_scan is gated on the same release, and it is
   // built by concatenation now rather than erased out of a finished query --
@@ -4191,6 +4588,68 @@ TEST_F(PostgresMCPServerTest, HostCapacityComputesRatiosFromInjectedHardware) {
   EXPECT_FALSE(d["committed_worst_case_percent_of_ram"].is_null());
 }
 
+// Memory the operating system holds outside the page cache -- a ZFS ARC of a
+// fixed size. Through 4.6 the worst case had no place for it, and on a 32 GB
+// server with an 8 GB ARC read 82% where the truth was over 100%.
+TEST_F(PostgresMCPServerTest, HostCapacityCountsReservedMemoryInTheWorstCase) {
+  json without = srv->call_host_capacity(32768, 16, "");
+  json with = srv->call_host_capacity(32768, 16, "", 8192);
+  const json& a = without["derived"];
+  const json& b = with["derived"];
+  // Not declared is null, never a zero that reads as "nothing is reserved".
+  ASSERT_TRUE(a.contains("host_reserved_bytes")) << a.dump(2);
+  EXPECT_TRUE(a["host_reserved_bytes"].is_null()) << a.dump(2);
+  EXPECT_FALSE(without["host"].contains("reserved_mb"));
+
+  const long long reserved = 8192LL * 1048576LL;
+  EXPECT_EQ(b["host_reserved_bytes"].get<long long>(), reserved);
+  EXPECT_NEAR(b["host_reserved_percent_of_ram"].get<double>(), 25.0, 0.05);
+  EXPECT_EQ(with["host"]["reserved_mb"], 8192);
+  EXPECT_EQ(b["committed_worst_case_bytes"].get<long long>(),
+            a["committed_worst_case_bytes"].get<long long>() + reserved);
+  EXPECT_NEAR(b["committed_worst_case_percent_of_ram"].get<double>(),
+              a["committed_worst_case_percent_of_ram"].get<double>() + 25.0, 0.11);
+
+}
+
+// A hash table is allowed work_mem x hash_mem_multiplier, and the worst case
+// counts one work_mem per connection. The allowance is reported beside it and
+// not folded in, so the worst case means what it meant.
+TEST_F(PostgresMCPServerTest, HostCapacityReportsWhatAHashMayTake) {
+  json r = srv->call_host_capacity(32768, 16, "");
+  const json& s = r["settings"];
+  const json& d = r["derived"];
+  ASSERT_TRUE(s.contains("hash_mem_multiplier")) << s.dump(2);
+  // A multiplier has no unit, so no byte count: null, not zero.
+  EXPECT_TRUE(s["hash_mem_multiplier"]["bytes"].is_null());
+  const double mult = std::stod(s["hash_mem_multiplier"]["setting"].get<std::string>());
+  const long long work_mem = d["work_mem_effective_max_bytes"].get<long long>();
+  const long long processes =
+    std::stoll(s["max_parallel_workers_per_gather"]["setting"].get<std::string>()) + 1;
+
+  const long long one = d["work_mem_times_hash_mem_multiplier_bytes"].get<long long>();
+  EXPECT_EQ(one, std::llround(static_cast<double>(work_mem) * mult)) << d.dump(2);
+  EXPECT_EQ(d["one_hash_node_all_processes_bytes"].get<long long>(),
+            std::llround(static_cast<double>(work_mem) * mult
+                         * static_cast<double>(processes))) << d.dump(2);
+  EXPECT_NEAR(d["one_hash_node_all_processes_percent_of_ram"].get<double>(),
+              100.0 * static_cast<double>(work_mem) * mult * static_cast<double>(processes)
+                / (32768.0 * 1048576.0), 0.06);
+  // Beside the worst case, not inside it.
+  const long long worst =
+    s["shared_buffers"]["bytes"].get<long long>()
+    + work_mem * std::stoll(s["max_connections"]["setting"].get<std::string>())
+    + s["maintenance_work_mem"]["bytes"].get<long long>()
+      * std::stoll(s["autovacuum_max_workers"]["setting"].get<std::string>());
+  EXPECT_EQ(d["committed_worst_case_bytes"].get<long long>(), worst) << d.dump(2);
+
+  // Without host RAM the bytes are still there and the percentage is null.
+  json bare = srv->call_host_capacity(0, 0, "");
+  EXPECT_EQ(bare["derived"]["one_hash_node_all_processes_bytes"].get<long long>(),
+            d["one_hash_node_all_processes_bytes"].get<long long>());
+  EXPECT_TRUE(bare["derived"]["one_hash_node_all_processes_percent_of_ram"].is_null());
+}
+
 TEST_F(PostgresMCPServerTest, HostCapacityResolvesByteUnitsPerSetting) {
   json r = srv->call_host_capacity(0, 0, "");
   auto& s = r["settings"];
@@ -4721,6 +5180,92 @@ TEST_F(PgssMCPServerTest, QueryIdFromADroppedDatabaseIsReportedNotCrashed) {
   EXPECT_TRUE(r.contains("hint"));
 }
 
+// pg_stat_statements tracks utility statements, and after a load they head
+// the ranking; diagnose-slow-query stopped at the first. Each entry now says
+// whether explainQuery will take it, by the rule explainQuery itself applies.
+TEST_F(PgssMCPServerTest, StatementStatsSaysWhichStatementsHaveAPlan) {
+  {
+    pqxx::connection c(url);
+    pqxx::nontransaction n(c);
+    n.exec("CREATE TABLE IF NOT EXISTS public.zzz_explainable_marker (id int)");
+    n.exec("ALTER TABLE public.zzz_explainable_marker ADD COLUMN IF NOT EXISTS note text");
+    n.exec("SELECT count(*) AS zzz_explainable_marker FROM public.zzz_explainable_marker");
+  }
+  json r = srv->call_statement_stats(5000);
+  ASSERT_FALSE(r.contains("error")) << r.dump(2).substr(0, 400);
+  bool utility = false, planned = false;
+  for (const auto& st : r["statements"]) {
+    ASSERT_TRUE(st.contains("explainable")) << st.dump();
+    if (!st["query"].is_string()) { EXPECT_TRUE(st["explainable"].is_null()); continue; }
+    const std::string q = st["query"].get<std::string>();
+    if (q.find("zzz_explainable_marker") == std::string::npos) continue;
+    if (q.rfind("ALTER TABLE", 0) == 0) { utility = true; EXPECT_EQ(st["explainable"], false) << q; }
+    if (q.rfind("SELECT count(*) AS zzz_explainable_marker", 0) == 0) {
+      planned = true; EXPECT_EQ(st["explainable"], true) << q;
+    }
+    // And the two tools agree: what is marked false, explainQuery refuses.
+    if (st["explainable"] == false) {
+      EXPECT_THROW(srv->call_explain_query(st["query_id"].get<std::string>(), "", json::array(), false, 0),
+                   std::runtime_error) << q;
+    }
+  }
+  EXPECT_TRUE(planned) << "the seeded SELECT was not found";
+  // track_utility is on by default; where it is off there is nothing to mark.
+  if (!utility) GTEST_SKIP() << "no utility statement was tracked (track_utility off?)";
+}
+
+// A typed literal is the one constant pg_stat_statements normalises into
+// text that is not SQL: DATE '2026-09-14' is recorded as DATE $1. Through 4.6
+// the answer blamed track_activity_query_size, on a statement that had not
+// been truncated.
+TEST_F(PgssMCPServerTest, AStatementWithATypedLiteralIsNotCalledTruncated) {
+  {
+    pqxx::connection c(url);
+    pqxx::work t(c);
+    t.exec("SELECT count(*) AS zzz_typed_literal_marker FROM pg_class "
+           "WHERE DATE '2026-09-14' > DATE '2026-01-01'");
+    t.commit();
+  }
+  std::string qid, recorded;
+  {
+    pqxx::connection c(url);
+    pqxx::work t(c);
+    pqxx::result r = t.exec(
+      "SELECT queryid::text, query FROM extensions.pg_stat_statements "
+      "WHERE query ILIKE '%zzz_typed_literal_marker%' AND query NOT ILIKE '%pg_stat_statements%' "
+      "ORDER BY total_exec_time DESC LIMIT 1");
+    if (!r.empty()) { qid = r[0][0].as<std::string>(); recorded = r[0][1].as<std::string>(); }
+  }
+  if (qid.empty()) GTEST_SKIP() << "could not seed the statement";
+  // The premise, checked: the constant went and the type name stayed.
+  ASSERT_NE(recorded.find("DATE $1"), std::string::npos) << recorded;
+
+  json r = srv->call_explain_query(qid, "", json::array(), false, 0);
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  EXPECT_NE(r["error"].get<std::string>().find("typed literal"), std::string::npos) << r.dump(2);
+  EXPECT_NE(r["error"].get<std::string>().find("DATE $1"), std::string::npos) << r.dump(2);
+  const std::string hint = r.value("hint", "");
+  EXPECT_NE(hint.find("type name"), std::string::npos) << hint;
+  EXPECT_NE(hint.find("'sql' argument"), std::string::npos) << hint;
+  EXPECT_EQ(hint.find("track_activity_query_size"), std::string::npos) << hint;
+
+  // A statement that really is cut short still gets the truncation hint,
+  // and so does one whose parameter merely follows a keyword: AT TIME ZONE $1
+  // is an ordinary parameter, and LIMIT $1 is not a type.
+  for (const char* q : {"SELECT count(*) FROM pg_class WHERE",
+                        "SELECT now() AT TIME ZONE $1 FROM pg_class WHERE",
+                        "SELECT relname FROM pg_class LIMIT $1 WHERE"}) {
+    json cut = srv->call_explain_query("", q, json::array(), false, 0);
+    ASSERT_TRUE(cut.contains("error")) << q << cut.dump(2);
+    EXPECT_EQ(cut["error"].get<std::string>().find("typed literal"), std::string::npos)
+        << q << cut.dump(2);
+  }
+  // The two-word forms are recognised by their first word too.
+  json tz = srv->call_explain_query("", "SELECT TIMESTAMP WITH TIME ZONE $1", json::array(), false, 0);
+  ASSERT_TRUE(tz.contains("error")) << tz.dump(2);
+  EXPECT_NE(tz["error"].get<std::string>().find("typed literal"), std::string::npos) << tz.dump(2);
+}
+
 // --- connection config ---
 
 namespace {
@@ -4761,6 +5306,19 @@ TEST(ConnectionConfigTest, ParsesNamedSections) {
   EXPECT_EQ(reg.get("other").dbname, "two");
   EXPECT_EQ(reg.get("other").user, "bob");
   EXPECT_NE(reg.get("default").conninfo.find("dbname=one"), std::string::npos);
+}
+
+// host_reserved_mb: per connection, inherited from an instance section like
+// the RAM it is counted against, never passed to libpq, and a positive
+// integer of megabytes or nothing.
+TEST(ConnectionConfigTest, ReservedMemoryIsReadAndInherited) {
+  auto reg = load("[own]\ndbname = x\nhost_ram_mb = 32768\nhost_reserved_mb = 8192\n"
+                  "[member]\ndbname = y\ninstance = pg-01\n"
+                  "[instance:pg-01]\nhost_ram_mb = 65536\nhost_reserved_mb = 4096\n");
+  EXPECT_EQ(reg.get("own").capacity.reserved_mb, 8192);
+  EXPECT_EQ(reg.get("own").conninfo.find("host_reserved_mb"), std::string::npos);
+  EXPECT_EQ(reg.get("member").capacity.reserved_mb, 4096);
+  EXPECT_THROW(load("[own]\ndbname = x\nhost_reserved_mb = 8GB\n"), std::runtime_error);
 }
 
 TEST(ConnectionConfigTest, AppendsApplicationName) {
@@ -5885,7 +6443,7 @@ TEST_F(PostgresMCPServerTest, PromptsAreListedWithTheirArguments) {
   for (const char* n : {"diagnose-slow-query", "triage-lock-contention",
                         "bloat-and-vacuum-review", "buffer-cache-review",
                         "capacity-check", "replication-slot-review",
-                        "plan-schema-change", "explain-and-fix"})
+                        "plan-schema-change", "review-clustering", "explain-and-fix"})
     EXPECT_TRUE(names.count(n)) << n << " is missing";
 }
 
@@ -5903,6 +6461,32 @@ TEST_F(PostgresMCPServerTest, PromptsSendTheModelToCheckPrivilegesFirst) {
     const std::string text = r["result"]["messages"][0]["content"]["text"].get<std::string>();
     EXPECT_NE(text.find("checkPrivileges"), std::string::npos) << n;
   }
+}
+
+// The clustering review rests on readings, and each one has to be named: a
+// prompt that recommends CLUSTER without the cost of the scatter, the rate of
+// decay or the lock is the recipe this server's prompts exist to avoid.
+TEST_F(PostgresMCPServerTest, TheClusteringPromptMeasuresBeforeItRecommends) {
+  json r = rpc1(*srv, "prompts/get", {{"name", "review-clustering"},
+                                      {"arguments", {{"schema", "shop"}, {"table", "orders"}}}});
+  const std::string t = r["result"]["messages"][0]["content"]["text"].get<std::string>();
+  EXPECT_NE(t.find("shop.orders"), std::string::npos);
+  for (const char* reading : {"checkPrivileges", "tableStats", "physical_order_correlation",
+                              "predicateStats", "rowScatter", "scatter_ratio", "n_tup_hot_upd",
+                              "tableDetails", "tableSize", "ACCESS EXCLUSIVE",
+                              "plan-schema-change"})
+    EXPECT_NE(t.find(reading), std::string::npos) << reading << " missing from the clustering review";
+  // And every tool it names exists, with the field it tells the reader to read.
+  json tools = rpc1(*srv, "tools/list", json::object());
+  std::set<std::string> names;
+  for (const auto& tl : tools["result"]["tools"]) names.insert(tl["name"].get<std::string>());
+  for (const char* tool : {"tableStats", "predicateStats", "statementStats", "rowScatter",
+                           "tableDetails", "tableSize", "checkPrivileges", "diskUsage"})
+    EXPECT_TRUE(names.count(tool)) << tool;
+  // Both arguments are required: there is no table to review without them.
+  json missing = rpc1(*srv, "prompts/get", {{"name", "review-clustering"},
+                                            {"arguments", {{"schema", "shop"}}}});
+  EXPECT_TRUE(missing.contains("error")) << missing.dump().substr(0, 300);
 }
 
 TEST_F(PostgresMCPServerTest, TheSlowQueryPromptBranchesIntoBloatAndVacuum) {
@@ -6025,6 +6609,21 @@ TEST_F(PostgresMCPServerTest, APromptSubstitutesItsArguments) {
   // the step that is most often skipped.
   EXPECT_NE(text.find("replicationSlots"), std::string::npos)
       << "the bloat prompt must send the model to check the slot first";
+}
+
+// After crash recovery every table reads as never vacuumed. The review that
+// tells a neglected table from a busy one by those fields has to be told there
+// is a third way to get that picture, and where the server says so.
+TEST_F(PostgresMCPServerTest, TheBloatPromptKnowsLostStatisticsFromNeglect) {
+  json r = rpc1(*srv, "prompts/get", {{"name", "bloat-and-vacuum-review"}});
+  const std::string text = r["result"]["messages"][0]["content"]["text"].get<std::string>();
+  EXPECT_NE(text.find("cumulative_statistics_missing"), std::string::npos);
+  const size_t lost = text.find("counters_since_source");
+  ASSERT_NE(lost, std::string::npos);
+  EXPECT_NE(text.find("Crash recovery"), std::string::npos);
+  EXPECT_NE(text.find("replica"), std::string::npos);
+  // In the step that ranks tables, before the slots and the measuring.
+  EXPECT_LT(lost, text.find("2. Call replicationSlots"));
 }
 
 TEST_F(PostgresMCPServerTest, APromptFallsBackWhenAnOptionalArgumentIsOmitted) {
@@ -6824,6 +7423,16 @@ TEST_F(PreloadExtTest, APreloadedLibraryWithoutItsExtensionSaysOnlyCreateIsMissi
           d.value("reason", "").find("preloaded, but the extension is not created") != std::string::npos)
         said = true;
     EXPECT_TRUE(said) << p.dump(2);
+    // pgstattuple is packaged here and not created in this database: one
+    // CREATE EXTENSION away, and the reason says so. Through 4.6 it said only
+    // "not installed", the same as for an extension whose package is absent.
+    bool one_command = false;
+    for (const auto& d : p.value("denied", json::array()))
+      if (d.value("tool", "") == "tableBloat" &&
+          d.value("reason", "").find("available on this server: CREATE EXTENSION pgstattuple;")
+            != std::string::npos)
+        one_command = true;
+    EXPECT_TRUE(one_command) << p.dump(2);
   }
   {
     pqxx::nontransaction n(*admin);
@@ -7834,6 +8443,50 @@ std::string standby_url() {
   return u ? std::string(u) : std::string();
 }
 }  // namespace
+
+// Vacuum and analyze are recorded where they run, so on a standby every table
+// that has rows reads as never vacuumed and holding no live tuples. Measured
+// on PostgreSQL 18. The flag is true of all of them, and the sentence beside
+// one table names the standby as the reason, not a crash.
+//
+// The fixture's database, which the standby has by replay: STANDBY_URL names
+// the rig's own, where there is nothing to read.
+TEST_F(PostgresMCPServerTest, OnAStandbyEveryTableWithRowsLacksItsCumulativeStatistics) {
+  if (standby_url().empty())
+    GTEST_SKIP() << "no STANDBY_URL; run cpp/test/run-pooled-tests.sh";
+  const std::string url = std::regex_replace(
+      standby_url(), std::regex(R"(\bdbname\s*=\s*\S+)"), "dbname=" + test_dbname);
+  PostgresMCPServer standby{url};
+
+  json all;
+  for (int i = 0; i < 50; i++) {
+    all = standby.call_list_table_stats("grocery");
+    if (all.contains("users") && all["users"]["rows"].is_number() &&
+        all["users"]["rows"].get<double>() > 0)
+      break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  ASSERT_TRUE(all.contains("users")) << all.dump(2);
+
+  int flagged = 0;
+  for (const auto& [name, t] : all.items()) {
+    if (!t["rows"].is_number() || t["rows"].get<double>() <= 0) continue;
+    if (t["cumulative_statistics_missing"].is_null()) continue;   // a parent or a view
+    EXPECT_EQ(t["cumulative_statistics_missing"], true) << name << ": " << t.dump(2);
+    flagged++;
+  }
+  EXPECT_GT(flagged, 1) << all.dump(2);
+
+  json r = standby.call_table_stats("grocery", "users");
+  ASSERT_TRUE(r.contains("note")) << r.dump(2);
+  const std::string note = r["note"].get<std::string>();
+  EXPECT_NE(note.find("standby"), std::string::npos) << note;
+  EXPECT_NE(note.find("primary"), std::string::npos) << note;
+  EXPECT_EQ(note.find("rash recovery"), std::string::npos) << note;
+  // The same table on the primary, a moment earlier, is in order.
+  json here = srv->call_table_stats("grocery", "users");
+  EXPECT_EQ(here["cumulative_statistics_missing"], false) << here.dump(2);
+}
 
 // A standby can be a sender too, and replay_behind_bytes has its own branch
 // for it: pg_current_wal_lsn() raises in recovery, so the minuend there is the
