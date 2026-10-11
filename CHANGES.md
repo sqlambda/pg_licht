@@ -1,6 +1,6 @@
 # Changelog
 
-## 4.7.0 (unreleased)
+## 4.7.0 (2026-10-11)
 
 What the prompts could not answer. Seven of the twelve prompts were followed
 step by step against a freshly loaded 106 GB database (PostgreSQL 18 on
