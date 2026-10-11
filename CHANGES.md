@@ -1,6 +1,6 @@
 # Changelog
 
-## 4.7.1 (unreleased)
+## 4.7.1 (2026-10-11)
 
 Three defects in the MCP layer, and two sentences that said more than is true
 since 4.7.0.
