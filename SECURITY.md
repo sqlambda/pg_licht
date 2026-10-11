@@ -32,9 +32,10 @@ with its limits, in the manual's SECURITY CONSIDERATIONS section (`man pg_licht_
   to a connection declared `kind = pgbouncer`. The connection's user should be one of
   PgBouncer's `stats_users`, which may run `SHOW` and nothing else. That second guard is
   the operator's to set up: pg_licht cannot verify which list a user belongs to.
-- **It never returns rows from your tables**, with two exceptions that return no rows
-  either: `checkKey` answers only whether a primary key exists, and `explainQuery` with
-  `analyze` returns the plan, with row counts and timings.
+- **It never returns rows from your tables**, with three exceptions that return no rows
+  either: `checkKey` answers only whether a primary key exists, `rowScatter` counts the
+  rows holding a value and the pages they are on, and `explainQuery` with `analyze`
+  returns the plan, with row counts and timings.
 - **It never returns a password it holds.** `listConnections` does not return one and
   never expands a service file; `listForeignServers` omits user mappings;
   `listSubscriptions` omits each subscription's connection string.
