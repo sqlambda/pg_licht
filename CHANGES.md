@@ -141,7 +141,10 @@ FreeBSD, ZFS); this release is what they ran into.
   snapshot the space occupied differs -- the database above occupied 68 GB on
   ZFS. `diskUsage`'s note says so, and `triage-disk-space` asks for the
   filesystem's own figure before promising what a cleanup returns, instead
-  of reading WAL and temporary files as "actually on disk".
+  of reading WAL and temporary files as "actually on disk". The descriptions
+  of `diskUsage`, `tableSize` and `listTableSizes`, and the pointers to them
+  in `listTables` and `tableDetails`, say "as PostgreSQL counts it" too, and
+  a test holds every description, output schema and prompt to it.
 
 ### Build
 

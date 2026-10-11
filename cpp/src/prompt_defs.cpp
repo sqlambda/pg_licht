@@ -663,7 +663,7 @@ auto PostgresMCPServer::prompt_defs() -> const std::vector<PromptDef>& {
            "last_failed_time if you need the reason; this server does not read "
            "it, but the backlog is enough to tell which of the two you have.\n"
            "2. Temporary files, which are the fastest to free and the easiest to "
-           "miss. diskUsage.temp_files is what is on disk at this moment, while "
+           "miss. diskUsage.temp_files is what is there at this moment, as PostgreSQL counts it, while "
            "databaseStats temp_files and temp_bytes are the running totals since "
            "the counters were reset -- the first says whether it is happening "
            "now, the second whether it is habitual. Both are sorts and hashes "

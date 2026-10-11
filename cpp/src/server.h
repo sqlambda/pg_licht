@@ -2671,7 +2671,7 @@ private:
       {"listForeignServers",     schema_map("server name", "its wrapper, options and user mappings")},
       {"listForeignTables",      schema_map("foreign table name", "its server and column list")},
       {"listPublications",       schema_map("publication name", "its tables and replicated operations")},
-      {"diskUsage",              schema_fixed("What PostgreSQL is holding on disk, by directory and by "
+      {"diskUsage",              schema_fixed("What PostgreSQL is holding, in the bytes it counts, by directory and by "
                                               "tablespace. Never how much room is left.",
                                               {{"wal", "object"}, {"archive_status", "object"},
                                                {"temp_files", "object"}, {"log_files", "object"},
@@ -8543,7 +8543,7 @@ private:
     return out;
   }
 
-  // What PostgreSQL is holding on disk, without a shell on the box.
+  // What PostgreSQL is holding, as it counts it, without a shell on the box.
   //
   // This exists because triage-disk-space is otherwise unexecutable: pg_licht
   // speaks SQL and nothing else, and "the disk is filling" is answered by

@@ -6626,6 +6626,39 @@ TEST_F(PostgresMCPServerTest, TheBloatPromptKnowsLostStatisticsFromNeglect) {
   EXPECT_LT(lost, text.find("2. Call replicationSlots"));
 }
 
+// Every size PostgreSQL reports is in logical bytes, and on a filesystem that
+// compresses it is not what the volume holds. Nothing a caller reads may call
+// a size "on disk": not a description, not an output schema, not a prompt.
+TEST_F(PostgresMCPServerTest, NoSizeIsCalledOnDisk) {
+  const auto offends = [](const json& j) {
+    std::string s = j.dump();
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s.find("on disk") != std::string::npos || s.find("on-disk") != std::string::npos;
+  };
+
+  json tools = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/list"},
+                              {"params", {{"_meta", modern_meta()}}}});
+  ASSERT_TRUE(tools["result"].contains("tools")) << tools.dump(2);
+  ASSERT_GT(tools["result"]["tools"].size(), 70u);
+  for (const auto& t : tools["result"]["tools"]) {
+    ASSERT_TRUE(t.contains("outputSchema")) << t["name"];
+    EXPECT_FALSE(offends(t)) << t["name"] << " calls something \"on disk\"";
+  }
+
+  json prompts = rpc1(*srv, "prompts/list", json::object());
+  ASSERT_TRUE(prompts["result"].contains("prompts")) << prompts.dump(2);
+  ASSERT_GE(prompts["result"]["prompts"].size(), 13u);
+  for (const auto& p : prompts["result"]["prompts"]) {
+    json args = json::object();
+    if (p.contains("arguments"))
+      for (const auto& a : p["arguments"]) args[a["name"].get<std::string>()] = "x";
+    json r = rpc1(*srv, "prompts/get", {{"name", p["name"]}, {"arguments", args}});
+    ASSERT_TRUE(r["result"].contains("messages")) << p["name"] << " " << r.dump(2);
+    EXPECT_FALSE(offends(r["result"]["messages"])) << p["name"] << " calls something \"on disk\"";
+  }
+}
+
 TEST_F(PostgresMCPServerTest, APromptFallsBackWhenAnOptionalArgumentIsOmitted) {
   json r = rpc1(*srv, "prompts/get", {{"name", "bloat-and-vacuum-review"}});
   ASSERT_TRUE(r["result"].contains("messages")) << r.dump(2);
