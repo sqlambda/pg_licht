@@ -1,5 +1,38 @@
 # Changelog
 
+## 4.7.1 (unreleased)
+
+Three defects in the MCP layer, and two sentences that said more than is true
+since 4.7.0.
+
+### Fixed
+
+- **A request without an id is not answered.** JSON-RPC calls it a
+  notification and forbids a response; since 4.5.2 the server executed it and
+  answered with `"id": null`, which no client can match to a call. Now
+  `notifications/initialized` is taken as before and any other method sent
+  without an id is dropped unexecuted. A request whose id is `null` has an id
+  and is answered as it was.
+
+- **A list cursor is one this server issued, or it is refused.** The decoder
+  stopped at the first `=`, so a cursor with bytes after the padding was
+  accepted, as was one with the padding left off or with a leading zero in
+  the offset. A cursor is now accepted only when it is exactly what the
+  server would have issued for that offset; anything else is `-32602`.
+
+- **`tableIOStats` is titled "Table IO stats".** The title is derived from
+  the name, and a run of capitals came out as "Table iOStats". A run is now
+  kept as an acronym. No other tool's title changes.
+
+### Changed
+
+- **The landing page and the README say what the server returns, not what it
+  reads.** `checkKey`, `explainQuery` and `rowScatter` read a table and return
+  no row of it, so "It reads the catalog, not your tables" overstated. The
+  heading is "It returns structure, not your rows", and the README says the
+  server "answers from the catalog and the statistics views and never returns
+  your rows".
+
 ## 4.7.0 (2026-10-11)
 
 What the prompts could not answer. Seven of the twelve prompts were followed
