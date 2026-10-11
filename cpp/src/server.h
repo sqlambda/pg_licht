@@ -3003,12 +3003,18 @@ private:
     for (size_t i = 0; i < name.size(); i++) {
       const unsigned char c = static_cast<unsigned char>(name[i]);
       if (i == 0) { out += static_cast<char>(std::toupper(c)); continue; }
-      if (std::isupper(c) && !std::isupper(static_cast<unsigned char>(name[i - 1]))) {
-        out += ' ';
-        out += static_cast<char>(std::tolower(c));
-      } else {
-        out += name[i];
-      }
+      if (!std::isupper(c)) { out += name[i]; continue; }
+      // A run of capitals is an acronym and keeps them, and its last capital
+      // starts the next word: tableIOStats is "Table IO stats".
+      const auto upper = [&](size_t k) {
+        return k < name.size() && std::isupper(static_cast<unsigned char>(name[k])) != 0;
+      };
+      const bool after_upper = upper(i - 1);
+      const bool starts_word = !after_upper
+        || (i + 1 < name.size() && !upper(i + 1));
+      if (starts_word) out += ' ';
+      const bool in_acronym = starts_word ? upper(i + 1) : true;
+      out += in_acronym ? name[i] : static_cast<char>(std::tolower(c));
     }
     return out;
   }
@@ -11104,6 +11110,15 @@ private:
     // two seconds in, on an initialize carrying no id.
     const json id = req.is_object() && req.contains("id") ? req["id"] : json();
     std::string const method = req.value("method", "");
+    // A request without an id is a notification, and JSON-RPC forbids
+    // answering one. Through 4.7.0 it was executed and answered with a null
+    // id, which no client can match to a call. The one notification that
+    // means something here is taken; any other method sent that way is
+    // dropped unexecuted, since nobody could read what it returned.
+    if (req.is_object() && !req.contains("id")) {
+      if (method == "notifications/initialized") initialized_ = true;
+      return;
+    }
     const json params = req.contains("params") && req["params"].is_object()
       ? req["params"] : json::object();
 
@@ -11169,10 +11184,6 @@ private:
 
     if (method == "initialize") {
       initialize(id, params);
-    }
-    else if (method == "notifications/initialized") {
-      initialized_ = true;
-      return;
     }
     else if (method == "tools/list") {
       json out = json::object();
@@ -11445,9 +11456,7 @@ private:
       }
     }
     else {
-      if (req.contains("id")) {
-        send_error(id, -32601, "Method not available");
-      }
+      send_error(id, -32601, "Method not available");
     }
   }
 
@@ -11540,7 +11549,9 @@ private:
     for (char const c : digits) if (c < '0' || c > '9') return false;
     try { offset = static_cast<size_t>(std::stoull(digits)); }
     catch (const std::exception&) { return false; }
-    return true;
+    // Only what encode_cursor() emits: b64_decode stops at the first '=', so
+    // bytes after the padding decoded to a valid offset, as did leading zeros.
+    return encode_cursor(offset) == cursor;
   }
 
   json cacheable(json result, int ttl_ms, const char* scope) const {

@@ -6,8 +6,8 @@ catalog. It never writes, and never returns rows from your tables.
 
 Why another PostgreSQL MCP:
 
-- It reads the catalog and the statistics views, not your data, so there is far less to
-  leak: the model sees structure, sizes, plans and counters.
+- It answers from the catalog and the statistics views and never returns your rows, so
+  there is far less to leak: the model sees structure, sizes, plans and counters.
 - Read-only is enforced, not promised: every call runs in its own `READ ONLY` transaction
   with a statement timeout, and no SQL is built from arguments.
 - One process serves the whole fleet. Any number of connections live in one file, and a

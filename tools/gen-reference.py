@@ -4,8 +4,8 @@
     tools/gen-reference.py --binary PATH --out DIR [--man-html NAME]
 
 Writes DIR/index.html, one page per tool and one per prompt, in the shape of
-the PostgreSQL manual's per-command pages (the format pg_laswell's reference
-uses): Synopsis, Description, Parameters, Output, Scope, Example, See also.
+the PostgreSQL manual's per-command pages: Synopsis, Description, Parameters,
+Output, Scope, Example, See also.
 
 Nothing about a tool is written by hand. Names, descriptions, parameters,
 output shapes, annotations and sweep eligibility come from the binary, asked

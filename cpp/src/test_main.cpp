@@ -6199,7 +6199,10 @@ TEST_F(PostgresMCPServerTest, CursorsAreOpaqueAndStable) {
 }
 
 TEST_F(PostgresMCPServerTest, AnInvalidCursorIsInvalidParams) {
-  for (const char* bad : {"not-base64!!", "", "cGdsaWNodDo5OTk5OTk="}) {
+  // The last three decode to offsets this server would issue as something
+  // else: bytes after the padding, a leading zero, padding left off.
+  for (const char* bad : {"not-base64!!", "", "cGdsaWNodDo5OTk5OTk=",
+                          "cGdsaWNodDoxMA==AAAA", "cGdsaWNodDowMQ==", "cGdsaWNodDoxMA"}) {
     json r = srv->call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/list"},
                             {"params", {{"_meta", modern_meta()}, {"cursor", bad}}}});
     ASSERT_TRUE(r.contains("error")) << "cursor '" << bad << "' was accepted";
@@ -6237,32 +6240,36 @@ json rpc1(PostgresMCPServer& s, const std::string& method, const json& params) {
 // A request without an id. Every response was built from req["id"] on a
 // const json, where operator[] on a missing key is undefined behaviour --
 // nlohmann dereferences the map's end -- so such a request read freed memory.
-// A JSON-RPC fuzzer found it within two seconds, on an initialize carrying no
-// id. Being undefined, the old code fails this reliably only under ASan, which
-// reports the read in the sanitizer job; elsewhere it fails when the stray
-// memory does not happen to decode as null.
-TEST_F(PostgresMCPServerTest, ARequestWithoutAnIdIsAnsweredWithANullId) {
+// A request without an id is a notification, and a notification is never
+// answered. A JSON-RPC fuzzer found the first form of this within two seconds,
+// on an initialize carrying no id: the id was read from a key that was not
+// there, which is undefined. From 4.5.2 to 4.7.0 such a request was executed
+// and answered with a null id; now it is neither.
+TEST_F(PostgresMCPServerTest, ARequestWithoutAnIdIsNotAnswered) {
   PostgresMCPServer own(test_url);
   for (const json& params : {json{{"protocolVersion", "2025-06-18"}, {"capabilities", json::object()},
                                   {"clientInfo", {{"name", "t"}, {"version", "0"}}}},
                              json::object()}) {
-    for (const char* method : {"initialize", "tools/list"}) {
+    for (const char* method : {"initialize", "tools/list", "no/such/method",
+                               "notifications/initialized", "notifications/cancelled"}) {
       json r = own.call_rpc({{"jsonrpc", "2.0"}, {"method", method}, {"params", params}});
-      ASSERT_TRUE(r.contains("result")) << method << ": " << r.dump().substr(0, 200);
-      ASSERT_TRUE(r.contains("id")) << method << ": " << r.dump().substr(0, 200);
-      EXPECT_TRUE(r["id"].is_null()) << method << ": " << r.dump().substr(0, 200);
-    }
-    // An unknown method without an id is a notification nobody handles.
-    json none = own.call_rpc({{"jsonrpc", "2.0"}, {"method", "no/such/method"}, {"params", params}});
-    if (none.contains("id")) {
-      EXPECT_TRUE(none["id"].is_null()) << none.dump().substr(0, 200);
+      EXPECT_TRUE(r.empty()) << method << ": " << r.dump().substr(0, 200);
     }
   }
   json call = own.call_rpc({{"jsonrpc", "2.0"}, {"method", "tools/call"},
                             {"params", {{"name", "listSchemas"}, {"arguments", json::object()}}}});
-  ASSERT_TRUE(call.contains("result")) << call.dump().substr(0, 200);
-  ASSERT_TRUE(call.contains("id")) << call.dump().substr(0, 200);
-  EXPECT_TRUE(call["id"].is_null()) << call.dump().substr(0, 200);
+  EXPECT_TRUE(call.empty()) << call.dump().substr(0, 200);
+  // Not executed either: an initialize without an id negotiates nothing, so
+  // the tools/list after it is still the legacy one, without titles.
+  own.call_rpc({{"jsonrpc", "2.0"}, {"method", "initialize"},
+                {"params", {{"protocolVersion", "2025-06-18"}, {"capabilities", json::object()},
+                            {"clientInfo", {{"name", "t"}, {"version", "0"}}}}}});
+  json legacy = own.call_rpc({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/list"}});
+  ASSERT_TRUE(legacy.contains("result")) << legacy.dump().substr(0, 200);
+  EXPECT_FALSE(legacy["result"]["tools"][0].contains("title"));
+  // A null id is an id: that request is answered.
+  json null_id = own.call_rpc({{"jsonrpc", "2.0"}, {"id", nullptr}, {"method", "tools/list"}});
+  EXPECT_TRUE(null_id.contains("result")) << null_id.dump().substr(0, 200);
   // An id of any JSON type is echoed as sent.
   json r = own.call_rpc({{"jsonrpc", "2.0"}, {"id", "abc"}, {"method", "tools/list"}});
   EXPECT_EQ(r.value("id", json()), "abc");
@@ -6714,6 +6721,10 @@ TEST_F(PostgresMCPServerTest, TitlesAppearOnlyFromTheRevisionThatDefinedThem) {
     if (t.value("name", "") == "bufferCacheSummary") {
       EXPECT_EQ(t["title"], "Buffer cache summary");
       checked = true;
+    }
+    // A run of capitals stays one: through 4.7.0 this was "Table iOStats".
+    if (t.value("name", "") == "tableIOStats") {
+      EXPECT_EQ(t["title"], "Table IO stats");
     }
   }
   EXPECT_TRUE(checked);
