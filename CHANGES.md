@@ -149,9 +149,9 @@ FreeBSD, ZFS); this release is what they ran into.
 ### Build
 
 - **GitHub Actions updated**, to the versions Dependabot proposed:
-  `checkout` 7.0.1, `upload-artifact` 7.0.1, `download-artifact` 8.0.1,
-  `cache` 6.1.0, `upload-pages-artifact` 5.0.0 and `deploy-pages` 5.0.1, each
-  pinned to its commit.
+  `checkout` 7.0.1, `upload-artifact` 7.0.2, `download-artifact` 8.0.2,
+  `cache` 6.1.0, `upload-pages-artifact` 5.0.0, `deploy-pages` 5.0.1 and
+  `vmactions/freebsd-vm` 1.5.9, each pinned to its commit.
 
 ## 4.6.0 (2026-10-03)
 
