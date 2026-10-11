@@ -1468,7 +1468,7 @@ private:
   }
 
   // An extension that is not created, told apart from one whose library is
-  // not loaded either. The pgshard campaign (October 2026) ran for weeks with
+  // not loaded either. Tests in a test laboratory (October 2026) ran for weeks with
   // pg_wait_sampling preloaded but never created -- its FreeBSD configuration
   // disabled the extension while preloading the library -- and this server
   // answered "pg_wait_sampling is not installed" with a hint to add it to
@@ -4076,7 +4076,7 @@ private:
   // pg_stat_kcache_detail, which joins in the statement text.
   // What pg_stat_kcache's counters mean depends on the platform the server
   // runs on, and a zero that looks like a measurement is worse than an error
-  // -- the pgshard campaign (October 2026) built two in-guest agents to get
+  // -- a test laboratory (October 2026) built two in-guest agents to get
   // around one. Measured on PostgreSQL 18.6, pg_stat_kcache 2.3.2, 2026-10-03:
   //
   //   CPU: FreeBSD accounts a thread's total CPU time exactly but splits it
@@ -9602,7 +9602,7 @@ private:
     // The preload-backed extensions, as three facts each -- library loaded,
     // extension created in this database, and functional (its view answers)
     // -- because the interesting state is a mismatch between them, and that
-    // is the state that goes unnoticed: the pgshard campaign ran FreeBSD
+    // is the state that goes unnoticed: a test laboratory ran FreeBSD
     // cells for weeks with pg_wait_sampling loaded and never created. Each
     // probe runs in a savepoint, so one that fails costs only itself.
     // pg_qualstats without its preload answers from this backend alone, which

@@ -7416,7 +7416,7 @@ std::string PreloadExtTest::url;
 std::set<std::string> PreloadExtTest::usable;
 bool PreloadExtTest::hypopg = false;
 
-// Library loaded, extension not created: the state the pgshard campaign ran
+// Library loaded, extension not created: the state a test laboratory ran
 // in for weeks (pg_wait_sampling preloaded, never created), which this server
 // answered with "not installed" and a hint to preload a library that already
 // was. A database on the same server without the extensions is exactly it.
@@ -7482,7 +7482,7 @@ TEST_F(PreloadExtTest, APreloadedLibraryWithoutItsExtensionSaysOnlyCreateIsMissi
 }
 
 // A query that fails is reported as failing, never as a fact about the
-// extension. pgshard's own script printed "wait sampling unavailable" when its
+// extension. A test laboratory's own script printed "wait sampling unavailable" when its
 // query broke against a server where wait sampling worked (October 2026); this
 // server's promise is the opposite, and this holds it to it. The failure here
 // is real and deterministic: another session holds the extension's view under

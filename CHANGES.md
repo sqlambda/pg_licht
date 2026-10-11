@@ -202,8 +202,8 @@ FreeBSD, ZFS); this release is what they ran into.
 - **"Preloaded but not created" is told apart from "not installed".** The
   extension operations answered a library that was preloaded but whose
   extension was never created with "not installed" and a hint to add it to
-  `shared_preload_libraries` -- where it already was. The pgshard
-  measurement campaign ran FreeBSD cells for weeks in exactly
+  `shared_preload_libraries` -- where it already was. A measurement
+  campaign in a test laboratory ran FreeBSD cells for weeks in exactly
   that state with pg_wait_sampling, giving up wait data for nothing. Now
   `waitEventProfile`, `statementKernelStats`, `predicateStats`,
   `suggestIndexes`, `statementStats` and `explainQuery` say "preloaded but not
@@ -217,8 +217,8 @@ FreeBSD, ZFS); this release is what they ran into.
   probe that fails for a reason of its own -- a timeout, a lock -- reports
   `functional` as null with a `probe_error`, not as false.
 
-- **`statementKernelStats` no longer reports platform-shaped zeros.** The
-  pgshard campaign found pg_stat_kcache's `exec_system_time` at 0.000 on
+- **`statementKernelStats` no longer reports platform-shaped zeros.** Tests
+  in a test laboratory found pg_stat_kcache's `exec_system_time` at 0.000 on
   FreeBSD and built two in-guest agents to work around it. Measured on
   PostgreSQL 18.6 with pg_stat_kcache 2.3.2: FreeBSD splits a thread's CPU
   time into user and system by sampling (~7.9 ms), so 567,895 short updates
@@ -235,7 +235,7 @@ FreeBSD, ZFS); this release is what they ran into.
   extension's view locked by another session and a short statement
   timeout, `waitEventProfile` must answer with the timeout, as an error, and
   not as "not installed" or "not preloaded". It already behaved this way;
-  the pgshard campaign's script did not, printing "wait sampling
+  the test laboratory's script did not, printing "wait sampling
   unavailable" when its own query broke.
 
 ### Testing
