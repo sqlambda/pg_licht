@@ -9,7 +9,8 @@ Why another PostgreSQL MCP:
 - It answers from the catalog and the statistics views and never returns your rows, so
   there is far less to leak: the model sees structure, sizes, plans and counters.
 - Read-only is enforced, not promised: every call runs in its own `READ ONLY` transaction
-  with a statement timeout, and no SQL is built from arguments.
+  with a statement timeout, and no SQL is built from arguments. The one tool that executes
+  a statement of yours refuses to when its plan writes or calls a volatile function.
 - One process serves the whole fleet. Any number of connections live in one file, and a
   question can be put to every database of an instance, a replication group or a label at
   once.
@@ -47,8 +48,11 @@ pg_licht never writes and never returns rows from your tables. Values from your 
 still reach the caller in a few named places: live and recorded statement text
 (`currentActivity`, `currentLocks`, `statementStats`), column statistics (`tableStats`,
 `columnHistogram`), plans that repeat a statement's literals, definitions as written, and
-settings such as a standby's `primary_conninfo`. No password pg_licht itself holds is ever
-returned. Connect as the narrowest role that answers the question; `checkPrivileges`
+settings such as a standby's `primary_conninfo`. When an explained statement fails,
+PostgreSQL's message is returned only where it is about the statement as written, since a
+data error quotes the value that failed. `explainQuery` with `analyze` returns no row, and
+its row counts can still confirm a value the caller proposes. No password pg_licht itself
+holds is ever returned. Connect as the narrowest role that answers the question; `checkPrivileges`
 reports what it can reach.
 
 Full rationale, including the guarded exception for `explainQuery` and the complete list of
@@ -262,6 +266,12 @@ dbname = orders
 pooler = pooler_prod
 ```
 
+A section may set `application_name`, which replaces pg_licht's own
+`pg-licht-cpp/<version>`. Where several people or assistants share one database role, a
+different name in each one's file tells them apart in `pg_stat_activity` and in the server
+log. It is a name the client chooses, not authentication. Other libpq keys, such as
+`sslmode` and `connect_timeout`, are passed through as written; `options` is refused.
+
 Editing the connections file (or the `budgets.ini` in use at startup) needs no restart: the
 change is picked up at the next request, and `SIGHUP` forces it. A budgets file created after
 startup is read at the next start. A file that fails to load leaves the running
@@ -469,7 +479,14 @@ the plan unexecuted. Both ratios can be changed in a `budgets.ini`:
 [analyze]
 memory_percent   = 10   ; worst-case plan memory, % of host_ram_mb
 vcpus_per_worker = 4    ; one parallel worker per this many host_vcpus
+forbidden_functions = audit.log_event    ; never analyzed, whatever it declares
+allowed_functions   = app.current_tenant ; analyzed although volatile
 ```
+
+The last two correct the gate that refuses to analyze a statement calling a volatile
+function. It trusts what a function declares, and only you know your own: a function
+declared `STABLE` that changes something is named under `forbidden_functions`, and one that
+is volatile only because nobody labelled it under `allowed_functions`.
 
 It is read from `$PG_LICHT_BUDGETS`, from beside the connections file, or from
 `~/.config/pg_licht/budgets.ini`, in that order, and must not be writable by other users.

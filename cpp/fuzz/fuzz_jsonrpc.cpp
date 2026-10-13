@@ -28,6 +28,8 @@ PostgresMCPServer& server() {
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   const std::string line(reinterpret_cast<const char*>(data), size);
+  // What run() refuses unparsed never reaches the parser there either.
+  if (!PostgresMCPServer::request_refusal(line).empty()) return 0;
   json req = json::parse(line, nullptr, /*allow_exceptions=*/false);
   if (req.is_discarded()) return 0;
   // Responses go to std::cout; keep them off the fuzzer's terminal.

@@ -4837,6 +4837,339 @@ TEST_F(PostgresMCPServerTest, ExplainQueryLeavesNoPreparedStatementBehind) {
   }
 }
 
+// --- what an analyzed explain must not do (4.7.2) ---
+
+// A READ ONLY transaction does not stop a function whose effect is not a
+// write to a table. Through 4.7.1 this statement ran, and with
+// pg_terminate_backend in its place it ended another session. The lock is the
+// stand-in here because another connection can see whether it was taken.
+TEST_F(PostgresMCPServerTest, ExplainQueryRefusesToAnalyzeAVolatileFunction) {
+  json r = srv->call_explain_query("", "SELECT pg_advisory_lock(424242)", json::array(), true, 2000);
+  ASSERT_TRUE(r.contains("plan")) << r.dump(2);
+  EXPECT_FALSE(r["analyzed"].get<bool>()) << r.dump(2);
+  ASSERT_TRUE(r.contains("volatile_functions")) << r.dump(2);
+  EXPECT_EQ(r["volatile_functions"], json::array({"pg_catalog.pg_advisory_lock"}));
+  EXPECT_NE(r["note"].get<std::string>().find("VOLATILE"), std::string::npos);
+  {
+    pqxx::nontransaction n(*admin_conn);
+    EXPECT_EQ(n.exec("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' "
+                     "AND objid = 424242")[0][0].as<int>(), 0);
+  }
+  // Through a set-returning call, which the plan names without parentheses,
+  // and through a prepared statement.
+  json scan = srv->call_explain_query("", "SELECT * FROM pg_notify('licht', 'x')",
+                                      json::array(), true, 2000);
+  EXPECT_FALSE(scan["analyzed"].get<bool>()) << scan.dump(2);
+  json prep = srv->call_explain_query("", "SELECT pg_advisory_lock($1)",
+                                      json::array({424242}), true, 2000);
+  EXPECT_FALSE(prep["analyzed"].get<bool>()) << prep.dump(2);
+
+  // Volatile and harmless: a different value each time, or a wait.
+  json ok = srv->call_explain_query(
+      "", "SELECT random(), clock_timestamp(), pg_sleep(0) FROM grocery.users",
+      json::array(), true, 2000);
+  EXPECT_TRUE(ok["analyzed"].get<bool>()) << ok.dump(2);
+  EXPECT_FALSE(ok.contains("volatile_functions"));
+  // Volatile because the state they read moves, not because they move it.
+  json reads = srv->call_explain_query(
+      "", "SELECT count(*), max(pg_total_relation_size('grocery.users'::regclass)) FROM pg_locks",
+      json::array(), true, 2000);
+  EXPECT_TRUE(reads["analyzed"].get<bool>()) << reads.dump(2);
+  // Reading a file is another matter.
+  json file = srv->call_explain_query("", "SELECT pg_ls_dir('.')", json::array(), true, 2000);
+  EXPECT_FALSE(file["analyzed"].get<bool>()) << file.dump(2);
+  // A name inside a string constant is not a call.
+  json quoted = srv->call_explain_query(
+      "", "SELECT 'pg_terminate_backend(1)'::text FROM grocery.users",
+      json::array(), true, 2000);
+  EXPECT_TRUE(quoted["analyzed"].get<bool>()) << quoted.dump(2);
+  // Without analyze nothing is executed, and nothing is refused.
+  json plain = srv->call_explain_query("", "SELECT pg_advisory_lock(424242)", json::array(), false, 0);
+  EXPECT_TRUE(plain.contains("plan")) << plain.dump(2);
+  EXPECT_FALSE(plain.contains("volatile_functions"));
+}
+
+// PostgreSQL's message for a failed cast quotes the value that failed, and
+// through 4.7.1 it was returned as `detail`: one row's value per call, handed
+// on to whoever operates the agent.
+TEST_F(PostgresMCPServerTest, ExplainQueryErrorDoesNotQuoteAValue) {
+  const std::string secret = "licht-secret-9131";
+  json r = srv->call_explain_query(
+      "", "SELECT v::int FROM (VALUES ('" + secret + "'), ('x')) AS t(v) WHERE random() >= 0",
+      json::array(), true, 2000);
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  EXPECT_EQ(r.dump().find(secret), std::string::npos) << r.dump(2);
+  EXPECT_FALSE(r.contains("detail"));
+  EXPECT_EQ(r["sqlstate"].get<std::string>(), "22P02");
+  EXPECT_EQ(r["condition"].get<std::string>(), "invalid_text_representation");
+  // A value cast to regclass fails with a name error, which is about the
+  // statement only when it is raised before the statement runs.
+  json reg = srv->call_explain_query(
+      "", "SELECT v::regclass FROM (VALUES ('" + secret + "'), ('x')) AS t(v) WHERE random() >= 0",
+      json::array(), true, 2000);
+  ASSERT_TRUE(reg.contains("error")) << reg.dump(2);
+  EXPECT_EQ(reg.dump().find(secret), std::string::npos) << reg.dump(2);
+  // An error about the statement as written still carries the message: it
+  // quotes only what the caller sent.
+  json typo = srv->call_explain_query("", "SELECT no_such_column FROM grocery.users",
+                                      json::array(), false, 0);
+  ASSERT_TRUE(typo.contains("detail")) << typo.dump(2);
+  EXPECT_NE(typo["detail"].get<std::string>().find("no_such_column"), std::string::npos);
+}
+
+// Neither a prepared statement nor a session advisory lock is undone by
+// ROLLBACK, and the connection outlives the call: this server keeps it for
+// the next one, and behind a pooler in transaction mode it goes back to the
+// pool. With the cleanup removed this fails both directly and pooled.
+TEST_F(PostgresMCPServerTest, ExplainQueryLeavesNothingBehindWhenItFails) {
+  json r = srv->call_explain_query("", "SELECT pg_sleep($1)", json::array({5}), true, 200);
+  ASSERT_TRUE(r.contains("error")) << r.dump(2);
+  EXPECT_NE(r["error"].get<std::string>().find("timeout"), std::string::npos);
+  EXPECT_THROW(srv->call_explain_query("", "SELECT $1::int", json::array({1, 2}), false, 0),
+               std::exception);
+  {
+    pqxx::connection c(test_url);
+    pqxx::nontransaction n(c);
+    EXPECT_EQ(n.exec("SELECT count(*) FROM pg_prepared_statements "
+                     "WHERE name LIKE 'pg_licht_explain_%'")[0][0].as<int>(), 0);
+  }
+  // A lock taken by a function that is not declared volatile: the gate cannot
+  // see it, so the lock has to be released afterwards.
+  {
+    pqxx::connection c(test_url);
+    pqxx::nontransaction n(c);
+    n.exec("CREATE OR REPLACE FUNCTION grocery.licht_sneaky_lock() RETURNS int STABLE "
+           "LANGUAGE plpgsql AS 'BEGIN PERFORM pg_advisory_lock(424243); RETURN 1; END'");
+  }
+  json sneaky = srv->call_explain_query(
+      "", "SELECT grocery.licht_sneaky_lock() FROM grocery.users LIMIT 1", json::array(), true, 2000);
+  EXPECT_TRUE(sneaky.value("analyzed", false)) << sneaky.dump(2);
+  {
+    pqxx::nontransaction n(*admin_conn);
+    int held = 1;
+    for (int i = 0; i < 20 && held > 0; i++) {
+      held = n.exec("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' "
+                    "AND objid = 424243")[0][0].as<int>();
+      if (held > 0) n.exec("SELECT pg_sleep(0.05)");
+    }
+    EXPECT_EQ(held, 0);
+  }
+  {
+    pqxx::connection c(test_url);
+    pqxx::nontransaction n(c);
+    n.exec("DROP FUNCTION IF EXISTS grocery.licht_sneaky_lock()");
+  }
+}
+
+// The gate reads what a function declares, and only the operator knows what
+// the functions of their own database do. budgets.ini carries both
+// corrections: a function declared STABLE that is not to run, and one that is
+// volatile only because nobody labelled it.
+TEST_F(PostgresMCPServerTest, BudgetsForbidAndAllowFunctionsByName) {
+  {
+    pqxx::connection c(test_url);
+    pqxx::nontransaction n(c);
+    n.exec("CREATE OR REPLACE FUNCTION grocery.licht_reader(int) RETURNS int "
+           "LANGUAGE plpgsql AS 'BEGIN RETURN $1 + 1; END'");
+    n.exec("CREATE OR REPLACE FUNCTION grocery.licht_declared_stable(int) RETURNS int STABLE "
+           "LANGUAGE plpgsql AS 'BEGIN RETURN $1 + 1; END'");
+  }
+  const std::string reader = "SELECT grocery.licht_reader(id) FROM grocery.users";
+  const std::string stable = "SELECT grocery.licht_declared_stable(id) FROM grocery.users";
+  PostgresMCPServer s(test_url);
+
+  // Built-in: unlabelled is volatile and refused, with the two ways out named.
+  json r = s.call_explain_query("", reader, json::array(), true, 2000);
+  EXPECT_FALSE(r["analyzed"].get<bool>()) << r.dump(2);
+  EXPECT_EQ(r["volatile_functions"], json::array({"grocery.licht_reader"}));
+  EXPECT_NE(r["note"].get<std::string>().find("allowed_functions"), std::string::npos);
+  EXPECT_NE(r["note"].get<std::string>().find("STABLE"), std::string::npos);
+  r = s.call_explain_query("", stable, json::array(), true, 2000);
+  EXPECT_TRUE(r["analyzed"].get<bool>()) << r.dump(2);
+
+  s.set_budgets(pglicht::Budgets::parse_text(
+      "[analyze]\n"
+      "allowed_functions = grocery.licht_reader\n"
+      "forbidden_functions = grocery.licht_declared_stable, pg_catalog.pg_sleep\n", "t"));
+  r = s.call_explain_query("", reader, json::array(), true, 2000);
+  EXPECT_TRUE(r["analyzed"].get<bool>()) << r.dump(2);
+  EXPECT_FALSE(r.contains("volatile_functions"));
+  r = s.call_explain_query("", stable, json::array(), true, 2000);
+  EXPECT_FALSE(r["analyzed"].get<bool>()) << r.dump(2);
+  EXPECT_EQ(r["forbidden_functions"], json::array({"grocery.licht_declared_stable"}));
+  EXPECT_NE(r["note"].get<std::string>().find("forbidden_functions"), std::string::npos);
+  // A function the built-in list lets through can be forbidden too.
+  r = s.call_explain_query("", "SELECT pg_sleep(0)", json::array(), true, 2000);
+  EXPECT_FALSE(r["analyzed"].get<bool>()) << r.dump(2);
+  EXPECT_EQ(r["forbidden_functions"], json::array({"pg_catalog.pg_sleep"}));
+  // Without analyze nothing is executed, so nothing is refused.
+  r = s.call_explain_query("", stable, json::array(), false, 0);
+  EXPECT_TRUE(r.contains("plan")) << r.dump(2);
+  EXPECT_FALSE(r.contains("forbidden_functions"));
+
+  // In both lists, forbidden wins.
+  s.set_budgets(pglicht::Budgets::parse_text(
+      "[analyze]\nallowed_functions = grocery.licht_reader\n"
+      "forbidden_functions = grocery.licht_reader\n", "t"));
+  r = s.call_explain_query("", reader, json::array(), true, 2000);
+  EXPECT_FALSE(r["analyzed"].get<bool>()) << r.dump(2);
+  EXPECT_TRUE(r.contains("forbidden_functions")) << r.dump(2);
+  // Allowing a name in one schema does not allow it in another.
+  s.set_budgets(pglicht::Budgets::parse_text(
+      "[analyze]\nallowed_functions = public.licht_reader\n", "t"));
+  r = s.call_explain_query("", reader, json::array(), true, 2000);
+  EXPECT_FALSE(r["analyzed"].get<bool>()) << r.dump(2);
+
+  {
+    pqxx::connection c(test_url);
+    pqxx::nontransaction n(c);
+    n.exec("DROP FUNCTION IF EXISTS grocery.licht_reader(int)");
+    n.exec("DROP FUNCTION IF EXISTS grocery.licht_declared_stable(int)");
+  }
+}
+
+TEST(BudgetsFunctionListTest, NamesAreSchemaAndNameAndNothingElse) {
+  const auto b = pglicht::Budgets::parse_text(
+      "[analyze]\nforbidden_functions = audit.log_event , public.wrap, audit.log_event\n"
+      "allowed_functions =\n", "t");
+  ASSERT_EQ(b.analyze_forbidden.size(), 2u);
+  EXPECT_EQ(b.analyze_forbidden[0], std::make_pair(std::string("audit"), std::string("log_event")));
+  EXPECT_EQ(b.analyze_forbidden[1], std::make_pair(std::string("public"), std::string("wrap")));
+  EXPECT_TRUE(b.analyze_allowed.empty());
+  EXPECT_TRUE(pglicht::Budgets{}.analyze_forbidden.empty());
+  for (const char* bad : {"log_event", "audit.log_event(int)", "a.b.c", ".x", "x.",
+                          "\"Audit\".log", "audit.log event", "audit.a,,audit.b"}) {
+    const std::string text = std::string("[analyze]\nforbidden_functions = ") + bad + "\n";
+    EXPECT_THROW(pglicht::Budgets::parse_text(text, "t"), std::runtime_error) << bad;
+    const std::string allowed = std::string("[analyze]\nallowed_functions = ") + bad + "\n";
+    EXPECT_THROW(pglicht::Budgets::parse_text(allowed, "t"), std::runtime_error) << bad;
+  }
+  // The refusal says what the entry should have been.
+  try {
+    pglicht::Budgets::parse_text("[analyze]\nforbidden_functions = log_event\n", "t");
+    ADD_FAILURE() << "a name without a schema was accepted";
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("schema.name"), std::string::npos) << e.what();
+  }
+  // The keys belong to [analyze] alone.
+  EXPECT_THROW(pglicht::Budgets::parse_text("[payload]\nforbidden_functions = a.b\n", "t"),
+               std::runtime_error);
+}
+
+// EXPLAIN checks privileges as the statement would, analyze or not, so a role
+// that may read everything still cannot have an UPDATE explained.
+TEST_F(PostgresMCPServerTest, ExplainOfAWriteWithoutThePrivilegeSaysWhy) {
+  const std::string role = "licht_ex_" + std::to_string(getpid());
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+    n.exec("CREATE ROLE \"" + role + "\" LOGIN");
+    n.exec("GRANT pg_monitor, pg_read_all_data TO \"" + role + "\"");
+  }
+  const std::string url = std::regex_replace(
+      test_url, std::regex(R"(\buser\s*=\s*\S+)"), "") + " user=" + role;
+  bool usable = false;
+  try {
+    pqxx::connection probe(url);
+    pqxx::work t(probe);
+    usable = (t.exec("SELECT current_user")[0][0].as<std::string>() == role);
+  } catch (const std::exception&) {
+  }
+  if (usable) {
+    PostgresMCPServer limited{url};
+    json r = limited.call_explain_query("", "UPDATE grocery.users SET id = id WHERE id = 1",
+                                        json::array(), false, 0);
+    EXPECT_TRUE(r.contains("error")) << r.dump(2);
+    EXPECT_NE(r.value("error", std::string()).find("privilege"), std::string::npos) << r.dump(2);
+    EXPECT_NE(r.value("hint", std::string()).find("pg_read_all_data"), std::string::npos);
+    json sel = limited.call_explain_query("", "SELECT * FROM grocery.users", json::array(), false, 0);
+    EXPECT_TRUE(sel.contains("plan")) << sel.dump(2);
+  }
+  {
+    pqxx::nontransaction n(*admin_conn);
+    n.exec("DROP ROLE IF EXISTS \"" + role + "\"");
+  }
+  if (!usable) GTEST_SKIP() << "cannot log in as a second role here (peer auth or a forced pool user)";
+}
+
+// --- the limits on a request, before it is parsed (4.7.2) ---
+
+TEST(RequestLimitsTest, DepthIsCountedOutsideStrings) {
+  const auto nested = [](size_t n) { return std::string(n, '[') + std::string(n, ']'); };
+  EXPECT_TRUE(PostgresMCPServer::request_refusal(nested(128)).empty());
+  EXPECT_NE(PostgresMCPServer::request_refusal(nested(129)).find("nested"), std::string::npos);
+  EXPECT_NE(PostgresMCPServer::request_refusal(std::string(200000, '[')).find("128"),
+            std::string::npos);
+  // Mixed, and never closed.
+  std::string mixed;
+  for (int i = 0; i < 100; i++) mixed += "{\"a\":[";
+  EXPECT_FALSE(PostgresMCPServer::request_refusal(mixed).empty());
+  // A statement's text may hold as many brackets as it likes, escaped quotes
+  // and all.
+  const std::string in_string =
+      R"({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"explainQuery",)"
+      R"("arguments":{"sql":"SELECT '\"' || ')" + std::string(5000, '[') + R"('"}}})";
+  EXPECT_TRUE(PostgresMCPServer::request_refusal(in_string).empty());
+  // Siblings are not depth.
+  std::string wide = "[";
+  for (int i = 0; i < 1000; i++) wide += "[],";
+  wide += "[]]";
+  EXPECT_TRUE(PostgresMCPServer::request_refusal(wide).empty());
+  EXPECT_TRUE(PostgresMCPServer::request_refusal("not json at all").empty());
+}
+
+TEST(RequestLimitsTest, ALongLineIsDroppedAndTheNextOneIsStillRead) {
+  const size_t cap = PostgresMCPServer::kMaxRequestBytes;
+  std::istringstream in(std::string(cap + 4096, 'a') + "\n{\"id\":1}\n\nlast");
+  std::string line;
+  ASSERT_TRUE(PostgresMCPServer::read_request_line(in, line));
+  EXPECT_EQ(line.size(), cap + 1);
+  EXPECT_NE(PostgresMCPServer::request_refusal(line).find("16 MiB"), std::string::npos);
+  ASSERT_TRUE(PostgresMCPServer::read_request_line(in, line));
+  EXPECT_EQ(line, "{\"id\":1}");
+  ASSERT_TRUE(PostgresMCPServer::read_request_line(in, line));
+  EXPECT_EQ(line, "");
+  ASSERT_TRUE(PostgresMCPServer::read_request_line(in, line));
+  EXPECT_EQ(line, "last");
+  EXPECT_FALSE(PostgresMCPServer::read_request_line(in, line));
+  // Exactly at the limit is a request like any other.
+  std::istringstream at(std::string(cap, 'a') + "\n");
+  ASSERT_TRUE(PostgresMCPServer::read_request_line(at, line));
+  EXPECT_TRUE(PostgresMCPServer::request_refusal(line).empty());
+}
+
+// Through 4.7.1 the first of these lines ended the process with a
+// segmentation fault. It is answered, and so is the request after it.
+TEST_F(PostgresMCPServerTest, ADeeplyNestedRequestIsRefusedAndTheServerGoesOn) {
+  PostgresMCPServer own(test_url);
+  std::istringstream in(
+      R"({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"x":)" +
+      std::string(200000, '[') + std::string(200000, ']') + "}}\n" +
+      R"({"jsonrpc":"2.0","id":7,"method":"tools/list"})" + "\n");
+  std::ostringstream out, err;
+  std::streambuf* const saved_in = std::cin.rdbuf(in.rdbuf());
+  std::streambuf* const saved_out = std::cout.rdbuf(out.rdbuf());
+  std::streambuf* const saved_err = std::cerr.rdbuf(err.rdbuf());
+  own.run();
+  std::cin.rdbuf(saved_in);
+  std::cout.rdbuf(saved_out);
+  std::cerr.rdbuf(saved_err);
+  std::cin.clear();
+
+  std::istringstream lines(out.str());
+  std::string first, second;
+  ASSERT_TRUE(std::getline(lines, first));
+  ASSERT_TRUE(std::getline(lines, second));
+  const json refused = json::parse(first);
+  EXPECT_EQ(refused["error"]["code"].get<int>(), -32600);
+  EXPECT_TRUE(refused["id"].is_null());
+  EXPECT_NE(refused["error"]["message"].get<std::string>().find("nested deeper than 128"),
+            std::string::npos);
+  const json listed = json::parse(second);
+  EXPECT_EQ(listed["id"].get<int>(), 7);
+  EXPECT_TRUE(listed["result"].contains("tools"));
+}
+
 TEST_F(PostgresMCPServerTest, ExplainQueryRejectsNonNumericQueryId) {
   EXPECT_THROW(srv->call_explain_query("abc", "", json::array(), false, 0), std::exception);
   EXPECT_THROW(srv->call_explain_query("1; DROP TABLE x", "", json::array(), false, 0),
@@ -6480,15 +6813,21 @@ TEST_F(PostgresMCPServerTest, TheClusteringPromptMeasuresBeforeItRecommends) {
   EXPECT_NE(t.find("shop.orders"), std::string::npos);
   for (const char* reading : {"checkPrivileges", "tableStats", "physical_order_correlation",
                               "predicateStats", "rowScatter", "scatter_ratio", "n_tup_hot_upd",
+                              "n_tup_newpage_upd", "tableBloat",
                               "tableDetails", "tableSize", "ACCESS EXCLUSIVE",
                               "plan-schema-change"})
     EXPECT_NE(t.find(reading), std::string::npos) << reading << " missing from the clustering review";
+  // Through 4.7.1 the decay was estimated from updates that are not HOT. One
+  // that changes an indexed column and still fits stays on its page.
+  EXPECT_EQ(t.find("an update that is not HOT moves the row"), std::string::npos);
+  EXPECT_NE(t.find("upper bound"), std::string::npos);
   // And every tool it names exists, with the field it tells the reader to read.
   json tools = rpc1(*srv, "tools/list", json::object());
   std::set<std::string> names;
   for (const auto& tl : tools["result"]["tools"]) names.insert(tl["name"].get<std::string>());
   for (const char* tool : {"tableStats", "predicateStats", "statementStats", "rowScatter",
-                           "tableDetails", "tableSize", "checkPrivileges", "diskUsage"})
+                           "tableBloat", "tableDetails", "tableSize", "checkPrivileges",
+                           "diskUsage"})
     EXPECT_TRUE(names.count(tool)) << tool;
   // Both arguments are required: there is no table to review without them.
   json missing = rpc1(*srv, "prompts/get", {{"name", "review-clustering"},
@@ -8167,6 +8506,31 @@ TEST_F(PostgresMCPServerTest, EvaluateIndexRefusesAnUnknownIndexClearly) {
   // Named, not a raw server error leaked through.
   EXPECT_NE(r["error"].get<std::string>().find("no index named"), std::string::npos)
       << r.dump(2);
+}
+
+// evaluateIndex plans a statement the caller wrote, as explainQuery does, and
+// holds its errors to the same rule: a message that can quote a value is not
+// passed on.
+TEST_F(PostgresMCPServerTest, EvaluateIndexErrorDoesNotQuoteAValue) {
+  if (!hypopg_available(*srv)) GTEST_SKIP() << "hypopg is not installed here";
+  const json defs = json::array({"CREATE INDEX ON grocery.orders (amount)"});
+  std::string said;
+  try {
+    srv->call_evaluate_index("SELECT 'licht-secret-9131'::int FROM grocery.orders",
+                             defs, json::array());
+  } catch (const std::exception& e) {
+    said = e.what();
+  }
+  EXPECT_NE(said.find("22P02"), std::string::npos) << said;
+  EXPECT_EQ(said.find("licht-secret-9131"), std::string::npos) << said;
+  // An error about the statement as written is still PostgreSQL's own.
+  said.clear();
+  try {
+    srv->call_evaluate_index("SELECT no_such_column FROM grocery.orders", defs, json::array());
+  } catch (const std::exception& e) {
+    said = e.what();
+  }
+  EXPECT_NE(said.find("no_such_column"), std::string::npos) << said;
 }
 
 TEST_F(PostgresMCPServerTest, EvaluateIndexNeedsSomethingToEvaluate) {

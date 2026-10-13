@@ -1,5 +1,98 @@
 # Changelog
 
+## 4.7.2 (2026-10-13)
+
+What `explainQuery` let through, and a request the server could not survive.
+`explainQuery` is the one tool that executes a statement the caller wrote, and
+what it returns goes on to whoever operates the assistant. Each defect below
+was reproduced on 4.7.1 before it was fixed.
+
+### Fixed
+
+- **`explainQuery` with `analyze` no longer runs a volatile function.** A
+  read-only transaction and a plan without `ModifyTable` stop a write to a
+  table, and nothing else: `SELECT pg_terminate_backend(pid)`, as a role
+  holding only `pg_monitor` and `pg_read_all_data`, ended another session of
+  that role and was answered `analyzed: true, read_only: true`. The functions
+  a plan calls are now read from a `VERBOSE` plan, and when one of them is
+  `VOLATILE` in `pg_proc` the statement is not executed: the plan comes back
+  with `analyzed: false` and the functions under `volatile_functions`. Those
+  with no effect outside the statement are let through, and the manual lists
+  them: the ones that return a different value each time or wait (`random`,
+  `clock_timestamp`, `gen_random_uuid`, `pg_sleep` and their kin), and the
+  ones that only read the state of the server (the size functions, what the
+  `pg_locks` view reads, the WAL positions, `currval`). **A
+  statement that calls any other volatile function was analyzed through 4.7.1
+  and is not now.** What the gate cannot see is in the manual: a function
+  declared stable or immutable that has an effect anyway, one behind an
+  operator or a cast, and what a function calls inside itself.
+
+- **`budgets.ini` can forbid and allow functions for `analyze`.** The gate
+  above reads what a function declares, and a function is `VOLATILE` unless
+  someone declared otherwise, so on a database with functions of its own it
+  errs both ways: a function declared `STABLE` whose body calls
+  `pg_terminate_backend` is analyzed, and one that only reads is refused. Two
+  keys in `[analyze]` let the operator correct it: `forbidden_functions`,
+  never analyzed and reported under `forbidden_functions` in the answer, and
+  `allowed_functions`, analyzed although volatile. Entries are `schema.name`
+  and mean every function of that name; a name in both is forbidden. The
+  refusal of a volatile function now says both ways out.
+
+- **An error no longer quotes a value from a table.** `SELECT email::int FROM
+  users` under `analyze` came back with one row's email in `detail`, because
+  PostgreSQL's message for a failed cast names the value. `detail` is now
+  returned only where the message is about the statement as written: a syntax
+  or name error, an unsupported feature, a missing privilege, raised before
+  the statement ran and not from inside a function. Any other error returns
+  `sqlstate` and, new, `condition`, its standard name
+  (`invalid_text_representation`), with no message.
+
+- **Nothing is left on the connection when an explain fails.** The prepared
+  statement was deallocated on the success path only, so a timeout left
+  `pg_licht_explain_<pid>_<n>` behind, and a session advisory lock taken by
+  the statement stayed too. Neither is undone by `ROLLBACK`. pg_licht keeps a
+  connection for the next call, so both stayed for as long as it did; behind
+  PgBouncer in transaction mode they stayed on a server connection that went
+  back to the pool.
+  The explain now runs inside a savepoint, and the statement is deallocated
+  and advisory locks released in the same transaction whatever the outcome.
+
+- **A deeply nested request no longer ends the server.** One request nested
+  200,000 levels deep was a segmentation fault, and a 200 MB line was read
+  whole, at 772 MB of memory. A request is now refused before it is parsed
+  when it is nested deeper than 128 levels or longer than 16 MiB, with
+  `-32600` and a null id, and the next request is answered.
+
+- **A missing privilege is reported as one.** Explaining an `UPDATE` as a role
+  without that privilege returned "explain failed" with an empty `sqlstate`.
+  It now says which kind of error it is and why: PostgreSQL checks privileges
+  for `EXPLAIN` as for the statement itself, with or without `analyze`.
+
+- **`review-clustering` counts the updates that leave their page.** Step 5
+  said "an update that is not HOT moves the row". One that changes an indexed
+  column and still fits stays on its page, so `n_tup_upd - n_tup_hot_upd`
+  overstates how fast a clustered order decays. The step now reads
+  `n_tup_newpage_upd`, which PostgreSQL 16 and later count exactly, and names
+  the old figure as an upper bound on 14 and 15.
+
+### Changed
+
+- **`rowScatter` says what its packing figure rests on.** In exact mode
+  `rows_per_page` is `pg_class`'s `reltuples` over `relpages`, so on a bloated
+  table the ratio understates the scatter. The note and the prompt say so and
+  point to `tableBloat`.
+
+- **The manual documents `application_name` and the keys passed to libpq.** A
+  section that sets `application_name` replaces pg_licht's own, which tells
+  apart several people behind one database role. It also says that the default
+  connections file is used alone when it exists, `DATABASE_URL` unread, and
+  that without `connect_timeout` an unreachable server is waited for as long
+  as the operating system waits.
+
+- **The manual says what `explainQuery` cannot be kept from**: functions run
+  while planning, values confirmed by row counts or by whether a statement
+  fails, and the write privilege a plain explain of a write needs.
+
 ## 4.7.1 (2026-10-11)
 
 Three defects in the MCP layer, and two sentences that said more than is true
