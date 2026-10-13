@@ -1,6 +1,6 @@
 # Changelog
 
-## 4.7.2 (unreleased)
+## 4.7.2 (2026-10-13)
 
 What `explainQuery` let through, and a request the server could not survive.
 `explainQuery` is the one tool that executes a statement the caller wrote, and
