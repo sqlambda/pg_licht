@@ -27,6 +27,17 @@ was reproduced on 4.7.1 before it was fixed.
   declared stable or immutable that has an effect anyway, one behind an
   operator or a cast, and what a function calls inside itself.
 
+- **`budgets.ini` can forbid and allow functions for `analyze`.** The gate
+  above reads what a function declares, and a function is `VOLATILE` unless
+  someone declared otherwise, so on a database with functions of its own it
+  errs both ways: a function declared `STABLE` whose body calls
+  `pg_terminate_backend` is analyzed, and one that only reads is refused. Two
+  keys in `[analyze]` let the operator correct it: `forbidden_functions`,
+  never analyzed and reported under `forbidden_functions` in the answer, and
+  `allowed_functions`, analyzed although volatile. Entries are `schema.name`
+  and mean every function of that name; a name in both is forbidden. The
+  refusal of a volatile function now says both ways out.
+
 - **An error no longer quotes a value from a table.** `SELECT email::int FROM
   users` under `analyze` came back with one row's email in `detail`, because
   PostgreSQL's message for a failed cast names the value. `detail` is now

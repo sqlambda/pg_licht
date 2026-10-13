@@ -479,7 +479,14 @@ the plan unexecuted. Both ratios can be changed in a `budgets.ini`:
 [analyze]
 memory_percent   = 10   ; worst-case plan memory, % of host_ram_mb
 vcpus_per_worker = 4    ; one parallel worker per this many host_vcpus
+forbidden_functions = audit.log_event    ; never analyzed, whatever it declares
+allowed_functions   = app.current_tenant ; analyzed although volatile
 ```
+
+The last two correct the gate that refuses to analyze a statement calling a volatile
+function. It trusts what a function declares, and only you know your own: a function
+declared `STABLE` that changes something is named under `forbidden_functions`, and one that
+is volatile only because nobody labelled it under `allowed_functions`.
 
 It is read from `$PG_LICHT_BUDGETS`, from beside the connections file, or from
 `~/.config/pg_licht/budgets.ini`, in that order, and must not be writable by other users.

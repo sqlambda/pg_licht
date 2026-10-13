@@ -905,7 +905,37 @@ struct Budgets {
   // and a guess set too low refuses answers a client would have taken. An
   // operator who knows their client's limit sets it.
   long long payload_max_kb = 0;
+  // Functions by schema and name, for explainQuery's analyze. The gate that
+  // refuses a volatile function reads what a function declares and not what
+  // it does, and only the operator knows the functions of their own database:
+  // one declared STABLE that ends sessions anyway is forbidden here, and one
+  // that is volatile only because nobody labelled it is allowed here. By
+  // name, every overload: the plan the gate reads does not print which
+  // signature was meant.
+  std::vector<std::pair<std::string, std::string>> analyze_forbidden;
+  std::vector<std::pair<std::string, std::string>> analyze_allowed;
   std::string source = "built-in defaults";
+
+  // "schema.name, schema.name" into pairs. The schema is required: a bare
+  // name would forbid or allow whatever any schema calls by it. An empty
+  // value is an empty list.
+  static std::vector<std::pair<std::string, std::string>> function_list(
+      const std::string& val, const std::string& where) {
+    std::vector<std::pair<std::string, std::string>> out;
+    if (val.empty()) return out;
+    for (const std::string& item : detail::split_list(val, where)) {
+      const auto dot = item.find('.');
+      if (dot == std::string::npos || dot == 0 || dot + 1 == item.size() ||
+          item.find('.', dot + 1) != std::string::npos ||
+          item.find_first_of(" \t()\"") != std::string::npos)
+        throw std::runtime_error(
+          where + ": \"" + item + "\" is not schema.name; write the schema and the "
+          "function's name as the catalog holds them, without quotes or parameters "
+          "-- every function of that name is meant");
+      out.emplace_back(item.substr(0, dot), item.substr(dot + 1));
+    }
+    return out;
+  }
 
   // Which file to read, or "" for the built-in defaults. Pure, so the order is
   // testable without touching the environment:
@@ -1014,9 +1044,14 @@ struct Budgets {
         if (v > 1024)
           throw std::runtime_error(where + " vcpus_per_worker: " + val + " is out of range; 1 to 1024");
         b.analyze_vcpus_per_worker = static_cast<int>(v);
+      } else if (key == "forbidden_functions") {
+        b.analyze_forbidden = function_list(val, where + " forbidden_functions");
+      } else if (key == "allowed_functions") {
+        b.analyze_allowed = function_list(val, where + " allowed_functions");
       } else {
         throw std::runtime_error(where + ": unknown key \"" + key + "\" in [analyze]; "
-                                 "expected memory_percent or vcpus_per_worker");
+                                 "expected memory_percent, vcpus_per_worker, "
+                                 "forbidden_functions or allowed_functions");
       }
     }
     b.source = path;

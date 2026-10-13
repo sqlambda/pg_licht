@@ -556,12 +556,46 @@ answer may be.
 [analyze]
 memory_percent   = 10   ; worst-case plan memory, % of host_ram_mb
 vcpus_per_worker = 4    ; one parallel worker per this many host_vcpus
+forbidden_functions =   ; schema.name, ... never analyzed
+allowed_functions =     ; schema.name, ... analyzed although volatile
 
 [payload]
 max_kb = 0              ; largest answer returned whole; 0, the default, is off
 .Ed
 .Pp
 Those are the built-in values, used when no file is found.
+.Pp
+.Va forbidden_functions
+and
+.Va allowed_functions
+correct the gate that keeps
+.Ic explainQuery
+from analyzing a statement whose plan calls a volatile function.
+That gate reads what a function declares and not what it does, and only the
+operator knows the functions of their own database.
+A function named under
+.Va forbidden_functions
+is never analyzed, even though it is declared
+.Li STABLE
+or
+.Li IMMUTABLE ;
+the answer names it under
+.Va forbidden_functions .
+A function named under
+.Va allowed_functions
+is analyzed although it is
+.Li VOLATILE ,
+which is what a function is when nobody declared otherwise.
+Each entry is
+.Ar schema Ns Li \&. Ns Ar name ,
+as the catalog holds them, without quotes or parameters: the plan the gate
+reads does not say which signature was meant, so every function of that name
+is.
+A name in both lists is forbidden.
+The lists apply to
+.Va analyze
+only: a function PostgreSQL evaluates while it builds the plan has run before
+any list can be consulted.
 .Va memory_percent
 takes 1 to 100,
 .Va vcpus_per_worker

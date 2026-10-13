@@ -2861,7 +2861,8 @@ private:
                                    {{"plan", "array"}, {"sql", "string"}, {"source", "string"},
                                     {"analyzed", "boolean"}, {"generic", "boolean"},
                                     {"read_only", "boolean"},
-                                    {"volatile_functions", "array"}})},
+                                    {"volatile_functions", "array"},
+                                    {"forbidden_functions", "array"}})},
       {"tableBloat",             schema_fixed("Physical storage bloat for one table.", {})},
       {"indexBloat",             schema_fixed("Physical statistics for one index, per access method.", {})},
       {"bufferCacheSummary",     schema_fixed("Shared buffer occupancy across the instance.", {})},
@@ -6468,14 +6469,30 @@ private:
     return schema == "pg_catalog" && ok.count(name) > 0;
   }
 
-  // The volatile functions a statement's plan calls, as "schema.name", sorted.
+  // What stands between a statement and its execution, as two sorted lists of
+  // "schema.name": the functions its plan calls that the operator forbade in
+  // budgets.ini, and the volatile ones nothing lets through. Either refuses.
+  //
+  // A call the plan prints without a schema matches the name in any schema,
+  // for both lists' purposes: forbidden then errs toward refusing, and so
+  // does volatile, since an unqualified name the operator allowed in one
+  // schema is still refused when another schema has a volatile function of
+  // that name.
   template<typename T>
-  static json volatile_calls(T& tx, const std::string& target) {
+  json analyze_gate(T& tx, const std::string& target) {
     pqxx::result const v = tx.exec("EXPLAIN (VERBOSE, FORMAT JSON) " + target);
     std::set<std::pair<std::string, std::string>> calls;
     plan_calls(json::parse(v[0][0].as<std::string>()), calls);
+    json forbidden = json::array();
+    {
+      std::set<std::string> hit;
+      for (const auto& f : budgets_.analyze_forbidden)
+        if (calls.count({std::string(), f.second}) > 0 || calls.count(f) > 0)
+          hit.insert(f.first + "." + f.second);
+      for (const auto& h : hit) forbidden.push_back(h);
+    }
     json found = json::array();
-    if (calls.empty()) return found;
+    if (calls.empty()) return {{"forbidden", forbidden}, {"volatile", found}};
     json names = json::array();
     for (const auto& c : calls) names.push_back(c.second);
     pqxx::result const res = pqxx_exec(tx, R"(
@@ -6490,12 +6507,15 @@ private:
       const std::string schema = row[0].as<std::string>();
       const std::string name = row[1].as<std::string>();
       if (harmless_volatile(schema, name)) continue;
+      if (std::find(budgets_.analyze_allowed.begin(), budgets_.analyze_allowed.end(),
+                    std::make_pair(schema, name)) != budgets_.analyze_allowed.end())
+        continue;
       // An unqualified call matches the name in any schema; a qualified one
       // only in its own.
       if (calls.count({std::string(), name}) > 0 || calls.count({schema, name}) > 0)
         found.push_back(schema + "." + name);
     }
-    return found;
+    return {{"forbidden", forbidden}, {"volatile", found}};
   }
 
   // The standard name of an SQLSTATE, for the errors whose message is not
@@ -6882,6 +6902,7 @@ private:
       const bool explicit_settings = settings.is_object() && !settings.empty();
       json exec_budget;
       json volatile_found = json::array();
+      json forbidden_found = json::array();
 
       // --- Phase B: optionally execute, only once proven safe ---
       if (analyze) {
@@ -6904,15 +6925,27 @@ private:
         } else {
           std::string const target = prepared.empty()
             ? sql : ("EXECUTE " + prepared + "(" + lits + ")");
-          volatile_found = volatile_calls(tx, target);
-          if (!volatile_found.empty()) {
+          const json gate = analyze_gate(tx, target);
+          forbidden_found = gate["forbidden"];
+          volatile_found = gate["volatile"];
+          auto listed = [](const json& fs) {
             std::string names;
-            for (const auto& f : volatile_found)
-              names += (names.empty() ? "" : ", ") + f.get<std::string>();
-            note = "not analyzed: the plan calls " + names + ", which PostgreSQL "
-                   "marks VOLATILE -- a function that may change the server or the "
-                   "session in ways a read-only transaction does not prevent, such "
-                   "as ending another session. Only the plan is returned";
+            for (const auto& f : fs) names += (names.empty() ? "" : ", ") + f.get<std::string>();
+            return names;
+          };
+          if (!forbidden_found.empty()) {
+            note = "not analyzed: the plan calls " + listed(forbidden_found) +
+                   ", which this server's budgets.ini forbids under "
+                   "forbidden_functions. Only the plan is returned";
+          } else if (!volatile_found.empty()) {
+            note = "not analyzed: the plan calls " + listed(volatile_found) +
+                   ", which PostgreSQL marks VOLATILE -- a function that may change "
+                   "the server or the session in ways a read-only transaction does "
+                   "not prevent, such as ending another session. Only the plan is "
+                   "returned. A function is VOLATILE unless it was declared "
+                   "otherwise: one that only reads can be declared STABLE in the "
+                   "database, or named under allowed_functions in this server's "
+                   "budgets.ini by its operator";
           } else {
             executing = true;
             pqxx::result const r = tx.exec(
@@ -6937,6 +6970,7 @@ private:
         {"sql",        sql}
       };
       if (!note.empty())    out["note"] = note;
+      if (!forbidden_found.empty()) out["forbidden_functions"] = forbidden_found;
       if (!volatile_found.empty()) out["volatile_functions"] = volatile_found;
       if (!stats.is_null()) out["statement"] = stats;
       if (!plan_env.is_null()) {

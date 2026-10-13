@@ -4961,6 +4961,101 @@ TEST_F(PostgresMCPServerTest, ExplainQueryLeavesNothingBehindWhenItFails) {
   }
 }
 
+// The gate reads what a function declares, and only the operator knows what
+// the functions of their own database do. budgets.ini carries both
+// corrections: a function declared STABLE that is not to run, and one that is
+// volatile only because nobody labelled it.
+TEST_F(PostgresMCPServerTest, BudgetsForbidAndAllowFunctionsByName) {
+  {
+    pqxx::connection c(test_url);
+    pqxx::nontransaction n(c);
+    n.exec("CREATE OR REPLACE FUNCTION grocery.licht_reader(int) RETURNS int "
+           "LANGUAGE plpgsql AS 'BEGIN RETURN $1 + 1; END'");
+    n.exec("CREATE OR REPLACE FUNCTION grocery.licht_declared_stable(int) RETURNS int STABLE "
+           "LANGUAGE plpgsql AS 'BEGIN RETURN $1 + 1; END'");
+  }
+  const std::string reader = "SELECT grocery.licht_reader(id) FROM grocery.users";
+  const std::string stable = "SELECT grocery.licht_declared_stable(id) FROM grocery.users";
+  PostgresMCPServer s(test_url);
+
+  // Built-in: unlabelled is volatile and refused, with the two ways out named.
+  json r = s.call_explain_query("", reader, json::array(), true, 2000);
+  EXPECT_FALSE(r["analyzed"].get<bool>()) << r.dump(2);
+  EXPECT_EQ(r["volatile_functions"], json::array({"grocery.licht_reader"}));
+  EXPECT_NE(r["note"].get<std::string>().find("allowed_functions"), std::string::npos);
+  EXPECT_NE(r["note"].get<std::string>().find("STABLE"), std::string::npos);
+  r = s.call_explain_query("", stable, json::array(), true, 2000);
+  EXPECT_TRUE(r["analyzed"].get<bool>()) << r.dump(2);
+
+  s.set_budgets(pglicht::Budgets::parse_text(
+      "[analyze]\n"
+      "allowed_functions = grocery.licht_reader\n"
+      "forbidden_functions = grocery.licht_declared_stable, pg_catalog.pg_sleep\n", "t"));
+  r = s.call_explain_query("", reader, json::array(), true, 2000);
+  EXPECT_TRUE(r["analyzed"].get<bool>()) << r.dump(2);
+  EXPECT_FALSE(r.contains("volatile_functions"));
+  r = s.call_explain_query("", stable, json::array(), true, 2000);
+  EXPECT_FALSE(r["analyzed"].get<bool>()) << r.dump(2);
+  EXPECT_EQ(r["forbidden_functions"], json::array({"grocery.licht_declared_stable"}));
+  EXPECT_NE(r["note"].get<std::string>().find("forbidden_functions"), std::string::npos);
+  // A function the built-in list lets through can be forbidden too.
+  r = s.call_explain_query("", "SELECT pg_sleep(0)", json::array(), true, 2000);
+  EXPECT_FALSE(r["analyzed"].get<bool>()) << r.dump(2);
+  EXPECT_EQ(r["forbidden_functions"], json::array({"pg_catalog.pg_sleep"}));
+  // Without analyze nothing is executed, so nothing is refused.
+  r = s.call_explain_query("", stable, json::array(), false, 0);
+  EXPECT_TRUE(r.contains("plan")) << r.dump(2);
+  EXPECT_FALSE(r.contains("forbidden_functions"));
+
+  // In both lists, forbidden wins.
+  s.set_budgets(pglicht::Budgets::parse_text(
+      "[analyze]\nallowed_functions = grocery.licht_reader\n"
+      "forbidden_functions = grocery.licht_reader\n", "t"));
+  r = s.call_explain_query("", reader, json::array(), true, 2000);
+  EXPECT_FALSE(r["analyzed"].get<bool>()) << r.dump(2);
+  EXPECT_TRUE(r.contains("forbidden_functions")) << r.dump(2);
+  // Allowing a name in one schema does not allow it in another.
+  s.set_budgets(pglicht::Budgets::parse_text(
+      "[analyze]\nallowed_functions = public.licht_reader\n", "t"));
+  r = s.call_explain_query("", reader, json::array(), true, 2000);
+  EXPECT_FALSE(r["analyzed"].get<bool>()) << r.dump(2);
+
+  {
+    pqxx::connection c(test_url);
+    pqxx::nontransaction n(c);
+    n.exec("DROP FUNCTION IF EXISTS grocery.licht_reader(int)");
+    n.exec("DROP FUNCTION IF EXISTS grocery.licht_declared_stable(int)");
+  }
+}
+
+TEST(BudgetsFunctionListTest, NamesAreSchemaAndNameAndNothingElse) {
+  const auto b = pglicht::Budgets::parse_text(
+      "[analyze]\nforbidden_functions = audit.log_event , public.wrap, audit.log_event\n"
+      "allowed_functions =\n", "t");
+  ASSERT_EQ(b.analyze_forbidden.size(), 2u);
+  EXPECT_EQ(b.analyze_forbidden[0], std::make_pair(std::string("audit"), std::string("log_event")));
+  EXPECT_EQ(b.analyze_forbidden[1], std::make_pair(std::string("public"), std::string("wrap")));
+  EXPECT_TRUE(b.analyze_allowed.empty());
+  EXPECT_TRUE(pglicht::Budgets{}.analyze_forbidden.empty());
+  for (const char* bad : {"log_event", "audit.log_event(int)", "a.b.c", ".x", "x.",
+                          "\"Audit\".log", "audit.log event", "audit.a,,audit.b"}) {
+    const std::string text = std::string("[analyze]\nforbidden_functions = ") + bad + "\n";
+    EXPECT_THROW(pglicht::Budgets::parse_text(text, "t"), std::runtime_error) << bad;
+    const std::string allowed = std::string("[analyze]\nallowed_functions = ") + bad + "\n";
+    EXPECT_THROW(pglicht::Budgets::parse_text(allowed, "t"), std::runtime_error) << bad;
+  }
+  // The refusal says what the entry should have been.
+  try {
+    pglicht::Budgets::parse_text("[analyze]\nforbidden_functions = log_event\n", "t");
+    ADD_FAILURE() << "a name without a schema was accepted";
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("schema.name"), std::string::npos) << e.what();
+  }
+  // The keys belong to [analyze] alone.
+  EXPECT_THROW(pglicht::Budgets::parse_text("[payload]\nforbidden_functions = a.b\n", "t"),
+               std::runtime_error);
+}
+
 // EXPLAIN checks privileges as the statement would, analyze or not, so a role
 // that may read everything still cannot have an UPDATE explained.
 TEST_F(PostgresMCPServerTest, ExplainOfAWriteWithoutThePrivilegeSaysWhy) {

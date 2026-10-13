@@ -32,7 +32,8 @@ with its limits, in the manual's SECURITY CONSIDERATIONS section (`man pg_licht_
 - **The limits of that exception are the connecting role's.** The volatile gate trusts
   what a function declares and reads its name from the plan: a function declared stable
   or immutable that has an effect anyway, one behind an operator or a cast, and what a
-  function calls inside itself are not seen. Planning alone evaluates immutable and
+  function calls inside itself are not seen. An operator who knows of such a function
+  names it under `forbidden_functions` in `budgets.ini`, and it is then never analyzed. Planning alone evaluates immutable and
   stable functions, so they run without `analyze`. And PostgreSQL checks privileges for
   `EXPLAIN` as for the statement itself: explaining a write needs the write privilege on
   the table, which `pg_monitor` and `pg_read_all_data` do not give.
