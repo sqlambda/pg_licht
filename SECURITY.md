@@ -25,7 +25,19 @@ with its limits, in the manual's SECURITY CONSIDERATIONS section (`man pg_licht_
   are parameterized; no argument is concatenated into SQL text. `explainQuery` with
   `analyze` executes the caller's statement only after its plan is proven free of any
   `ModifyTable` node, so data-modifying statements, data-modifying CTEs included, are
-  never run. It requires an explicit timeout.
+  never run, and of any function PostgreSQL marks `VOLATILE`, since such a function can
+  change the server in ways a read-only transaction does not prevent (end another
+  session, reload the configuration). It requires an explicit timeout, and leaves no
+  prepared statement or session lock on the connection, whatever the outcome.
+- **The limits of that exception are the connecting role's.** The volatile gate trusts
+  what a function declares and reads its name from the plan: a function declared stable
+  or immutable that has an effect anyway, one behind an operator or a cast, and what a
+  function calls inside itself are not seen. Planning alone evaluates immutable and
+  stable functions, so they run without `analyze`. And PostgreSQL checks privileges for
+  `EXPLAIN` as for the statement itself: explaining a write needs the write privilege on
+  the table, which `pg_monitor` and `pg_read_all_data` do not give.
+- **A request is bounded before it is parsed.** One nested deeper than 128 levels, or
+  longer than 16 MiB, is refused with a JSON-RPC error and the server goes on.
 - **A PgBouncer admin console gets fixed `SHOW` commands only.** The console refuses
   transactions, so the read-only guard cannot apply there. The pooler tools send only
   `SHOW` commands that are constants in the server, with nothing from the caller in them,
@@ -51,6 +63,15 @@ running (`currentActivity`, `currentLocks`) and that `pg_stat_statements` record
 `primary_conninfo`); and, from a PgBouncer console, client addresses, application
 names, backend hosts and pool users. The manual's "What reaches the caller" lists every
 case. Run pg_licht as a role whose visibility you are content to hand to the client.
+
+Two things about `explainQuery` belong here too. When a statement fails, PostgreSQL's
+message is returned only where it is about the statement as written; a data error quotes
+the value that failed, so for any other error only the SQLSTATE and its name come back.
+And with `analyze`, a caller can confirm a value it proposes without a row being
+returned, from the plan's row counts or from whether a statement fails. That is inherent
+to executing a caller's statement and is not prevented: what reaches the caller reaches
+whoever operates the assistant, so a table of personal data is protected by the role not
+being able to `SELECT` it.
 
 ## The build
 

@@ -719,9 +719,75 @@ public:
                     std::shared_ptr<ConnectionCache> cache)
     : registry_(registry), cache_(std::move(cache)) {}
 
+  // The two limits on a request, checked before it is parsed. A request is
+  // the one input that comes from outside the operator's control, and through
+  // 4.7.1 it had neither: an array nested 200,000 deep ended the server with a
+  // segmentation fault -- nlohmann parses it iteratively and then copies it
+  // recursively -- and a 200 MB line was read whole, at 772 MB of memory. The
+  // deepest request this server has a use for is four levels, a settings
+  // object inside the arguments, and the only long field is a statement's
+  // text.
+  static constexpr size_t kMaxRequestBytes = static_cast<size_t>(16) * 1024 * 1024;
+  static constexpr int kMaxRequestDepth = 128;
+
+  // Why a request line is refused unparsed; empty when it may be parsed.
+  // Brackets are counted outside strings only, so a statement's text may hold
+  // as many as it likes. A line that is not JSON at all passes, and is the
+  // parser's to refuse.
+  static std::string request_refusal(const std::string& line) {
+    if (line.size() > kMaxRequestBytes)
+      return "the request is longer than " + std::to_string(kMaxRequestBytes / (static_cast<size_t>(1024) * 1024)) +
+             " MiB";
+    int depth = 0;
+    bool in_string = false, escaped = false;
+    for (char const c : line) {
+      if (in_string) {
+        if (escaped) escaped = false;
+        else if (c == '\\') escaped = true;
+        else if (c == '"') in_string = false;
+        continue;
+      }
+      if (c == '"') in_string = true;
+      else if (c == '[' || c == '{') {
+        if (++depth > kMaxRequestDepth)
+          return "the request is nested deeper than " + std::to_string(kMaxRequestDepth) +
+                 " levels";
+      } else if (c == ']' || c == '}') {
+        --depth;
+      }
+    }
+    return "";
+  }
+
+  // std::getline, except that it keeps no more of a line than is needed to
+  // know it is too long: the rest is read and dropped, so the next line is
+  // still the next request.
+  static bool read_request_line(std::istream& in, std::string& line) {
+    line.clear();
+    std::streambuf* const sb = in.rdbuf();
+    bool any = false;
+    for (;;) {
+      const int ch = sb->sbumpc();
+      if (ch == std::char_traits<char>::eof()) {
+        if (!any) in.setstate(std::ios::eofbit | std::ios::failbit);
+        return any;
+      }
+      any = true;
+      if (ch == '\n') return true;
+      if (line.size() <= kMaxRequestBytes) line.push_back(static_cast<char>(ch));
+    }
+  }
+
   void run() {
     std::string line;
-    while (std::getline(std::cin, line)) {
+    while (read_request_line(std::cin, line)) {
+      // Refused before parsing, so with no id to answer to: the id is inside
+      // what was not read.
+      if (const std::string why = request_refusal(line); !why.empty()) {
+        std::cerr << "Invalid request: " << why << std::endl;
+        send_error(json(), -32600, "Invalid request: " + why);
+        continue;
+      }
       json request;
       try {
         request = json::parse(line);
@@ -2794,7 +2860,8 @@ private:
       {"explainQuery",           schema_fixed("An EXPLAIN plan and what produced it.",
                                    {{"plan", "array"}, {"sql", "string"}, {"source", "string"},
                                     {"analyzed", "boolean"}, {"generic", "boolean"},
-                                    {"read_only", "boolean"}})},
+                                    {"read_only", "boolean"},
+                                    {"volatile_functions", "array"}})},
       {"tableBloat",             schema_fixed("Physical storage bloat for one table.", {})},
       {"indexBloat",             schema_fixed("Physical statistics for one index, per access method.", {})},
       {"bufferCacheSummary",     schema_fixed("Shared buffer occupancy across the instance.", {})},
@@ -2970,8 +3037,8 @@ private:
         };
         // explainQuery is the carve-out. With analyze:true it really executes
         // the statement -- the plan is proven free of any ModifyTable node
-        // first, so it still cannot mutate, but running it twice is not the
-        // same as running it once.
+        // and of any volatile function first, so it still cannot mutate, but
+        // running it twice is not the same as running it once.
         if (name == "explainQuery") ann["idempotentHint"] = false;
         tool["annotations"] = ann;
       }
@@ -5927,7 +5994,7 @@ private:
   // statement's inferred parameter type. That is deliberate: it means there is
   // exactly one escaping path (txn.quote, i.e. libpq's escaping) rather than
   // one per JSON type, and no numeric or boolean value is ever spliced in raw.
-  static std::string build_execute_literals(pqxx::work& txn, const json& params) {
+  static std::string build_execute_literals(pqxx::dbtransaction& txn, const json& params) {
     std::string lits;
     for (size_t i = 0; i < params.size(); i++) {
       if (i > 0) lits += ", ";
@@ -6026,7 +6093,7 @@ private:
   // Decides whether a plan built under caller settings may be executed, and
   // says why in either case. `allowed` is the decision; everything else is the
   // arithmetic, so a refusal can be checked rather than taken on trust.
-  json analyze_budget(pqxx::work& txn, const json& plan) {
+  json analyze_budget(pqxx::dbtransaction& txn, const json& plan) {
     const pglicht::HostCapacity& cap = active_cfg().capacity;
     json out = json::object();
     json host = json::object();
@@ -6302,6 +6369,220 @@ private:
     return "";
   }
 
+  // --- the volatile gate ---
+  // A READ ONLY transaction and a plan without ModifyTable stop a statement
+  // from writing to a table. They do not stop a function whose effect is
+  // something else: through 4.7.1, SELECT pg_terminate_backend(pid) under
+  // analyze ended another session and was answered analyzed: true,
+  // read_only: true. PostgreSQL's own word for "may have an effect" is
+  // VOLATILE, so analyze is refused when the plan calls a volatile function.
+  //
+  // The functions are read from the text of a VERBOSE plan, which is the only
+  // place PostgreSQL names them: the plain plan of SELECT f() is a Result node
+  // and nothing else. A name followed by an opening parenthesis is a call, or
+  // a construct such as COALESCE( that pg_proc does not know and which is
+  // then ignored. The match is by name, not by signature: one volatile
+  // function of that name refuses, whichever overload the plan meant.
+  //
+  // What this cannot see, and the manual says so: a function declared STABLE
+  // or IMMUTABLE that has an effect anyway, a volatile function behind an
+  // operator or a cast, and whatever a function calls inside itself.
+  static void collect_calls(const std::string& s,
+                            std::set<std::pair<std::string, std::string>>& out) {
+    const size_t n = s.size();
+    size_t i = 0;
+    std::vector<std::string> chain;   // identifiers joined by dots, so far
+    auto is_start = [](unsigned char c) { return std::isalpha(c) || c == '_' || c >= 0x80; };
+    auto is_part = [](unsigned char c) {
+      return std::isalnum(c) || c == '_' || c == '$' || c >= 0x80;
+    };
+    while (i < n) {
+      const auto c = static_cast<unsigned char>(s[i]);
+      if (c == '\'') {                // a string constant; '' is a quote within it
+        ++i;
+        while (i < n) {
+          if (s[i] == '\'') {
+            if (i + 1 < n && s[i + 1] == '\'') { i += 2; continue; }
+            ++i;
+            break;
+          }
+          ++i;
+        }
+        chain.clear();
+        continue;
+      }
+      std::string ident;
+      bool got = false;
+      if (c == '"') {                 // a quoted identifier; "" is a quote within it
+        ++i;
+        while (i < n) {
+          if (s[i] == '"') {
+            if (i + 1 < n && s[i + 1] == '"') { ident += '"'; i += 2; continue; }
+            ++i;
+            break;
+          }
+          ident += s[i++];
+        }
+        got = true;
+      } else if (is_start(c)) {
+        while (i < n && is_part(static_cast<unsigned char>(s[i]))) ident += s[i++];
+        got = true;
+      }
+      if (!got) { chain.clear(); ++i; continue; }
+      chain.push_back(ident);
+      if (i < n && s[i] == '.') { ++i; continue; }
+      if (i < n && s[i] == '(')
+        out.insert({chain.size() >= 2 ? chain[chain.size() - 2] : std::string(), chain.back()});
+      chain.clear();
+    }
+  }
+
+  static void plan_calls(const json& node, std::set<std::pair<std::string, std::string>>& out) {
+    if (node.is_string()) { collect_calls(node.get_ref<const std::string&>(), out); return; }
+    if (node.is_array()) { for (const auto& e : node) plan_calls(e, out); return; }
+    if (!node.is_object()) return;
+    // A Function Scan names its function without parentheses.
+    auto fn = node.find("Function Name");
+    if (fn != node.end() && fn->is_string())
+      out.insert({json_str(node, "Schema"), fn->get<std::string>()});
+    for (const auto& e : node.items()) plan_calls(e.value(), out);
+  }
+
+  // Volatile in pg_proc, and with no effect outside the statement that calls
+  // them. The first group returns a different value each time, or waits. The
+  // second only reads the state of the server, and is volatile because that
+  // state moves under it: without it SELECT count(*) FROM pg_locks could not
+  // be analyzed. The functions that read files -- pg_read_file, pg_ls_dir,
+  // pg_stat_file -- and query_to_xml are deliberately not here.
+  static bool harmless_volatile(const std::string& schema, const std::string& name) {
+    static const std::set<std::string> ok = {
+      "random", "random_normal", "clock_timestamp", "timeofday",
+      "gen_random_uuid", "uuidv4", "uuidv7",
+      "pg_sleep", "pg_sleep_for", "pg_sleep_until",
+
+      "pg_relation_size", "pg_total_relation_size", "pg_table_size",
+      "pg_indexes_size", "pg_database_size", "pg_tablespace_size",
+      "pg_lock_status", "pg_blocking_pids", "pg_safe_snapshot_blocking_pids",
+      "pg_is_in_recovery", "pg_current_wal_lsn", "pg_last_wal_replay_lsn",
+      "pg_last_committed_xact", "pg_stat_get_io", "currval", "lastval"};
+    return schema == "pg_catalog" && ok.count(name) > 0;
+  }
+
+  // The volatile functions a statement's plan calls, as "schema.name", sorted.
+  template<typename T>
+  static json volatile_calls(T& tx, const std::string& target) {
+    pqxx::result const v = tx.exec("EXPLAIN (VERBOSE, FORMAT JSON) " + target);
+    std::set<std::pair<std::string, std::string>> calls;
+    plan_calls(json::parse(v[0][0].as<std::string>()), calls);
+    json found = json::array();
+    if (calls.empty()) return found;
+    json names = json::array();
+    for (const auto& c : calls) names.push_back(c.second);
+    pqxx::result const res = pqxx_exec(tx, R"(
+      SELECT DISTINCT n.nspname::text, p.proname::text
+        FROM pg_proc AS p
+        JOIN pg_namespace AS n ON n.oid = p.pronamespace
+       WHERE p.provolatile = 'v'
+         AND p.proname IN (SELECT jsonb_array_elements_text($1::jsonb))
+       ORDER BY 1, 2;
+    )", pqxx::params{names.dump()});
+    for (const auto& row : res) {
+      const std::string schema = row[0].as<std::string>();
+      const std::string name = row[1].as<std::string>();
+      if (harmless_volatile(schema, name)) continue;
+      // An unqualified call matches the name in any schema; a qualified one
+      // only in its own.
+      if (calls.count({std::string(), name}) > 0 || calls.count({schema, name}) > 0)
+        found.push_back(schema + "." + name);
+    }
+    return found;
+  }
+
+  // The standard name of an SQLSTATE, for the errors whose message is not
+  // returned. The class name where the code itself is not listed.
+  static std::string sqlstate_name(const std::string& ss) {
+    static const std::map<std::string, std::string> codes = {
+      {"21000", "cardinality_violation"},
+      {"22001", "string_data_right_truncation"},
+      {"22003", "numeric_value_out_of_range"},
+      {"22004", "null_value_not_allowed"},
+      {"22007", "invalid_datetime_format"},
+      {"22008", "datetime_field_overflow"},
+      {"22012", "division_by_zero"},
+      {"22021", "character_not_in_repertoire"},
+      {"22023", "invalid_parameter_value"},
+      {"22025", "invalid_escape_sequence"},
+      {"2201B", "invalid_regular_expression"},
+      {"22P02", "invalid_text_representation"},
+      {"22P03", "invalid_binary_representation"},
+      {"40001", "serialization_failure"},
+      {"40P01", "deadlock_detected"},
+      {"53200", "out_of_memory"},
+      {"54001", "statement_too_complex"},
+      {"55P03", "lock_not_available"},
+      {"P0001", "raise_exception"},
+      {"P0002", "no_data_found"},
+      {"P0003", "too_many_rows"},
+      {"XX000", "internal_error"}};
+    static const std::map<std::string, std::string> classes = {
+      {"08", "connection_exception"},        {"0A", "feature_not_supported"},
+      {"21", "cardinality_violation"},       {"22", "data_exception"},
+      {"23", "integrity_constraint_violation"}, {"25", "invalid_transaction_state"},
+      {"26", "invalid_sql_statement_name"},  {"2F", "sql_routine_exception"},
+      {"38", "external_routine_exception"},  {"39", "external_routine_invocation_exception"},
+      {"40", "transaction_rollback"},        {"42", "syntax_error_or_access_rule_violation"},
+      {"53", "insufficient_resources"},      {"54", "program_limit_exceeded"},
+      {"55", "object_not_in_prerequisite_state"}, {"57", "operator_intervention"},
+      {"58", "system_error"},                {"P0", "plpgsql_error"},
+      {"XX", "internal_error"}};
+    if (auto it = codes.find(ss); it != codes.end()) return it->second;
+    if (ss.size() >= 2)
+      if (auto it = classes.find(ss.substr(0, 2)); it != classes.end()) return it->second;
+    return "";
+  }
+
+  // libpqxx 7 raises insufficient_privilege without its SQLSTATE.
+  static std::string sqlstate_of(const pqxx::sql_error& e) {
+    std::string ss(e.sqlstate());
+    if (ss.empty() && dynamic_cast<const pqxx::insufficient_privilege*>(&e) != nullptr)
+      ss = "42501";
+    return ss;
+  }
+
+  // Whether PostgreSQL's message for a statement the caller wrote may be
+  // returned. Only where it is about the statement as written: a syntax or
+  // name error, an unsupported feature, a read-only violation -- raised
+  // before the statement ran, and not from inside a function. Anything else
+  // can quote a value out of a table. Through 4.7.1 SELECT email::int FROM
+  // users under analyze came back with one row's email in `detail`, and what
+  // reaches the caller is handed on to whoever operates the agent.
+  //
+  // The line labels are libpq's and are English here: this process never
+  // calls setlocale, so libpq's own catalog is not loaded, whatever language
+  // the server answers in.
+  static bool about_the_statement(const std::string& ss, const std::string& what,
+                                  bool executing) {
+    const std::string cls = ss.substr(0, std::min<size_t>(2, ss.size()));
+    return !executing && (cls == "42" || cls == "0A" || cls == "25") &&
+           what.find("CONTEXT:") == std::string::npos &&
+           what.find("QUERY:") == std::string::npos;
+  }
+
+  // For a tool that plans a caller's statement and has no error shape of its
+  // own: the error goes on as it is when it is about the statement, and as
+  // its SQLSTATE alone when it is not.
+  [[noreturn]] static void rethrow_planning_error(const pqxx::sql_error& e) {
+    const std::string ss = sqlstate_of(e);
+    if (about_the_statement(ss, e.what(), false)) throw;
+    const std::string name = sqlstate_name(ss);
+    throw std::runtime_error(
+      "the statement could not be planned: SQLSTATE " + ss +
+      (name.empty() ? "" : " (" + name + ")") +
+      ". PostgreSQL's message is not returned for this error, because it can "
+      "quote a value from a table");
+  }
+
+
   const json explain_query(const std::string& queryid, const std::string& sql_in,
                            const json& params, bool analyze, int timeout_ms,
                            const json& settings, const std::string& plan_as_role) {
@@ -6483,8 +6764,34 @@ private:
     std::string lits;
     json plan;
     bool generic = false;
+    // True once the statement itself is being executed. An error before that
+    // is about the statement as written; one after it can be about the data.
+    bool executing = false;
+
+    // Everything from here runs inside a savepoint, so that whatever fails --
+    // a timeout included -- the transaction is still usable to clean up in.
+    // Through 4.7.1 the DEALLOCATE ran on the success path only, so a
+    // timed-out explain left its prepared statement behind, and any session
+    // advisory lock the statement took stayed too: neither is undone by
+    // ROLLBACK. This server keeps a connection for the next call, so they
+    // stayed for as long as it did; behind a pooler in transaction mode they
+    // stayed on a server connection that went back to the pool, for whoever
+    // was handed it next. A statement sent after the transaction would not
+    // do, because the pooler may hand it to another server connection.
+    std::optional<pqxx::subtransaction> guard;
+    auto leave_clean = [&]() {
+      try {
+        if (guard) { guard->abort(); guard.reset(); }
+        txn.exec((prepared.empty() ? std::string() : "DEALLOCATE " + prepared + "; ") +
+                 "SELECT pg_advisory_unlock_all()");
+      } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch)
+        // A connection that is gone took the statement and the locks with it.
+      }
+    };
 
     try {
+      guard.emplace(txn);
+      pqxx::subtransaction& tx = *guard;
       // Every EXPLAIN here carries SETTINGS, which reports the settings that
       // differ from the built-in default -- and so names the environment this
       // plan was built in.
@@ -6510,7 +6817,7 @@ private:
         try {
           // A savepoint, so that the expected failure below leaves the
           // transaction usable rather than aborted.
-          pqxx::subtransaction sub{txn};
+          pqxx::subtransaction sub{tx};
           pqxx::result const r = sub.exec("EXPLAIN (SETTINGS, FORMAT JSON) " + sql);
           plan = json::parse(r[0][0].as<std::string>());
           sub.commit();
@@ -6536,17 +6843,21 @@ private:
             if (!plan_env.is_null()) out["planning_environment"] = plan_env;
             return out;
           }
-          pqxx::result const r = txn.exec("EXPLAIN (SETTINGS, GENERIC_PLAN, FORMAT JSON) " + sql);
+          pqxx::result const r = tx.exec("EXPLAIN (SETTINGS, GENERIC_PLAN, FORMAT JSON) " + sql);
           plan = json::parse(r[0][0].as<std::string>());
           generic = true;
         }
       } else {
-        prepared = "pg_licht_explain_" + std::to_string(static_cast<long long>(::getpid())) +
-                   "_" + std::to_string(++explain_seq_);
-        txn.exec("PREPARE " + prepared + " AS " + sql);
+        const std::string name =
+          "pg_licht_explain_" + std::to_string(static_cast<long long>(::getpid())) +
+          "_" + std::to_string(++explain_seq_);
+        tx.exec("PREPARE " + name + " AS " + sql);
+        // Named only once it exists: a PREPARE that failed left nothing to
+        // deallocate.
+        prepared = name;
 
         pqxx::result const pr = pqxx_exec(
-          txn,
+          tx,
           "SELECT COALESCE(array_length(parameter_types, 1), 0) "
           "FROM pg_prepared_statements WHERE name = $1",
           pqxx::params{prepared});
@@ -6556,8 +6867,8 @@ private:
           throw std::runtime_error("statement takes " + std::to_string(want) +
                                    " parameter(s), got " + std::to_string(params.size()));
 
-        lits = build_execute_literals(txn, params);
-        pqxx::result const r = txn.exec(
+        lits = build_execute_literals(tx, params);
+        pqxx::result const r = tx.exec(
           "EXPLAIN (SETTINGS, FORMAT JSON) EXECUTE " + prepared + "(" + lits + ")");
         plan = json::parse(r[0][0].as<std::string>());
       }
@@ -6570,6 +6881,7 @@ private:
       // does not count: see analyze_budget.
       const bool explicit_settings = settings.is_object() && !settings.empty();
       json exec_budget;
+      json volatile_found = json::array();
 
       // --- Phase B: optionally execute, only once proven safe ---
       if (analyze) {
@@ -6584,7 +6896,7 @@ private:
                    // The budget is computed only on this branch, and reported
                    // below either way.
                    // NOLINTNEXTLINE(bugprone-assignment-in-if-condition)
-                   !(exec_budget = analyze_budget(txn, plan)).value("allowed", false)) {
+                   !(exec_budget = analyze_budget(tx, plan)).value("allowed", false)) {
           // Refused the way the other two are: the plan is still returned,
           // analyzed stays false, and the note says why. The arithmetic goes
           // into planning_environment so a refusal can be checked.
@@ -6592,14 +6904,28 @@ private:
         } else {
           std::string const target = prepared.empty()
             ? sql : ("EXECUTE " + prepared + "(" + lits + ")");
-          pqxx::result const r = txn.exec(
-            "EXPLAIN (SETTINGS, ANALYZE, BUFFERS, FORMAT JSON) " + target);
-          plan = json::parse(r[0][0].as<std::string>());
-          analyzed = true;
+          volatile_found = volatile_calls(tx, target);
+          if (!volatile_found.empty()) {
+            std::string names;
+            for (const auto& f : volatile_found)
+              names += (names.empty() ? "" : ", ") + f.get<std::string>();
+            note = "not analyzed: the plan calls " + names + ", which PostgreSQL "
+                   "marks VOLATILE -- a function that may change the server or the "
+                   "session in ways a read-only transaction does not prevent, such "
+                   "as ending another session. Only the plan is returned";
+          } else {
+            executing = true;
+            pqxx::result const r = tx.exec(
+              "EXPLAIN (SETTINGS, ANALYZE, BUFFERS, FORMAT JSON) " + target);
+            plan = json::parse(r[0][0].as<std::string>());
+            analyzed = true;
+          }
         }
       }
 
-      if (!prepared.empty()) txn.exec("DEALLOCATE " + prepared);
+      guard->commit();
+      guard.reset();
+      leave_clean();
 
       json out = {
         {"plan",       plan},
@@ -6611,6 +6937,7 @@ private:
         {"sql",        sql}
       };
       if (!note.empty())    out["note"] = note;
+      if (!volatile_found.empty()) out["volatile_functions"] = volatile_found;
       if (!stats.is_null()) out["statement"] = stats;
       if (!plan_env.is_null()) {
         if (!exec_budget.is_null()) plan_env["execution_budget"] = exec_budget;
@@ -6625,7 +6952,31 @@ private:
       // Direct-init, not copy-init: libpqxx 8's sqlstate() returns
       // std::string_view (explicit conversion to std::string), while 7.x
       // returns std::string. Parens accept both.
-      std::string ss(e.sqlstate());
+      const std::string ss = sqlstate_of(e);
+      leave_clean();
+      // See about_the_statement for which messages are returned and why.
+      const std::string what = e.what();
+      const bool about_statement = about_the_statement(ss, what, executing);
+      auto with_detail = [&](json j) {
+        if (about_statement) j["detail"] = what;
+        return j;
+      };
+      auto unexplained = [&]() {
+        json out = {{"error", "explain failed"}, {"sqlstate", ss}};
+        if (const std::string name = sqlstate_name(ss); !name.empty()) out["condition"] = name;
+        if (about_statement)
+          out["detail"] = what;
+        else
+          out["hint"] = "PostgreSQL's message is not returned for this error, because it "
+                        "can quote a value from a table; the SQLSTATE and its name say "
+                        "what kind of error it was";
+        return out;
+      };
+      // The explanations below are of a statement that could not be parsed or
+      // planned. Once it is running, the same SQLSTATE means something else:
+      // 42P01 is then a value cast to regclass, not a table the statement
+      // misnamed.
+      if (executing && ss != "57014") return unexplained();
       // A typed literal -- DATE '2026-09-14', INTERVAL '1 day' -- is the one
       // thing pg_stat_statements normalises into text that is not SQL: it
       // replaces the string and keeps the type name, leaving DATE $6, and a
@@ -6635,7 +6986,7 @@ private:
       if (ss == "42601") {
         const std::string typed = typed_literal_parameter(std::string(e.query()));
         if (!typed.empty())
-          return {{"error", "the statement could not be parsed: it had a typed literal, "
+          return with_detail({{"error", "the statement could not be parsed: it had a typed literal, "
                             "which pg_stat_statements recorded as " + typed},
                   {"hint", "the original statement wrote a constant as a type name and "
                            "a string, such as DATE '2026-09-14'. pg_stat_statements "
@@ -6643,40 +6994,34 @@ private:
                            "name, and the result is not valid SQL whatever its length, "
                            "so this statement cannot be explained by queryid. "
                            "Pass the statement via the 'sql' argument with the "
-                           "constant written out, or as a cast: $1::date"},
-                  {"detail", e.what()}};
+                           "constant written out, or as a cast: $1::date"}});
       }
       if (ss == "42601")
-        return {{"error", "the statement could not be parsed"},
+        return with_detail({{"error", "the statement could not be parsed"},
                 {"hint", "pg_stat_statements truncates query text at "
                          "track_activity_query_size; raise that setting, or pass "
-                         "the full statement via the 'sql' argument"},
-                {"detail", e.what()}};
+                         "the full statement via the 'sql' argument"}});
       if (ss == "42P18")
-        return {{"error", "PostgreSQL could not infer the type of one or more parameters"},
+        return with_detail({{"error", "PostgreSQL could not infer the type of one or more parameters"},
                 {"hint", "add an explicit cast in the statement, e.g. "
-                         "WHERE col = $1::uuid, and retry"},
-                {"detail", e.what()}};
+                         "WHERE col = $1::uuid, and retry"}});
       if (ss == "57014")
-        return {{"error", "the explain exceeded the statement timeout of " +
+        return with_detail({{"error", "the explain exceeded the statement timeout of " +
                           std::to_string(tmo) + " ms"},
                 {"hint", "this is expected for a genuinely slow statement; raise "
                          "timeout_ms (max 30000), or omit analyze to plan without "
-                         "executing"}};
+                         "executing"}});
       if (ss == "25006")
-        return {{"error", "the statement attempted to write in a read-only transaction"},
+        return with_detail({{"error", "the statement attempted to write in a read-only transaction"},
                 {"hint", "pg-licht never executes data-modifying statements; only "
-                         "the plan can be returned"},
-                {"detail", e.what()}};
+                         "the plan can be returned"}});
       if (ss == "0A000")
-        return {{"error", "this statement cannot be explained on this server"},
+        return with_detail({{"error", "this statement cannot be explained on this server"},
                 {"hint", "EXPLAIN (GENERIC_PLAN) requires PostgreSQL 16 or newer; "
-                         "supply concrete values via params instead"},
-                {"detail", e.what()}};
+                         "supply concrete values via params instead"}});
       if (ss == "42P02")
-        return {{"error", "the statement has parameters that could not be planned generically"},
-                {"hint", "supply values via the params argument"},
-                {"detail", e.what()}};
+        return with_detail({{"error", "the statement has parameters that could not be planned generically"},
+                {"hint", "supply values via the params argument"}});
       // 42883 on a statement recovered from pg_stat_statements is almost always
       // the normalization, not the statement. Normalizing replaces every
       // literal with $n and strips its type, so a placeholder in a position
@@ -6687,7 +7032,7 @@ private:
       // params, gets the identical error, and has no way to tell whether the
       // params were even applied.
       if (ss == "42883")
-        return {{"error", "the statement references an operator or function that "
+        return with_detail({{"error", "the statement references an operator or function that "
                           "does not exist for the types PostgreSQL inferred"},
                 {"params_supplied", !params.empty()},
                 {"hint", std::string(
@@ -6703,15 +7048,24 @@ private:
                    "assigned text when the statement is parsed -- before any "
                    "value is bound, so no params argument can change it. Pass the "
                    "statement to 'sql' with the literals written back in, or add "
-                   "explicit casts such as $1::numeric, and it will plan."},
-                {"detail", e.what()}};
+                   "explicit casts such as $1::numeric, and it will plan."}});
       if (ss == "42P01")
-        return {{"error", "a relation referenced by the statement does not exist"},
+        return with_detail({{"error", "a relation referenced by the statement does not exist"},
                 {"hint", "the statement may target a different database; check "
                          "listTables, or select another database with the "
-                         "'connection' argument"},
-                {"detail", e.what()}};
-      return {{"error", "explain failed"}, {"sqlstate", ss}, {"detail", e.what()}};
+                         "'connection' argument"}});
+      if (ss == "42501")
+        return with_detail({{"error", "this role lacks a privilege the statement needs"},
+                {"hint", "PostgreSQL checks privileges for EXPLAIN as it would for the "
+                         "statement itself, with or without analyze: explaining an "
+                         "INSERT, UPDATE, DELETE or MERGE needs that privilege on the "
+                         "target table, which pg_read_all_data does not include"}});
+      return unexplained();
+    } catch (...) {
+      // A caller error raised after the PREPARE, such as a wrong number of
+      // params: the statement still has to go.
+      leave_clean();
+      throw;
     }
   }
 
@@ -7461,7 +7815,9 @@ private:
           "pages_if_packed is what the same rows would need at the table's average "
           "rows_per_page, and scatter_ratio is pages over that -- 1 is already packed, "
           "and the ratio is roughly what clustering on this column would save a query "
-          "that reads these rows from the table.") +
+          "that reads these rows from the table. rows_per_page is pg_class's reltuples "
+          "over relpages, so on a bloated table, or one not analyzed lately, it is low "
+          "and the ratio understates the scatter; tableBloat says whether that applies.") +
           (rows >= max_rows ? " The cap was reached: only the first max_rows matching "
                               "rows were read, so rows and pages are lower bounds and "
                               "the ratio describes that part." : "") +
@@ -9265,12 +9621,17 @@ private:
       } catch (const pqxx::sql_error& e) {
         // 42P02: the statement carries $n placeholders. GENERIC_PLAN is the
         // same fallback explainQuery uses, and it is PostgreSQL 16+.
-        if (e.sqlstate() != "42P02" || !pg16) throw;
-        pqxx::subtransaction sub{txn};
-        pqxx::result const r = sub.exec("EXPLAIN (SETTINGS, FORMAT JSON, GENERIC_PLAN) " + sql);
-        json p = json::parse(r[0][0].as<std::string>());
-        sub.commit();
-        return p;
+        if (e.sqlstate() != "42P02" || !pg16) rethrow_planning_error(e);
+        try {
+          pqxx::subtransaction sub{txn};
+          pqxx::result const r =
+            sub.exec("EXPLAIN (SETTINGS, FORMAT JSON, GENERIC_PLAN) " + sql);
+          json p = json::parse(r[0][0].as<std::string>());
+          sub.commit();
+          return p;
+        } catch (const pqxx::sql_error& generic) {
+          rethrow_planning_error(generic);
+        }
       }
     };
     auto cost_of = [](const json& p) -> double {
@@ -10688,7 +11049,8 @@ private:
       "Every statement sent to a database runs inside a transaction opened with "
       "SET TRANSACTION READ ONLY. Nothing here writes: the one tool that executes "
       "anything is explainQuery with analyze:true, and it does so only after the "
-      "plan is proven free of any ModifyTable node. The three pooler tools read a "
+      "plan is proven free of any ModifyTable node and of any volatile function. "
+      "The three pooler tools read a "
       "PgBouncer admin console instead, which refuses transactions: they send "
       "only fixed SHOW commands, to a connection declared kind = pgbouncer whose "
       "user should be one of PgBouncer's stats_users, which may run SHOW and "

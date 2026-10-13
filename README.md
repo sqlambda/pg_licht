@@ -9,7 +9,8 @@ Why another PostgreSQL MCP:
 - It answers from the catalog and the statistics views and never returns your rows, so
   there is far less to leak: the model sees structure, sizes, plans and counters.
 - Read-only is enforced, not promised: every call runs in its own `READ ONLY` transaction
-  with a statement timeout, and no SQL is built from arguments.
+  with a statement timeout, and no SQL is built from arguments. The one tool that executes
+  a statement of yours refuses to when its plan writes or calls a volatile function.
 - One process serves the whole fleet. Any number of connections live in one file, and a
   question can be put to every database of an instance, a replication group or a label at
   once.
@@ -47,8 +48,11 @@ pg_licht never writes and never returns rows from your tables. Values from your 
 still reach the caller in a few named places: live and recorded statement text
 (`currentActivity`, `currentLocks`, `statementStats`), column statistics (`tableStats`,
 `columnHistogram`), plans that repeat a statement's literals, definitions as written, and
-settings such as a standby's `primary_conninfo`. No password pg_licht itself holds is ever
-returned. Connect as the narrowest role that answers the question; `checkPrivileges`
+settings such as a standby's `primary_conninfo`. When an explained statement fails,
+PostgreSQL's message is returned only where it is about the statement as written, since a
+data error quotes the value that failed. `explainQuery` with `analyze` returns no row, and
+its row counts can still confirm a value the caller proposes. No password pg_licht itself
+holds is ever returned. Connect as the narrowest role that answers the question; `checkPrivileges`
 reports what it can reach.
 
 Full rationale, including the guarded exception for `explainQuery` and the complete list of
@@ -261,6 +265,12 @@ port   = 6432
 dbname = orders
 pooler = pooler_prod
 ```
+
+A section may set `application_name`, which replaces pg_licht's own
+`pg-licht-cpp/<version>`. Where several people or assistants share one database role, a
+different name in each one's file tells them apart in `pg_stat_activity` and in the server
+log. It is a name the client chooses, not authentication. Other libpq keys, such as
+`sslmode` and `connect_timeout`, are passed through as written; `options` is refused.
 
 Editing the connections file (or the `budgets.ini` in use at startup) needs no restart: the
 change is picked up at the next request, and `SIGHUP` forces it. A budgets file created after

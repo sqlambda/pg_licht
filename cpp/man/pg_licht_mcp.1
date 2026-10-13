@@ -350,6 +350,40 @@ or at least
 a section with neither is reported by name at startup rather than failing later
 with an obscure libpq error.
 .Pp
+.Nm
+adds one key of its own unless the section sets it:
+.Va application_name ,
+as
+.Ql pg-licht-cpp/ Ns Ar version .
+A section that sets
+.Va application_name
+replaces that name, version included.
+Where several people or assistants connect as one database role, a different
+.Va application_name
+in each one's connections file tells them apart in
+.Li pg_stat_activity ,
+in the server log
+.Pq Ql %a
+and in
+.Ic currentActivity .
+It is a name the client chooses and not authentication: nothing keeps two
+files from carrying the same one.
+The key has to be in the section itself; a value set in a service file is
+overridden by the default.
+.Pp
+Every other key reaches libpq as written, among them
+.Va sslmode ,
+.Va connect_timeout ,
+.Va target_session_attrs
+and
+.Va passfile .
+None of them lifts a guard, because the read-only transaction and the
+statement ceiling are set per transaction, after the connection is made.
+Without
+.Va connect_timeout ,
+a server that does not answer is waited for as long as the operating system
+waits, which can be minutes; the statement ceiling does not cover it.
+.Pp
 The key
 .Va options
 is rejected.
@@ -585,6 +619,15 @@ the positional
 .Ar database_url
 argument
 .El
+.Pp
+The first that applies is used alone.
+Where
+.Pa ~/.config/pg_licht/connections.ini
+exists,
+.Ev DATABASE_URL
+and the positional argument are not read, and a call that names no
+.Va connection
+goes to that file's default.
 .Ss File permissions
 Because sections may carry passwords, the configuration file must not be group-
 or world-accessible.
@@ -2688,6 +2731,50 @@ Honoured only after the plan is proven free of any
 .Li ModifyTable
 node, so data-modifying statements, including data-modifying CTEs, are never
 executed.
+Nor is a statement whose plan calls a function PostgreSQL marks
+.Li VOLATILE :
+such a function may change the server or the session in ways a read-only
+transaction does not prevent \(em end another session, reload the
+configuration, reset statistics, take a session lock.
+The plan is then returned with
+.Va analyzed
+false and the functions named in
+.Va volatile_functions .
+A few volatile functions with no effect outside the statement are let through:
+.Fn random ,
+.Fn random_normal ,
+.Fn clock_timestamp ,
+.Fn timeofday ,
+.Fn gen_random_uuid ,
+.Fn uuidv4 ,
+.Fn uuidv7 ,
+.Fn pg_sleep ,
+.Fn pg_sleep_for
+and
+.Fn pg_sleep_until ,
+which return a different value each time or wait; and those that only read
+the state of the server,
+.Fn pg_relation_size ,
+.Fn pg_total_relation_size ,
+.Fn pg_table_size ,
+.Fn pg_indexes_size ,
+.Fn pg_database_size ,
+.Fn pg_tablespace_size ,
+.Fn pg_lock_status
+.Pq the Li pg_locks No view ,
+.Fn pg_blocking_pids ,
+.Fn pg_safe_snapshot_blocking_pids ,
+.Fn pg_is_in_recovery ,
+.Fn pg_current_wal_lsn ,
+.Fn pg_last_wal_replay_lsn ,
+.Fn pg_last_committed_xact ,
+.Fn pg_stat_get_io ,
+.Fn currval
+and
+.Fn lastval .
+The functions that read files, and
+.Fn query_to_xml ,
+are not among them.
 Requires
 .Va timeout_ms .
 Default
@@ -4041,8 +4128,57 @@ It is guarded by a leading-keyword whitelist, a single-statement check,
 .Ic PREPARE Ns d
 parameter binding with every value escaped through libpq, a
 .Li ModifyTable
-gate that refuses to execute anything that writes, and a bounded
+gate that refuses to execute anything that writes, a gate that refuses to
+execute a plan calling a volatile function, and a bounded
 .Va statement_timeout .
+Whether the statement succeeds, fails or times out, nothing of the call stays
+on the connection: its prepared statement is deallocated and session-level
+advisory locks are released inside the transaction.
+The connection outlives the call \(em
+.Nm
+keeps it for the next one, and a pooler hands it to another client \(em so
+what a statement left on it would otherwise stay.
+.Pp
+Three things about
+.Ic explainQuery
+are limits and not guards, and the role
+.Nm
+connects as is what bounds them.
+The volatile gate reads function names from the plan and trusts what each
+function declares: a function declared
+.Li STABLE
+or
+.Li IMMUTABLE
+that has an effect anyway, a volatile function behind an operator or a cast,
+and whatever a function calls inside itself are not seen.
+Planning alone runs functions: PostgreSQL evaluates an
+.Li IMMUTABLE
+function of constant arguments, and may evaluate a
+.Li STABLE
+one, while it builds the plan, so they run without
+.Va analyze .
+And
+.Ic EXPLAIN
+checks privileges as the statement itself would, with or without
+.Va analyze :
+to have an
+.Ic INSERT ,
+.Ic UPDATE ,
+.Ic DELETE
+or
+.Ic MERGE
+explained, the role needs that privilege on the target table, which
+.Li pg_monitor
+and
+.Li pg_read_all_data
+do not give.
+Granting it is the operator's decision; without it PostgreSQL refuses the
+plan of a write.
+.Pp
+A request is refused before it is parsed when it is nested deeper than 128
+levels or its line is longer than 16 MiB, with JSON-RPC error
+.Er -32600
+and a null id, and the server goes on to the next request.
 .Pp
 Every tool call to a database runs inside its own
 .Ql READ ONLY
@@ -4108,7 +4244,8 @@ are on, which is a fact about the table in the same way; and
 with
 .Va analyze
 executes a statement the caller supplied, only once its plan is proven not to
-write, and returns the plan with row counts and timings rather than the rows.
+write and to call no volatile function, and returns the plan with row counts
+and timings rather than the rows.
 .Pp
 Values that came from your data can still reach the caller, in these places:
 .Bl -tag -width Ds
@@ -4149,6 +4286,27 @@ returns, each beside its page counts.
 With a value it returns counts alone.
 .It Ic explainQuery , evaluateIndex
 Plans, which repeat the literals of the statement the caller wrote.
+.It Ic explainQuery
+When the statement fails, PostgreSQL's own message, only where it is about the
+statement as written: a
+syntax or name error, an unsupported feature, a missing privilege, raised
+before the statement ran and not from inside a function.
+A data error quotes the value that failed \(em
+.Ql invalid input syntax for type integer
+followed by the value \(em so for every other error only the SQLSTATE and its
+standard name are returned.
+.Pp
+With
+.Va analyze
+no row is returned, and a caller can still confirm a value it proposes: the
+plan's actual row counts say how many rows met a condition, and a statement
+can be written to fail or not depending on a value.
+That is inherent to executing a statement the caller wrote and is not
+prevented.
+What reaches the caller reaches whoever operates the assistant, so a table
+holding personal data is protected by the connecting role not being able to
+.Ic SELECT
+it, and by nothing less.
 .It Ic functionDetails , tableDetails
 Definitions as written: function source, view definitions, column defaults,
 check constraints and policy expressions, carrying whatever literals were
