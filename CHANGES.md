@@ -1,5 +1,66 @@
 # Changelog
 
+## 4.8.0 (unreleased)
+
+PostgreSQL 19. Released on 2026-11-19, it renamed a column `subscriptionStats`
+read, and the tool failed on every 19 server, subscriptions or not. Tested
+against 19.0 before any change: that was the only break, and every other tool
+answered, directly and through PgBouncer. This release fixes it, verifies
+14 to 19 in CI, and reads what 19 adds for the questions these tools answer.
+
+### Fixed
+
+- **`subscriptionStats` answers on PostgreSQL 19.** 19 renamed
+  `pg_stat_subscription_stats.sync_error_count` to `sync_table_error_count`,
+  when sequences began to be synchronized and got a counter of their own, and
+  the whole statement failed with `column "sync_error_count" does not exist`.
+  `sync_error_count` stays on 19 with the table count it always carried, so a
+  caller written against 15 to 18 reads the same key; `sync_table_error_count`
+  and `sync_seq_error_count` are given beside it.
+
+### Added
+
+- **Each table, partition and index dates its own counters on 19.**
+  PostgreSQL 19 records `stats_reset` per table and per index, set by
+  `pg_stat_reset()` and by `pg_stat_reset_single_table_counters()`, null where
+  the counters were not reset since the relation first had any. `tableStats`, `listTableStats`,
+  `partitionDetails` and `duplicateIndexes` return it beside the counters it
+  dates, `covered_by_stats_reset` for the covering index of a redundant one;
+  and in `tableStats` the latest of the table's and its indexes' becomes
+  `counters_since` wherever one is set, with `counters_since_source`
+  `pg_stat_user_tables` or `pg_stat_user_indexes`: the latest, so that every
+  count in the answer, the indexes' included, lies inside the window. A reset of one relation is
+  what the instance-wide reading cannot see: it zeroes that table or that
+  index alone, and an index with `idx_scan` 0 that was reset yesterday has
+  been unused for a day, whatever the database says.
+- **`replicationSlots`: why a standby skipped synchronizing a slot**, on 19:
+  `slotsync_skip_reason`, `slotsync_skip_count` and `slotsync_last_skip`. A
+  failover slot that is never synced looks healthy on the primary; on the
+  standby this is the reason it would not be there to fail over to.
+- **`progressStats`: `started_by` on vacuum and analyze**, on 19: `manual`,
+  `autovacuum`, or for vacuum `autovacuum_wraparound`, the one that cannot be
+  cancelled to release a lock. Before 19 it could only be read from the query
+  text, which a role without `pg_read_all_stats` does not see.
+- **`subscriptionStats`: the `update_deleted` conflict**, on 19, counted where
+  the subscription has `retain_dead_tuples`; without it the same conflict is
+  counted as `update_missing`.
+
+### Documentation
+
+- The manual said that `counters_since` is a lower bound because resetting
+  one table moves nothing. It moves `pg_stat_database.stats_reset`, measured
+  on 14, 17, 18 and 19, so every other relation's counters are dated later
+  than they are: a shorter window than the truth, the side that errs towards
+  keeping an index.
+
+### Build
+
+- CI runs the sanitizer, valgrind and pooled jobs on PostgreSQL 14 to 19, and
+  the rig served to the FreeBSD clients on 19.
+- The replication slot test drops its probe slot however it ends. A failed
+  assertion used to leave the slot behind, and the next run on that server
+  failed in two tests.
+
 ## 4.7.2 (2026-10-13)
 
 What `explainQuery` let through, and a request the server could not survive.

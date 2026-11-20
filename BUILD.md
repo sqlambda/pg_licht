@@ -145,7 +145,7 @@ npx @modelcontextprotocol/inspector \
 
 ## PostgreSQL version support
 
-Supports PostgreSQL 14 and newer, verified in CI on 14–18. One feature degrades gracefully
+Supports PostgreSQL 14 and newer, verified in CI on 14–19. One feature degrades gracefully
 below 16: `explainQuery` can only produce a plan for a `pg_stat_statements` statement
 (whose text is normalized to `$1`/`$2`) by using `EXPLAIN (GENERIC_PLAN)`, which is
 PostgreSQL 16+. On 14/15 that path returns an actionable hint instead — supplying `params`

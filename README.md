@@ -532,7 +532,7 @@ man --local-file cpp/man/pg_licht_mcp.1
 
 ## PostgreSQL version support
 
-PostgreSQL 14 and newer, verified in CI on 14–18. Every operation returns its full result
+PostgreSQL 14 and newer, verified in CI on 14–19. Every operation returns its full result
 on every supported version, apart from `ioStats`, which needs the PostgreSQL 16
 `pg_stat_io` view and says so on older servers. Individual fields are omitted where the
 underlying column does not exist, and views that changed shape upstream —

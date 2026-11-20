@@ -1748,6 +1748,109 @@ TEST_F(PostgresMCPServerTest, ScanCountersCarryTheWindowTheyCover) {
       "  SELECT stats_reset FROM pg_stat_wal)") || !expected.empty());
 }
 
+// PostgreSQL 19 dates each table's and each index's counters on their own
+// (stats_reset on pg_stat_*_tables and _indexes), and a single-table reset is
+// exactly what the instance-wide counters_since cannot see. On 19 the table's
+// own value is counters_since wherever it is set; before 19 nothing changes.
+TEST_F(PostgresMCPServerTest, A19TableCarriesItsOwnStatsReset) {
+  const std::string sch = "osr_" + std::to_string(getpid());
+  pqxx::connection c(test_url);
+  struct Drop {
+    pqxx::connection& c; std::string sch;
+    ~Drop() {
+      try { pqxx::nontransaction n(c); n.exec("DROP SCHEMA IF EXISTS " + sch + " CASCADE"); }
+      catch (...) {}
+    }
+  } drop{c, sch};
+  {
+    pqxx::nontransaction n(c);
+    n.exec("CREATE SCHEMA " + sch);
+    n.exec("CREATE TABLE " + sch + ".t (a int, b int)");
+    n.exec("CREATE INDEX t_a1 ON " + sch + ".t (a)");
+    n.exec("CREATE INDEX t_a2 ON " + sch + ".t (a)");
+    // Covers both of the above, so they are also reported as redundant.
+    n.exec("CREATE INDEX t_ab ON " + sch + ".t (a, b)");
+    n.exec("CREATE TABLE " + sch + ".p (a int) PARTITION BY LIST (a)");
+    n.exec("CREATE TABLE " + sch + ".p_one PARTITION OF " + sch + ".p FOR VALUES IN (1)");
+    n.exec("INSERT INTO " + sch + ".t VALUES (1)");
+    n.exec("INSERT INTO " + sch + ".p VALUES (1)");
+  }
+  const bool v19 = pg_server_version_num(test_url) >= 190000;
+
+  json before = srv->call_table_stats(sch, "t");
+  ASSERT_TRUE(before.contains("counters_since")) << before.dump(2);
+  EXPECT_NE(before["counters_since_source"], "pg_stat_user_tables") << before.dump(2);
+  if (v19) {
+    ASSERT_TRUE(before.contains("stats_reset")) << before.dump(2);
+    EXPECT_TRUE(before["stats_reset"].is_null()) << "never reset: " << before.dump(2);
+  } else {
+    EXPECT_FALSE(before.contains("stats_reset")) << before.dump(2);
+  }
+
+  {
+    pqxx::nontransaction n(c);
+    n.exec("SELECT pg_stat_reset_single_table_counters('" + sch + ".t'::regclass)");
+  }
+  json after = srv->call_table_stats(sch, "t");
+  if (v19) {
+    ASSERT_TRUE(after["stats_reset"].is_string()) << after.dump(2);
+    EXPECT_EQ(after["counters_since"], after["stats_reset"]) << after.dump(2);
+    EXPECT_EQ(after["counters_since_source"], "pg_stat_user_tables") << after.dump(2);
+    // The reset named the table, and an index is a relation of its own: its
+    // date is its own, not the table's.
+    EXPECT_NE(after["indexes"]["t_a1"]["stats_reset"], after["stats_reset"]) << after.dump(2);
+    // listTableStats is built from the same fragment and must agree.
+    json lts = srv->call_list_table_stats(sch);
+    EXPECT_EQ(lts["t"]["stats_reset"], after["stats_reset"]) << lts.dump(2);
+  } else {
+    EXPECT_FALSE(after.contains("stats_reset")) << after.dump(2);
+    EXPECT_NE(after["counters_since_source"], "pg_stat_user_tables") << after.dump(2);
+  }
+
+  // An index reset after its table dates the answer from then: index_uses
+  // are in it too, and the table's date would claim a longer window for
+  // them than they have had. A reset of a relation with no statistics yet
+  // leaves its stats_reset null, so the index is scanned first.
+  if (v19) {
+    {
+      pqxx::nontransaction n(c);
+      n.exec("SET enable_seqscan = off");
+      n.exec("SELECT count(*) FROM " + sch + ".t WHERE a = 1");
+      n.exec("SELECT pg_stat_force_next_flush()");
+    }
+    std::string used;
+    const json scanned = srv->call_table_stats(sch, "t");
+    for (const auto& [name, ix] : scanned["indexes"].items())
+      if (ix["index_uses"].is_number() && ix["index_uses"].get<long long>() > 0) used = name;
+    ASSERT_FALSE(used.empty()) << "no index was scanned";
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    {
+      pqxx::nontransaction n(c);
+      n.exec("SELECT pg_stat_reset_single_table_counters('" + sch + "." + used + "'::regclass)");
+    }
+    json later = srv->call_table_stats(sch, "t");
+    ASSERT_TRUE(later["indexes"][used]["stats_reset"].is_string()) << later.dump(2);
+    EXPECT_EQ(later["counters_since"], later["indexes"][used]["stats_reset"]) << later.dump(2);
+    EXPECT_EQ(later["counters_since_source"], "pg_stat_user_indexes") << later.dump(2);
+    EXPECT_NE(later["counters_since"], later["stats_reset"]) << later.dump(2);
+  }
+
+  // Each index of an identical pair, and each partition, carries its own.
+  json dup = srv->call_duplicate_indexes(sch, "t");
+  ASSERT_EQ(dup["identical"].size(), 1u) << dup.dump(2);
+  for (const auto& ix : dup["identical"][0]["indexes"])
+    EXPECT_EQ(ix.contains("stats_reset"), v19) << ix.dump(2);
+  ASSERT_FALSE(dup["redundant"].empty()) << dup.dump(2);
+  for (const auto& red : dup["redundant"]) {
+    EXPECT_EQ(red.contains("stats_reset"), v19) << red.dump(2);
+    EXPECT_EQ(red.contains("covered_by_stats_reset"), v19) << red.dump(2);
+  }
+  json pd = srv->call_partition_details(sch, "p");
+  ASSERT_EQ(pd["partitions"].size(), 1u) << pd.dump(2);
+  EXPECT_EQ(pd["partitions"][0].contains("stats_reset"), v19) << pd.dump(2);
+  EXPECT_EQ(after["indexes"]["t_a1"].contains("stats_reset"), v19) << after.dump(2);
+}
+
 // listSchemas dumped every relation name in every schema. On a database where
 // one schema holds 1,816 tables that is an 89 kB payload past the client's
 // limit, and the tool returns nothing at all.
@@ -3643,6 +3746,20 @@ TEST_F(PostgresMCPServerTest, ReplicationSlotsReportsWalStatusAndSpillCounters) 
     pqxx::nontransaction n(c);
     n.exec("SELECT pg_create_physical_replication_slot('pg_licht_probe_slot')");
   }
+  // Dropped however the test ends. Through 4.7 the drop was the last
+  // statement, so a failed ASSERT left the slot behind, and on that server
+  // the next run failed here at creation and in
+  // ReplicationSlotsReturnsEmptyWhenNoneConfigured.
+  struct Drop {
+    pqxx::connection& c;
+    ~Drop() {
+      try {
+        pqxx::nontransaction n(c);
+        n.exec("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots"
+               " WHERE slot_name = 'pg_licht_probe_slot'");
+      } catch (...) {}
+    }
+  } drop_slot{c};
 
   json r = srv->call_replication_slots();
   ASSERT_TRUE(r.contains("pg_licht_probe_slot")) << r.dump(2);
@@ -3666,9 +3783,17 @@ TEST_F(PostgresMCPServerTest, ReplicationSlotsReportsWalStatusAndSpillCounters) 
     EXPECT_TRUE(s.contains("invalidation_reason"));
     EXPECT_TRUE(s.contains("inactive_since"));
   }
-
-  pqxx::nontransaction drop(c);
-  drop.exec("SELECT pg_drop_replication_slot('pg_licht_probe_slot')");
+  // The slot-synchronization skip is PostgreSQL 19. On a primary's own slot
+  // nothing has skipped it, so the reason is null.
+  if (pg_server_version_num(test_url) >= 190000) {
+    ASSERT_TRUE(s.contains("slotsync_skip_reason")) << s.dump(2);
+    EXPECT_TRUE(s["slotsync_skip_reason"].is_null()) << s.dump(2);
+    EXPECT_TRUE(s.contains("slotsync_skip_count"));
+    EXPECT_TRUE(s.contains("slotsync_last_skip"));
+  } else {
+    EXPECT_FALSE(s.contains("slotsync_skip_reason"));
+    EXPECT_FALSE(s.contains("slotsync_skip_count"));
+  }
 }
 
 // --- databaseStats enrichment ---
@@ -4059,6 +4184,13 @@ TEST_F(PostgresMCPServerTest, ProgressStatsReportsARunningVacuum) {
   } else {
     EXPECT_FALSE(found.contains("delay_time_ms"));
     EXPECT_FALSE(found.contains("delay_percent"));
+  }
+  // started_by is PostgreSQL 19, and this VACUUM was typed by a user.
+  if (pg_server_version_num(test_url) >= 190000) {
+    ASSERT_TRUE(found.contains("started_by")) << found.dump(2);
+    EXPECT_EQ(found["started_by"].get<std::string>(), "manual");
+  } else {
+    EXPECT_FALSE(found.contains("started_by"));
   }
   if (pg_server_version_num(test_url) < 170000) {
     EXPECT_EQ(found["dead_tuple_unit"].get<std::string>(), "tuples");
@@ -11098,11 +11230,26 @@ TEST_F(TopologyFixture, SubscriptionStatsCarriesTheErrorCountersWhereTheyExist) 
   EXPECT_EQ(sb["errors"]["apply_error_count"], 0);
   EXPECT_EQ(sb["errors"]["sync_error_count"], 0);
 
-  // The seven conflict counters are PostgreSQL 18.
+  // PostgreSQL 19 renamed sync_error_count to sync_table_error_count and added
+  // sync_seq_error_count. The old key stays on 19, with the table count, so a
+  // caller written against 15 to 18 reads the same key; the new names are
+  // only where the server has them.
+  if (pg_server_version_num(sub) >= 190000) {
+    ASSERT_TRUE(sb["errors"].contains("sync_table_error_count")) << sb.dump(2);
+    EXPECT_EQ(sb["errors"]["sync_table_error_count"], sb["errors"]["sync_error_count"]);
+    EXPECT_EQ(sb["errors"]["sync_seq_error_count"], 0);
+  } else {
+    EXPECT_FALSE(sb["errors"].contains("sync_table_error_count"));
+    EXPECT_FALSE(sb["errors"].contains("sync_seq_error_count"));
+  }
+
+  // The seven conflict counters are PostgreSQL 18, update_deleted 19.
   if (pg_server_version_num(sub) >= 180000) {
     ASSERT_TRUE(sb["errors"].contains("conflicts")) << sb.dump(2);
     EXPECT_EQ(sb["errors"]["conflicts"]["insert_exists"], 0);
     EXPECT_EQ(sb["errors"]["conflicts"]["multiple_unique_conflicts"], 0);
+    EXPECT_EQ(sb["errors"]["conflicts"].contains("update_deleted"),
+              pg_server_version_num(sub) >= 190000) << sb.dump(2);
   } else {
     EXPECT_FALSE(sb["errors"].contains("conflicts"));
   }
