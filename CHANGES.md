@@ -57,6 +57,9 @@ answered, directly and through PgBouncer. This release fixes it, verifies
 
 - CI runs the sanitizer, valgrind and pooled jobs on PostgreSQL 14 to 19, and
   the rig served to the FreeBSD clients on 19.
+- clang-tidy 21, which CI installs since `ubuntu-latest` became Ubuntu 26.04,
+  flags a pointer array in the payload cap whose pointers could be const;
+  they are now, and CI's clang job passes again.
 - The replication slot test drops its probe slot however it ends. A failed
   assertion used to leave the slot behind, and the next run on that server
   failed in two tests.

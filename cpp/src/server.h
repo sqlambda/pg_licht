@@ -12148,7 +12148,7 @@ private:
     // Only arguments that make an answer smaller when given. include_system
     // and group_by are not here although both change the size: each makes it
     // larger when set, and the default is already the small one.
-    static const char* kNarrowing[] = {
+    static const char* const kNarrowing[] = {
       "limit", "schema", "table", "pattern", "query_id", "pid", "state",
       "min_calls", "min_duration_s", "relation", "database"};
     std::string args;
