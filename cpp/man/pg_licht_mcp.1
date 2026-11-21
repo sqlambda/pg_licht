@@ -1,7 +1,7 @@
 .\" Copyright (c) 2026 Daniel Cristian.
 .\" Licensed under the Apache License, Version 2.0; see LICENSE.
 .\"
-.Dd October 13, 2026
+.Dd November 21, 2026
 .Dt PG_LICHT_MCP 1
 .Os pg-licht
 .Sh NAME
@@ -1176,9 +1176,26 @@ is what says the record is an hour old.
 and
 .Ic partitionDetails
 carry the same two fields.
-It remains a lower bound:
+It is a bound, not an exact date.
 .Fn pg_stat_reset_single_table_counters
-zeroes one relation and moves nothing.
+zeroes the one table or index it names and stamps the database as it does, so
+every other relation's counters are older than reported \(em a shorter window
+than the truth, which errs towards keeping an index.
+.Pp
+PostgreSQL 19 dates each table's and each index's counters on their own.
+.Va stats_reset
+is returned beside them on every table, partition and index there, null where
+they were not reset since the relation first had statistics.
+In
+.Ic tableStats
+the latest of the table's and its indexes' becomes
+.Va counters_since
+wherever one is set, with
+.Va counters_since_source
+.Ql pg_stat_user_tables
+or
+.Ql pg_stat_user_indexes ,
+so that every count in the answer lies inside the window.
 .Pp
 .Va cumulative_statistics_missing
 is true where the catalog counts rows in the table and the cumulative
@@ -1582,6 +1599,19 @@ and its
 .Va conflicts
 are PostgreSQL 18.
 An absent key means the server cannot answer, which is not the same as no errors.
+PostgreSQL 19 counts sequence synchronization failures apart from table ones:
+.Va sync_table_error_count
+and
+.Va sync_seq_error_count
+appear there, and
+.Va sync_error_count
+stays, carrying the table count it always counted.
+19 also adds the
+.Va update_deleted
+conflict, counted only where the subscription has
+.Va retain_dead_tuples ;
+without it the same conflict is counted as
+.Va update_missing .
 .It Ic replicationSlots
 Replication slots with retained WAL bytes.
 A lagging or unused slot holds back WAL indefinitely and is a common cause of
@@ -1605,10 +1635,17 @@ disk, which is invisible in the slot's own row and is a common, silent
 throughput cliff.
 PostgreSQL 16 adds
 .Va conflicting ,
-and 17 adds
+17 adds
 .Va invalidation_reason
 and
-.Va inactive_since .
+.Va inactive_since ,
+and 19 adds
+.Va slotsync_skip_reason ,
+.Va slotsync_skip_count
+and
+.Va slotsync_last_skip :
+on a standby, why slot synchronization skipped a failover slot, how often and
+when \(em the reason it would not be there to fail over to.
 .It Ic replicationStats
 Every WAL sender on this server with state, sync state, the LSNs, the byte gap
 to replay \(em on a cascading standby measured from the WAL it has received
@@ -1978,6 +2015,14 @@ PostgreSQL 17 renamed the vacuum dead-tuple columns from counts to bytes;
 both are reported under their own names, with
 .Va dead_tuple_unit
 saying which the server produced, because they measure different things.
+PostgreSQL 19 adds
+.Va started_by
+to vacuum and analyze:
+.Ql manual ,
+.Ql autovacuum ,
+or for vacuum
+.Ql autovacuum_wraparound ,
+the one an autovacuum cannot be cancelled out of.
 .Pp
 .Bl -tag -width "min_duration_s" -compact
 .It Va pid
@@ -3981,7 +4026,7 @@ key from the configuration file.
 .El
 .Sh COMPATIBILITY
 .Nm
-supports PostgreSQL 14 and newer, and is verified on 14 through 18.
+supports PostgreSQL 14 and newer, and is verified on 14 through 19.
 .Pp
 One feature degrades gracefully below 16.
 .Ic explainQuery
@@ -4089,6 +4134,23 @@ and
 .Va parallel_workers_launched ;
 .Li pg_stat_io
 byte counters.
+.It PostgreSQL 19
+subscription
+.Va sync_table_error_count ,
+.Va sync_seq_error_count
+and the
+.Va update_deleted
+conflict counter;
+slot
+.Va slotsync_skip_reason ,
+.Va slotsync_skip_count
+and
+.Va slotsync_last_skip ;
+vacuum and analyze progress
+.Va started_by ;
+.Va stats_reset
+on each table, partition and index, and
+.Va covered_by_stats_reset .
 .El
 .Pp
 Two views changed shape upstream and are normalized rather than passed through.
@@ -4106,6 +4168,12 @@ timing columns that PostgreSQL 18 removed.
 .Ic progressStats
 reports the PostgreSQL 17 vacuum dead-tuple columns under their own names and
 labels the unit, since the old and new columns count different things.
+.Ic subscriptionStats
+reports
+.Va sync_error_count
+on every version from 15: PostgreSQL 19 renamed the column
+.Li sync_table_error_count ,
+and it is read under that name there and returned under both.
 .Pp
 On a Citus worker the shards are ordinary tables that Citus hides from any
 client whose

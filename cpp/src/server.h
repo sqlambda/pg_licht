@@ -269,6 +269,12 @@ enum class Feature {
   CheckpointerNumDone,      // pg_stat_checkpointer.num_done, slru_written
   VacuumDelayTime,          // pg_stat_progress_vacuum.delay_time
   SubConflictCounters,      // the seven confl_* counters
+  // 19
+  SubSyncErrorSplit,        // sync_error_count became sync_table_ and sync_seq_error_count
+  SubConflictUpdateDeleted, // confl_update_deleted
+  SlotSyncSkip,             // slotsync_skip_reason, and the skip count and time beside it
+  ProgressStartedBy,        // pg_stat_progress_vacuum/_analyze.started_by
+  RelStatsReset,            // stats_reset on pg_stat_*_tables and _indexes
 };
 
 constexpr int feature_since(Feature f) {
@@ -306,6 +312,12 @@ constexpr int feature_since(Feature f) {
     case Feature::CheckpointerNumDone:
     case Feature::VacuumDelayTime:
     case Feature::SubConflictCounters:      return 180000;
+
+    case Feature::SubSyncErrorSplit:
+    case Feature::SubConflictUpdateDeleted:
+    case Feature::SlotSyncSkip:
+    case Feature::ProgressStartedBy:
+    case Feature::RelStatsReset:            return 190000;
   }
   return 0;  // unreachable; every enumerator is listed above
 }
@@ -3752,6 +3764,16 @@ private:
     const std::string invalidation = sess.has(Feature::SlotInvalidationReason)
       ? ", 'invalidation_reason', s.invalidation_reason, 'inactive_since', s.inactive_since"
       : "";
+    // PostgreSQL 19 says why a standby's slot synchronization skipped a slot
+    // (slotsync_skip_reason, in the slot's own row) and how often and when
+    // (in pg_stat_replication_slots). A failover slot that is never synced
+    // shows nothing wrong on the primary; on the standby this is the reason
+    // it would not be there to fail over to.
+    const std::string slot_sync = sess.has(Feature::SlotSyncSkip)
+      ? ", 'slotsync_skip_reason', s.slotsync_skip_reason"
+        ", 'slotsync_skip_count', st.slotsync_skip_count"
+        ", 'slotsync_last_skip', st.slotsync_last_skip"
+      : "";
 
     std::string const query = R"(
       SELECT JSONB_OBJECT_AGG(s.slot_name,
@@ -3778,7 +3800,7 @@ private:
                  'total_txns',          st.total_txns,
                  'total_bytes',         st.total_bytes,
                  'stats_reset',         st.stats_reset
-               )" + conflicting + invalidation + R"(
+               )" + conflicting + invalidation + slot_sync + R"(
                ))
       FROM pg_replication_slots AS s
       LEFT JOIN pg_stat_replication_slots AS st ON st.slot_name = s.slot_name;
@@ -4903,6 +4925,16 @@ private:
                      / NULLIF(EXTRACT(EPOCH FROM now() - a.query_start) * 1000, 0))::numeric, 1))"
       : "";
 
+    // started_by (PostgreSQL 19) says whether a user or autovacuum began the
+    // run, and for vacuum whether autovacuum began it to prevent wraparound --
+    // the one kind that cannot be cancelled to free a lock and returns at
+    // once if killed. Before 19 it was read from the query text
+    // ("autovacuum: VACUUM ... (to prevent wraparound)"), which a role
+    // without pg_read_all_stats cannot see.
+    const bool started_by = sess.has(Feature::ProgressStartedBy);
+    const std::string vacuum_started_by = started_by ? ", 'started_by', v.started_by" : "";
+    const std::string analyze_started_by = started_by ? ", 'started_by', an.started_by" : "";
+
     // Percentages are the point of a progress view: "1.2 million of 4 million
     // blocks" is only useful once it is 30%.
     std::string const query = R"(
@@ -4924,7 +4956,7 @@ private:
                    'query',             a.query,
                    'started',           a.query_start,
                    'elapsed_s',         round(EXTRACT(EPOCH FROM now() - a.query_start)::numeric, 1),
-                   )" + vacuum_dead + vacuum_delay + R"())
+                   )" + vacuum_dead + vacuum_delay + vacuum_started_by + R"())
           FROM pg_stat_progress_vacuum AS v
           LEFT JOIN pg_stat_activity AS a ON a.pid = v.pid
           WHERE true)" + pid_v + rel_filter("v") + R"(), '[]'::jsonb),
@@ -4942,7 +4974,8 @@ private:
                    'ext_stats_computed',    an.ext_stats_computed,
                    'child_tables_total',    an.child_tables_total,
                    'child_tables_done',     an.child_tables_done,
-                   'elapsed_s',             round(EXTRACT(EPOCH FROM now() - a.query_start)::numeric, 1)))
+                   'elapsed_s',             round(EXTRACT(EPOCH FROM now() - a.query_start)::numeric, 1)
+                   )" + analyze_started_by + R"())
           FROM pg_stat_progress_analyze AS an
           LEFT JOIN pg_stat_activity AS a ON a.pid = an.pid
           WHERE true)" + pid_an + rel_filter("an") + R"(), '[]'::jsonb),
@@ -5309,6 +5342,15 @@ private:
     // what the INCLUDE coverage test compares against: an included column is
     // covered by a key column of the wider index regardless of how that key is
     // sorted or compared.
+    //
+    // stats_reset (PostgreSQL 19) dates each index's idx_scan on its own, which
+    // counters_since, one value for the whole answer, cannot:
+    // pg_stat_reset_single_table_counters() zeroes the one relation it names,
+    // so two indexes of one table can count from different resets.
+    const bool own_reset = sess.has(Feature::RelStatsReset);
+    const std::string idx_stats_reset = own_reset ? " s.stats_reset," : "";
+    const std::string a_reset = own_reset ? " 'stats_reset', a.stats_reset," : "";
+    const std::string b_reset = own_reset ? " 'covered_by_stats_reset', b.stats_reset," : "";
     std::string const query = R"(
       WITH idx AS (
         SELECT i.indexrelid,
@@ -5325,7 +5367,7 @@ private:
                pg_get_expr(i.indpred, i.indrelid, true) AS predicate,
                pg_get_indexdef(i.indexrelid)  AS definition,
                pg_relation_size(i.indexrelid) AS size,
-               s.idx_scan,
+               s.idx_scan,)" + idx_stats_reset + R"(
                (SELECT ARRAY_AGG(pg_get_indexdef(i.indexrelid, k::int, true) ORDER BY k)
                   FROM generate_series(1, i.indnkeyatts) AS k) AS key_columns,
                (SELECT ARRAY_AGG(pg_get_indexdef(i.indexrelid, k::int, true) || ' '
@@ -5364,7 +5406,7 @@ private:
                                   'name', a.index_name,
                                   'definition', a.definition,
                                   'size', a.size,
-                                  'idx_scan', a.idx_scan,
+                                  'idx_scan', a.idx_scan,)" + a_reset + R"(
                                   'unique', a.is_unique,
                                   'primary_key', a.is_primary,
                                   'constraint', a.constraint_name,
@@ -5383,11 +5425,11 @@ private:
                      'index', a.index_name,
                      'definition', a.definition,
                      'size', a.size,
-                     'idx_scan', a.idx_scan,
+                     'idx_scan', a.idx_scan,)" + a_reset + R"(
                      'covered_by', b.index_name,
                      'covered_by_definition', b.definition,
                      'covered_by_size', b.size,
-                     'covered_by_idx_scan', b.idx_scan,
+                     'covered_by_idx_scan', b.idx_scan,)" + b_reset + R"(
                      'reason',
                        CASE WHEN array_length(a.key_signature, 1) < array_length(b.key_signature, 1)
                             THEN 'key columns are a leading prefix of ' || b.index_name
@@ -8580,7 +8622,11 @@ private:
     // returned as nulls: absent means "this server cannot answer", which is
     // not the same as zero errors.
     const bool has_stats = sess.has(Feature::SubscriptionStatsView);
-    // The seven conflict counters are PG18.
+    // The seven conflict counters are PG18. confl_update_deleted is PG19, and
+    // counts only on a subscription with retain_dead_tuples: without it the
+    // deleted row is gone and the conflict is reported as update_missing.
+    const std::string update_deleted = sess.has(Feature::SubConflictUpdateDeleted)
+      ? " , 'update_deleted',            ss.confl_update_deleted" : "";
     const std::string conflicts = sess.has(Feature::SubConflictCounters) ?
       ", 'conflicts', JSONB_BUILD_OBJECT("
       "   'insert_exists',             ss.confl_insert_exists"
@@ -8589,13 +8635,26 @@ private:
       " , 'update_missing',            ss.confl_update_missing"
       " , 'delete_origin_differs',     ss.confl_delete_origin_differs"
       " , 'delete_missing',            ss.confl_delete_missing"
-      " , 'multiple_unique_conflicts', ss.confl_multiple_unique_conflicts)" : "";
+      " , 'multiple_unique_conflicts', ss.confl_multiple_unique_conflicts"
+      + update_deleted + ")" : "";
+
+    // PostgreSQL 19 renamed sync_error_count to sync_table_error_count, when
+    // sequences began to be synchronized and got a counter of their own, and
+    // 4.7 read the old name: subscriptionStats failed on every 19 server,
+    // subscriptions or not. sync_error_count stays, under its own name and
+    // with the value it always had, so that a caller written against 15 to
+    // 18 reads the same key on 19; the new names are given beside it.
+    const std::string sync_errors = sess.has(Feature::SubSyncErrorSplit)
+      ? "         , 'sync_error_count',       ss.sync_table_error_count"
+        "         , 'sync_table_error_count', ss.sync_table_error_count"
+        "         , 'sync_seq_error_count',   ss.sync_seq_error_count"
+      : "         , 'sync_error_count',  ss.sync_error_count";
 
     const std::string errors_cte = has_stats ?
       ", e AS ("
       "  SELECT ss.subid, JSONB_BUILD_OBJECT("
       "           'apply_error_count', ss.apply_error_count"
-      "         , 'sync_error_count',  ss.sync_error_count"
+      + sync_errors +
       "         , 'stats_reset',       ss.stats_reset" + conflicts + ") AS errors"
       "    FROM pg_stat_subscription_stats AS ss"
       "    JOIN sub ON sub.oid = ss.subid)" : "";
@@ -10121,10 +10180,16 @@ private:
   // index proposed for dropping on the strength of a zero that was four days
   // old.
   //
-  // Reported as a lower bound rather than a guarantee:
-  // pg_stat_reset_single_table_counters() zeroes one relation without touching
-  // pg_stat_database.stats_reset, so a null or old value here does not prove
-  // the counters beside it are that old. It does prove they are no older.
+  // Reported as a bound rather than an exact date.
+  // pg_stat_reset_single_table_counters() zeroes the one relation it names,
+  // a table or an index, and stamps pg_stat_database.stats_reset as it does
+  // (measured on 14, 17, 18 and 19 on 2026-11-20; on 14 the stamp lands a
+  // moment after the call; 15 and 16 not checked). So resetting one relation
+  // moves the date of every other relation's counters forward, and theirs are
+  // then older than reported: a window shorter than the truth, which for
+  // "has this index been used" is the side that errs towards keeping it.
+  // Through 4.7 this comment said the reset moved nothing, which was never
+  // true.
   //
   // pg_stat_database.stats_reset is null on a database nobody has reset, and
   // since PostgreSQL 15 it is null again after crash recovery, which discards
@@ -10152,12 +10217,37 @@ private:
             WHERE d.datname = current_database()))";
   // A function, not a static string: building one at start-up can throw where
   // nothing can catch it.
-  static std::string counters_since_sql() {
-    return std::string("'counters_since', (SELECT COALESCE(d.stats_reset, w.stats_reset)")
-      + kCountersSinceFrom
-      + ", 'counters_since_source', (SELECT CASE WHEN d.stats_reset IS NOT NULL"
-        " THEN 'pg_stat_database' ELSE w.source END"
-      + kCountersSinceFrom;
+  //
+  // `own`, where given, is an expression for the date of the answer's own
+  // counters from their relations' stats_reset (PostgreSQL 19), and
+  // `own_source` an expression naming the view it came from. A stats_reset is
+  // the exact date of that relation's counters wherever it is set, set by the
+  // two calls
+  // that zero them, pg_stat_reset() and pg_stat_reset_single_table_counters()
+  // (measured on 19.0). Null means they were not reset while the statistics
+  // survived -- or were reset before the relation had any, when they were
+  // zero anyway -- and the instance-wide reading stands in as before.
+  static std::string counters_since_sql(const std::string& own = "",
+                                        const std::string& own_source = "") {
+    if (own.empty())
+      return std::string("'counters_since', (SELECT COALESCE(d.stats_reset, w.stats_reset)")
+        + kCountersSinceFrom
+        + ", 'counters_since_source', (SELECT CASE WHEN d.stats_reset IS NOT NULL"
+          " THEN 'pg_stat_database' ELSE w.source END"
+        + kCountersSinceFrom;
+    return "'counters_since', COALESCE(" + own
+      + ", (SELECT COALESCE(d.stats_reset, w.stats_reset)" + kCountersSinceFrom + ")"
+      + ", 'counters_since_source', CASE WHEN " + own + " IS NOT NULL THEN " + own_source
+      + " ELSE (SELECT CASE WHEN d.stats_reset IS NOT NULL"
+        " THEN 'pg_stat_database' ELSE w.source END" + kCountersSinceFrom + " END";
+  }
+
+  // The relation's own stats_reset, PostgreSQL 19, beside its counters: null
+  // where they were never reset. counters_since is one value for a whole
+  // answer; this is the one for each table, partition or index, which a
+  // single-table reset moves alone.
+  static std::string stats_reset_fragment(const Session& sess, const std::string& alias) {
+    return sess.has(Feature::RelStatsReset) ? ", 'stats_reset', " + alias + ".stats_reset" : "";
   }
 
   static constexpr const char* kTableStatsCommon = R"(
@@ -10206,10 +10296,25 @@ private:
     // on an undefined column.
     const std::string idx_pg16 = sess.has(Feature::IndexLastScan)
       ? R"(, 'last_use', si.last_idx_scan)" : "";
+    // On 19 the answer is dated by its own relations: the LATEST stats_reset of
+    // the table and its indexes, since index_uses are in the answer too and
+    // pg_stat_reset_single_table_counters() resets an index apart from its
+    // table. The earliest, or the table's alone, would date an index's
+    // counters from before they were zeroed -- the direction that makes an
+    // index look unused for longer than it has been.
+    const bool own_reset = sess.has(Feature::RelStatsReset);
+    const std::string idx_reset =
+      "(SELECT max(si2.stats_reset) FROM pg_stat_user_indexes AS si2 WHERE si2.relid = c.oid)";
+    const std::string since = own_reset
+      ? counters_since_sql("GREATEST(s.stats_reset, " + idx_reset + ")",
+                           "CASE WHEN s.stats_reset IS NULL OR " + idx_reset + " > s.stats_reset"
+                           " THEN 'pg_stat_user_indexes' ELSE 'pg_stat_user_tables' END")
+      : counters_since_sql();
 
     std::string const query = std::string(R"(
       SELECT JSONB_BUILD_OBJECT(
-               'table', c.relname,)") + counters_since_sql() + "," + kTableStatsCommon + pg16 + R"(,
+               'table', c.relname,)") + since + "," + kTableStatsCommon + pg16
+                 + stats_reset_fragment(sess, "s") + R"(,
                'columns', COALESCE(columns, '{}'::jsonb),
                -- pg_stats returns NO ROW for a table whose RLS is active for
                -- this role, so every per-column statistic below comes back null
@@ -10275,7 +10380,8 @@ private:
                            AND NOT a.attisdropped) _lat40 ON true
       LEFT JOIN LATERAL (SELECT JSONB_OBJECT_AGG(si.indexrelname,
                           JSONB_BUILD_OBJECT(
-                           'index_uses', si.idx_scan)" + idx_pg16 + R"()) AS indexes
+                           'index_uses', si.idx_scan)" + idx_pg16
+                           + stats_reset_fragment(sess, "si") + R"()) AS indexes
                          FROM pg_stat_user_indexes AS si
                          WHERE si.relid = c.oid) _lat41 ON true
       WHERE c.relnamespace = $1::regnamespace
@@ -10864,7 +10970,7 @@ private:
                        'last_vacuum',      s.last_vacuum,
                        'last_autovacuum',  s.last_autovacuum,
                        'last_analyze',     s.last_analyze,
-                       'last_autoanalyze', s.last_autoanalyze) AS obj,
+                       'last_autoanalyze', s.last_autoanalyze)" + stats_reset_fragment(sess, "s") + R"() AS obj,
                      pg_get_expr(ch.relpartbound, ch.oid) = 'DEFAULT' AS is_def,
                      ch.relname,
                      ch.relpages,
@@ -10922,7 +11028,8 @@ private:
     // nobody asked for. Name a table to tableStats to get them.
     std::string const query = std::string(R"(
       SELECT JSONB_OBJECT_AGG(c.relname,
-              JSONB_BUILD_OBJECT()") + kTableStatsCommon + pg16 + R"(
+              JSONB_BUILD_OBJECT()") + kTableStatsCommon + pg16
+                 + stats_reset_fragment(sess, "s") + R"(
                ))
       FROM pg_class AS c
       LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
@@ -12041,7 +12148,7 @@ private:
     // Only arguments that make an answer smaller when given. include_system
     // and group_by are not here although both change the size: each makes it
     // larger when set, and the default is already the small one.
-    static const char* kNarrowing[] = {
+    static const char* const kNarrowing[] = {
       "limit", "schema", "table", "pattern", "query_id", "pid", "state",
       "min_calls", "min_duration_s", "relation", "database"};
     std::string args;

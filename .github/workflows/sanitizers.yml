@@ -206,7 +206,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: [14, 15, 16, 17, 18]
+        pg: [14, 15, 16, 17, 18, 19]
         sanitizer: [address-undefined, thread]
 
     steps:
@@ -253,7 +253,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: [14, 15, 16, 17, 18]
+        pg: [14, 15, 16, 17, 18, 19]
     services:
       postgres:
         image: postgres:${{ matrix.pg }}
@@ -312,7 +312,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: [14, 15, 16, 17, 18]
+        pg: [14, 15, 16, 17, 18, 19]
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -383,7 +383,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install the rig's server side
-        run: .github/scripts/apt-pgdg.sh libpq5 postgresql-18 postgresql-18-hypopg postgresql-18-pg-wait-sampling postgresql-18-pg-stat-kcache postgresql-18-pg-qualstats pgbouncer
+        run: .github/scripts/apt-pgdg.sh libpq5 postgresql-19 postgresql-19-hypopg postgresql-19-pg-wait-sampling postgresql-19-pg-stat-kcache postgresql-19-pg-qualstats pgbouncer
 
       # Every address, since the VM's route to the runner is only known inside
       # it; trust the private ranges a VM network can use, on a runner that
@@ -391,7 +391,7 @@ jobs:
       - name: Serve the rig
         run: |
           RIG_HOST=0.0.0.0 RIG_TRUST_NET=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16 \
-            RIG_SERVE="$GITHUB_WORKSPACE/rig.env" PG_BINDIR=/usr/lib/postgresql/18/bin \
+            RIG_SERVE="$GITHUB_WORKSPACE/rig.env" PG_BINDIR=/usr/lib/postgresql/19/bin \
             nohup cpp/test/run-pooled-tests.sh > rig.log 2>&1 &
           for _ in $(seq 1 150); do [ -f rig.env ] && break; sleep 2; done
           cat rig.log
