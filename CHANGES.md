@@ -1,6 +1,6 @@
 # Changelog
 
-## 4.8.0 (unreleased)
+## 4.8.0 (2026-11-21)
 
 PostgreSQL 19. Released on 2026-11-19, it renamed a column `subscriptionStats`
 read, and the tool failed on every 19 server, subscriptions or not. Tested
