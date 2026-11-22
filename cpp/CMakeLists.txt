@@ -12,6 +12,13 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# MSVC takes libpqxx and libpq from vcpkg, through the packages' own CMake
+# files; everything else, MinGW included, finds them with pkg-config.
+if(MSVC)
+    find_package(libpqxx CONFIG REQUIRED)
+    find_package(PostgreSQL REQUIRED)
+    set(PGLICHT_PQ_LIBS libpqxx::pqxx PostgreSQL::PostgreSQL)
+else()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PQXX REQUIRED IMPORTED_TARGET libpqxx)
 # libpqxx's .pc only exposes libpq via Requires.private, which CMake's
@@ -21,6 +28,12 @@ pkg_check_modules(PQXX REQUIRED IMPORTED_TARGET libpqxx)
 # a no-op when libpqxx is a shared library (libpq is already a transitive
 # runtime dependency there) and required when it's static.
 pkg_check_modules(LIBPQ REQUIRED IMPORTED_TARGET libpq)
+    set(PGLICHT_PQ_LIBS PkgConfig::PQXX PkgConfig::LIBPQ)
+endif()
+# WSAPoll, which stands in for poll() on Windows, is in Winsock.
+if(WIN32)
+    list(APPEND PGLICHT_PQ_LIBS ws2_32)
+endif()
 find_package(nlohmann_json REQUIRED)
 # The server starts threads -- the connection cache's reaper, parallel sweeps,
 # the pooler tests' clients -- and must say so at link time. glibc 2.34+ has
@@ -41,8 +54,7 @@ target_compile_definitions(pg_licht_mcp PRIVATE PGLICHT_VERSION="${PROJECT_VERSI
 target_link_libraries(pg_licht_mcp
     PRIVATE
         nlohmann_json::nlohmann_json
-        PkgConfig::PQXX
-        PkgConfig::LIBPQ
+        ${PGLICHT_PQ_LIBS}
         Threads::Threads
 )
 pglicht_harden(pg_licht_mcp)
@@ -74,7 +86,7 @@ if(PGLICHT_FUZZ)
         add_executable(fuzz_${_fuzz} ${_sources})
         target_compile_definitions(fuzz_${_fuzz} PRIVATE PGLICHT_VERSION="${PROJECT_VERSION}")
         target_link_libraries(fuzz_${_fuzz} PRIVATE
-            nlohmann_json::nlohmann_json PkgConfig::PQXX PkgConfig::LIBPQ Threads::Threads)
+            nlohmann_json::nlohmann_json ${PGLICHT_PQ_LIBS} Threads::Threads)
         pglicht_harden(fuzz_${_fuzz})
         target_compile_options(fuzz_${_fuzz} PRIVATE
             -g -fno-omit-frame-pointer -fsanitize=fuzzer,address,undefined
@@ -102,8 +114,7 @@ if(BUILD_TESTING)
             GTest::gtest
             GTest::gtest_main
             nlohmann_json::nlohmann_json
-            PkgConfig::PQXX
-            PkgConfig::LIBPQ
+            ${PGLICHT_PQ_LIBS}
             Threads::Threads)
     pglicht_harden(pg_licht_mcp_test)
     pglicht_harden_binary(pg_licht_mcp_test)

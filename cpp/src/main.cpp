@@ -46,11 +46,15 @@ int main(int argc, char *argv[]) {
   // with a connection string there is nothing to reload, and the signal is
   // then simply harmless. SA_RESTART: a read blocked on stdin resumes, and the
   // reload happens at the next request, which is when it can be seen.
+  // Windows has neither SIGHUP nor sigaction. Nothing replaces the signal
+  // there: a changed file is still seen at the next request, by its identity.
+#ifndef _WIN32
   struct sigaction sa {};
   sa.sa_handler = [](int) { PostgresMCPServer::request_reload(); };
   sigemptyset(&sa.sa_mask);
   sa.sa_flags = SA_RESTART;
   sigaction(SIGHUP, &sa, nullptr);
+#endif
 
   std::string config_path;
   std::string db_url;

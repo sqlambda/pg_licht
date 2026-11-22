@@ -294,10 +294,16 @@ public:
     struct stat st {};
     if (::stat(path.c_str(), &st) != 0)
       throw std::runtime_error("cannot read config file: " + path);
+    // TRIAL, NOT DECIDED: Windows' stat copies the owner's bits to group and
+    // other, so this test would refuse every file there. Skipped so the trial
+    // build can be run; what stands in for it on Windows (an exemption, as
+    // libpq makes for .pgpass, or a reading of the file's ACL) is open.
+#ifndef _WIN32
     if (st.st_mode & 0077)
       throw std::runtime_error(
         "config file " + path + " is group/world accessible; "
         "it may contain credentials. Run: chmod 600 " + path);
+#endif
 
     std::ifstream in(path);
     if (!in) throw std::runtime_error("cannot open config file: " + path);
@@ -975,10 +981,14 @@ struct Budgets {
     // Holds no credentials, so it may be readable. It must not be WRITABLE by
     // anyone but its owner: these are limits, and a file another user can
     // edit is a limit another user can raise.
+    // TRIAL, NOT DECIDED: skipped on Windows for the reason given at the
+    // connections file's test in from_ini.
+#ifndef _WIN32
     if (st.st_mode & 0022)
       throw std::runtime_error(
         "budgets file " + path + " is group/world writable, so another user "
         "could raise its limits. Run: chmod go-w " + path);
+#endif
 
     std::ifstream in(path);
     if (!in) throw std::runtime_error("cannot open budgets file: " + path);

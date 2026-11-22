@@ -20,7 +20,21 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#ifdef _WIN32
+// winsock2.h before anything that might bring in windows.h, and without the
+// min and max macros, which would rewrite std::min and std::numeric_limits.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <process.h>
+#include <filesystem>
+#else
 #include <unistd.h>
+#endif
 #include <nlohmann/json.hpp>
 #include "config.h"
 #if defined(__GNUC__) && !defined(__clang__)
@@ -32,7 +46,9 @@
 #endif
 #include <pqxx/pqxx>
 #include <libpq-fe.h>
+#ifndef _WIN32
 #include <poll.h>
+#endif
 #include <csignal>
 #include <sys/stat.h>
 #include <cerrno>
@@ -653,6 +669,22 @@ inline json rows(const PGresult* r) {
 // this server answers one call at a time. On expiry the command is cancelled
 // and `dead` set, so the caller sends nothing more on it. 0 turns the bound
 // off, as it does for statement_timeout.
+// Waits until the socket can be read, or `wait_ms` has passed (-1: no limit).
+// False only when the wait itself failed; an interrupted wait is not a failure,
+// since the caller loops on PQisBusy. Windows has no poll(): WSAPoll is its
+// counterpart, on a SOCKET rather than a file descriptor.
+inline bool wait_readable(int fd, int wait_ms) {
+#ifdef _WIN32
+  WSAPOLLFD pfd{};
+  pfd.fd = static_cast<SOCKET>(fd);
+  pfd.events = POLLRDNORM;
+  return WSAPoll(&pfd, 1, wait_ms) != SOCKET_ERROR;
+#else
+  pollfd pfd{fd, POLLIN, 0};
+  return ::poll(&pfd, 1, wait_ms) >= 0 || errno == EINTR;
+#endif
+}
+
 inline json exec(PGconn* conn, const std::string& cmd, int timeout_ms,
                  std::string& why, bool& dead) {
   if (!PQsendQuery(conn, cmd.c_str())) { why = PQerrorMessage(conn); dead = true; return json(); }
@@ -676,9 +708,8 @@ inline json exec(PGconn* conn, const std::string& cmd, int timeout_ms,
       }
       wait = static_cast<int>(left);
     }
-    pollfd pfd{PQsocket(conn), POLLIN, 0};
-    if (pfd.fd < 0 || (::poll(&pfd, 1, wait) < 0 && errno != EINTR) ||
-        !PQconsumeInput(conn)) {
+    const int fd = PQsocket(conn);
+    if (fd < 0 || !wait_readable(fd, wait) || !PQconsumeInput(conn)) {
       why = PQerrorMessage(conn);
       dead = true;
       return json();
@@ -1153,6 +1184,16 @@ private:
   // What identifies one version of a file: "" when there is none.
   static std::string file_identity(const std::string& path) {
     if (path.empty()) return "";
+#ifdef _WIN32
+    // Windows' stat has whole seconds and no inode. The file's own timestamp,
+    // in 100 ns units, and its size are what there is.
+    std::error_code ec;
+    const auto written = std::filesystem::last_write_time(path, ec);
+    if (ec) return "missing";
+    const auto size = std::filesystem::file_size(path, ec);
+    if (ec) return "missing";
+    return std::to_string(written.time_since_epoch().count()) + "/" + std::to_string(size);
+#else
     struct stat st {};
     if (::stat(path.c_str(), &st) != 0) return "missing";
     // The nanosecond timestamp is st_mtim on Linux and st_mtimespec on macOS;
@@ -1164,6 +1205,7 @@ private:
 #endif
     return std::to_string(mt.tv_sec) + "." + std::to_string(mt.tv_nsec) +
            "/" + std::to_string(st.st_size) + "/" + std::to_string(st.st_ino);
+#endif
   }
 
   void maybe_reload() {
@@ -6911,7 +6953,13 @@ private:
         }
       } else {
         const std::string name =
-          "pg_licht_explain_" + std::to_string(static_cast<long long>(::getpid())) +
+          "pg_licht_explain_" + std::to_string(static_cast<long long>(
+#ifdef _WIN32
+            ::_getpid()
+#else
+            ::getpid()
+#endif
+          )) +
           "_" + std::to_string(++explain_seq_);
         tx.exec("PREPARE " + name + " AS " + sql);
         // Named only once it exists: a PREPARE that failed left nothing to

@@ -1,0 +1,189 @@
+name: Windows trial
+
+# A trial, not a release: it builds pg_licht_mcp for Windows x86_64 with two
+# toolchains so that the choice between them rests on what each one does to
+# this source. Nothing here publishes. What to read in a run:
+#   - MSYS2 UCRT64: which DLLs the executable needs beside it, and whether
+#     MSYS2 ships static libraries for libpq and libpqxx.
+#   - MSVC with vcpkg, static triplet: what the compiler raises at /W4, and
+#     whether the executable needs any DLL that Windows does not have.
+# Both then answer one exchange over stdio, and one call against the
+# PostgreSQL the runner image carries.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The two requests every smoke step sends: the handshake, then a tool that
+  # answers from the registry without connecting.
+  INIT: '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"trial","version":"0"}}}'
+  LIST: '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"listConnections","arguments":{}}}'
+  SCHEMAS: '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"listSchemas","arguments":{}}}'
+
+jobs:
+  msys2:
+    name: MSYS2 UCRT64 (GCC)
+    runs-on: windows-2025
+    timeout-minutes: 40
+    env:
+      MSYSTEM: UCRT64
+      CHERE_INVOKING: 1
+    defaults:
+      run:
+        # The MSYS2 the image carries; it is not on PATH.
+        shell: C:\msys64\usr\bin\bash.exe -leo pipefail {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the toolchain and the libraries
+        run: |
+          pacman -Sy --noconfirm --needed \
+            mingw-w64-ucrt-x86_64-gcc \
+            mingw-w64-ucrt-x86_64-cmake \
+            mingw-w64-ucrt-x86_64-ninja \
+            mingw-w64-ucrt-x86_64-pkgconf \
+            mingw-w64-ucrt-x86_64-libpqxx \
+            mingw-w64-ucrt-x86_64-postgresql \
+            mingw-w64-ucrt-x86_64-nlohmann-json
+          g++ --version
+          pacman -Q mingw-w64-ucrt-x86_64-libpqxx mingw-w64-ucrt-x86_64-postgresql
+
+      - name: What MSYS2 ships, static or shared
+        run: |
+          echo "== libpqxx"
+          pacman -Ql mingw-w64-ucrt-x86_64-libpqxx | grep -E '\.(a|dll)$' || echo "(no library files listed)"
+          echo "== libpq"
+          pacman -Ql mingw-w64-ucrt-x86_64-postgresql | grep -E 'libpq[^/]*\.(a|dll)$' || echo "(no libpq files listed)"
+          echo "== pkg-config"
+          pkg-config --libs libpqxx libpq
+          pkg-config --static --libs libpqxx libpq || true
+
+      - name: Build
+        run: |
+          cmake -S cpp -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DPGLICHT_WERROR=ON
+          cmake --build build --target pg_licht_mcp
+          strip build/pg_licht_mcp.exe
+          ls -l build/pg_licht_mcp.exe
+
+      - name: The DLLs it needs
+        run: |
+          echo "== imported directly"
+          objdump -p build/pg_licht_mcp.exe | grep 'DLL Name'
+          echo "== everything loaded, Windows' own left out"
+          ldd build/pg_licht_mcp.exe | grep -vi '/c/windows/' | sort
+          echo "== how many would ship beside the executable"
+          ldd build/pg_licht_mcp.exe | grep -vi '/c/windows/' | wc -l
+
+      - name: The same, with GCC's runtime linked in
+        continue-on-error: true
+        run: |
+          cmake -S cpp -B build-rt -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DPGLICHT_WERROR=ON \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++ -Wl,-Bstatic,--whole-archive -lwinpthread -Wl,--no-whole-archive,-Bdynamic"
+          cmake --build build-rt --target pg_licht_mcp
+          ldd build-rt/pg_licht_mcp.exe | grep -vi '/c/windows/' | sort
+          ldd build-rt/pg_licht_mcp.exe | grep -vi '/c/windows/' | wc -l
+
+      - name: It starts and answers over stdio
+        run: |
+          build/pg_licht_mcp.exe --version
+          build/pg_licht_mcp.exe --help
+          printf '%s\n%s\n' "$INIT" "$LIST" \
+            | build/pg_licht_mcp.exe "host=192.0.2.1 port=5432 dbname=x user=y connect_timeout=1" > answer.txt
+          cat answer.txt
+          test "$(grep -c '"jsonrpc"' answer.txt)" = 2
+          grep -q '"protocolVersion":"2025-06-18"' answer.txt
+          # Reported, not judged: whether Windows turned each newline into CR LF.
+          echo "lines ending in CR: $(grep -c $'\r$' answer.txt || true)"
+
+      - name: It reads a PostgreSQL server
+        continue-on-error: true
+        run: |
+          powershell -Command "Set-Service postgresql-x64-17 -StartupType Manual; Start-Service postgresql-x64-17"
+          printf '%s\n%s\n' "$INIT" "$SCHEMAS" \
+            | build/pg_licht_mcp.exe "host=127.0.0.1 port=5432 dbname=postgres user=postgres password=root connect_timeout=5" > schemas.txt
+          cat schemas.txt
+          grep -q 'pg_catalog\|public' schemas.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: trial-msys2-ucrt64
+          path: build/pg_licht_mcp.exe
+
+  msvc:
+    name: MSVC, vcpkg static
+    runs-on: windows-2025
+    # vcpkg builds OpenSSL, libpq and libpqxx from source.
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build the libraries with vcpkg
+        run: |
+          git -C "$VCPKG_INSTALLATION_ROOT" log -1 --format='vcpkg at %H, %cs'
+          "$VCPKG_INSTALLATION_ROOT/vcpkg.exe" install \
+            libpqxx nlohmann-json --triplet x64-windows-static
+          "$VCPKG_INSTALLATION_ROOT/vcpkg.exe" list
+
+      # Warnings are counted, not refused: this source has never met MSVC, and
+      # the count is what the trial is for.
+      - name: Build
+        run: |
+          cmake -S cpp -B build -A x64 \
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static \
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
+            -DBUILD_TESTING=OFF -DPGLICHT_WERROR=OFF
+          cmake --build build --config Release --target pg_licht_mcp 2>&1 | tee build.log
+          ls -l build/Release/pg_licht_mcp.exe
+
+      - name: What MSVC raised
+        if: always()
+        run: |
+          echo "warnings: $(grep -c ': warning C' build.log || true)"
+          echo "errors:   $(grep -c ': error C' build.log || true)"
+          echo "== by warning number"
+          grep -o 'warning C[0-9]*' build.log | sort | uniq -c | sort -rn || true
+          echo "== errors"
+          grep ': error C' build.log | head -50 || true
+
+      - name: The DLLs it needs
+        run: |
+          llvm-objdump -p build/Release/pg_licht_mcp.exe | grep 'DLL Name'
+
+      - name: It starts and answers over stdio
+        run: |
+          build/Release/pg_licht_mcp.exe --version
+          build/Release/pg_licht_mcp.exe --help
+          printf '%s\n%s\n' "$INIT" "$LIST" \
+            | build/Release/pg_licht_mcp.exe "host=192.0.2.1 port=5432 dbname=x user=y connect_timeout=1" > answer.txt
+          cat answer.txt
+          test "$(grep -c '"jsonrpc"' answer.txt)" = 2
+          grep -q '"protocolVersion":"2025-06-18"' answer.txt
+          echo "lines ending in CR: $(grep -c $'\r$' answer.txt || true)"
+
+      - name: It reads a PostgreSQL server
+        continue-on-error: true
+        run: |
+          powershell -Command "Set-Service postgresql-x64-17 -StartupType Manual; Start-Service postgresql-x64-17"
+          printf '%s\n%s\n' "$INIT" "$SCHEMAS" \
+            | build/Release/pg_licht_mcp.exe "host=127.0.0.1 port=5432 dbname=postgres user=postgres password=root connect_timeout=5" > schemas.txt
+          cat schemas.txt
+          grep -q 'pg_catalog\|public' schemas.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: trial-msvc-vcpkg-static
+          path: build/Release/pg_licht_mcp.exe

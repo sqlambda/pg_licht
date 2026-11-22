@@ -34,6 +34,15 @@ option(PGLICHT_WERROR "Treat compiler warnings as errors" ${_pglicht_werror_defa
 
 # Always-on static hygiene: the warning set + hardened standard library.
 function(pglicht_harden target)
+    # MSVC spells all of it differently. /utf-8: the sources are UTF-8, which
+    # MSVC otherwise reads in the machine's code page.
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /utf-8 /permissive-)
+        if(PGLICHT_WERROR)
+            target_compile_options(${target} PRIVATE /WX)
+        endif()
+        return()
+    endif()
     target_compile_options(${target} PRIVATE
         -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion
         -Wuninitialized -Wshadow
@@ -79,6 +88,9 @@ check_pie_supported(OUTPUT_VARIABLE _pglicht_pie_msg LANGUAGES CXX)
 # with only "argument unused during compilation", so a plain check passed and
 # the -Werror build then failed on it -- found by CI's macOS job on 4.6's
 # first push. A flag the compiler would only warn about is unsupported here.
+# None of these is an MSVC option, and MSVC only warns about an option it does
+# not know, so there the checks are not made and every flag stays unset.
+if(NOT MSVC)
 set(_pglicht_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
 set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -Werror")
 foreach(_flag -fstack-protector-strong -fstack-clash-protection -fcf-protection
@@ -91,6 +103,7 @@ foreach(_flag -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack)
     string(MAKE_C_IDENTIFIER "PGLICHT_HAS${_flag}" _var)
     check_linker_flag(CXX ${_flag} ${_var})
 endforeach()
+endif()
 
 function(pglicht_harden_binary target)
     # PIE whether or not the compiler defaults to it. CMake adds -fPIE and
@@ -99,6 +112,11 @@ function(pglicht_harden_binary target)
     # their static libpqxx with CMAKE_POSITION_INDEPENDENT_CODE=ON: Rocky's
     # gcc-toolset does not default to PIE the way Debian's GCC does.
     set_property(TARGET ${target} PROPERTY POSITION_INDEPENDENT_CODE ON)
+    # What follows is GCC's and clang's. MSVC's own defaults (/GS, /DYNAMICBASE,
+    # /NXCOMPAT) are left as they are; what to add there is not decided.
+    if(MSVC)
+        return()
+    endif()
     foreach(_flag -fstack-protector-strong -fstack-clash-protection -fcf-protection)
         string(MAKE_C_IDENTIFIER "PGLICHT_HAS${_flag}" _var)
         if(${_var})
