@@ -12098,7 +12098,10 @@ private:
     const std::string digits = plain.substr(prefix.size());
     if (digits.empty()) return false;
     for (char const c : digits) if (c < '0' || c > '9') return false;
-    try { offset = static_cast<size_t>(std::stoull(digits)); }
+    // Assigned, not cast: size_t is unsigned long on Linux and unsigned long
+    // long on Windows, so a cast is needed by neither and useless on one, which
+    // GCC refuses there.
+    try { const unsigned long long parsed = std::stoull(digits); offset = parsed; }
     catch (const std::exception&) { return false; }
     // Only what encode_cursor() emits: b64_decode stops at the first '=', so
     // bytes after the padding decoded to a valid offset, as did leading zeros.
