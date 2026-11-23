@@ -29,6 +29,11 @@
 // _CRT_NONSTDC_NO_WARNINGS; the environment is set through _putenv_s, where an
 // empty value removes the variable; and a file has no mode to set.
 #ifdef _WIN32
+// Windows' headers, which server.h brings in for Winsock, still define the
+// keywords of 16-bit pointers as macros that expand to nothing, and two tests
+// name their readings `near` and `far`. Nothing after this line needs them.
+#undef near
+#undef far
 using mode_t = int;
 static int setenv(const char* name, const char* value, int) { return _putenv_s(name, value); }
 static int unsetenv(const char* name) { return _putenv_s(name, ""); }
