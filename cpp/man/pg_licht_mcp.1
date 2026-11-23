@@ -677,6 +677,32 @@ Note that libpq enforces that rule on
 but not on
 .Pa pg_service.conf ,
 so if a service file holds a password its permissions are yours to manage.
+.Ss Windows
+On Windows the default files are
+.Pa %APPDATA%\epg_licht\econnections.ini
+and
+.Pa %APPDATA%\epg_licht\ebudgets.ini ,
+beside the
+.Pa %APPDATA%\epostgresql
+where libpq keeps
+.Pa pgpass.conf ;
+.Ev HOME
+is not read.
+Everywhere this manual writes
+.Pa ~/.config/pg_licht ,
+read that directory.
+.Pp
+The permissions of the two files are not tested there, as libpq does not test
+its password file on Windows.
+Keep them in
+.Pa %APPDATA% ,
+which only your own account can read.
+.Pp
+There is no
+.Dv SIGHUP
+on Windows.
+A changed file is still read at the next request, known by its modification
+time and size.
 .Ss Reloading
 An edit to the connections file, or to the budgets file in use at startup, takes
 effect at the next request, without restarting the server or the client.
@@ -3764,6 +3790,11 @@ Path to a libpq password file; defaults to
 .It Ev HOME
 Used to locate
 .Pa ~/.config/pg_licht/connections.ini .
+.It Ev APPDATA
+On Windows, used in place of
+.Ev HOME :
+see
+.Sx Windows .
 .El
 .Pp
 Any other libpq environment variable is honoured as usual, since connection

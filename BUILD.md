@@ -25,6 +25,27 @@ runs the same libpqxx regardless of what each distro packages; libpq stays a dyn
 runtime dependency, since its C ABI is stable and distros patch it independently. Local
 builds use whatever libpqxx your system provides — dynamic or static both work.
 
+### Windows
+
+With Visual Studio's C++ tools and [vcpkg](https://vcpkg.io). `cpp/vcpkg.json` names the
+libraries and pins the vcpkg commit they are taken at, so the toolchain file is all CMake
+needs to be told; it builds libpq, OpenSSL and libpqxx from source on the first
+configure, which takes several minutes.
+
+```powershell
+cmake -S cpp -B cpp/build -A x64 `
+  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
+  -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+  -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+  -DBUILD_TESTING=OFF
+cmake --build cpp/build --config Release --target pg_licht_mcp
+```
+
+The static triplet is what the release uses: `cpp\build\Release\pg_licht_mcp.exe` then
+needs no DLL beside it. The test suite is not built on Windows yet, hence
+`-DBUILD_TESTING=OFF`. MinGW (MSYS2's UCRT64) also builds it, through pkg-config as on
+Linux, but is not what ships and is not in CI.
+
 ### Build options
 
 | Option | Default | Purpose |
@@ -186,8 +207,9 @@ not duplicate it.
 - `freebsd-*-client` builds the test binary in a FreeBSD 14 and a FreeBSD 15 VM and runs the
   whole suite against the rig served from the Linux runner, then the kernel-counter tests
   against a PostgreSQL started inside the VM (`.github/scripts/freebsd-server.sh`).
-- `.github/workflows/release.yml` — 7 build targets (Linux x86_64/arm64, Debian 13 deb,
-  Rocky 9 rpm, macOS arm64). Tarballs are staged through `cmake --install`; deb and rpm are
+- `.github/workflows/release.yml` — 8 build targets (Linux x86_64/arm64, Debian 13 deb,
+  Rocky 9 rpm, macOS arm64, Windows x86_64). The Windows one is built with MSVC and
+  vcpkg's static triplet, checked for importing no library Windows lacks, and zipped. Tarballs are staged through `cmake --install`; deb and rpm are
   produced by CPack, which picks up the same install rules. libpqxx is pinned via
   `PQXX_VERSION`. The `.deb` Depends is derived by `dpkg-shlibdeps`; the `.rpm` requires
   PGDG's `libpq5` by name.

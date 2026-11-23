@@ -75,6 +75,13 @@ jobs:
             artifact: pg_licht_mcp-macos-arm64
             distro: macos
             extension: tar.gz
+          # MSVC, with every library from vcpkg's static triplet, so the
+          # executable needs nothing beside it. Its steps name bash, which on
+          # this runner is Git's; the default shell there is PowerShell.
+          - os: windows-2025
+            artifact: pg_licht_mcp-windows-x86_64
+            distro: windows
+            extension: zip
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -156,6 +163,7 @@ jobs:
           echo "PKG_CONFIG_PATH=$(brew --prefix libpq)/lib/pkgconfig" >> $GITHUB_ENV
 
       - name: Build
+        if: matrix.distro != 'windows'
         run: |
           # -Werror explicitly: the packages ship from these toolchains, and
           # a warning here is one to fix before release, not to ship past.
@@ -168,8 +176,82 @@ jobs:
       # build has no tests, so this is the one place it is checked on every
       # toolchain in the matrix. ELF only: macOS has no readelf.
       - name: Check the binary's hardening
-        if: matrix.distro != 'macos'
+        if: matrix.distro != 'macos' && matrix.distro != 'windows'
         run: cpp/test/hardening-check.sh cpp/build/pg_licht_mcp
+
+      # vcpkg reads cpp/vcpkg.json while CMake configures, and builds libpq,
+      # OpenSSL and libpqxx from source at the baseline pinned there: about
+      # seven minutes. The static triplet links the C runtime in as well,
+      # which CMAKE_MSVC_RUNTIME_LIBRARY has to agree with. /WX, as -Werror is
+      # for the others.
+      - name: Build (Windows)
+        if: matrix.distro == 'windows'
+        shell: bash
+        run: |
+          cmake -S cpp -B cpp/build -A x64 \
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static \
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
+            -DBUILD_TESTING=OFF -DPGLICHT_WERROR=ON
+          cmake --build cpp/build --config Release --target pg_licht_mcp
+
+      # What the hardening check is to the ELF binaries, as far as it goes
+      # here: the executable is the one that was meant. It names its version,
+      # it imports nothing but Windows' own libraries -- a DLL from vcpkg or
+      # the compiler would be one the archive does not carry -- its header
+      # declares the hardening asked for, and it answers a request with a line
+      # feed and no carriage return.
+      - name: Check the executable (Windows)
+        if: matrix.distro == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe=cpp/build/Release/pg_licht_mcp.exe
+          version=$(sed -n 's/^project(pg_licht_mcp VERSION \([0-9.]*\).*/\1/p' cpp/CMakeLists.txt)
+          test "$("$exe" --version | tr -d '\r')" = "pg_licht_mcp $version"
+          llvm-objdump -p "$exe" | sed -n 's/^ *DLL Name: //p' | tr 'A-Z' 'a-z' | sort -u > imports.txt
+          cat imports.txt
+          test -s imports.txt
+          if grep -Ev '^(kernel32|user32|advapi32|shell32|ws2_32|wsock32|crypt32|secur32|bcrypt|ole32|oleaut32|iphlpapi|wldap32|userenv|ntdll)\.dll$' imports.txt; then
+            echo "the executable needs a library that Windows does not have" >&2
+            exit 1
+          fi
+          # ASLR with high entropy, DEP and Control Flow Guard, as the header
+          # declares them: 0x0020, 0x0040, 0x0100 and 0x4000 of
+          # DllCharacteristics. The first three are the linker's defaults and
+          # the last is asked for in SafetyFlags.cmake; none is taken on trust.
+          llvm-objdump -p "$exe" | grep -i 'DllCharacteristics'
+          chars=$(llvm-objdump -p "$exe" | awk 'tolower($1) == "dllcharacteristics" { print $2; exit }')
+          test -n "$chars"
+          if [ $(( 16#${chars#0x} & 0x4160 )) -ne $(( 0x4160 )) ]; then
+            echo "DllCharacteristics $chars lacks one of ASLR, high-entropy ASLR, DEP, CFG" >&2
+            exit 1
+          fi
+          printf '%s\n%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"release","version":"0"}}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"listConnections","arguments":{}}}' \
+            | "$exe" "host=192.0.2.1 port=5432 dbname=x user=y connect_timeout=1" > answer.txt
+          cat answer.txt
+          test "$(grep -c '"jsonrpc"' answer.txt)" = 2
+          grep -q '"protocolVersion":"2025-06-18"' answer.txt
+          if grep -q $'\r' answer.txt; then
+            echo "an answer carries a carriage return" >&2
+            exit 1
+          fi
+
+      # The executable, the licence and a page of what differs on Windows. No
+      # manual page: it is mdoc, which nothing there reads, and the README
+      # points at the same manual online.
+      - name: Package (zip)
+        if: matrix.extension == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force stage | Out-Null
+          Copy-Item cpp/build/Release/pg_licht_mcp.exe stage/
+          Copy-Item LICENSE stage/LICENSE.txt
+          Copy-Item cpp/windows/README.txt stage/
+          Compress-Archive -Path stage/* -DestinationPath "${{ matrix.artifact }}.zip"
+          Get-ChildItem stage
 
       - name: Package (tar.gz)
         if: matrix.extension == 'tar.gz'
@@ -208,7 +290,7 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.${{ matrix.extension }}
 
-  # Four of the seven release assets are packages, and until 4.3.0 none of
+  # Four of the eight release assets are packages, and until 4.3.0 none of
   # them was ever opened: the tarball was listed, the .deb and .rpm were
   # uploaded unexamined. A listing would not be enough either -- it shows a
   # Depends line and cannot say whether that line resolves. So each package is
@@ -400,6 +482,7 @@ jobs:
             pg_licht_mcp-*.tar.gz
             pg_licht_mcp-*.deb
             pg_licht_mcp-*.rpm
+            pg_licht_mcp-*.zip
 
       # One file a user can check every download against without the GitHub
       # CLI: sha256sum -c --ignore-missing SHA256SUMS. The source tarball is
@@ -411,14 +494,14 @@ jobs:
       - name: Write SHA256SUMS
         run: |
           set -euo pipefail
-          sha256sum pg_licht_mcp-*.tar.gz pg_licht_mcp-*.deb pg_licht_mcp-*.rpm > SHA256SUMS
+          sha256sum pg_licht_mcp-*.tar.gz pg_licht_mcp-*.deb pg_licht_mcp-*.rpm pg_licht_mcp-*.zip > SHA256SUMS
           curl -fsSL -o source.tar.gz "https://github.com/${{ github.repository }}/archive/refs/tags/${{ github.ref_name }}.tar.gz"
           test -s source.tar.gz
           src=$(sha256sum source.tar.gz | cut -d' ' -f1)
           tag="${{ github.ref_name }}"
           echo "$src  $tag.tar.gz" >> SHA256SUMS
           echo "$src  ${{ github.event.repository.name }}-${tag#v}.tar.gz" >> SHA256SUMS
-          test "$(wc -l < SHA256SUMS)" -eq 9
+          test "$(wc -l < SHA256SUMS)" -eq 10
           cat SHA256SUMS
 
       - name: Create GitHub release
@@ -440,6 +523,7 @@ jobs:
               pg_licht_mcp-linux-x86_64-rocky9.rpm \
               pg_licht_mcp-linux-arm64-rocky9.rpm \
               pg_licht_mcp-macos-arm64.tar.gz \
+              pg_licht_mcp-windows-x86_64.zip \
               SHA256SUMS
             exit 0
           fi
@@ -454,6 +538,7 @@ jobs:
             pg_licht_mcp-linux-x86_64-rocky9.rpm \
             pg_licht_mcp-linux-arm64-rocky9.rpm \
             pg_licht_mcp-macos-arm64.tar.gz \
+            pg_licht_mcp-windows-x86_64.zip \
             SHA256SUMS
         env:
           GH_TOKEN: ${{ github.token }}

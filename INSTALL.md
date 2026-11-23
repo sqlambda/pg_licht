@@ -3,7 +3,7 @@
 Pre-built packages and binaries for every supported platform. To compile from source
 instead, see [BUILD.md](BUILD.md).
 
-Every channel below installs the manual page, so once installed:
+Every channel below installs the manual page, except the Windows archive, so once installed:
 
 ```bash
 man pg_licht_mcp
@@ -33,6 +33,7 @@ Download the latest release for your platform from the
 | Linux x86_64 (generic) | `pg_licht_mcp-linux-x86_64.tar.gz` | tarball |
 | Linux arm64 (generic) | `pg_licht_mcp-linux-arm64.tar.gz` | tarball |
 | macOS Apple Silicon | `pg_licht_mcp-macos-arm64.tar.gz` | tarball |
+| Windows x86_64 | `pg_licht_mcp-windows-x86_64.zip` | zip |
 
 ### Debian / Ubuntu / other apt-based distros (`.deb`)
 
@@ -87,6 +88,33 @@ tar -xzf pg_licht_mcp-linux-x86_64.tar.gz -C ~/.local
 Add `~/.local/bin` to your `PATH` if it is not already there. Most distributions add
 `~/.local/share/man` to the man search path automatically; if `man pg_licht_mcp` does not
 find it, export `MANPATH="$HOME/.local/share/man:$MANPATH"`.
+
+### Windows (`.zip`)
+
+The archive holds `pg_licht_mcp.exe`, the licence and a `README.txt`. The program needs
+nothing beside it: no PostgreSQL installation, no runtime, no other library. Unpack it
+wherever you keep programs and give your MCP client the full path:
+
+```powershell
+Expand-Archive pg_licht_mcp-windows-x86_64.zip -DestinationPath "$env:LOCALAPPDATA\pg_licht"
+& "$env:LOCALAPPDATA\pg_licht\pg_licht_mcp.exe" --version
+```
+
+It is not signed, so Windows may ask before running a file it has not seen; the checksum
+and the attestation under [Verify the installation](#verify-the-installation) are how to
+know it is the one built here.
+
+Three things differ from the other platforms:
+
+- The default files are `%APPDATA%\pg_licht\connections.ini` and
+  `%APPDATA%\pg_licht\budgets.ini`, beside the `%APPDATA%\postgresql\` where libpq keeps
+  `pgpass.conf`.
+- The permissions of those files are not tested, as libpq does not test its password file
+  on Windows. Keep them in `%APPDATA%`, which only your own account can read.
+- There is no `SIGHUP`. A changed file is read at the next request.
+
+The archive carries no manual page; the same manual is
+[online](https://sqlambda.github.io/pg_licht/).
 
 ## FreeBSD (build from source)
 

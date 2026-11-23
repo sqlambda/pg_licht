@@ -13,6 +13,32 @@
 
 #include <sys/stat.h>
 
+// Where a user's own files are looked for when nothing names them.
+//
+// On Unix, under $HOME: ~/.config/pg_licht/. On Windows, under %APPDATA%:
+// %APPDATA%\pg_licht\, beside the %APPDATA%\postgresql\ where libpq keeps
+// pgpass.conf. HOME is not normally set there.
+namespace pglicht {
+
+#ifdef _WIN32
+inline constexpr const char* kUserBaseEnv = "APPDATA";
+inline constexpr const char* kDefaultDirShown = "%APPDATA%\\pg_licht\\";
+#else
+inline constexpr const char* kUserBaseEnv = "HOME";
+inline constexpr const char* kDefaultDirShown = "~/.config/pg_licht/";
+#endif
+
+// The default file of that name, given what kUserBaseEnv holds.
+inline std::string default_file(const std::string& base, const std::string& name) {
+#ifdef _WIN32
+  return base + "\\pg_licht\\" + name;
+#else
+  return base + "/.config/pg_licht/" + name;
+#endif
+}
+
+}  // namespace pglicht
+
 // Connection configuration for pg-licht.
 //
 // A connection is either a libpq service name or an explicit set of libpq
@@ -294,10 +320,17 @@ public:
     struct stat st {};
     if (::stat(path.c_str(), &st) != 0)
       throw std::runtime_error("cannot read config file: " + path);
+    // Not on Windows, as libpq does not test its password file there: "On
+    // Win32, the directory is protected, so we don't have to check the file"
+    // (fe-connect.c). Windows' stat could not answer in any case: it copies
+    // the owner's bits to group and other, so the test would refuse every
+    // file. The default file is in %APPDATA%, which only its user can read.
+#ifndef _WIN32
     if (st.st_mode & 0077)
       throw std::runtime_error(
         "config file " + path + " is group/world accessible; "
         "it may contain credentials. Run: chmod 600 " + path);
+#endif
 
     std::ifstream in(path);
     if (!in) throw std::runtime_error("cannot open config file: " + path);
@@ -941,8 +974,9 @@ struct Budgets {
   // testable without touching the environment:
   //   1. $PG_LICHT_BUDGETS, which must then exist
   //   2. budgets.ini beside the connections file in use
-  //   3. ~/.config/pg_licht/budgets.ini
-  // 2 and 3 are honoured only when the file exists.
+  //   3. ~/.config/pg_licht/budgets.ini (on Windows, %APPDATA%\pg_licht\)
+  // 2 and 3 are honoured only when the file exists. `home` is what
+  // kUserBaseEnv holds.
   static std::string resolve_path(const std::string& env_path,
                                   const std::string& config_path,
                                   const std::string& home) {
@@ -952,14 +986,20 @@ struct Budgets {
     };
     if (!env_path.empty()) return env_path;
     if (!config_path.empty()) {
+      // Windows takes either separator in a path, so a file is beside the
+      // last of either.
+#ifdef _WIN32
+      const auto slash = config_path.find_last_of("/\\");
+#else
       const auto slash = config_path.rfind('/');
+#endif
       const std::string beside =
           (slash == std::string::npos ? std::string(".") : config_path.substr(0, slash)) +
           "/budgets.ini";
       if (exists(beside)) return beside;
     }
     if (!home.empty()) {
-      const std::string def = home + "/.config/pg_licht/budgets.ini";
+      const std::string def = default_file(home, "budgets.ini");
       if (exists(def)) return def;
     }
     return "";
@@ -975,10 +1015,14 @@ struct Budgets {
     // Holds no credentials, so it may be readable. It must not be WRITABLE by
     // anyone but its owner: these are limits, and a file another user can
     // edit is a limit another user can raise.
+    // Not on Windows, for the reason given at the connections file's test in
+    // ConnectionRegistry::from_ini.
+#ifndef _WIN32
     if (st.st_mode & 0022)
       throw std::runtime_error(
         "budgets file " + path + " is group/world writable, so another user "
         "could raise its limits. Run: chmod go-w " + path);
+#endif
 
     std::ifstream in(path);
     if (!in) throw std::runtime_error("cannot open budgets file: " + path);
