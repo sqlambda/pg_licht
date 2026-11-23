@@ -526,9 +526,13 @@ jobs:
             echo "expected $WANT" >&2
             exit 1
           fi
-          # The server and contrib; not pgAdmin, which is most of the archive.
-          unzip -q pg.zip 'pgsql/bin/*' 'pgsql/lib/*' 'pgsql/share/*'
+          # All of it, pgAdmin included, which is most of the archive. Naming
+          # the three directories wanted took only their top level: in the
+          # unzip Git for Windows carries, * stops at a directory, and initdb
+          # then found no share/timezonesets.
+          unzip -q pg.zip
           rm pg.zip
+          test -d pgsql/share/timezonesets
           pgsql/bin/postgres.exe --version
 
       # Started, used and stopped in one step, so nothing outlives it. Trust
