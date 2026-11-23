@@ -37,7 +37,9 @@ function(pglicht_harden target)
     # MSVC spells all of it differently. /utf-8: the sources are UTF-8, which
     # MSVC otherwise reads in the machine's code page.
     if(MSVC)
-        target_compile_options(${target} PRIVATE /W4 /utf-8 /permissive-)
+        # /bigobj: the suite is one translation unit of eleven thousand
+        # lines, more sections than an object file otherwise holds.
+        target_compile_options(${target} PRIVATE /W4 /utf-8 /permissive- /bigobj)
         # MSVC calls getenv deprecated (C4996) and offers _dupenv_s, which is
         # its own. The environment is read here and never written, which is
         # the case getenv is safe in.
@@ -172,7 +174,7 @@ endfunction()
 find_program(READELF_EXECUTABLE readelf)
 find_program(NM_EXECUTABLE nm)
 function(pglicht_add_hardening_test target)
-    if(NOT PGLICHT_SANITIZER STREQUAL "NONE" OR APPLE OR NOT READELF_EXECUTABLE OR NOT NM_EXECUTABLE)
+    if(NOT PGLICHT_SANITIZER STREQUAL "NONE" OR APPLE OR WIN32 OR NOT READELF_EXECUTABLE OR NOT NM_EXECUTABLE)
         return()
     endif()
     if(NOT CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$")

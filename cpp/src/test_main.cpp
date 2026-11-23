@@ -1,7 +1,12 @@
 #include <gtest/gtest.h>
 #include <chrono>
 #include <cstdlib>
+#ifdef _WIN32
+#include <io.h>
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 #include <sstream>
 #include <filesystem>
 #include <fstream>
@@ -18,6 +23,28 @@
 #pragma GCC diagnostic pop
 #endif
 #include "server.h"
+
+// What the suite uses of POSIX that Windows spells otherwise or has not.
+// getpid is there under its own name, which the build lets through with
+// _CRT_NONSTDC_NO_WARNINGS; the environment is set through _putenv_s, where an
+// empty value removes the variable; and a file has no mode to set.
+#ifdef _WIN32
+using mode_t = int;
+static int setenv(const char* name, const char* value, int) { return _putenv_s(name, value); }
+static int unsetenv(const char* name) { return _putenv_s(name, ""); }
+static void set_mode(const std::string&, mode_t) {}
+#else
+static void set_mode(const std::string& path, mode_t mode) { ::chmod(path.c_str(), mode); }
+#endif
+
+// A path under the system's temporary directory that no other run of the
+// suite has: /tmp is not everywhere, and neither is mkdtemp.
+static std::string fresh_temp_path(const std::string& stem, const std::string& suffix = "") {
+  static int counter = 0;
+  const auto path = std::filesystem::temp_directory_path() /
+      (stem + "_" + std::to_string(getpid()) + "_" + std::to_string(counter++) + suffix);
+  return path.string();
+}
 
 // Server version as libpq reports it (e.g. 160004 for 16.4), for gating tests
 // on features that require a minimum PostgreSQL major -- explainQuery's
@@ -2663,11 +2690,11 @@ namespace {
 struct BudgetsFile {
   std::string dir, path;
   BudgetsFile(const std::string& body, mode_t mode = 0644) {
-    char tmpl[] = "/tmp/licht-budgets-XXXXXX";
-    dir = ::mkdtemp(tmpl);
+    dir = fresh_temp_path("licht-budgets");
+    std::filesystem::create_directories(dir);
     path = dir + "/budgets.ini";
     std::ofstream(path) << body;
-    ::chmod(path.c_str(), mode);
+    set_mode(path, mode);
   }
   ~BudgetsFile() { std::filesystem::remove_all(dir); }
 };
@@ -2738,6 +2765,9 @@ TEST(BudgetsTest, PayloadLimitIsReadAndZeroTurnsItOff) {
 }
 
 TEST(BudgetsTest, AFileOthersCanWriteIsRefused) {
+#ifdef _WIN32
+  GTEST_SKIP() << "Windows: the file's mode is not tested, as libpq does not test its own";
+#endif
   // Limits another user can edit are limits another user can raise.
   BudgetsFile f("[analyze]\nmemory_percent = 10\n", 0666);
   try {
@@ -2755,16 +2785,17 @@ TEST(BudgetsTest, ResolutionOrderIsEnvironmentThenBesideTheConfigThenHome) {
   BudgetsFile beside("[analyze]\nmemory_percent = 20\n");
   const std::string config = beside.dir + "/connections.ini";
 
-  char tmpl[] = "/tmp/licht-home-XXXXXX";
-  const std::string home = ::mkdtemp(tmpl);
-  std::filesystem::create_directories(home + "/.config/pg_licht");
-  std::ofstream(home + "/.config/pg_licht/budgets.ini") << "[analyze]\n";
+  // Where the default file is under a user's directory differs by system:
+  // default_file knows, and is what main() uses too.
+  const std::string home = fresh_temp_path("licht-home");
+  const std::string in_home = pglicht::default_file(home, "budgets.ini");
+  std::filesystem::create_directories(std::filesystem::path(in_home).parent_path());
+  std::ofstream(in_home) << "[analyze]\n";
 
   using pglicht::Budgets;
   EXPECT_EQ(Budgets::resolve_path("/explicit.ini", config, home), "/explicit.ini");
   EXPECT_EQ(Budgets::resolve_path("", config, home), beside.path);
-  EXPECT_EQ(Budgets::resolve_path("", "/nowhere/connections.ini", home),
-            home + "/.config/pg_licht/budgets.ini");
+  EXPECT_EQ(Budgets::resolve_path("", "/nowhere/connections.ini", home), in_home);
   EXPECT_EQ(Budgets::resolve_path("", "", "/nonexistent-home"), "");
   std::filesystem::remove_all(home);
 }
@@ -5740,21 +5771,17 @@ namespace {
 class TempIni {
 public:
   TempIni(const std::string& body, mode_t mode = 0600) {
-    std::ostringstream p;
-    p << "/tmp/pg_licht_test_" << ::getpid() << "_" << (counter_++) << ".ini";
-    path_ = p.str();
+    path_ = fresh_temp_path("pg_licht_test", ".ini");
     std::ofstream out(path_);
     out << body;
     out.close();
-    ::chmod(path_.c_str(), mode);
+    set_mode(path_, mode);
   }
-  ~TempIni() { ::unlink(path_.c_str()); }
+  ~TempIni() { std::error_code ec; std::filesystem::remove(path_, ec); }
   const std::string& path() const { return path_; }
 private:
   std::string path_;
-  static int counter_;
 };
-int TempIni::counter_ = 0;
 
 pglicht::ConnectionRegistry load(const std::string& body, mode_t mode = 0600) {
   TempIni ini(body, mode);
@@ -5823,6 +5850,9 @@ TEST(ConnectionConfigTest, SectionWithNeitherServiceNorDbnameIsRejected) {
 }
 
 TEST(ConnectionConfigTest, GroupReadableFileIsRejected) {
+#ifdef _WIN32
+  GTEST_SKIP() << "Windows: the file's mode is not tested, as libpq does not test its own";
+#endif
   try {
     load("[default]\ndbname = one\npassword = hunter2\n", 0644);
     FAIL() << "expected a permission rejection";

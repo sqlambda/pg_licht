@@ -116,6 +116,11 @@ if(BUILD_TESTING)
             nlohmann_json::nlohmann_json
             ${PGLICHT_PQ_LIBS}
             Threads::Threads)
+    # The suite calls getpid by the name POSIX gives it, which MSVC has and
+    # calls deprecated.
+    if(MSVC)
+        target_compile_definitions(pg_licht_mcp_test PRIVATE _CRT_NONSTDC_NO_WARNINGS)
+    endif()
     pglicht_harden(pg_licht_mcp_test)
     pglicht_harden_binary(pg_licht_mcp_test)
     pglicht_apply_sanitizers(pg_licht_mcp_test)
@@ -143,9 +148,13 @@ if(BUILD_TESTING)
     set_tests_properties(cli_version PROPERTIES
         PASS_REGULAR_EXPRESSION "^pg_licht_mcp ${PROJECT_VERSION}\n$")
     pglicht_add_hardening_test(pg_licht_mcp)
+    # The tests below this point that are scripts are bash, and what they
+    # check does not vary by system: on Windows they are left to the others.
+    if(NOT WIN32)
     # Every GitHub Action pinned to a commit SHA (SECURITY.md, "The build").
     add_test(NAME actions_pinned
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/actions-pinned.sh ${CMAKE_CURRENT_SOURCE_DIR}/..)
+    endif()
     add_test(NAME cli_unknown_option COMMAND $<TARGET_FILE:pg_licht_mcp> --no-such-option)
     set_tests_properties(cli_unknown_option PROPERTIES
         PASS_REGULAR_EXPRESSION "unknown option: --no-such-option")
@@ -154,16 +163,18 @@ if(BUILD_TESTING)
     # switches it covers are read once per process from the environment, so
     # they cannot be exercised from inside the gtest suite. It needs no
     # database: listConnections answers from the registry without connecting.
+    if(NOT WIN32)
     add_test(NAME protocol_compat
              COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/protocol-compat.sh
                      $<TARGET_FILE:pg_licht_mcp>)
+    endif()
 
     # llms.txt, generated from the binary as the release workflow does, so a
     # tool without a man page entry -- or a generator broken by a change to
     # tools/list -- fails here rather than at tag time. Needs mandoc to render
     # the man page the entries link into, and python3 for the generator.
     find_package(Python3 COMPONENTS Interpreter QUIET)
-    if(MANDOC_EXECUTABLE AND Python3_Interpreter_FOUND)
+    if(MANDOC_EXECUTABLE AND Python3_Interpreter_FOUND AND NOT WIN32)
         add_test(NAME llms_txt
                  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/llms-txt.sh
                          $<TARGET_FILE:pg_licht_mcp>)

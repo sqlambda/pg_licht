@@ -432,3 +432,129 @@ jobs:
       - name: Rig log
         if: always()
         run: tail -40 rig.log; rm -f rig.env
+
+  # The suite on Windows: compiled once with MSVC, as the release compiles the
+  # server, then run against each PostgreSQL major.
+  #
+  # vcpkg builds the libraries the manifest names, and gtest with them through
+  # its `tests` feature, at the commit pinned in cpp/vcpkg.json. The static
+  # triplet makes the test binary one file that the jobs below can be handed.
+  windows-build:
+    name: windows-build
+    runs-on: windows-2025
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure and build
+        run: |
+          cmake -S cpp -B cpp/build -A x64 \
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static \
+            -DVCPKG_MANIFEST_FEATURES=tests \
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
+            -DPGLICHT_WERROR=ON
+          grep -x 'PGLICHT_WERROR:BOOL=ON' cpp/build/CMakeCache.txt
+          cmake --build cpp/build --config Release
+
+      # The two that need neither a database nor a shell. The scripts the
+      # Linux build runs here are bash and check nothing that varies by system.
+      - name: The command line
+        working-directory: cpp/build
+        run: ctest -C Release -R "cli_" --output-on-failure
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-binary-windows
+          path: cpp/build/Release/pg_licht_mcp_test.exe
+          retention-days: 1
+          if-no-files-found: error
+
+  # A PostgreSQL server for Windows, in the runner itself: a service container
+  # needs a Linux runner. EnterpriseDB publishes the binaries of each major as
+  # one archive, with contrib, which is where pg_stat_statements, postgres_fdw
+  # and pgstattuple come from. hypopg and the three shared-memory extensions
+  # are not in it, so the tests behind them skip here; the Linux jobs run them.
+  #
+  # The archive's name carries the minor release, so each is named in full and
+  # moved by hand. EnterpriseDB publishes no checksum for them: the job prints
+  # the one it computed, and compares it where the matrix gives one.
+  windows:
+    name: windows-pg${{ matrix.pg }}
+    needs: windows-build
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { pg: 14, edb: "14.25-1", sha256: "" }
+          - { pg: 15, edb: "15.20-1", sha256: "" }
+          - { pg: 16, edb: "16.16-1", sha256: "" }
+          - { pg: 17, edb: "17.12-1", sha256: "" }
+          - { pg: 18, edb: "18.7-1", sha256: "" }
+          - { pg: 19, edb: "19.0-1", sha256: "" }
+    steps:
+      # The suite reads cpp/test/connections.example.ini through a path baked
+      # in at compile time, so the source tree has to be present, at the path
+      # the build job had it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: test-binary-windows
+          path: cpp/build/Release
+
+      - name: Fetch PostgreSQL ${{ matrix.edb }}
+        env:
+          EDB: ${{ matrix.edb }}
+          WANT: ${{ matrix.sha256 }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o pg.zip \
+            "https://get.enterprisedb.com/postgresql/postgresql-$EDB-windows-x64-binaries.zip"
+          got=$(sha256sum pg.zip | cut -d' ' -f1)
+          echo "sha256 of postgresql-$EDB-windows-x64-binaries.zip: $got"
+          if [ -n "$WANT" ] && [ "$got" != "$WANT" ]; then
+            echo "expected $WANT" >&2
+            exit 1
+          fi
+          # The server and contrib; not pgAdmin, which is most of the archive.
+          unzip -q pg.zip 'pgsql/bin/*' 'pgsql/lib/*' 'pgsql/share/*'
+          rm pg.zip
+          pgsql/bin/postgres.exe --version
+
+      # Started, used and stopped in one step, so nothing outlives it. Trust
+      # authentication on the loopback address only: the server exists for the
+      # length of this step, on a runner nothing else reaches.
+      - name: Run tests
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/pgsql/bin"
+          data="$RUNNER_TEMP/pgdata"
+          log="$RUNNER_TEMP/postgres.log"
+          "$bin/initdb.exe" -D "$data" -U postgres -A trust -E UTF8 > /dev/null
+          {
+            echo "listen_addresses = '127.0.0.1'"
+            echo "port = 5432"
+            echo "shared_preload_libraries = 'pg_stat_statements'"
+          } >> "$data/postgresql.conf"
+          stop() {
+            status=$?
+            "$bin/pg_ctl.exe" -D "$data" -m fast -w stop > /dev/null 2>&1 || true
+            if [ "$status" -ne 0 ]; then echo "--- the server's log"; tail -60 "$log" || true; fi
+            exit "$status"
+          }
+          trap stop EXIT
+          "$bin/pg_ctl.exe" -D "$data" -l "$log" -w start < /dev/null
+          "$bin/psql.exe" -X -qtA -h 127.0.0.1 -U postgres -d postgres \
+            -c "SELECT version()" -c "SHOW shared_preload_libraries"
+          DATABASE_URL="host=127.0.0.1 port=5432 user=postgres dbname=postgres" \
+            cpp/build/Release/pg_licht_mcp_test.exe
