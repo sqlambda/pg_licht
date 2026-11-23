@@ -480,8 +480,10 @@ jobs:
   # are not in it, so the tests behind them skip here; the Linux jobs run them.
   #
   # The archive's name carries the minor release, so each is named in full and
-  # moved by hand. EnterpriseDB publishes no checksum for them: the job prints
-  # the one it computed, and compares it where the matrix gives one.
+  # moved by hand. EnterpriseDB publishes no checksum for them, so each one
+  # here is what the archive had when it was first fetched, 2026-11-22: it
+  # says the file has not changed since, not whose it is. To move to a new
+  # minor, change the name, run the job, and copy the checksum it prints.
   windows:
     name: windows-pg${{ matrix.pg }}
     needs: windows-build
@@ -494,12 +496,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { pg: 14, edb: "14.25-1", sha256: "" }
-          - { pg: 15, edb: "15.20-1", sha256: "" }
-          - { pg: 16, edb: "16.16-1", sha256: "" }
-          - { pg: 17, edb: "17.12-1", sha256: "" }
-          - { pg: 18, edb: "18.7-1", sha256: "" }
-          - { pg: 19, edb: "19.0-1", sha256: "" }
+          - { pg: 14, edb: "14.25-1", sha256: "f48930bc4de670c8b75be546a1dafd9062ef54807bb81731c75d41acdbdb936d" }
+          - { pg: 15, edb: "15.20-1", sha256: "6fbe06a1c3d63494baa7a76ad6426968fa5b6cfdd37fbfd5c2febd3be748eb09" }
+          - { pg: 16, edb: "16.16-1", sha256: "5c0d06f3d26a929ecb36dd931409f1e51a4181355794a259b90aae8bffc57a9f" }
+          - { pg: 17, edb: "17.12-1", sha256: "a2cd8a774389347b70be7748ac4a37ef43cb6ee539c5fc3e85ae264b15e4a04c" }
+          - { pg: 18, edb: "18.7-1", sha256: "ead0bbc27fb678fa24dcf86b738981323042abd073c744103bf7f3aed23f9a33" }
+          - { pg: 19, edb: "19.0-1", sha256: "bc397f1e58f018e364262074c2e9d960f6169e7436892dbe6e73313d1bb201ff" }
     steps:
       # The suite reads cpp/test/connections.example.ini through a path baked
       # in at compile time, so the source tree has to be present, at the path
