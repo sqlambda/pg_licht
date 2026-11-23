@@ -12,6 +12,13 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# MSVC takes libpqxx and libpq from vcpkg, through the packages' own CMake
+# files; everything else, MinGW included, finds them with pkg-config.
+if(MSVC)
+    find_package(libpqxx CONFIG REQUIRED)
+    find_package(PostgreSQL REQUIRED)
+    set(PGLICHT_PQ_LIBS libpqxx::pqxx PostgreSQL::PostgreSQL)
+else()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PQXX REQUIRED IMPORTED_TARGET libpqxx)
 # libpqxx's .pc only exposes libpq via Requires.private, which CMake's
@@ -21,6 +28,12 @@ pkg_check_modules(PQXX REQUIRED IMPORTED_TARGET libpqxx)
 # a no-op when libpqxx is a shared library (libpq is already a transitive
 # runtime dependency there) and required when it's static.
 pkg_check_modules(LIBPQ REQUIRED IMPORTED_TARGET libpq)
+    set(PGLICHT_PQ_LIBS PkgConfig::PQXX PkgConfig::LIBPQ)
+endif()
+# WSAPoll, which stands in for poll() on Windows, is in Winsock.
+if(WIN32)
+    list(APPEND PGLICHT_PQ_LIBS ws2_32)
+endif()
 find_package(nlohmann_json REQUIRED)
 # The server starts threads -- the connection cache's reaper, parallel sweeps,
 # the pooler tests' clients -- and must say so at link time. glibc 2.34+ has
@@ -41,8 +54,7 @@ target_compile_definitions(pg_licht_mcp PRIVATE PGLICHT_VERSION="${PROJECT_VERSI
 target_link_libraries(pg_licht_mcp
     PRIVATE
         nlohmann_json::nlohmann_json
-        PkgConfig::PQXX
-        PkgConfig::LIBPQ
+        ${PGLICHT_PQ_LIBS}
         Threads::Threads
 )
 pglicht_harden(pg_licht_mcp)
@@ -74,7 +86,7 @@ if(PGLICHT_FUZZ)
         add_executable(fuzz_${_fuzz} ${_sources})
         target_compile_definitions(fuzz_${_fuzz} PRIVATE PGLICHT_VERSION="${PROJECT_VERSION}")
         target_link_libraries(fuzz_${_fuzz} PRIVATE
-            nlohmann_json::nlohmann_json PkgConfig::PQXX PkgConfig::LIBPQ Threads::Threads)
+            nlohmann_json::nlohmann_json ${PGLICHT_PQ_LIBS} Threads::Threads)
         pglicht_harden(fuzz_${_fuzz})
         target_compile_options(fuzz_${_fuzz} PRIVATE
             -g -fno-omit-frame-pointer -fsanitize=fuzzer,address,undefined
@@ -102,9 +114,13 @@ if(BUILD_TESTING)
             GTest::gtest
             GTest::gtest_main
             nlohmann_json::nlohmann_json
-            PkgConfig::PQXX
-            PkgConfig::LIBPQ
+            ${PGLICHT_PQ_LIBS}
             Threads::Threads)
+    # The suite calls getpid by the name POSIX gives it, which MSVC has and
+    # calls deprecated.
+    if(MSVC)
+        target_compile_definitions(pg_licht_mcp_test PRIVATE _CRT_NONSTDC_NO_WARNINGS)
+    endif()
     pglicht_harden(pg_licht_mcp_test)
     pglicht_harden_binary(pg_licht_mcp_test)
     pglicht_apply_sanitizers(pg_licht_mcp_test)
@@ -132,9 +148,13 @@ if(BUILD_TESTING)
     set_tests_properties(cli_version PROPERTIES
         PASS_REGULAR_EXPRESSION "^pg_licht_mcp ${PROJECT_VERSION}\n$")
     pglicht_add_hardening_test(pg_licht_mcp)
+    # The tests below this point that are scripts are bash, and what they
+    # check does not vary by system: on Windows they are left to the others.
+    if(NOT WIN32)
     # Every GitHub Action pinned to a commit SHA (SECURITY.md, "The build").
     add_test(NAME actions_pinned
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/actions-pinned.sh ${CMAKE_CURRENT_SOURCE_DIR}/..)
+    endif()
     add_test(NAME cli_unknown_option COMMAND $<TARGET_FILE:pg_licht_mcp> --no-such-option)
     set_tests_properties(cli_unknown_option PROPERTIES
         PASS_REGULAR_EXPRESSION "unknown option: --no-such-option")
@@ -143,16 +163,18 @@ if(BUILD_TESTING)
     # switches it covers are read once per process from the environment, so
     # they cannot be exercised from inside the gtest suite. It needs no
     # database: listConnections answers from the registry without connecting.
+    if(NOT WIN32)
     add_test(NAME protocol_compat
              COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/protocol-compat.sh
                      $<TARGET_FILE:pg_licht_mcp>)
+    endif()
 
     # llms.txt, generated from the binary as the release workflow does, so a
     # tool without a man page entry -- or a generator broken by a change to
     # tools/list -- fails here rather than at tag time. Needs mandoc to render
     # the man page the entries link into, and python3 for the generator.
     find_package(Python3 COMPONENTS Interpreter QUIET)
-    if(MANDOC_EXECUTABLE AND Python3_Interpreter_FOUND)
+    if(MANDOC_EXECUTABLE AND Python3_Interpreter_FOUND AND NOT WIN32)
         add_test(NAME llms_txt
                  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test/llms-txt.sh
                          $<TARGET_FILE:pg_licht_mcp>)

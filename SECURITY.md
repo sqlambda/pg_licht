@@ -80,3 +80,16 @@ The Linux release binaries are built with PIE, full RELRO, a non-executable stac
 stack protector and, against glibc, `_FORTIFY_SOURCE=3`; `cpp/test/hardening-check.sh` checks
 each property on every Linux binary the release ships. GitHub Actions are pinned to
 commit SHAs and kept current by Dependabot.
+
+The Windows executable is built with MSVC and links libpq, OpenSSL and libpqxx statically,
+from vcpkg at a pinned commit (`cpp/vcpkg.json`). It has the stack cookies, ASLR with high
+entropy and DEP that MSVC gives by default, and Control Flow Guard in pg_licht's own code;
+the release reads the last three from the executable's header and refuses an executable
+that imports any library Windows does not have. The statically linked libraries are
+compiled as vcpkg compiles them, without Control Flow Guard. The executable is not signed:
+its provenance is the attestation and `SHA256SUMS`, as for every other asset.
+
+On Windows the connections and budgets files are not tested for who may read or write
+them, as libpq does not test its password file there. The default location,
+`%APPDATA%\pg_licht`, is readable by its user alone; a file kept elsewhere is yours to
+protect.

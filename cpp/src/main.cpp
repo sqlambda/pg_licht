@@ -1,13 +1,17 @@
 #include <cstdlib>
 #include <signal.h>
 #include <string>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 #include "server.h"
 
 namespace {
 
 std::string default_config_path() {
-  if (const char* home = std::getenv("HOME"))
-    return std::string(home) + "/.config/pg_licht/connections.ini";
+  if (const char* base = std::getenv(pglicht::kUserBaseEnv))
+    return pglicht::default_file(base, "connections.ini");
   return "";
 }
 
@@ -25,14 +29,14 @@ void usage(const char* argv0) {
     << "Resolution order:" << std::endl
     << "  1. --config <file>" << std::endl
     << "  2. $PG_LICHT_CONFIG" << std::endl
-    << "  3. ~/.config/pg_licht/connections.ini (if present)" << std::endl
+    << "  3. " << pglicht::kDefaultDirShown << "connections.ini (if present)" << std::endl
     << "  4. $DATABASE_URL" << std::endl
     << "  5. argv[1]" << std::endl
     << std::endl
     << "Budgets (budgets.ini), first found:" << std::endl
     << "  1. $PG_LICHT_BUDGETS" << std::endl
     << "  2. budgets.ini beside the connections file" << std::endl
-    << "  3. ~/.config/pg_licht/budgets.ini" << std::endl
+    << "  3. " << pglicht::kDefaultDirShown << "budgets.ini" << std::endl
     << std::endl
     << "See pg_licht_mcp(1) for the full manual." << std::endl;
 }
@@ -40,17 +44,28 @@ void usage(const char* argv0) {
 }  // namespace
 
 int main(int argc, char *argv[]) {
+#ifdef _WIN32
+  // The protocol is one JSON message per line, each ended by a line feed.
+  // Windows opens stdin and stdout as text, where every line feed written
+  // becomes CR LF and a Ctrl-Z read ends the input; binary leaves both alone.
+  (void)_setmode(_fileno(stdin), _O_BINARY);
+  (void)_setmode(_fileno(stdout), _O_BINARY);
+#endif
   // SIGHUP reloads the connections file, as it does for PostgreSQL and
   // PgBouncer. Through 4.4 it took the default action: the process died, and
   // the client's session with it. Installed first thing and in every mode --
   // with a connection string there is nothing to reload, and the signal is
   // then simply harmless. SA_RESTART: a read blocked on stdin resumes, and the
   // reload happens at the next request, which is when it can be seen.
+  // Windows has neither SIGHUP nor sigaction. Nothing replaces the signal
+  // there: a changed file is still seen at the next request, by its identity.
+#ifndef _WIN32
   struct sigaction sa {};
   sa.sa_handler = [](int) { PostgresMCPServer::request_reload(); };
   sigemptyset(&sa.sa_mask);
   sa.sa_flags = SA_RESTART;
   sigaction(SIGHUP, &sa, nullptr);
+#endif
 
   std::string config_path;
   std::string db_url;
@@ -114,7 +129,7 @@ int main(int argc, char *argv[]) {
     // developer's own file. A bad file is fatal at startup, like a bad
     // connections file.
     const char* env_budgets = std::getenv("PG_LICHT_BUDGETS");
-    const char* home = std::getenv("HOME");
+    const char* home = std::getenv(pglicht::kUserBaseEnv);
     const std::string budgets_path =
       pglicht::Budgets::resolve_path(env_budgets ? env_budgets : "", config_path,
                                      home ? home : "");

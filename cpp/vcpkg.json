@@ -1,0 +1,16 @@
+{
+  "name": "pg-licht",
+  "dependencies": [
+    "libpqxx",
+    "nlohmann-json"
+  ],
+  "features": {
+    "tests": {
+      "description": "What the test suite needs beyond the server: -DVCPKG_MANIFEST_FEATURES=tests",
+      "dependencies": [
+        "gtest"
+      ]
+    }
+  },
+  "builtin-baseline": "0df93a05b9de080129e653ec4776d7e14a1b2e4f"
+}
